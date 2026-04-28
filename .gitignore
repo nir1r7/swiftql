@@ -1,0 +1,51 @@
+# CMake and native build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+Testing/
+_deps/
+bin/
+lib/
+
+# Compiled binaries and objects
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+
+# Test and benchmark outputs
+*.prof
+*.gcda
+*.gcno
+*.gcov
+*.log
+
+# Python caches and virtual environments (python_tools)
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Editor and local workspace settings
+.vscode/*
+!.vscode/extensions.json
+
+# macOS filesystem files
+.DS_Store
+
+# Misc local/accidental folders
+%HOME/
