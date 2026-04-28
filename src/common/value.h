@@ -17,6 +17,7 @@ class Value{
         double asDouble() const;
         const std::string& asString() const;
 
+        // helper for comparisions
         void checkMatchingType(const Value& other) const;
 
         // comparisions
