@@ -16,24 +16,24 @@ struct ColumnDef {
 };
 
 class Schema {
-public:
-    explicit Schema(std::vector<ColumnDef> columns);
+    public:
+        explicit Schema(std::vector<ColumnDef> columns);
 
-    // number of columns
-    int size() const;
+        // number of columns
+        int size() const;
 
-    // return a ColumnDef by index
-    const ColumnDef& column(int index) const;
+        // return a ColumnDef by index
+        const ColumnDef& column(int index) const;
 
-    // return all ColumnDef(s)
-    const std::vector<ColumnDef>& columns() const;
+        // return all ColumnDef(s)
+        const std::vector<ColumnDef>& columns() const;
 
-    // return a ColumnDef's index by name
-    int indexOf(const std::string& name) const;
+        // return a ColumnDef's index by name
+        int indexOf(const std::string& name) const;
 
-    // has ColumnDef
-    bool hasColumn(const std::string& name) const;
+        // has ColumnDef
+        bool hasColumn(const std::string& name) const;
 
-private:
-    std::vector<ColumnDef> columns_;
+    private:
+        std::vector<ColumnDef> columns_;
 };

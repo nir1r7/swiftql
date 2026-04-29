@@ -24,6 +24,8 @@ FetchContent_MakeAvailable(nlohmann_json)
 add_library(swiftql_lib
     src/common/value.cc
     src/common/schema.cc
+    src/catalog/catalog.cc
+    src/storage/csv_loader.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 

@@ -17,13 +17,13 @@ Catalog::Catalog(const std::string& catalog_path){
         std::vector<ColumnDef> cols;
 
         for (auto& col : table_json["columns"]){
-            ColumnDef coldef {col["name"].get<std::string>(), parseTypeId(col["type"].get<std::string>())};
-            cols.push_back(coldef);
+            ColumnDef colDef {col["name"].get<std::string>(), parseTypeId(col["type"].get<std::string>())};
+            cols.push_back(colDef);
         }
 
         TableMetadata meta {table_json["name"].get<std::string>(), table_json["file"].get<std::string>(), Schema(cols)};
 
-        tables_[meta.name] = std::move(meta);
+        tables_.emplace(meta.name, std::move(meta));
     }
 }
 

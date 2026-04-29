@@ -18,6 +18,6 @@ class Catalog {
     private:
         std::unordered_map<std::string, TableMetadata> tables_;
     
-        // Helper to parse TypeId from string ("INT", "DOUBLE", "STRING")
+        // helper to parse TypeId from string ("INT", "DOUBLE", "STRING")
         TypeId parseTypeId(const std::string& type_str) const;
 };
