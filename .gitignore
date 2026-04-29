@@ -42,6 +42,7 @@ env/
 
 # Editor and local workspace settings
 .vscode/*
+.vscode/
 !.vscode/extensions.json
 
 # macOS filesystem files
