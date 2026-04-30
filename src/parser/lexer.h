@@ -9,7 +9,6 @@ public:
     explicit Lexer(const std::string& input);
 
     Token nextToken();
-
     Token peek();
 
 private:
@@ -21,7 +20,7 @@ private:
     void skipWhitespace();
     Token readIdentifierOrKeyword();
     Token readNumber();
-    Token readString();  // handles 'single quoted strings'
+    Token readString(); // handles 'single quoted strings'
 
     char current() const;   // character at pos_
     char advance();         // return current char and move pos_ forward
