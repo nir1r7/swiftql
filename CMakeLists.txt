@@ -27,6 +27,7 @@ add_library(swiftql_lib
     src/catalog/catalog.cc
     src/storage/csv_loader.cc
     src/parser/lexer.cc
+    src/parser/parser.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 

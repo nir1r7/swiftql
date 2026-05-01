@@ -19,6 +19,7 @@ struct ColumnRef : Expr {
 // literal or constant
 struct Literal : Expr {
     Value value;
+    explicit Literal(Value v) : value(std::move(v)) {}
 };
 
 // binary express; two expressions joined by an operator
