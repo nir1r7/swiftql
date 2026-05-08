@@ -4,11 +4,16 @@
 #include <string>
 #include <stdexcept>
 
-Value::Value(int64_t v): data_{v}{}
-Value::Value(double v): data_{v}{}
-Value::Value(std::string v): data_{v}{}
+Value::Value()                : data_(int64_t(0)), is_null_(true)  {}
+Value::Value(int64_t v)      : data_{v},          is_null_(false) {}
+Value::Value(double v)       : data_{v},          is_null_(false) {}
+Value::Value(std::string v)  : data_{v},          is_null_(false) {}
+
+Value Value::null() { return Value(); }
+bool  Value::isNull() const { return is_null_; }
 
 TypeId Value::type() const{
+    if (is_null_) throw std::runtime_error("Cannot get type of null Value");
     switch(data_.index()){
         case 0: return TypeId::INT;
         case 1: return TypeId::DOUBLE;
@@ -37,36 +42,43 @@ const std::string& Value::asString() const {
 }
 
 bool Value::operator==(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ == other.data_;
 }
 
 bool Value::operator!=(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ != other.data_;
 }
 
 bool Value::operator<(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ < other.data_;
 }
 
 bool Value::operator>(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ > other.data_;
 }
 
 bool Value::operator<=(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ <= other.data_;
 }
 
 bool Value::operator>=(const Value& other) const {
+    if (is_null_ || other.is_null_) return false;
     checkMatchingType(other);
     return data_ >= other.data_;
 }
 
 std::string Value::toString() const {
+    if (is_null_) return "NULL";
     switch(data_.index()){
         case 0: return std::to_string(std::get<int64_t>(data_));
         case 1: return std::to_string(std::get<double>(data_));

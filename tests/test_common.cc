@@ -43,6 +43,34 @@ TEST(ValueTest, TypeMismatchThrows) {
     EXPECT_THROW(a < b, std::runtime_error);
 }
 
+TEST(ValueTest, NullDefaultConstruction) {
+    Value v;
+    EXPECT_TRUE(v.isNull());
+}
+
+TEST(ValueTest, NullFactory) {
+    Value v = Value::null();
+    EXPECT_TRUE(v.isNull());
+}
+
+TEST(ValueTest, NonNullIsNotNull) {
+    Value v(int64_t(42));
+    EXPECT_FALSE(v.isNull());
+}
+
+TEST(ValueTest, NullComparisonReturnsFalse) {
+    Value null_v;
+    Value int_v(int64_t(42));
+    EXPECT_FALSE(null_v == int_v);
+    EXPECT_FALSE(int_v == null_v);
+    EXPECT_FALSE(null_v == null_v);  // NULL = NULL is false in SQL
+}
+
+TEST(ValueTest, NullToString) {
+    Value v;
+    EXPECT_EQ(v.toString(), "NULL");
+}
+
 // ===== schema tests =====
 
 TEST(SchemaTest, IndexOf) {
