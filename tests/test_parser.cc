@@ -142,7 +142,7 @@ TEST(ParserTest, Join) {
 TEST(ParserTest, AndPrecedence) {
     Parser p("SELECT team FROM laps WHERE season = 2025 AND speed > 300");
     auto stmt = p.parse();
-    // Top level should be AND
+    // top level should be AND
     auto* bin = dynamic_cast<BinaryExpr*>(stmt.where.get());
     ASSERT_NE(bin, nullptr);
     EXPECT_EQ(bin->op, "AND");

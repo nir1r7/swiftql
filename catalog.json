@@ -2,7 +2,7 @@
   "tables": [
     {
       "name": "laps",
-      "file": "data/laps.csv",
+      "file": "../data/laps.csv",
       "columns": [
         {"name": "lap_id",    "type": "INT"},
         {"name": "driver_id", "type": "INT"},
@@ -17,7 +17,7 @@
     },
     {
       "name": "drivers",
-      "file": "data/drivers.csv",
+      "file": "../data/drivers.csv",
       "columns": [
         {"name": "driver_id",   "type": "INT"},
         {"name": "name",        "type": "STRING"},

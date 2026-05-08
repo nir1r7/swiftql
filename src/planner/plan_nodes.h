@@ -34,8 +34,8 @@ class FilterNode : public PlanNode{
         void close() override;
         const Schema& outputSchema() const override;
     private:
-        std::unique_ptr<PlanNode> child; // child node to pull rows from
-        std::unique_ptr<Expr> predicate; // the WHERE condition expression
+        std::unique_ptr<PlanNode> child_;
+        std::unique_ptr<Expr> predicate_;
 };
 
 
@@ -62,7 +62,7 @@ class ProjectNode : public PlanNode {
 struct AggregateSpec {
     std::string function; // i.e, AVG, SUM, ...
     std::string column; // empty for star param
-    bool is_Star;
+    bool is_star;
 };
 
 // group rows by specified columns and compute aggregates (apply GROUP BY)

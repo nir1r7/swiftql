@@ -8,11 +8,39 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     }
     const Schema& schema = catalog.getTable(stmt.from_table).schema;
 
+    // SELECT list columns must exist
+    for (const auto& expr : stmt.select_list) {
+        validateExpr(expr.get(), schema, "SELECT");
+    }
+
+    // aggregate functions must be applied to compatible column types
+    for (const auto& expr : stmt.select_list) {
+        if (auto* agg = dynamic_cast<const AggregateExpr*>(expr.get())) {
+            if (agg->is_star) continue;
+            if (agg->function_name == "SUM" || agg->function_name == "AVG") {
+                if (agg->argument) {
+                    if (auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get())) {
+                        if (col->table_name.empty() && schema.hasColumn(col->column_name)) {
+                            TypeId t = schema.column(schema.indexOf(col->column_name)).type;
+                            if (t == TypeId::STRING){
+                                throw std::runtime_error(agg->function_name + "() requires a numeric column, but '" + col->column_name + "' is of type STRING");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // JOIN table must exist (if present)
     if (stmt.join.has_value()) {
         if (!catalog.hasTable(stmt.join->join_table)) {
             throw std::runtime_error(
                 "Join table not found: '" + stmt.join->join_table + "'");
+        }
+        if (stmt.join->condition) {
+            const Schema& right_schema = catalog.getTable(stmt.join->join_table).schema;
+            validateJoinCondition(stmt.join->condition.get(), schema, stmt.from_table, right_schema, stmt.join->join_table);
         }
     }
 
@@ -34,11 +62,35 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         throw std::runtime_error("HAVING requires GROUP BY");
     }
 
+    // non aggregated SELECT columns must appear in GROUP BY when aggregates are present
+    bool has_aggregates = false;
+    for (const auto& expr : stmt.select_list) {
+        if (dynamic_cast<const AggregateExpr*>(expr.get())) {
+            has_aggregates = true;
+            break;
+        }
+    }
+    if (has_aggregates) {
+        for (const auto& expr : stmt.select_list) {
+            if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
+                bool in_group_by = false;
+                for (const auto& gb_col : stmt.group_by){
+                    if (gb_col == col->column_name) {
+                        in_group_by = true;
+                        break;
+                    }
+                }
+                if (!in_group_by){
+                    throw std::runtime_error("SELECT column '" + col->column_name + "' must appear in GROUP BY or be used in an aggregate function");
+                }
+            }
+        }
+    }
+
     // ORDER BY columns must exist
     for (const auto& col : stmt.order_by) {
         if (!schema.hasColumn(col)) {
-            throw std::runtime_error(
-                "ORDER BY column not found: '" + col + "'");
+            throw std::runtime_error("ORDER BY column not found: '" + col + "'");
         }
     }
 }
@@ -66,4 +118,27 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
         }
     }
     // literal nodes need no validation
+}
+
+
+void Validator::validateJoinCondition(const Expr* expr, const Schema& left_schema, const std::string& left_table, const Schema& right_schema, const std::string& right_table){
+    if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        if (col->table_name == left_table) {
+            if (!left_schema.hasColumn(col->column_name)){
+                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in table '" + left_table + "'");
+            }
+        } else if (col->table_name == right_table) {
+            if (!right_schema.hasColumn(col->column_name)){
+                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in table '" + right_table + "'");
+            }
+        } else if (col->table_name.empty()) {
+            if (!left_schema.hasColumn(col->column_name) && !right_schema.hasColumn(col->column_name)){
+                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in either joined table");
+            }
+        }
+        // qualified ref with unknown table prefix: skip (alias, deferred resolution)
+    } else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        validateJoinCondition(bin->left.get(),  left_schema, left_table, right_schema, right_table);
+        validateJoinCondition(bin->right.get(), left_schema, left_table, right_schema, right_table);
+    }
 }

@@ -30,6 +30,7 @@ add_library(swiftql_lib
     src/parser/parser.cc
     src/planner/validator.cc
     src/planner/planner.cc
+    src/planner/plan_nodes.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 
