@@ -31,6 +31,7 @@ add_library(swiftql_lib
     src/planner/validator.cc
     src/planner/planner.cc
     src/planner/plan_nodes.cc
+    src/execution/evaluator.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 
