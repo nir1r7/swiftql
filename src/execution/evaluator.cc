@@ -1,4 +1,5 @@
-#include "evaluator.h"
+#include "execution/evaluator.h"
+#include <stdexcept>
 
 
 Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
@@ -16,7 +17,7 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     // binary expression
     // note: using 0 and 1 to represent false and true for boolean results
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        Value left  = evaluate(bin->left.get(),  row, schema);
+        Value left = evaluate(bin->left.get(), row, schema);
         Value right = evaluate(bin->right.get(), row, schema);
 
         // any null operand returns a null result
@@ -25,8 +26,8 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
         const std::string& op = bin->op;
         if (op == "=")  return Value(static_cast<int64_t>(left == right));
         if (op == "!=") return Value(static_cast<int64_t>(left != right));
-        if (op == "<")  return Value(static_cast<int64_t>(left <  right));
-        if (op == ">")  return Value(static_cast<int64_t>(left >  right));
+        if (op == "<") return Value(static_cast<int64_t>(left < right));
+        if (op == ">") return Value(static_cast<int64_t>(left > right));
         if (op == "<=") return Value(static_cast<int64_t>(left <= right));
         if (op == ">=") return Value(static_cast<int64_t>(left >= right));
 
@@ -40,7 +41,8 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
             bool r = right.asInt() != 0;
             return Value(static_cast<int64_t>(l || r));
         }
-        throw std::runtime_error("Unknown operator: " + op);
+
+        throw std::runtime_error("Unknown binary operator: " + op);
     }
 
     // null expression
@@ -65,6 +67,7 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
         int idx = schema.indexOf(col_name);
         return row[idx];
     }
+    throw std::runtime_error("evaluate(): unknown Expr subtype");
 }
 
 

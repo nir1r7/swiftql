@@ -114,7 +114,6 @@ TEST(PlannerTest, JoinPlanStubbed) {
     auto plan = Planner::plan(stmt, catalog);
     // plan builds successfully
     EXPECT_NE(plan, nullptr);
-    // but executing it throws
-    plan->open();
-    EXPECT_THROW(plan->next(), std::runtime_error);
+    // open() propagates down to HashJoinNode::open() which throws
+    EXPECT_THROW(plan->open(), std::runtime_error);
 }

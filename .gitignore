@@ -44,6 +44,7 @@ env/
 .vscode/*
 .vscode/
 !.vscode/extensions.json
+.claude/
 
 # macOS filesystem files
 .DS_Store
