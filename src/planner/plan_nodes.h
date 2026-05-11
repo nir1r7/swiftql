@@ -11,7 +11,7 @@
 // read rows one at a time from the loaded row vector (read data)
 class SeqScanNode : public PlanNode {
     public:
-        SeqScanNode(std::vector<Row> rows, Schema schema);
+        SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema);
 
         void open() override; // initialize cursor
         Row* next() override; // get next row
@@ -21,6 +21,7 @@ class SeqScanNode : public PlanNode {
         std::vector<Row> rows_;
         Schema schema_;
         int cursor_; //current position in rows_
+        std::string table_name_;
 };
 
 

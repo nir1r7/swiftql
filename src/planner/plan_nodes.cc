@@ -3,25 +3,40 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
+#include <chrono>
 
 // SeqScanNode
-SeqScanNode::SeqScanNode(std::vector<Row> rows, Schema schema) : rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
+SeqScanNode::SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema) : table_name_(std::move(table_name)), rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
 
 void SeqScanNode::open() {
     cursor_ = 0;
 }
 
 Row* SeqScanNode::next() {
-    if (cursor_ < static_cast<int>(rows_.size())) {
-        return &rows_[cursor_++];
+    auto t0 = std::chrono::high_resolution_clock::now();
+    Row* row = nullptr;
+
+    if (cursor_ < static_cast<int>(rows_.size())){
+        row = &rows_[cursor_++];
     }
-    return nullptr;
+    if (row) stats.rows_out++;
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    
+    return row;
 }
 
 void SeqScanNode::close() {}
 
 const Schema& SeqScanNode::outputSchema() const {
     return schema_;
+}
+
+std::string SeqScanNode::explain() const {
+    return "SeqScan [" + table_name_ + ", " + std::to_string(schema_.columns().size()) + " columns]";
+}
+
+std::vector<PlanNode*> SeqScanNode::children() const {
+    return {};
 }
 
 
@@ -33,13 +48,19 @@ void FilterNode::open() {
 }
 
 Row* FilterNode::next() {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     while (Row* row = child_->next()){
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
         // pass rows if predicate is true (not zero + not null)
         if (!result.isNull() && result.asInt() != 0){
+            stats.rows_out++;
+            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
     }
+    
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -51,6 +72,14 @@ const Schema& FilterNode::outputSchema() const {
     return child_->outputSchema();
 }
 
+std::string FilterNode::explain() const {
+    return "Filter [" + exprToString(predicate_.get()) + "]";
+}
+
+std::vector<PlanNode*> FilterNode::children() const {
+    return {child_.get()};
+}
+
 
 // ProjectNode
 ProjectNode::ProjectNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> expressions, Schema output_schema) : child_(std::move(child)), expressions_(std::move(expressions)), output_schema_(std::move(output_schema)) {}
@@ -60,15 +89,21 @@ void ProjectNode::open() {
 }
 
 Row* ProjectNode::next() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     Row* row = child_->next();
-    if (!row) return nullptr;
-
+    if (!row){
+        stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        return nullptr;
+    }
+    stats.rows_in++;
     current_row_.clear();
     current_row_.reserve(expressions_.size());
 
     for (const auto& expr : expressions_){
         current_row_.push_back(evaluate(expr.get(), *row, child_->outputSchema()));
     }
+    stats.rows_out++;
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
     return &current_row_;
 }
 
@@ -78,6 +113,19 @@ void ProjectNode::close() {
 
 const Schema& ProjectNode::outputSchema() const {
     return output_schema_;
+}
+
+std::string ProjectNode::explain() const {
+    std::string s = "Project [";
+    for (size_t i = 0; i < output_schema_.columns().size(); ++i) {
+        if (i) s += ", ";
+        s += output_schema_.columns()[i].name;
+    }
+    return s + "]";
+}
+
+std::vector<PlanNode*> ProjectNode::children() const {
+    return {child_.get()};
 }
 
 
@@ -95,6 +143,32 @@ namespace {
         Value max_val;
     };
 
+    std::string exprToString(const Expr* expr) {
+        if (!expr) return "?";
+        if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+            return col->table_name.empty()
+                ? col->column_name
+                : col->table_name + "." + col->column_name;
+        }
+        if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+            return lit->value.toString();
+        }
+        if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+            return exprToString(bin->left.get())
+                + " " + bin->op + " "
+                + exprToString(bin->right.get());
+        }
+        if (auto* n = dynamic_cast<const IsNullExpr*>(expr)) {
+            return exprToString(n->operand.get())
+                + (n->is_not_null ? " IS NOT NULL" : " IS NULL");
+        }
+        if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+            std::string arg = agg->is_star ? "*" : exprToString(agg->argument.get());
+            return agg->function_name + "(" + arg + ")";
+        }
+        return "?";
+    }
+
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
         for (const auto& v : key) {
@@ -110,6 +184,7 @@ namespace {
 }
 
 void HashAggregateNode::open() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     child_->open();
     const Schema& child_schema = child_->outputSchema();
 
@@ -117,6 +192,7 @@ void HashAggregateNode::open() {
     std::unordered_map<std::string, std::vector<Value>> group_keys;
 
     while (Row* row = child_->next()){
+        stats.rows_in++;
         // build group key
         std::vector<Value> key;
         for (const auto& col : group_by_cols_){
@@ -182,10 +258,12 @@ void HashAggregateNode::open() {
         results_.push_back(std::move(result_row));
     }
     cursor_ = 0;
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 }
 
 Row* HashAggregateNode::next() {
     if (cursor_ >= static_cast<int>(results_.size())) return nullptr;
+    stats.rows_out++;
     return &results_[cursor_++];
 }
 
@@ -197,6 +275,22 @@ const Schema& HashAggregateNode::outputSchema() const {
     return output_schema_;
 }
 
+std::string HashAggregateNode::explain() const {
+    std::string s = "Aggregate [group_by=";
+    for (size_t i = 0; i < group_by_cols_.size(); ++i) {
+        if (i) s += ", ";
+        s += group_by_cols_[i];
+    }
+    for (const auto& agg : aggregates_) {
+        s += ", agg=" + agg.function + "(" + (agg.is_star ? "*" : agg.column) + ")";
+    }
+    return s + "]";
+}
+
+std::vector<PlanNode*> HashAggregateNode::children() const {
+    return {child_.get()};
+}
+
 
 // HavingNode
 HavingNode::HavingNode(std::unique_ptr<PlanNode> child, std::unique_ptr<Expr> predicate) : child_(std::move(child)), predicate_(std::move(predicate)) {}
@@ -206,10 +300,19 @@ void HavingNode::open() {
 }
 
 Row* HavingNode::next() {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     while (Row* row = child_->next()){
+        stats.rows_in++;
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
-        if (!result.isNull() && result.asInt() != 0) return row;
+        if (!result.isNull() && result.asInt() != 0){
+            stats.rows_out++;
+            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            return row;
+        }
     }
+
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -219,6 +322,14 @@ void HavingNode::close() {
 
 const Schema& HavingNode::outputSchema() const {
     return child_->outputSchema();
+}
+
+std::string HavingNode::explain() const {
+    return "Having [" + exprToString(predicate_.get()) + "]";
+}
+
+std::vector<PlanNode*> HavingNode::children() const {
+    return {child_.get()};
 }
 
 
@@ -231,7 +342,9 @@ void DistinctNode::open() {
 }
 
 Row* DistinctNode::next() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     while (Row* row = child_->next()){
+        stats.rows_in++;
         // serialize the row to a string key
         std::string key;
         for (const auto& val : *row){
@@ -240,9 +353,12 @@ Row* DistinctNode::next() {
         }
         if (seen_.insert(key).second){
             // insert returns {interator, bool}
+            stats.rows_out++;
+            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
     }
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -251,17 +367,29 @@ void DistinctNode::close() {
     seen_.clear();
 }
 
-const Schema& DistinctNode::outputSchema() const { return child_->outputSchema(); }
+const Schema& DistinctNode::outputSchema() const {
+    return child_->outputSchema();
+}
+
+std::string DistinctNode::explain() const {
+    return "Distinct";
+}
+
+std::vector<PlanNode*> DistinctNode::children() const {
+    return {child_.get()};
+}
 
 
 // SortNode
 SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<std::string> sort_cols) : child_(std::move(child)), sort_cols_(std::move(sort_cols)), cursor_(0) {}
 
 void SortNode::open() {
+    auto t0 = std::chrono::high_resolution_clock::now();
     child_->open();
     sorted_rows_.clear();
 
     while (Row* row = child_->next()) {
+        stats.rows_in++;
         sorted_rows_.push_back(*row);  // copy
     }
 
@@ -277,10 +405,12 @@ void SortNode::open() {
     });
 
     cursor_ = 0;
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
 }
 
 Row* SortNode::next() {
     if (cursor_ >= static_cast<int>(sorted_rows_.size())) return nullptr;
+    stats.rows_out++;
     return &sorted_rows_[cursor_++];
 }
 
@@ -292,8 +422,21 @@ const Schema& SortNode::outputSchema() const {
     return child_->outputSchema();
 }
 
+std::string SortNode::explain() const {
+    std::string s = "Sort [";
+    for (size_t i = 0; i < sort_cols_.size(); ++i) {
+        if (i) s += ", ";
+        s += sort_cols_[i];
+    }
+    return s + "]";
+}
 
-// HashJoinNode
+std::vector<PlanNode*> SortNode::children() const {
+    return {child_.get()};
+}
+
+
+// LimitNode
 LimitNode::LimitNode(std::unique_ptr<PlanNode> child, int limit) : child_(std::move(child)), limit_(limit), count_(0) {}
 
 void LimitNode::open() {
@@ -302,10 +445,20 @@ void LimitNode::open() {
 }
 
 Row* LimitNode::next() {
-    if (count_ >= limit_) return nullptr;
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    if (count_ >= limit_){
+        stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        return nullptr;
+    }
     Row* row = child_->next();
-    if (!row) return nullptr;
-    ++count_;
+    if (row) {
+        stats.rows_in++;
+        stats.rows_out++;
+        ++count_;
+    }
+    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    
     return row;
 }
 
@@ -315,6 +468,14 @@ void LimitNode::close() {
 
 const Schema& LimitNode::outputSchema() const {
     return child_->outputSchema();
+}
+
+std::string LimitNode::explain() const {
+    return "Limit [" + std::to_string(limit_) + "]";
+}
+
+std::vector<PlanNode*> LimitNode::children() const {
+    return {child_.get()};
 }
 
 
@@ -333,4 +494,12 @@ void HashJoinNode::close() {}
 
 const Schema& HashJoinNode::outputSchema() const {
     return output_schema_;
+}
+
+std::string HashJoinNode::explain() const {
+    return "HashJoin [" + left_col_ + " = " + right_col_ + "]";
+}
+
+std::vector<PlanNode*> HashJoinNode::children() const {
+    return {left_.get(), right_.get()};
 }

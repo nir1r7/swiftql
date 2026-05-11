@@ -8,13 +8,13 @@ std::unique_ptr<PlanNode> Planner::plan(const SelectStatement& stmt, const Catal
 
     // load rows and build seqScan (bottom of tree)
     auto rows = CSVLoader::load(meta.filepath, meta.schema);
-    std::unique_ptr<PlanNode> node = std::make_unique<SeqScanNode>(std::move(rows), meta.schema);
+    std::unique_ptr<PlanNode> node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(rows), meta.schema);
 
     // hash join
     if (stmt.join.has_value()){
         const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
         auto join_rows = CSVLoader::load(join_meta.filepath, join_meta.schema);
-        auto right = std::make_unique<SeqScanNode>(std::move(join_rows), join_meta.schema);
+        auto right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(join_rows), join_meta.schema);
 
         // build merged schema for join output
         std::vector<ColumnDef> merged_cols = meta.schema.columns();
