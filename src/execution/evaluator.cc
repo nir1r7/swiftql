@@ -11,6 +11,8 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     // column reference
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         int idx = schema.indexOf(col->column_name);
+        if (idx == -1)
+            throw std::runtime_error("Column not found in schema: " + col->column_name);
         return row[idx];
     }
 
@@ -65,6 +67,8 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
             col_name = agg->function_name + "(" + inner->column_name + ")";
         }
         int idx = schema.indexOf(col_name);
+        if (idx == -1)
+            throw std::runtime_error("Column not found in schema: " + col_name);
         return row[idx];
     }
     throw std::runtime_error("evaluate(): unknown Expr subtype");

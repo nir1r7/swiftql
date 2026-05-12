@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
+#include <filesystem>
 
 using json = nlohmann::json;
 
@@ -10,6 +11,11 @@ Catalog::Catalog(const std::string& catalog_path){
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open catalog: " + catalog_path);
     }
+
+    // resolve data file paths relative to the catalog file's directory.
+    // use absolute() first so the result is cwd-independent.
+    std::filesystem::path catalog_dir =
+        std::filesystem::absolute(catalog_path).parent_path();
 
     json data = json::parse(file);
 
@@ -21,7 +27,10 @@ Catalog::Catalog(const std::string& catalog_path){
             cols.push_back(colDef);
         }
 
-        TableMetadata meta {table_json["name"].get<std::string>(), table_json["file"].get<std::string>(), Schema(cols)};
+        std::string rel_path = table_json["file"].get<std::string>();
+        std::string abs_path = (catalog_dir / rel_path).string();
+
+        TableMetadata meta {table_json["name"].get<std::string>(), abs_path, Schema(cols)};
 
         tables_.emplace(meta.name, std::move(meta));
     }

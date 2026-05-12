@@ -8,9 +8,11 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     }
     const Schema& schema = catalog.getTable(stmt.from_table).schema;
 
-    // SELECT list columns must exist
-    for (const auto& expr : stmt.select_list) {
-        validateExpr(expr.get(), schema, "SELECT");
+    // SELECT list columns must exist (skip for SELECT *)
+    if (!stmt.select_star) {
+        for (const auto& expr : stmt.select_list) {
+            validateExpr(expr.get(), schema, "SELECT");
+        }
     }
 
     // aggregate functions must be applied to compatible column types
@@ -70,7 +72,7 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
             break;
         }
     }
-    if (has_aggregates) {
+    if (has_aggregates && !stmt.select_star) {
         for (const auto& expr : stmt.select_list) {
             if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
                 bool in_group_by = false;
@@ -87,10 +89,14 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         }
     }
 
-    // ORDER BY columns must exist
-    for (const auto& col : stmt.order_by) {
-        if (!schema.hasColumn(col)) {
-            throw std::runtime_error("ORDER BY column not found: '" + col + "'");
+    // ORDER BY: validate ColumnRef nodes against the base table schema.
+    // Aggregate expressions (e.g. COUNT(*)) resolve against the post-aggregate
+    // output schema at execution time and are not checked here.
+    for (const auto& expr : stmt.order_by) {
+        if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
+            if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
+                throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
+            }
         }
     }
 }

@@ -10,7 +10,7 @@ using Row = std::vector<Value>;
 struct NodeStats {
     int rows_in  = 0;
     int rows_out = 0;
-    double elapsed_ms = 0.0;
+    double elapsed_us = 0.0;
 };
 
 class PlanNode {

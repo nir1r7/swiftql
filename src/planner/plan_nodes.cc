@@ -1,9 +1,35 @@
 #include "plan_nodes.h"
 #include "execution/evaluator.h"
+#include "parser/expr_utils.h"
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
 #include <chrono>
+
+
+namespace {
+    struct AggAccumulator {
+        int64_t count = 0;
+        int64_t non_null_count = 0;
+        double sum = 0.0;
+        Value min_val;
+        Value max_val;
+    };
+
+    std::string serializeKey(const std::vector<Value>& key) {
+        std::string result;
+        for (const auto& v : key) {
+            result += v.toString();
+            result += '\x01'; // non-printable separator unlikely to appear in data
+        }
+        return result;
+    }
+
+    double toDouble(const Value& v) {
+        return v.type() == TypeId::DOUBLE ? v.asDouble() : static_cast<double>(v.asInt());
+    }
+}
+
 
 // SeqScanNode
 SeqScanNode::SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema) : table_name_(std::move(table_name)), rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
@@ -20,7 +46,7 @@ Row* SeqScanNode::next() {
         row = &rows_[cursor_++];
     }
     if (row) stats.rows_out++;
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     
     return row;
 }
@@ -51,16 +77,17 @@ Row* FilterNode::next() {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     while (Row* row = child_->next()){
+        stats.rows_in++;
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
         // pass rows if predicate is true (not zero + not null)
         if (!result.isNull() && result.asInt() != 0){
             stats.rows_out++;
-            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
     }
     
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -92,7 +119,7 @@ Row* ProjectNode::next() {
     auto t0 = std::chrono::high_resolution_clock::now();
     Row* row = child_->next();
     if (!row){
-        stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         return nullptr;
     }
     stats.rows_in++;
@@ -103,7 +130,7 @@ Row* ProjectNode::next() {
         current_row_.push_back(evaluate(expr.get(), *row, child_->outputSchema()));
     }
     stats.rows_out++;
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     return &current_row_;
 }
 
@@ -131,57 +158,6 @@ std::vector<PlanNode*> ProjectNode::children() const {
 
 // HashAggregateNode
 HashAggregateNode::HashAggregateNode(std::unique_ptr<PlanNode> child,std::vector<std::string> group_by_cols, std::vector<AggregateSpec> aggregates, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), aggregates_(std::move(aggregates)), output_schema_(std::move(output_schema)), cursor_(0) {}
-
-// anonymous namespace
-// everything in the following is private to this file
-namespace {
-    struct AggAccumulator {
-        int64_t count = 0;
-        int64_t non_null_count = 0;
-        double sum = 0.0;
-        Value min_val;
-        Value max_val;
-    };
-
-    std::string exprToString(const Expr* expr) {
-        if (!expr) return "?";
-        if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-            return col->table_name.empty()
-                ? col->column_name
-                : col->table_name + "." + col->column_name;
-        }
-        if (auto* lit = dynamic_cast<const Literal*>(expr)) {
-            return lit->value.toString();
-        }
-        if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-            return exprToString(bin->left.get())
-                + " " + bin->op + " "
-                + exprToString(bin->right.get());
-        }
-        if (auto* n = dynamic_cast<const IsNullExpr*>(expr)) {
-            return exprToString(n->operand.get())
-                + (n->is_not_null ? " IS NOT NULL" : " IS NULL");
-        }
-        if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
-            std::string arg = agg->is_star ? "*" : exprToString(agg->argument.get());
-            return agg->function_name + "(" + arg + ")";
-        }
-        return "?";
-    }
-
-    std::string serializeKey(const std::vector<Value>& key) {
-        std::string result;
-        for (const auto& v : key) {
-            result += v.toString();
-            result += '\x01'; // non-printable separator unlikely to appear in data
-        }
-        return result;
-    }
-
-    double toDouble(const Value& v) {
-        return v.type() == TypeId::DOUBLE ? v.asDouble() : static_cast<double>(v.asInt());
-    }
-}
 
 void HashAggregateNode::open() {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -247,8 +223,10 @@ void HashAggregateNode::open() {
             } else if (spec.function == "SUM") {
                 result_row.push_back(Value(acc.sum));
             } else if (spec.function == "AVG") {
-                double avg = acc.non_null_count > 0 ? acc.sum / static_cast<double>(acc.non_null_count) : 0.0;
-                result_row.push_back(Value(avg));
+                Value avg_val = acc.non_null_count > 0
+                    ? Value(acc.sum / static_cast<double>(acc.non_null_count))
+                    : Value::null();
+                result_row.push_back(avg_val);
             } else if (spec.function == "MIN") {
                 result_row.push_back(acc.min_val);
             } else if (spec.function == "MAX") {
@@ -258,7 +236,7 @@ void HashAggregateNode::open() {
         results_.push_back(std::move(result_row));
     }
     cursor_ = 0;
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 }
 
 Row* HashAggregateNode::next() {
@@ -307,12 +285,12 @@ Row* HavingNode::next() {
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
         if (!result.isNull() && result.asInt() != 0){
             stats.rows_out++;
-            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
     }
 
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -354,11 +332,11 @@ Row* DistinctNode::next() {
         if (seen_.insert(key).second){
             // insert returns {interator, bool}
             stats.rows_out++;
-            stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
     }
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     return nullptr;
 }
 
@@ -381,7 +359,7 @@ std::vector<PlanNode*> DistinctNode::children() const {
 
 
 // SortNode
-SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<std::string> sort_cols) : child_(std::move(child)), sort_cols_(std::move(sort_cols)), cursor_(0) {}
+SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs) : child_(std::move(child)), sort_exprs_(std::move(sort_exprs)), cursor_(0) {}
 
 void SortNode::open() {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -395,17 +373,18 @@ void SortNode::open() {
 
     const Schema& schema = child_->outputSchema();
 
-    std::sort(sorted_rows_.begin(), sorted_rows_.end(),[&](const Row& a, const Row& b) {
-        for (const auto& col : sort_cols_) {
-            int idx = schema.indexOf(col);
-            if (a[idx] < b[idx]) return true;
-            if (b[idx] < a[idx]) return false;
+    std::sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
+        for (const auto& expr : sort_exprs_) {
+            Value va = evaluate(expr.get(), a, schema);
+            Value vb = evaluate(expr.get(), b, schema);
+            if (va < vb) return true;
+            if (vb < va) return false;
         }
         return false;  // equal
     });
 
     cursor_ = 0;
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 }
 
 Row* SortNode::next() {
@@ -424,9 +403,9 @@ const Schema& SortNode::outputSchema() const {
 
 std::string SortNode::explain() const {
     std::string s = "Sort [";
-    for (size_t i = 0; i < sort_cols_.size(); ++i) {
+    for (size_t i = 0; i < sort_exprs_.size(); ++i) {
         if (i) s += ", ";
-        s += sort_cols_[i];
+        s += exprToString(sort_exprs_[i].get());
     }
     return s + "]";
 }
@@ -448,7 +427,7 @@ Row* LimitNode::next() {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     if (count_ >= limit_){
-        stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         return nullptr;
     }
     Row* row = child_->next();
@@ -457,7 +436,7 @@ Row* LimitNode::next() {
         stats.rows_out++;
         ++count_;
     }
-    stats.elapsed_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     
     return row;
 }

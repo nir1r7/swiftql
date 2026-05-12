@@ -103,7 +103,7 @@ TEST(PlannerTest, BuildsSeqScan) {
     Catalog catalog("../catalog.json");
     Parser p("SELECT team FROM laps");
     auto stmt = p.parse();
-    auto plan = Planner::plan(stmt, catalog);
+    auto plan = Planner::plan(std::move(stmt), catalog);
     EXPECT_NE(plan, nullptr);
 }
 
@@ -111,7 +111,7 @@ TEST(PlannerTest, JoinPlanStubbed) {
     Catalog catalog("../catalog.json");
     Parser p("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id");
     auto stmt = p.parse();
-    auto plan = Planner::plan(stmt, catalog);
+    auto plan = Planner::plan(std::move(stmt), catalog);
     // plan builds successfully
     EXPECT_NE(plan, nullptr);
     // open() propagates down to HashJoinNode::open() which throws

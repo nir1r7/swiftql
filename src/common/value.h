@@ -20,6 +20,7 @@ class Value{
         int64_t asInt() const;
         double asDouble() const;
         const std::string& asString() const;
+        double toNumeric() const; // coerces INT or DOUBLE to double
 
         // helper for comparisions
         void checkMatchingType(const Value& other) const;

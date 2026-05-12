@@ -17,6 +17,8 @@ class SeqScanNode : public PlanNode {
         Row* next() override; // get next row
         void close() override; // cleanup
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::vector<Row> rows_;
         Schema schema_;
@@ -34,6 +36,8 @@ class FilterNode : public PlanNode{
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
         std::unique_ptr<Expr> predicate_;
@@ -43,14 +47,16 @@ class FilterNode : public PlanNode{
 // evaluate the SELECT list and hold projected rows (apply SELECT)
 class ProjectNode : public PlanNode {
     public:
-        ProjectNode(std::unique_ptr<PlanNode> child, 
-            std::vector<std::unique_ptr<Expr>> expressions, 
+        ProjectNode(std::unique_ptr<PlanNode> child,
+            std::vector<std::unique_ptr<Expr>> expressions,
             Schema output_schema);
 
         void open() override;
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
         std::vector<std::unique_ptr<Expr>> expressions_; // the select list
@@ -69,7 +75,7 @@ struct AggregateSpec {
 // group rows by specified columns and compute aggregates (apply GROUP BY)
 class HashAggregateNode : public PlanNode {
     public:
-        HashAggregateNode(std::unique_ptr<PlanNode> child, 
+        HashAggregateNode(std::unique_ptr<PlanNode> child,
             std::vector<std::string> group_by_cols,
             std::vector<AggregateSpec> aggregates,
             Schema output_schema);
@@ -78,6 +84,8 @@ class HashAggregateNode : public PlanNode {
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
         std::vector<std::string> group_by_cols_; // columns to group by
@@ -99,6 +107,8 @@ class HavingNode : public PlanNode {
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
         std::unique_ptr<Expr> predicate_; // condition expression
@@ -114,24 +124,28 @@ class DistinctNode : public PlanNode {
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
         std::unordered_set<std::string> seen_; // seen rows (serialized as strings for easy hashing)
 };
 
 
-// sort rows by specified columns (apply ORDER BY)
+// sort rows by specified expressions (apply ORDER BY)
 class SortNode : public PlanNode {
     public:
-        SortNode(std::unique_ptr<PlanNode> child, std::vector<std::string> sorts_cols);
+        SortNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs);
 
         void open() override;
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
-        std::vector<std::string> sort_cols_; // columns to sort by (in order of precedence)
+        std::vector<std::unique_ptr<Expr>> sort_exprs_;
         std::vector<Row> sorted_rows_;
         int cursor_;
 };
@@ -146,6 +160,8 @@ class LimitNode : public PlanNode {
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
 
     private:
         std::unique_ptr<PlanNode> child_;
@@ -168,6 +184,8 @@ class HashJoinNode : public PlanNode {
         Row* next() override;
         void close() override;
         const Schema& outputSchema() const override;
+        std::string explain() const override;
+        std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> left_; // left child node to pull rows from
         std::unique_ptr<PlanNode> right_; // right child node to pull rows from

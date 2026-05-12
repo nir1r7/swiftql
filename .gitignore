@@ -44,10 +44,14 @@ env/
 .vscode/*
 .vscode/
 !.vscode/extensions.json
+
 .claude/
+CLAUDE.md
 
 # macOS filesystem files
 .DS_Store
 
 # Misc local/accidental folders
 %HOME/
+
+.cache/

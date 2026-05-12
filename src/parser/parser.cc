@@ -50,9 +50,14 @@ SelectStatement Parser::parseSelect(){
 
     stmt.distinct = match(TokenType::DISTINCT);
 
-    stmt.select_list.push_back(parseExpr());
-    while (match(TokenType::COMMA)) {
+    if (check(TokenType::STAR)) {
+        consume();
+        stmt.select_star = true;
+    } else {
         stmt.select_list.push_back(parseExpr());
+        while (match(TokenType::COMMA)) {
+            stmt.select_list.push_back(parseExpr());
+        }
     }
 
     expect(TokenType::FROM, "FROM");
@@ -94,7 +99,10 @@ SelectStatement Parser::parseSelect(){
 
     if (match(TokenType::ORDER)){
         expect(TokenType::BY, "BY");
-        stmt.order_by = parseColumnList();
+        stmt.order_by.push_back(parsePrimary());
+        while (match(TokenType::COMMA)) {
+            stmt.order_by.push_back(parsePrimary());
+        }
     }
 
     if (match(TokenType::LIMIT)){

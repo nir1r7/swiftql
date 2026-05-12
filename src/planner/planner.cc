@@ -1,6 +1,6 @@
 #include "planner.h"
 
-std::unique_ptr<PlanNode> Planner::plan(const SelectStatement& stmt, const Catalog& catalog){
+std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog){
     // validate
     Validator::validate(stmt, catalog);
 
@@ -39,7 +39,7 @@ std::unique_ptr<PlanNode> Planner::plan(const SelectStatement& stmt, const Catal
     // fliter (WHERE)
     if (stmt.where) {
         // clone predicate
-        node = std::make_unique<FilterNode>(std::move(node), std::move(const_cast<SelectStatement&>(stmt).where));
+        node = std::make_unique<FilterNode>(std::move(node), std::move(stmt.where));
     }
 
     // HashAgrgegate (GROUP BY + aggregates)
@@ -58,30 +58,41 @@ std::unique_ptr<PlanNode> Planner::plan(const SelectStatement& stmt, const Catal
 
     // HAVING
     if (stmt.having) {
-        node = std::make_unique<HavingNode>(std::move(node), std::move(const_cast<SelectStatement&>(stmt).having));
+        node = std::make_unique<HavingNode>(std::move(node), std::move(stmt.having));
     }
 
-    // DISTINCT
+    // project; SELECT list — placed before Distinct/Sort/Limit so DISTINCT deduplicates projected rows
+    if (stmt.select_star) {
+        const Schema& child_schema = node->outputSchema();
+        std::vector<std::unique_ptr<Expr>> star_exprs;
+        for (const auto& col : child_schema.columns()) {
+            auto ref = std::make_unique<ColumnRef>();
+            ref->column_name = col.name;
+            star_exprs.push_back(std::move(ref));
+        }
+        node = std::make_unique<ProjectNode>(std::move(node), std::move(star_exprs), child_schema);
+    } else {
+        auto project_schema = buildProjectSchema(stmt, node->outputSchema());
+        node = std::make_unique<ProjectNode>(
+            std::move(node),
+            std::move(stmt.select_list),
+            project_schema);
+    }
+
+    // DISTINCT — runs on projected rows
     if (stmt.distinct) {
         node = std::make_unique<DistinctNode>(std::move(node));
     }
 
     // sort (ORDER BY)
     if (!stmt.order_by.empty()) {
-        node = std::make_unique<SortNode>(std::move(node), stmt.order_by);
+        node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
     }
 
     // limit
     if (stmt.limit.has_value()) {
         node = std::make_unique<LimitNode>(std::move(node), stmt.limit.value());
     }
-
-    // project; SELECT list (top)
-    auto project_schema = buildProjectSchema(stmt, meta.schema);
-    node = std::make_unique<ProjectNode>(
-        std::move(node),
-        std::move(const_cast<SelectStatement&>(stmt).select_list),
-        project_schema);
 
     return node;
 }

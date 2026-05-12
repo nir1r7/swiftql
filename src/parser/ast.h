@@ -46,6 +46,7 @@ struct AggregateExpr : Expr {
 // the full parsed query
 struct SelectStatement {
     bool distinct = false;
+    bool select_star = false;  // true when SELECT *
 
     std::vector<std::unique_ptr<Expr>> select_list;
 
@@ -68,7 +69,7 @@ struct SelectStatement {
     std::unique_ptr<Expr> having; // nullptr if no HAVING
 
     // optional ORDER BY
-    std::vector<std::string> order_by;
+    std::vector<std::unique_ptr<Expr>> order_by;
 
     // optional LIMIT
     std::optional<int> limit;

@@ -41,3 +41,7 @@ add_subdirectory(tests)
 target_link_libraries(swiftql_lib 
     nlohmann_json::nlohmann_json
 )
+
+# CLI executable
+add_executable(swiftql src/cli/main.cc)
+target_link_libraries(swiftql swiftql_lib)

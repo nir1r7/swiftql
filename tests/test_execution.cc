@@ -52,7 +52,7 @@ static std::unique_ptr<AggregateExpr> aggExprStar(std::string fn) {
 }
 
 static std::unique_ptr<SeqScanNode> makeScan(std::vector<Row> rows, Schema schema) {
-    return std::make_unique<SeqScanNode>(std::move(rows), std::move(schema));
+    return std::make_unique<SeqScanNode>("test", std::move(rows), std::move(schema));
 }
 
 // open a node, collect all rows into a vector (copying each), then close.
@@ -164,7 +164,7 @@ TEST(SeqScanNode, ScanAndReset) {
         {Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(3))}
     };
 
-    SeqScanNode scan(rows, schema);
+    SeqScanNode scan("test", rows, schema);
 
     // first pass
     scan.open();
@@ -182,7 +182,7 @@ TEST(SeqScanNode, ScanAndReset) {
     EXPECT_EQ(count, 3);
 
     // Empty table is immediately nullptr
-    SeqScanNode empty({}, schema);
+    SeqScanNode empty("test", {}, schema);
     empty.open();
     EXPECT_EQ(empty.next(), nullptr);
     empty.close();
@@ -354,7 +354,10 @@ TEST(SortNode, SortsRows) {
     };
 
     // multicolumn sort: a ASC, then b ASC
-    SortNode sort(makeScan(rows, schema), {"a", "b"});
+    std::vector<std::unique_ptr<Expr>> sort_exprs;
+    sort_exprs.push_back(colRef("a"));
+    sort_exprs.push_back(colRef("b"));
+    SortNode sort(makeScan(rows, schema), std::move(sort_exprs));
     auto result = drainAll(&sort);
 
     ASSERT_EQ(result.size(), 4u);
@@ -363,7 +366,9 @@ TEST(SortNode, SortsRows) {
     EXPECT_EQ(result[2][0].asInt(), 2); EXPECT_EQ(result[2][1].asInt(), 10);
     EXPECT_EQ(result[3][0].asInt(), 2); EXPECT_EQ(result[3][1].asInt(), 20);
 
-    SortNode empty_sort(makeScan({}, schema), {"a"});
+    std::vector<std::unique_ptr<Expr>> empty_exprs;
+    empty_exprs.push_back(colRef("a"));
+    SortNode empty_sort(makeScan({}, schema), std::move(empty_exprs));
     EXPECT_TRUE(drainAll(&empty_sort).empty());
 }
 
@@ -448,8 +453,10 @@ TEST(Pipeline, CheckpointQuery) {
     auto distinct = std::make_unique<DistinctNode>(std::move(project));
 
     // ORDER BY team
+    std::vector<std::unique_ptr<Expr>> pipeline_sort_exprs;
+    pipeline_sort_exprs.push_back(colRef("team"));
     auto sort = std::make_unique<SortNode>(
-        std::move(distinct), std::vector<std::string>{"team"});
+        std::move(distinct), std::move(pipeline_sort_exprs));
 
     // LIMIT 10
     LimitNode limit(std::move(sort), 10);
