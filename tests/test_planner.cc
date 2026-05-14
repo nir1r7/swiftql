@@ -2,6 +2,7 @@
 #include "planner/validator.h"
 #include "planner/planner.h"
 #include "parser/parser.h"
+#include "storage/csv_loader.h"
 
 
 // ===== validator tests =====
@@ -103,7 +104,12 @@ TEST(PlannerTest, BuildsSeqScan) {
     Catalog catalog("../catalog.json");
     Parser p("SELECT team FROM laps");
     auto stmt = p.parse();
-    auto plan = Planner::plan(std::move(stmt), catalog);
+
+    std::unordered_map<std::string, std::vector<Row>> table_rows;
+    const auto& meta = catalog.getTable(stmt.from_table);
+    table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+
+    auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
     EXPECT_NE(plan, nullptr);
 }
 
@@ -111,7 +117,16 @@ TEST(PlannerTest, JoinPlanStubbed) {
     Catalog catalog("../catalog.json");
     Parser p("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id");
     auto stmt = p.parse();
-    auto plan = Planner::plan(std::move(stmt), catalog);
+
+    std::unordered_map<std::string, std::vector<Row>> table_rows;
+    const auto& meta = catalog.getTable(stmt.from_table);
+    table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+    if (stmt.join.has_value()) {
+        const auto& jmeta = catalog.getTable(stmt.join->join_table);
+        table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+    }
+
+    auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
     // plan builds successfully
     EXPECT_NE(plan, nullptr);
     // open() propagates down to HashJoinNode::open() which throws

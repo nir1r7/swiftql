@@ -74,21 +74,23 @@ void FilterNode::open() {
 }
 
 Row* FilterNode::next() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    while (Row* row = child_->next()){
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            return nullptr;
+        }
         stats.rows_in++;
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
         // pass rows if predicate is true (not zero + not null)
-        if (!result.isNull() && result.asInt() != 0){
+        if (!result.isNull() && result.asInt() != 0) {
             stats.rows_out++;
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
-    
-    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-    return nullptr;
 }
 
 void FilterNode::close() {
@@ -116,9 +118,9 @@ void ProjectNode::open() {
 }
 
 Row* ProjectNode::next() {
+    Row* row = child_->next();  // child time excluded from self-clock
     auto t0 = std::chrono::high_resolution_clock::now();
-    Row* row = child_->next();
-    if (!row){
+    if (!row) {
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         return nullptr;
     }
@@ -126,7 +128,7 @@ Row* ProjectNode::next() {
     current_row_.clear();
     current_row_.reserve(expressions_.size());
 
-    for (const auto& expr : expressions_){
+    for (const auto& expr : expressions_) {
         current_row_.push_back(evaluate(expr.get(), *row, child_->outputSchema()));
     }
     stats.rows_out++;
@@ -160,18 +162,23 @@ std::vector<PlanNode*> ProjectNode::children() const {
 HashAggregateNode::HashAggregateNode(std::unique_ptr<PlanNode> child,std::vector<std::string> group_by_cols, std::vector<AggregateSpec> aggregates, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), aggregates_(std::move(aggregates)), output_schema_(std::move(output_schema)), cursor_(0) {}
 
 void HashAggregateNode::open() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-    child_->open();
+    child_->open();  // child time excluded from self-clock
     const Schema& child_schema = child_->outputSchema();
 
     std::unordered_map<std::string, std::vector<AggAccumulator>> accumulators;
     std::unordered_map<std::string, std::vector<Value>> group_keys;
 
-    while (Row* row = child_->next()){
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            break;
+        }
         stats.rows_in++;
         // build group key
         std::vector<Value> key;
-        for (const auto& col : group_by_cols_){
+        for (const auto& col : group_by_cols_) {
             key.push_back((*row)[child_schema.indexOf(col)]);
         }
         std::string key_str = serializeKey(key);
@@ -206,9 +213,11 @@ void HashAggregateNode::open() {
                 }
             }
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
 
-    // materialize results
+    // materialize results — self-work only, no child calls
+    auto t0 = std::chrono::high_resolution_clock::now();
     results_.clear();
     for (auto& [key_str, group_accs] : accumulators) {
         Row result_row = group_keys[key_str];   // group-by column values come first
@@ -278,20 +287,22 @@ void HavingNode::open() {
 }
 
 Row* HavingNode::next() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    while (Row* row = child_->next()){
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            return nullptr;
+        }
         stats.rows_in++;
         Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
-        if (!result.isNull() && result.asInt() != 0){
+        if (!result.isNull() && result.asInt() != 0) {
             stats.rows_out++;
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
-
-    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-    return nullptr;
 }
 
 void HavingNode::close() {
@@ -320,24 +331,28 @@ void DistinctNode::open() {
 }
 
 Row* DistinctNode::next() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-    while (Row* row = child_->next()){
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            return nullptr;
+        }
         stats.rows_in++;
         // serialize the row to a string key
         std::string key;
-        for (const auto& val : *row){
+        for (const auto& val : *row) {
             key += val.toString();
             key += '\x01';
         }
-        if (seen_.insert(key).second){
-            // insert returns {interator, bool}
+        if (seen_.insert(key).second) {
+            // insert returns {iterator, bool}
             stats.rows_out++;
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
-    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-    return nullptr;
 }
 
 void DistinctNode::close() {
@@ -362,17 +377,24 @@ std::vector<PlanNode*> DistinctNode::children() const {
 SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs) : child_(std::move(child)), sort_exprs_(std::move(sort_exprs)), cursor_(0) {}
 
 void SortNode::open() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-    child_->open();
+    child_->open();  // child time excluded from self-clock
     sorted_rows_.clear();
 
-    while (Row* row = child_->next()) {
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            break;
+        }
         stats.rows_in++;
         sorted_rows_.push_back(*row);  // copy
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
 
+    // sort — self-work only, no child calls
+    auto t0 = std::chrono::high_resolution_clock::now();
     const Schema& schema = child_->outputSchema();
-
     std::sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
         for (const auto& expr : sort_exprs_) {
             Value va = evaluate(expr.get(), a, schema);
@@ -382,7 +404,6 @@ void SortNode::open() {
         }
         return false;  // equal
     });
-
     cursor_ = 0;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 }
@@ -424,20 +445,25 @@ void LimitNode::open() {
 }
 
 Row* LimitNode::next() {
+    // self-work: check limit
     auto t0 = std::chrono::high_resolution_clock::now();
-
-    if (count_ >= limit_){
+    if (count_ >= limit_) {
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         return nullptr;
     }
-    Row* row = child_->next();
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+
+    Row* row = child_->next();  // child time excluded from self-clock
+
+    // self-work: update count
+    t0 = std::chrono::high_resolution_clock::now();
     if (row) {
         stats.rows_in++;
         stats.rows_out++;
         ++count_;
     }
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-    
+
     return row;
 }
 

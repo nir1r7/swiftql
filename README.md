@@ -57,7 +57,7 @@ The project is structured in four progressive phases, each leaving a working and
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 - `EXPLAIN` — prints the query plan tree without executing
-- `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows processed and time spent
+- `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
 - `--storage row | columnar` — switches the storage backend
 - `--execution volcano | vectorized` — switches the execution model
 - Query result cache — identical queries served from cache without re-execution
@@ -392,7 +392,7 @@ Hash join is **parsed and planned** in this phase but execution is stubbed — j
 - `Validator` — semantic checks against the catalog, including join column validation and having/group-by consistency
 - `PlanNode` abstract base with `open()`, `next()`, `close()`
 - Plan node classes: `SeqScanNode`, `FilterNode`, `ProjectNode`, `HashAggregateNode`, `HavingNode`, `DistinctNode`, `SortNode`, `LimitNode`, `HashJoinNode` (stubbed)
-- `Planner::plan(SelectStatement, Catalog)` → `PlanNode*` tree
+- `Planner::plan(SelectStatement, Catalog, table_rows)` → `PlanNode*` tree — accepts pre-loaded rows; planner performs no I/O
 
 **Checkpoint:** Plan trees built correctly for all query types. Join queries plan but return "not yet implemented" at execution. Bad queries rejected with clean error messages.
 
@@ -408,7 +408,7 @@ Hash join is **parsed and planned** in this phase but execution is stubbed — j
 
 - `main.cc` with `--catalog`, `--query`, `--storage`, `--execution`, `--explain`, `--explain-analyze`, `--no-cache`, `--no-optimize` args
 - Aligned result printer with null display
-- `EXPLAIN ANALYZE` — executes query, annotates each plan node with rows in, rows out, and wall time
+- `EXPLAIN ANALYZE` — executes query; per-node exclusive self-time (child time excluded) and % of execution total; footer shows rows returned and parse/plan/execution breakdown (CSV load excluded from all timers, consistent with TPC-H benchmark methodology)
 - Query result cache — `unordered_map<string, vector<Row>>`, bypassed with `--no-cache`
 - `compare_against_sqlite.py` correctness harness — 20+ test queries passing vs SQLite
 - Consistent error handling throughout — no crashes on bad input
@@ -672,11 +672,16 @@ Project [team, AVG(speed)]
 **Example `--explain-analyze` output:**
 
 ```
-Project [team, AVG(speed)]            rows_out=3        time=0.1ms
-  Aggregate [group_by=team]           rows_in=48203     time=12.4ms
-    Filter [season = 2025]            rows_in=1000000   rows_out=48203   time=38.2ms
-      SeqScan [laps, 4 columns]       rows_out=1000000  time=21.3ms
-Total: 72.0ms
+Project [team, AVG(speed)]       rows_out=3                       time=0.1ms   (0.1%)
+  Aggregate [group_by=team]      rows_in=48203   rows_out=3       time=12.4ms  (17.2%)
+    Filter [season = 2025]       rows_in=1000000 rows_out=48203   time=38.2ms  (53.1%)
+      SeqScan [laps, 4 columns]  rows_out=1000000                 time=21.3ms  (29.6%)
+
+Rows returned: 3
+
+Parse:     1.2ms
+Plan:      0.8ms
+Execution: 72.0ms
 ```
 
 ---

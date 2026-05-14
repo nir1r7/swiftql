@@ -19,7 +19,6 @@ Usage:
 import argparse
 import subprocess
 import sys
-import time
 
 SWIFTQL_BIN = "./build/swiftql"
 CATALOG_PATH = "catalog.json"
@@ -57,12 +56,10 @@ def load_queries_from_file(path: str) -> list[str]:
     return [q.strip() for q in text.split(";") if q.strip()]
 
 
-def run_query(binary: str, catalog: str, query: str, extra_flags: list[str]) -> tuple[str, str, int, float]:
+def run_query(binary: str, catalog: str, query: str, extra_flags: list[str]) -> tuple[str, str, int]:
     cmd = [binary, "--catalog", catalog, "--no-cache", "--query", query] + extra_flags
-    t0 = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
-    elapsed = time.monotonic() - t0
-    return result.stdout, result.stderr, result.returncode, elapsed
+    return result.stdout, result.stderr, result.returncode
 
 
 def main():
@@ -84,25 +81,22 @@ def main():
 
     passed = 0
     failed = 0
-    total_wall = 0.0
 
     for i, query in enumerate(queries, 1):
         print(f"\n[{i}/{len(queries)}] {query}")
         print("-" * 72)
 
-        stdout, stderr, rc, elapsed = run_query(args.binary, args.catalog, query, extra_flags)
-        total_wall += elapsed
+        stdout, stderr, rc = run_query(args.binary, args.catalog, query, extra_flags)
 
         if rc != 0:
-            print(f"ERROR ({elapsed*1e6:.1f}µs): {stderr.strip()}")
+            print(f"ERROR: {stderr.strip()}")
             failed += 1
         else:
             print(stdout, end="")
-            print(f"Process Overhead: {elapsed*1e6:.1f}µs \n")
             passed += 1
 
     print("\n" + "=" * 72)
-    print(f"{passed} ok, {failed} failed | {len(queries)} queries | {total_wall*1e6:.1f}µs total")
+    print(f"{passed} ok, {failed} failed | {len(queries)} queries")
     if failed:
         sys.exit(1)
 

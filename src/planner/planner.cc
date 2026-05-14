@@ -1,19 +1,19 @@
 #include "planner.h"
 
-std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog){
+std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows){
     // validate
     Validator::validate(stmt, catalog);
 
     const TableMetadata& meta = catalog.getTable(stmt.from_table);
 
-    // load rows and build seqScan (bottom of tree)
-    auto rows = CSVLoader::load(meta.filepath, meta.schema);
+    // build seqScan (bottom of tree) using pre-loaded rows
+    auto rows = std::move(table_rows.at(stmt.from_table));
     std::unique_ptr<PlanNode> node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(rows), meta.schema);
 
     // hash join
     if (stmt.join.has_value()){
         const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
-        auto join_rows = CSVLoader::load(join_meta.filepath, join_meta.schema);
+        auto join_rows = std::move(table_rows.at(stmt.join->join_table));
         auto right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(join_rows), join_meta.schema);
 
         // build merged schema for join output

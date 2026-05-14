@@ -127,19 +127,30 @@ Cache is skipped for `--explain-analyze` (results aren't stored) and bypassed en
 ### Understanding `--explain-analyze` output
 
 ```
-Project [team, AVG(speed)]  rows_in=5  rows_out=5  time=21µs
-  Having [AVG(speed) > 310]  rows_in=8  rows_out=5  time=11µs
-    Aggregate [group_by=team, agg=AVG(speed)]  rows_in=1000  rows_out=8  time=1914µs
-      SeqScan [laps, 9 columns]  rows_out=1000  time=36µs
-Total: 1948µs
+Project [team, AVG(speed)]  rows_in=5  rows_out=5  time=8µs  (0.4%)
+  Having [AVG(speed) > 310]  rows_in=8  rows_out=5  time=10µs  (0.5%)
+    Aggregate [group_by=team, agg=AVG(speed)]  rows_in=1000  rows_out=8  time=1800µs  (85.7%)
+      SeqScan [laps, 9 columns]  rows_out=1000  time=40µs  (1.9%)
+
+Rows returned: 5
+
+Parse:     28.4µs
+Plan:      95.1µs
+Execution: 2100µs
 ```
 
 - `rows_in` — rows this node received from its child
 - `rows_out` — rows this node passed up to its parent
-- `time` — wall time spent inside this node's own code (µs), not including child time
-- `Total` — end-to-end volcano execution time (µs)
+- `time` — exclusive self-time (µs): time spent in this node's own code only; child operator time is excluded and counted in the child's `time` instead
+- `(X.X%)` — this node's time as a percentage of total execution time; per-node percentages do not sum to 100% — the gap is measurement overhead from timing instrumentation (~10–25% typical)
 
-> **Note:** `Total` does not include CSV loading or catalog parsing — those happen before the volcano tree opens. See [Process Overhead](#process-overhead) below.
+Footer fields:
+- `Rows returned` — number of rows in the final result set
+- `Parse` — time to lex the SQL string and build the AST
+- `Plan` — time to validate semantics and build the plan tree (no I/O)
+- `Execution` — end-to-end volcano execution time; CSV load is excluded from all three timers (consistent with TPC-H benchmark methodology)
+
+> **Note:** None of the engine timers include CSV loading — that happens between parse and plan, outside all clocks. See [Process Overhead](#process-overhead) below.
 
 ---
 
@@ -214,11 +225,11 @@ When running queries via subprocess (as `run_queries.py` does), each invocation 
 
 1. Process fork + binary load (~10–50ms on macOS)
 2. Catalog JSON parsing
-3. CSV loading — `CSVLoader::load()` reads the full CSV into memory before the volcano tree opens
+3. CSV loading — `CSVLoader::load()` reads the full CSV into memory; this happens after parsing (so the engine knows which tables to load) but before planning, and is excluded from all engine timers
 
-This is why `Process Overhead` is typically 100–200ms even for trivial queries, while `Total` (the engine's own timer) is in the hundreds of microseconds.
+This is why `Process Overhead` is typically 100–200ms even for trivial queries, while `Execution` (the engine's own timer) is in the hundreds of microseconds.
 
-The `Total` line from `--explain-analyze` is the number to watch when optimizing the engine. Process overhead is a constant that won't move.
+The `Execution` line from `--explain-analyze` is the number to watch when optimizing the engine. Process overhead is a constant that won't move.
 
 ---
 

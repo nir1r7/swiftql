@@ -10,6 +10,7 @@
 #include "parser/parser.h"
 #include "planner/planner.h"
 #include "planner/plan_nodes.h"
+#include "storage/csv_loader.h"
 #include "common/schema.h"
 #include "common/value.h"
 
@@ -74,7 +75,7 @@ void printResults(const std::vector<Row>& rows, const Schema& schema) {
     }
 }
 
-void printTree(PlanNode* node, int depth, bool analyze) {
+void printTree(PlanNode* node, int depth, bool analyze, double exec_total_us = 0.0) {
     std::cout << std::string(depth * 2, ' ') << node->explain();
     if (analyze) {
         if (node->stats.rows_in > 0)
@@ -83,10 +84,13 @@ void printTree(PlanNode* node, int depth, bool analyze) {
             std::cout << "  rows_out=" << node->stats.rows_out;
         std::cout << "  time=" << std::fixed << std::setprecision(1)
                   << node->stats.elapsed_us << "µs";
+        if (exec_total_us > 0.0)
+            std::cout << "  (" << std::setprecision(1)
+                      << (node->stats.elapsed_us / exec_total_us * 100.0) << "%)";
     }
     std::cout << "\n";
     for (PlanNode* child : node->children())
-        printTree(child, depth + 1, analyze);
+        printTree(child, depth + 1, analyze, exec_total_us);
 }
 
 // main
@@ -106,9 +110,27 @@ int main(int argc, char* argv[]) {
             if (multi)
                 std::cout << "\n-- " << query << "\n";
 
+            // time parsing
+            auto parse_start = std::chrono::high_resolution_clock::now();
             Parser parser(query);
             auto stmt = parser.parse();
-            auto plan = Planner::plan(std::move(stmt), catalog);
+            double parse_us = std::chrono::duration<double, std::micro>(
+                std::chrono::high_resolution_clock::now() - parse_start).count();
+
+            // load CSV data (excluded from timing, per benchmark methodology)
+            std::unordered_map<std::string, std::vector<Row>> table_rows;
+            const TableMetadata& meta = catalog.getTable(stmt.from_table);
+            table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+            if (stmt.join.has_value()) {
+                const TableMetadata& jmeta = catalog.getTable(stmt.join->join_table);
+                table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+            }
+
+            // time planning
+            auto plan_start = std::chrono::high_resolution_clock::now();
+            auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
+            double plan_us = std::chrono::duration<double, std::micro>(
+                std::chrono::high_resolution_clock::now() - plan_start).count();
 
             if (args.explain) {
                 printTree(plan.get(), 0, false);
@@ -136,8 +158,12 @@ int main(int argc, char* argv[]) {
                 std::chrono::high_resolution_clock::now() - exec_start).count();
 
             if (args.explain_analyze) {
-                printTree(plan.get(), 0, true);
-                std::cout << "Total: " << std::fixed << std::setprecision(1) << total_us << "µs\n";
+                printTree(plan.get(), 0, true, total_us);
+                std::cout << "\n";
+                std::cout << "Rows returned: " << rows.size() << "\n\n";
+                std::cout << "Parse:     " << std::fixed << std::setprecision(1) << parse_us     << "µs\n";
+                std::cout << "Plan:      " << std::fixed << std::setprecision(1) << plan_us      << "µs\n";
+                std::cout << "Execution: " << std::fixed << std::setprecision(1) << total_us     << "µs\n";
                 continue;
             }
 
