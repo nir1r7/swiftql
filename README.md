@@ -212,6 +212,7 @@ Bridges the gap between the AST and the execution plan.
 - Aggregate functions applied to compatible types only
 - Non-aggregated `SELECT` columns appear in `GROUP BY` when aggregates are present
 - `HAVING` only used when `GROUP BY` is present
+- Aggregate functions not allowed in `WHERE` clause
 - Join columns exist in their respective tables
 
 **Plan nodes:**

@@ -1,4 +1,5 @@
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -75,22 +76,67 @@ void printResults(const std::vector<Row>& rows, const Schema& schema) {
     }
 }
 
-void printTree(PlanNode* node, int depth, bool analyze, double exec_total_us = 0.0) {
-    std::cout << std::string(depth * 2, ' ') << node->explain();
+struct NodeLine {
+    std::string label;
+    std::string rows_in;
+    std::string rows_out;
+    std::string time;
+    std::string pct;
+};
+
+void collectNodes(PlanNode* node, int depth, bool analyze,
+                  double exec_total_us, std::vector<NodeLine>& out) {
+    NodeLine line;
+    line.label = std::string(depth * 2, ' ') + node->explain();
     if (analyze) {
         if (node->stats.rows_in > 0)
-            std::cout << "  rows_in=" << node->stats.rows_in;
+            line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
         if (node->stats.rows_out > 0)
-            std::cout << "  rows_out=" << node->stats.rows_out;
-        std::cout << "  time=" << std::fixed << std::setprecision(1)
-                  << node->stats.elapsed_us << "µs";
-        if (exec_total_us > 0.0)
-            std::cout << "  (" << std::setprecision(1)
-                      << (node->stats.elapsed_us / exec_total_us * 100.0) << "%)";
+            line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
+        std::ostringstream t;
+        t << std::fixed << std::setprecision(1) << node->stats.elapsed_us;
+        line.time = "time=" + t.str() + "µs";
+        if (exec_total_us > 0.0) {
+            std::ostringstream p;
+            p << std::fixed << std::setprecision(1)
+              << (node->stats.elapsed_us / exec_total_us * 100.0);
+            line.pct = "(" + p.str() + "%)";
+        }
     }
-    std::cout << "\n";
+    out.push_back(std::move(line));
     for (PlanNode* child : node->children())
-        printTree(child, depth + 1, analyze, exec_total_us);
+        collectNodes(child, depth + 1, analyze, exec_total_us, out);
+}
+
+void printAligned(const std::vector<NodeLine>& lines) {
+    auto dispLen = [](const std::string& s) {
+        size_t extra = 0;
+        for (unsigned char c : s) if ((c & 0xC0) == 0x80) ++extra;
+        return s.size() - extra;
+    };
+
+    size_t w_label = 0, w_ri = 0, w_ro = 0, w_time = 0;
+    for (const auto& l : lines) {
+        w_label = std::max(w_label, dispLen(l.label));
+        w_ri    = std::max(w_ri,    l.rows_in.size());
+        w_ro    = std::max(w_ro,    l.rows_out.size());
+        w_time  = std::max(w_time,  dispLen(l.time));
+    }
+    const size_t gap = 3;
+
+    for (const auto& l : lines) {
+        std::cout << l.label
+                  << std::string(w_label - dispLen(l.label) + gap, ' ');
+        if (w_ri > 0)
+            std::cout << std::left << std::setw(static_cast<int>(w_ri + gap)) << l.rows_in;
+        if (w_ro > 0)
+            std::cout << std::setw(static_cast<int>(w_ro + gap)) << l.rows_out;
+        if (!l.time.empty()) {
+            std::cout << l.time
+                      << std::string(w_time - dispLen(l.time) + gap, ' ');
+        }
+        std::cout << l.pct << "\n";
+    }
 }
 
 // main
@@ -133,7 +179,9 @@ int main(int argc, char* argv[]) {
                 std::chrono::high_resolution_clock::now() - plan_start).count();
 
             if (args.explain) {
-                printTree(plan.get(), 0, false);
+                std::vector<NodeLine> lines;
+                collectNodes(plan.get(), 0, false, 0.0, lines);
+                printAligned(lines);
                 continue;
             }
 
@@ -158,7 +206,9 @@ int main(int argc, char* argv[]) {
                 std::chrono::high_resolution_clock::now() - exec_start).count();
 
             if (args.explain_analyze) {
-                printTree(plan.get(), 0, true, total_us);
+                std::vector<NodeLine> lines;
+                collectNodes(plan.get(), 0, true, total_us, lines);
+                printAligned(lines);
                 std::cout << "\n";
                 std::cout << "Rows returned: " << rows.size() << "\n\n";
                 std::cout << "Parse:     " << std::fixed << std::setprecision(1) << parse_us     << "µs\n";

@@ -46,9 +46,9 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         }
     }
 
-    // WHERE columns must exist
+    // WHERE columns must exist; aggregates are not allowed in WHERE
     if (stmt.where) {
-        validateExpr(stmt.where.get(), schema, "WHERE");
+        validateExpr(stmt.where.get(), schema, "WHERE", /*allow_aggregates=*/false);
     }
 
     // GROUP BY columns must exist
@@ -103,7 +103,7 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
 
 // recursively validate an expression and its sub expressions
-void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::string& context) {
+void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::string& context, bool allow_aggregates) {
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         // skip validation for qualified refs (table.column)
         // full resolution handled when join schema is merged
@@ -112,15 +112,19 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
         }
     }
     else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        validateExpr(bin->left.get(), schema, context);
-        validateExpr(bin->right.get(), schema, context);
+        validateExpr(bin->left.get(), schema, context, allow_aggregates);
+        validateExpr(bin->right.get(), schema, context, allow_aggregates);
     }
     else if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
-        validateExpr(isnull->operand.get(), schema, context);
+        validateExpr(isnull->operand.get(), schema, context, allow_aggregates);
     }
     else if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        if (!allow_aggregates) {
+            throw std::runtime_error(
+                context + ": aggregate functions are not allowed in WHERE clause; use HAVING instead");
+        }
         if (!agg->is_star && agg->argument) {
-            validateExpr(agg->argument.get(), schema, context);
+            validateExpr(agg->argument.get(), schema, context, allow_aggregates);
         }
     }
     // literal nodes need no validation
