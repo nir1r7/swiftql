@@ -32,6 +32,7 @@ add_library(swiftql_lib
     src/planner/planner.cc
     src/planner/plan_nodes.cc
     src/execution/evaluator.cc
+    src/storage/csv_to_columnar.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 

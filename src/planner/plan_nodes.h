@@ -3,6 +3,7 @@
 #include "plan_node.h"
 #include "parser/ast.h"
 #include "storage/csv_loader.h"
+#include "storage/columnar_table.h"
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,7 +12,11 @@
 // read rows one at a time from the loaded row vector (read data)
 class SeqScanNode : public PlanNode {
     public:
+        // row storage
         SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema);
+
+        // columnar storage
+        SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema);
 
         void open() override; // initialize cursor
         Row* next() override; // get next row
@@ -20,10 +25,17 @@ class SeqScanNode : public PlanNode {
         std::string explain() const override;
         std::vector<PlanNode*> children() const override;
     private:
-        std::vector<Row> rows_;
         Schema schema_;
         int cursor_; //current position in rows_
         std::string table_name_;
+
+        // row path
+        std::vector<Row> rows_;
+
+        // columnar path
+        ColumnarTable columnar_table_;
+        bool use_columnar_ = false;
+        Row reconstructed_row_; // reuse on every columnar next()
 };
 
 

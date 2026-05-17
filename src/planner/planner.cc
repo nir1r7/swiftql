@@ -1,20 +1,29 @@
 #include "planner.h"
 
-std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows){
+std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
     // validate
     Validator::validate(stmt, catalog);
 
     const TableMetadata& meta = catalog.getTable(stmt.from_table);
 
     // build seqScan (bottom of tree) using pre-loaded rows
-    auto rows = std::move(table_rows.at(stmt.from_table));
-    std::unique_ptr<PlanNode> node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(rows), meta.schema);
+    std::unique_ptr<PlanNode> node;
+    if (columnar_tables.count(stmt.from_table) > 0) {
+        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), meta.schema);
+    } else {
+        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(table_rows.at(stmt.from_table)), meta.schema);
+    }
 
     // hash join
     if (stmt.join.has_value()){
         const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
-        auto join_rows = std::move(table_rows.at(stmt.join->join_table));
-        auto right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(join_rows), join_meta.schema);
+        
+        std::unique_ptr<PlanNode> right;
+        if (columnar_tables.count(stmt.join->join_table) > 0) {
+            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), join_meta.schema);
+        } else {
+            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
+        }
 
         // build merged schema for join output
         std::vector<ColumnDef> merged_cols = meta.schema.columns();

@@ -34,6 +34,8 @@ namespace {
 // SeqScanNode
 SeqScanNode::SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema) : table_name_(std::move(table_name)), rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
 
+SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), cursor_(0), use_columnar_(true) {}
+
 void SeqScanNode::open() {
     cursor_ = 0;
 }
@@ -42,9 +44,22 @@ Row* SeqScanNode::next() {
     auto t0 = std::chrono::high_resolution_clock::now();
     Row* row = nullptr;
 
-    if (cursor_ < static_cast<int>(rows_.size())){
-        row = &rows_[cursor_++];
+    if (use_columnar_){
+        if (cursor_ < columnar_table_.num_rows){
+            reconstructed_row_.clear();
+            for (int c = 0; c < schema_.size(); ++c){
+                reconstructed_row_.push_back(columnar_table_.getValue(schema_.column(c).name, cursor_));
+            }
+            ++cursor_;
+            row = &reconstructed_row_;
+        }
     }
+    else{
+        if (cursor_ < static_cast<int>(rows_.size())){
+            row = &rows_[cursor_++];
+        }
+    }
+
     if (row) stats.rows_out++;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     

@@ -12,6 +12,7 @@
 #include "planner/planner.h"
 #include "planner/plan_nodes.h"
 #include "storage/csv_loader.h"
+#include "storage/csv_to_columnar.h"
 #include "common/schema.h"
 #include "common/value.h"
 
@@ -26,7 +27,7 @@ struct Args {
     bool explain_analyze = false;
     bool no_cache = false;
     bool no_optimize = false; // accepted, ignored in Phase 1
-    std::string storage = "row"; // accepted, ignored in Phase 1
+    std::string storage = "row"; // default to row
     std::string execution = "volcano";
 };
 
@@ -172,11 +173,21 @@ int main(int argc, char* argv[]) {
                 table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
             }
 
+            // build columnar tables if --storage columnar
+            // part of loading section
+            std::unordered_map<std::string, ColumnarTable> columnar_tables;
+            if (args.storage == "columnar") {
+                for (const auto& [name, rows] : table_rows) {
+                    const Schema& s = catalog.getTable(name).schema;
+                    columnar_tables.emplace(name, CSVToColumnar::convert(rows, s));
+                }
+                table_rows.clear(); // row data no longer needed; free before plan timer starts
+            }
+
             // time planning
             auto plan_start = std::chrono::high_resolution_clock::now();
-            auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
-            double plan_us = std::chrono::duration<double, std::micro>(
-                std::chrono::high_resolution_clock::now() - plan_start).count();
+            auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows), std::move(columnar_tables));
+            double plan_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - plan_start).count();
 
             if (args.explain) {
                 std::vector<NodeLine> lines;
@@ -199,11 +210,11 @@ int main(int argc, char* argv[]) {
             auto exec_start = std::chrono::high_resolution_clock::now();
             plan->open();
             std::vector<Row> rows;
-            while (Row* r = plan->next())
+            while (Row* r = plan->next()){
                 rows.push_back(*r);
+            }
             plan->close();
-            double total_us = std::chrono::duration<double, std::micro>(
-                std::chrono::high_resolution_clock::now() - exec_start).count();
+            double total_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - exec_start).count();
 
             if (args.explain_analyze) {
                 std::vector<NodeLine> lines;
@@ -217,8 +228,9 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (!args.no_cache)
+            if (!args.no_cache){
                 result_cache.emplace(query, std::make_pair(plan->outputSchema(), rows));
+            }
 
             printResults(rows, plan->outputSchema());
         }
