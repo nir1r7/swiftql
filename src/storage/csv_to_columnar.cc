@@ -4,10 +4,8 @@
 ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema& schema){
     ColumnarTable table(schema, static_cast<int>(rows.size()));
 
-    /*
-    - two pass structure (initialize, then disperse) is intentional
-    - could combine into single pass, but would need to check and initialize each column slot on first visit
-    */
+    // two pass structure (initialize, then disperse) is intentional
+    // could combine into single pass, but would need to check and initialize each column slot on first visit
 
     // initialize one typed array per column
     for (int c = 0; c < schema.size(); ++c){
