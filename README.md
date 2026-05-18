@@ -157,7 +157,7 @@ Responsible for physically reading table data and turning it into something the 
 - `ColumnArray` — a typed column: `std::variant<vector<int64_t>, vector<double>, vector<string>>`
 - `ColumnarTable` — map of column name → ColumnArray + schema + row count
 - `DictionaryEncoder` — maps unique strings to int IDs; stores column as `vector<int32_t>`
-- `RLEColumn` — stores repeated-value columns as `(value, run_length)` pairs
+- `RLEColumn` — stores repeated-value columns as `(value, run_length)` pairs with a parallel `run_starts` prefix-sum array; `get(row_idx)` uses binary search — O(log n_runs); applied selectively when `n_runs < n_rows / 4` (2× threshold); 16 bytes/run
 - `ColumnChunk` — a segment of a column with min, max, and row count metadata for zone-map pruning
 
 ### Layer 4 — Parser
@@ -436,7 +436,7 @@ Hash join is **parsed and planned** in this phase but execution is stubbed — j
 
 - `required_columns` set pushed down to `SeqScanNode` — planner determines which columns are needed, scan skips the rest
 - `DictionaryEncoder` for string columns — unique strings mapped to `int32_t` IDs
-- `RLEColumn` for repeated integer columns — stored as `(value, run_length)` pairs
+- `RLEColumn` for integer columns with `n_runs < n_rows / 4` — `(value, run_length)` pairs plus a `run_starts` prefix-sum array enabling O(log n_runs) binary-search access; 16 bytes/run; columns exceeding the threshold stay as raw `vector<int64_t>`; `decodeRange()` deferred to Week 13 for vectorized path
 - Storage size measured and recorded before/after encoding
 
 **Checkpoint:** Fewer columns touched per query. Storage size reduced and measured.

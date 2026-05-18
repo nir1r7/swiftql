@@ -1,13 +1,16 @@
 
 #include "csv_to_columnar.h"
+#include <iostream>
+#include <iomanip>
 
 ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema& schema){
     ColumnarTable table(schema, static_cast<int>(rows.size()));
 
-    // two pass structure (initialize, then disperse) is intentional
-    // could combine into single pass, but would need to check and initialize each column slot on first visit
+    // structure:
+    // pass 1: initialize one typed raw array per column
+    // pass 2: populate raw values
+    // pass 3: apply encodings (selective RLE for INT, dictionary for STRING)
 
-    // initialize one typed array per column
     for (int c = 0; c < schema.size(); ++c){
         const std::string& name = schema.column(c).name;
         switch (schema.column(c).type){
@@ -29,7 +32,6 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
         }
     }
 
-    // dispere each row's values into the appropriate column arrays
     for (const auto& row : rows){
         for (int c = 0; c < schema.size(); ++c){
             const std::string& name = schema.column(c).name;
@@ -46,5 +48,45 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
             }
         }
     }
+
+    // calculate storage before encoding (for stats)
+    size_t raw_bytes = 0;
+    for (int c = 0; c < schema.size(); ++c){
+        raw_bytes += columnByteSize(table.columns[schema.column(c).name]);
+    }
+
+    for (int c = 0; c < schema.size(); ++c){
+        const std::string& name = schema.column(c).name;
+        size_t before_bytes = columnByteSize(table.columns[name]);
+        switch (schema.column(c).type){
+            case TypeId::INT: {
+                auto& raw_col = std::get<std::vector<int64_t>>(table.columns[name]);
+                size_t col_raw_bytes = raw_col.size() * sizeof(int64_t);
+                RLEColumn rle = RLEColumn::encode(raw_col);
+                if (rle.byteSize() * 2 < col_raw_bytes){
+                    table.columns[name] = std::move(rle);
+                }
+                break;
+            }
+            case TypeId::DOUBLE:
+                break;
+            case TypeId::STRING: {
+                auto& raw_col = std::get<std::vector<std::string>>(table.columns[name]);
+                DictionaryEncoder enc = DictionaryEncoder::encode(raw_col);
+                table.columns[name] = std::move(enc);
+                break;
+            }
+        }
+        std::cout << "  " << name << ": " << before_bytes / 1024 << " KB -> ";
+        std::cout << columnByteSize(table.columns[name]) / 1024 << " KB\n";
+    }
+
+    // calculate storage after encoding (for sstats)
+    size_t encoded_bytes = columnarTableByteSize(table);
+    std::cout << "[columnar] raw=" << raw_bytes / 1024 << " KB";
+    std::cout << "  encoded=" << encoded_bytes / 1024 << " KB";
+    std::cout << "  ratio=" << std::fixed << std::setprecision(2);
+    std::cout << (double)encoded_bytes / raw_bytes << "\n";
+
     return table;
 }

@@ -90,15 +90,15 @@ TEST(CSVToColumnar, ConversionCorrectness) {
 
     // each column array holds the correct typed values in order
     const auto& id_arr   = std::get<std::vector<int64_t>>(tbl.columns.at("id"));
-    const auto& name_arr = std::get<std::vector<std::string>>(tbl.columns.at("name"));
+    const auto& name_enc = std::get<DictionaryEncoder>(tbl.columns.at("name"));
     const auto& val_arr  = std::get<std::vector<double>>(tbl.columns.at("val"));
 
-    ASSERT_EQ(id_arr.size(),   3u);
-    ASSERT_EQ(name_arr.size(), 3u);
-    ASSERT_EQ(val_arr.size(),  3u);
+    ASSERT_EQ(id_arr.size(),        3u);
+    ASSERT_EQ(name_enc.codes.size(), 3u);
+    ASSERT_EQ(val_arr.size(),       3u);
 
     EXPECT_EQ(id_arr[0], 1); EXPECT_EQ(id_arr[1], 2); EXPECT_EQ(id_arr[2], 3);
-    EXPECT_EQ(name_arr[0], "alpha"); EXPECT_EQ(name_arr[1], "beta"); EXPECT_EQ(name_arr[2], "gamma");
+    EXPECT_EQ(name_enc.decode(0), "alpha"); EXPECT_EQ(name_enc.decode(1), "beta"); EXPECT_EQ(name_enc.decode(2), "gamma");
     EXPECT_DOUBLE_EQ(val_arr[0], 1.5); EXPECT_DOUBLE_EQ(val_arr[1], 2.5); EXPECT_DOUBLE_EQ(val_arr[2], 3.5);
 
     // getValue() round-trips every cell back to a Value matching the original row
