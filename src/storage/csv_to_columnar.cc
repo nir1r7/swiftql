@@ -63,7 +63,7 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
                 auto& raw_col = std::get<std::vector<int64_t>>(table.columns[name]);
                 size_t col_raw_bytes = raw_col.size() * sizeof(int64_t);
                 RLEColumn rle = RLEColumn::encode(raw_col);
-                if (rle.byteSize() * 2 < col_raw_bytes){
+                if (rle.byteSize()*2 < col_raw_bytes){
                     table.columns[name] = std::move(rle);
                 }
                 break;
