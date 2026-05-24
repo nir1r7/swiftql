@@ -6,7 +6,6 @@
 ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema& schema){
     ColumnarTable table(schema, static_cast<int>(rows.size()));
 
-    // structure:
     // pass 1: initialize one typed raw array per column
     // pass 2: populate raw values
     // pass 3: apply encodings (selective RLE for INT, dictionary for STRING)
