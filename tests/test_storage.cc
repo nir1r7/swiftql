@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
+#include "storage/chunk_pruner.h"
 #include "planner/plan_nodes.h"
 #include "parser/ast.h"
 #include "common/value.h"
@@ -203,4 +204,385 @@ TEST(SeqScanNode, ColumnarRowParity) {
         EXPECT_DOUBLE_EQ(row_result[i][1].asDouble(), col_result[i][1].asDouble());
         EXPECT_EQ(row_result[i][2].asString(),        col_result[i][2].asString());
     }
+}
+
+
+// ===== Zone Map Construction Tests =====
+
+// CSVToColumnar::convert() populates zone_maps for every column.
+TEST(ZoneMapConstruction, BuiltForAllColumns) {
+    Schema schema = makeColumnarSchema({
+        {"id",    TypeId::INT},
+        {"val",   TypeId::DOUBLE},
+        {"label", TypeId::STRING}
+    });
+    std::vector<Row> rows = {
+        {Value(int64_t(1)), Value(1.0), Value(std::string("a"))},
+        {Value(int64_t(2)), Value(2.0), Value(std::string("b"))},
+        {Value(int64_t(3)), Value(3.0), Value(std::string("c"))},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    EXPECT_EQ(tbl.zone_maps.size(), 3u);
+    EXPECT_EQ(tbl.zone_maps.count("id"),    1u);
+    EXPECT_EQ(tbl.zone_maps.count("val"),   1u);
+    EXPECT_EQ(tbl.zone_maps.count("label"), 1u);
+}
+
+// Single chunk (< CHUNK_SIZE rows) captures the correct min and max.
+TEST(ZoneMapConstruction, SingleChunkMinMax) {
+    Schema schema = makeColumnarSchema({{"season", TypeId::INT}});
+    std::vector<Row> rows = {
+        {Value(int64_t(10))},
+        {Value(int64_t(5))},
+        {Value(int64_t(20))},
+        {Value(int64_t(15))},
+        {Value(int64_t(30))},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    ASSERT_EQ(tbl.zone_maps.at("season").size(), 1u);
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].min_val, Value(int64_t(5)));
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].max_val, Value(int64_t(30)));
+}
+
+// Single chunk has correct start_row=0 and row_count matching the data size.
+TEST(ZoneMapConstruction, SingleChunkStartRowAndCount) {
+    Schema schema = makeColumnarSchema({{"season", TypeId::INT}});
+    std::vector<Row> rows = {
+        {Value(int64_t(10))},
+        {Value(int64_t(5))},
+        {Value(int64_t(20))},
+        {Value(int64_t(15))},
+        {Value(int64_t(30))},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    ASSERT_EQ(tbl.zone_maps.at("season").size(), 1u);
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].start_row, 0);
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].row_count, 5);
+}
+
+// CHUNK_SIZE+10 rows produce exactly 2 chunks; last chunk has the correct partial size.
+TEST(ZoneMapConstruction, MultipleChunksCreatedWithCorrectSizes) {
+    Schema schema = makeColumnarSchema({{"season", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(CHUNK_SIZE + 10);
+    for (int i = 0; i < CHUNK_SIZE + 10; ++i)
+        rows.push_back({Value(int64_t(i))});  // unique values, not RLE-compressed
+
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    ASSERT_EQ(tbl.zone_maps.at("season").size(), 2u);
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].start_row,  0);
+    EXPECT_EQ(tbl.zone_maps.at("season")[0].row_count,  CHUNK_SIZE);
+    EXPECT_EQ(tbl.zone_maps.at("season")[1].start_row,  CHUNK_SIZE);
+    EXPECT_EQ(tbl.zone_maps.at("season")[1].row_count,  10);
+}
+
+// Dictionary-encoded STRING columns produce zone maps over decoded string values.
+TEST(ZoneMapConstruction, DictionaryEncodedColumnZoneMap) {
+    Schema schema = makeColumnarSchema({{"name", TypeId::STRING}});
+    std::vector<Row> rows = {
+        {Value(std::string("gamma"))},
+        {Value(std::string("alpha"))},
+        {Value(std::string("beta"))},
+        {Value(std::string("delta"))},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    // STRING columns are always stored as DictionaryEncoder
+    ASSERT_TRUE(std::holds_alternative<DictionaryEncoder>(tbl.columns.at("name")));
+
+    ASSERT_EQ(tbl.zone_maps.at("name").size(), 1u);
+    EXPECT_EQ(tbl.zone_maps.at("name")[0].min_val, Value(std::string("alpha")));
+    EXPECT_EQ(tbl.zone_maps.at("name")[0].max_val, Value(std::string("gamma")));
+}
+
+// DOUBLE columns produce zone maps with correct double min/max.
+TEST(ZoneMapConstruction, DoubleColumnZoneMap) {
+    Schema schema = makeColumnarSchema({{"speed", TypeId::DOUBLE}});
+    std::vector<Row> rows = {
+        {Value(1.5)},
+        {Value(3.5)},
+        {Value(2.5)},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    ASSERT_EQ(tbl.zone_maps.at("speed").size(), 1u);
+    EXPECT_EQ(tbl.zone_maps.at("speed")[0].min_val, Value(1.5));
+    EXPECT_EQ(tbl.zone_maps.at("speed")[0].max_val, Value(3.5));
+}
+
+
+// ===== ChunkPruner::canSkipChunk Tests =====
+// All use chunk: start=0, count=4, min=2020, max=2023
+
+static ColumnChunk testChunk() {
+    return {0, 4, Value(int64_t(2020)), Value(int64_t(2023))};
+}
+
+TEST(ChunkPrunerCanSkip, EqualAboveMax) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk("=", Value(int64_t(2025)), testChunk()));
+}
+
+TEST(ChunkPrunerCanSkip, EqualBelowMin) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk("=", Value(int64_t(2019)), testChunk()));
+}
+
+// Boundary: val==min is inside the range, cannot skip.
+TEST(ChunkPrunerCanSkip, EqualAtMin) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("=", Value(int64_t(2020)), testChunk()));
+}
+
+// Boundary: val==max is inside the range, cannot skip.
+TEST(ChunkPrunerCanSkip, EqualAtMax) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("=", Value(int64_t(2023)), testChunk()));
+}
+
+TEST(ChunkPrunerCanSkip, EqualInRange) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("=", Value(int64_t(2021)), testChunk()));
+}
+
+// Boundary: val==min for col<val — all values in chunk are >= min == val, none satisfy col<val.
+TEST(ChunkPrunerCanSkip, LessThanAtMin) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk("<", Value(int64_t(2020)), testChunk()));
+}
+
+// val > min — chunk contains min=2020 which satisfies col < 2021.
+TEST(ChunkPrunerCanSkip, LessThanAboveMin) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("<", Value(int64_t(2021)), testChunk()));
+}
+
+// Boundary: val==max for col>val — all values in chunk are <= max == val, none satisfy col>val.
+TEST(ChunkPrunerCanSkip, GreaterThanAtMax) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk(">", Value(int64_t(2023)), testChunk()));
+}
+
+// val < max — chunk contains max=2023 which satisfies col > 2022.
+TEST(ChunkPrunerCanSkip, GreaterThanBelowMax) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk(">", Value(int64_t(2022)), testChunk()));
+}
+
+TEST(ChunkPrunerCanSkip, LessThanOrEqualBelowMin) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk("<=", Value(int64_t(2019)), testChunk()));
+}
+
+// Boundary: val==min for col<=val — the min row satisfies col<=min, cannot skip.
+TEST(ChunkPrunerCanSkip, LessThanOrEqualAtMin) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("<=", Value(int64_t(2020)), testChunk()));
+}
+
+TEST(ChunkPrunerCanSkip, GreaterThanOrEqualAboveMax) {
+    EXPECT_TRUE(ChunkPruner::canSkipChunk(">=", Value(int64_t(2024)), testChunk()));
+}
+
+// Boundary: val==max for col>=val — the max row satisfies col>=max, cannot skip.
+TEST(ChunkPrunerCanSkip, GreaterThanOrEqualAtMax) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk(">=", Value(int64_t(2023)), testChunk()));
+}
+
+// != can never be pruned via range metadata.
+TEST(ChunkPrunerCanSkip, NotEqualNeverSkips) {
+    EXPECT_FALSE(ChunkPruner::canSkipChunk("!=", Value(int64_t(2022)), testChunk()));
+}
+
+
+// ===== ChunkPruner::shouldSkip Tests =====
+
+TEST(ChunkPrunerShouldSkip, SinglePredicateProveSkip) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    EXPECT_TRUE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+}
+
+TEST(ChunkPrunerShouldSkip, SinglePredicateNoSkip) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2022))));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+}
+
+// AND walk: season sub-predicate alone proves skip; speed not in zone_maps.
+TEST(ChunkPrunerShouldSkip, AndWalkOneProvesSkip) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto season_pred = makeColumnarBinary("=",   columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    auto speed_pred  = makeColumnarBinary(">",   columnarColRef("speed"),  columnarLit(Value(300.0)));
+    auto and_pred    = makeColumnarBinary("AND", std::move(season_pred),   std::move(speed_pred));
+
+    EXPECT_TRUE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0));
+}
+
+// AND walk: both sub-predicates fail to prove skip independently.
+TEST(ChunkPrunerShouldSkip, AndWalkBothFail) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+    zone_maps["speed"]  = {{0, 4, Value(150.0),         Value(350.0)}};
+
+    // season=2022 in [2020,2023]: cannot skip
+    // speed>100.0 with max=350.0: 100.0 >= 350.0 is false: cannot skip
+    auto season_pred = makeColumnarBinary("=",   columnarColRef("season"), columnarLit(Value(int64_t(2022))));
+    auto speed_pred  = makeColumnarBinary(">",   columnarColRef("speed"),  columnarLit(Value(100.0)));
+    auto and_pred    = makeColumnarBinary("AND", std::move(season_pred),   std::move(speed_pred));
+
+    EXPECT_FALSE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0));
+}
+
+// Predicate column absent from zone_maps: no crash, returns false.
+TEST(ChunkPrunerShouldSkip, ColNotInZoneMapNoSkip) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto pred = makeColumnarBinary("=", columnarColRef("unknown_col"), columnarLit(Value(int64_t(2025))));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+}
+
+// nullptr WHERE always returns false without crashing.
+TEST(ChunkPrunerShouldSkip, NullWhereNoSkip) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    EXPECT_FALSE(ChunkPruner::shouldSkip(nullptr, zone_maps, 0));
+}
+
+
+// ===== SeqScanNode Pruning Integration Tests =====
+
+static Schema singleSeasonSchema() {
+    return makeColumnarSchema({{"season", TypeId::INT}});
+}
+
+// 3 rows all season=2020; zone map chunk 0 is [2020,2020].
+static ColumnarTable makeSingleChunkTable() {
+    Schema schema = singleSeasonSchema();
+    std::vector<Row> rows = {
+        {Value(int64_t(2020))},
+        {Value(int64_t(2020))},
+        {Value(int64_t(2020))},
+    };
+    return CSVToColumnar::convert(rows, schema);
+}
+
+// Predicate val > max: entire chunk skipped, zero rows returned.
+TEST(SeqScanNodePruning, SkipsAllRowsWhenChunkProvedEmpty) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+
+    EXPECT_EQ(columnarDrainAll(&scan).size(), 0u);
+}
+
+// Predicate val in range: chunk not skipped, all rows returned.
+TEST(SeqScanNodePruning, NoSkipWhenPredicateInRange) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2020))));
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+
+    EXPECT_EQ(columnarDrainAll(&scan).size(), 3u);
+}
+
+// nullptr pruning predicate: no pruning applied, all rows returned.
+TEST(SeqScanNodePruning, NoSkipWithNullPredicate) {
+    Schema schema = singleSeasonSchema();
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, nullptr);
+
+    EXPECT_EQ(columnarDrainAll(&scan).size(), 3u);
+}
+
+// After a scan that skips, explain() reports chunks_skipped=1/1.
+TEST(SeqScanNodePruning, ExplainShowsChunksSkippedAfterScan) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+
+    scan.open();
+    while (scan.next()) {}
+    scan.close();
+
+    EXPECT_NE(scan.explain().find("chunks_skipped=1/1"), std::string::npos);
+}
+
+// After a scan with no skip, explain() reports chunks_skipped=0/1.
+TEST(SeqScanNodePruning, ExplainShowsZeroWhenNoSkip) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2020))));
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+
+    scan.open();
+    while (scan.next()) {}
+    scan.close();
+
+    EXPECT_NE(scan.explain().find("chunks_skipped=0/1"), std::string::npos);
+}
+
+// open() resets skipped_chunks_ so a second pass doesn't accumulate counts.
+TEST(SeqScanNodePruning, OpenResetsSkippedChunksCount) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+
+    // First pass: skips chunk → skipped_chunks_=1
+    scan.open();
+    while (scan.next()) {}
+    scan.close();
+    EXPECT_NE(scan.explain().find("chunks_skipped=1/1"), std::string::npos);
+
+    // Second pass: open() must reset to 0; skip increments back to 1 (not 2)
+    scan.open();
+    while (scan.next()) {}
+    scan.close();
+    EXPECT_NE(scan.explain().find("chunks_skipped=1/1"), std::string::npos);
+    EXPECT_EQ(scan.explain().find("chunks_skipped=2/1"), std::string::npos);
+}
+
+// CHUNK_SIZE rows season=2020 then 10 rows season=2025:
+// chunk 0 [2020,2020] is skipped; chunk 1 [2025,2025] is not.
+// Exactly 10 rows are returned and explain shows chunks_skipped=1/2.
+TEST(SeqScanNodePruning, MultiChunkPartialSkip) {
+    Schema schema = singleSeasonSchema();
+    std::vector<Row> rows;
+    rows.reserve(CHUNK_SIZE + 10);
+    for (int i = 0; i < CHUNK_SIZE; ++i)
+        rows.push_back({Value(int64_t(2020))});
+    for (int i = 0; i < 10; ++i)
+        rows.push_back({Value(int64_t(2025))});
+
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    SeqScanNode scan("test", std::move(tbl), schema, pred.get());
+
+    auto result = columnarDrainAll(&scan);
+
+    ASSERT_EQ(result.size(), 10u);
+    for (const auto& row : result)
+        EXPECT_EQ(row[0].asInt(), 2025);
+
+    EXPECT_NE(scan.explain().find("chunks_skipped=1/2"), std::string::npos);
+}
+
+// AND predicate: season sub-predicate alone proves skip.
+TEST(SeqScanNodePruning, AndPredicatePrunesCorrectly) {
+    Schema schema = makeColumnarSchema({
+        {"season", TypeId::INT},
+        {"speed",  TypeId::DOUBLE}
+    });
+    std::vector<Row> rows = {
+        {Value(int64_t(2020)), Value(100.0)},
+        {Value(int64_t(2020)), Value(200.0)},
+        {Value(int64_t(2020)), Value(150.0)},
+    };
+    ColumnarTable tbl = CSVToColumnar::convert(rows, schema);
+
+    // season=2025 AND speed>50: season chunk [2020,2020], 2025 > max → skip
+    auto season_pred = makeColumnarBinary("=",   columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+    auto speed_pred  = makeColumnarBinary(">",   columnarColRef("speed"),  columnarLit(Value(50.0)));
+    auto and_pred    = makeColumnarBinary("AND", std::move(season_pred),   std::move(speed_pred));
+
+    SeqScanNode scan("test", std::move(tbl), schema, and_pred.get());
+    EXPECT_EQ(columnarDrainAll(&scan).size(), 0u);
 }

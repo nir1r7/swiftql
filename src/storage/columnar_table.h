@@ -11,6 +11,15 @@
 
 using ColumnArray = std::variant<std::vector<int64_t>, std::vector<double>, std::vector<std::string>, DictionaryEncoder, RLEColumn>;
 
+static constexpr int CHUNK_SIZE = 8192;
+
+struct ColumnChunk {
+    int start_row;
+    int row_count;
+    Value min_val;
+    Value max_val;
+};
+
 struct ColumnarTable {
     explicit ColumnarTable() : schema(std::vector<ColumnDef>{}), num_rows(0) {}
     ColumnarTable(Schema s, int n) : schema(std::move(s)), num_rows(n) {}
@@ -19,6 +28,8 @@ struct ColumnarTable {
     int num_rows;
     // ordering is with schema
     std::unordered_map<std::string, ColumnArray> columns;
+    // same key as columns map above
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
 
     Value getValue(const std::string& col_name, int row_idx) const {
         const auto& arr = columns.at(col_name);

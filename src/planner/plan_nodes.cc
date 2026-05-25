@@ -1,6 +1,7 @@
 #include "plan_nodes.h"
 #include "execution/evaluator.h"
 #include "parser/expr_utils.h"
+#include "storage/chunk_pruner.h"
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
@@ -34,10 +35,12 @@ namespace {
 // SeqScanNode
 SeqScanNode::SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema) : table_name_(std::move(table_name)), rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
 
-SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), cursor_(0), use_columnar_(true) {}
+SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), cursor_(0), use_columnar_(true), pruning_where_(pruning_where) {}
+
 
 void SeqScanNode::open() {
     cursor_ = 0;
+    skipped_chunks_ = 0;
 }
 
 Row* SeqScanNode::next() {
@@ -45,13 +48,25 @@ Row* SeqScanNode::next() {
     Row* row = nullptr;
 
     if (use_columnar_){
-        if (cursor_ < columnar_table_.num_rows){
+        while (cursor_ < columnar_table_.num_rows) {
+            // decide whether to skip the entire chunk
+            if (pruning_where_ && cursor_ % CHUNK_SIZE == 0) {
+                int chunk_idx = cursor_/CHUNK_SIZE;
+                if (ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx)) {
+                    // advance past the whole chunk, never call getValue()
+                    cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - cursor_);
+                    ++skipped_chunks_;
+                    continue;
+                }
+            }
+            // not skipped, reconstruct this row and return it
             reconstructed_row_.clear();
             for (int c = 0; c < schema_.size(); ++c){
                 reconstructed_row_.push_back(columnar_table_.getValue(schema_.column(c).name, cursor_));
             }
             ++cursor_;
             row = &reconstructed_row_;
+            break;
         }
     }
     else{
@@ -73,7 +88,12 @@ const Schema& SeqScanNode::outputSchema() const {
 }
 
 std::string SeqScanNode::explain() const {
-    return "SeqScan [" + table_name_ + ", " + std::to_string(schema_.columns().size()) + " columns]";
+    std::string s = "SeqScan [" + table_name_ + ", " + std::to_string(schema_.columns().size()) + " columns]";
+    if (use_columnar_ && pruning_where_){
+        int total = (columnar_table_.num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        s += " chunks_skipped=" + std::to_string(skipped_chunks_) + "/" + std::to_string(total);
+    }
+    return s;
 }
 
 std::vector<PlanNode*> SeqScanNode::children() const {

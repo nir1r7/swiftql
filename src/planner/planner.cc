@@ -70,7 +70,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // build seqScan (bottom of tree) using narrowed schema
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
-        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema);
+        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, stmt.where.get());
     } else {
         node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(table_rows.at(stmt.from_table)), meta.schema);
     }
@@ -83,7 +83,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
         std::unique_ptr<PlanNode> right;
         if (columnar_tables.count(stmt.join->join_table) > 0) {
-            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), right_scan_schema);
+            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), right_scan_schema, nullptr);
         } else {
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
         }

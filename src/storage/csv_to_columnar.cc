@@ -8,8 +8,11 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
 
     // pass 1: initialize one typed raw array per column
     // pass 2: populate raw values
-    // pass 3: apply encodings (selective RLE for INT, dictionary for STRING)
+    // pass 3:
+    //   (a) apply encodings (selective RLE for INT, dictionary for STRING)
+    //   (b) build zone maps (min/max per chunk)
 
+    // pass 1
     for (int c = 0; c < schema.size(); ++c){
         const std::string& name = schema.column(c).name;
         switch (schema.column(c).type){
@@ -31,6 +34,7 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
         }
     }
 
+    // pass 2
     for (const auto& row : rows){
         for (int c = 0; c < schema.size(); ++c){
             const std::string& name = schema.column(c).name;
@@ -54,8 +58,11 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
         raw_bytes += columnByteSize(table.columns[schema.column(c).name]);
     }
 
+    // pass 3
     for (int c = 0; c < schema.size(); ++c){
         const std::string& name = schema.column(c).name;
+
+        // apply encodings
         size_t before_bytes = columnByteSize(table.columns[name]);
         switch (schema.column(c).type){
             case TypeId::INT: {
@@ -78,6 +85,25 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
         }
         std::cout << "  " << name << ": " << before_bytes / 1024 << " KB -> ";
         std::cout << columnByteSize(table.columns[name]) / 1024 << " KB\n";
+
+        // build zone maps
+        std::vector<ColumnChunk> chunks;
+        int num_rows = static_cast<int>(rows.size());
+        for (int start = 0; start < num_rows; start += CHUNK_SIZE){
+            // last row may have fewer than 8192
+            int count = std::min(CHUNK_SIZE, num_rows - start);
+            Value first = table.getValue(name, start);
+            Value mn = first;
+            Value mx = first;
+
+            for (int r = start + 1; r < start + count; ++r){
+                Value v = table.getValue(name, r);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            chunks.push_back({start, count, mn, mx});
+        }
+        table.zone_maps[name] = std::move(chunks);
     }
 
     // calculate storage after encoding (for sstats)

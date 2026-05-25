@@ -15,8 +15,8 @@ class SeqScanNode : public PlanNode {
         // row storage
         SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema);
 
-        // columnar storage
-        SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema);
+        // columnar storage (pruning_where = nullptr disables chunk pruning)
+        SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where = nullptr);
 
         void open() override; // initialize cursor
         Row* next() override; // get next row
@@ -36,6 +36,9 @@ class SeqScanNode : public PlanNode {
         ColumnarTable columnar_table_;
         bool use_columnar_ = false;
         Row reconstructed_row_; // reuse on every columnar next()
+
+        const Expr* pruning_where_ = nullptr; // non owning
+        int skipped_chunks_ = 0;
 };
 
 
@@ -51,8 +54,8 @@ class FilterNode : public PlanNode{
         std::string explain() const override;
         std::vector<PlanNode*> children() const override;
     private:
-        std::unique_ptr<PlanNode> child_;
         std::unique_ptr<Expr> predicate_;
+        std::unique_ptr<PlanNode> child_;
 };
 
 
