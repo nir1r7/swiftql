@@ -2,6 +2,14 @@
 #include "csv_to_columnar.h"
 #include <iostream>
 #include <iomanip>
+#include <sstream>
+
+static std::string formatKB(size_t bytes) {
+    if (bytes < 1024) return std::to_string(bytes) + " B";
+    std::ostringstream s;
+    s << std::fixed << std::setprecision(1) << bytes / 1024.0 << " KB";
+    return s.str();
+}
 
 ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema& schema){
     ColumnarTable table(schema, static_cast<int>(rows.size()));
@@ -83,8 +91,8 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
                 break;
             }
         }
-        std::cout << "  " << name << ": " << before_bytes / 1024 << " KB -> ";
-        std::cout << columnByteSize(table.columns[name]) / 1024 << " KB\n";
+        std::cout << "  " << name << ": " << formatKB(before_bytes) << " -> "
+                  << formatKB(columnByteSize(table.columns[name])) << "\n";
 
         // build zone maps
         std::vector<ColumnChunk> chunks;
@@ -108,8 +116,8 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
 
     // calculate storage after encoding (for sstats)
     size_t encoded_bytes = columnarTableByteSize(table);
-    std::cout << "[columnar] raw=" << raw_bytes / 1024 << " KB";
-    std::cout << "  encoded=" << encoded_bytes / 1024 << " KB";
+    std::cout << "[columnar] raw=" << formatKB(raw_bytes);
+    std::cout << "  encoded=" << formatKB(encoded_bytes);
     std::cout << "  ratio=" << std::fixed << std::setprecision(2);
     std::cout << (double)encoded_bytes / raw_bytes << "\n";
 

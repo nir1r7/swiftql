@@ -189,11 +189,7 @@ class LimitNode : public PlanNode {
 // not to be implemented yet
 class HashJoinNode : public PlanNode {
     public:
-        HashJoinNode(std::unique_ptr<PlanNode> left,
-            std::unique_ptr<PlanNode> right,
-            std::string left_col,
-            std::string right_col,
-            Schema output_schema);
+        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema);
 
         void open() override;
         Row* next() override;
@@ -207,4 +203,11 @@ class HashJoinNode : public PlanNode {
         std::string left_col_; // join column from left table
         std::string right_col_; // join column from right table
         Schema output_schema_;
+
+        std::unordered_map<std::string, std::vector<Row>> hash_table_;
+        
+        Row* current_probe_row_ = nullptr;
+        int bucket_idx_;
+
+        Row current_row_;
 };

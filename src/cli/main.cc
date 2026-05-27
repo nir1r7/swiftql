@@ -6,6 +6,7 @@
 #include <utility>
 #include <iomanip>
 #include <chrono>
+#include <cmath>
 
 #include "catalog/catalog.h"
 #include "parser/parser.h"
@@ -85,6 +86,15 @@ struct NodeLine {
     std::string pct;
 };
 
+// Format microseconds with ~4 significant digits, no scientific notation.
+static std::string formatMicros(double us) {
+    if (us == 0.0) return "0";
+    int exp = us >= 1.0 ? static_cast<int>(std::log10(us)) : 0;
+    std::ostringstream t;
+    t << std::fixed << std::setprecision(std::max(0, 3 - exp)) << us;
+    return t.str();
+}
+
 void collectNodes(PlanNode* node, int depth, bool analyze,
                   double exec_total_us, std::vector<NodeLine>& out) {
     NodeLine line;
@@ -94,9 +104,7 @@ void collectNodes(PlanNode* node, int depth, bool analyze,
             line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
         if (node->stats.rows_out > 0)
             line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
-        std::ostringstream t;
-        t << std::fixed << std::setprecision(1) << node->stats.elapsed_us;
-        line.time = "time=" + t.str() + "µs";
+        line.time = "time=" + formatMicros(node->stats.elapsed_us) + "µs";
         if (exec_total_us > 0.0) {
             std::ostringstream p;
             p << std::fixed << std::setprecision(1)

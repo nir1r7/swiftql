@@ -523,14 +523,83 @@ std::vector<PlanNode*> LimitNode::children() const {
 HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema) : left_(std::move(left)), right_(std::move(right)), left_col_(std::move(left_col)), right_col_(std::move(right_col)), output_schema_(std::move(output_schema)) {}
 
 void HashJoinNode::open() {
-    throw std::runtime_error("HashJoin not implemented until Phase 2");
+    left_->open();
+    right_->open();
+
+    // build phase
+    hash_table_.clear();
+    const Schema& build_schema = right_->outputSchema();
+    int build_key_idx = build_schema.indexOf(right_col_);
+
+    while (true){
+        Row* row = right_->next();
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        if (!row){
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            break;
+        }
+
+        const Value& key_val = (*row)[build_key_idx];
+        std::string key = key_val.toString() + '\x01'; // same operator that serializeKey() uses
+        hash_table_[key].push_back(*row);
+
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+    }
+
+    current_probe_row_ = nullptr;
+    bucket_idx_ = 0;
 }
 
-Row* HashJoinNode::next() { 
-    return nullptr;
+Row* HashJoinNode::next() {
+    const Schema& probe_schema = left_->outputSchema();
+    int probe_key_idx = probe_schema.indexOf(left_col_);
+
+    while (true){
+        if (current_probe_row_ != nullptr){
+            // check if there are more matches in the current probe row's bucket
+            std::string key = (*current_probe_row_)[probe_key_idx].toString() + '\x01';
+            auto it = hash_table_.find(key);
+
+            if (it != hash_table_.end() && bucket_idx_ < static_cast<int>(it->second.size())){
+                auto t0 = std::chrono::high_resolution_clock::now();
+
+                const Row& build_row = it->second[bucket_idx_++];
+
+                current_row_.clear();
+                for (const Value& v : *current_probe_row_) current_row_.push_back(v);
+                for (const Value& v : build_row) current_row_.push_back(v);
+
+                stats.rows_out++;
+                stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+                return &current_row_;
+            } else {
+                current_probe_row_ = nullptr;
+            }
+        } else {
+            // fetch next probe row
+            Row* probe_row = left_->next();
+            auto t0 = std::chrono::high_resolution_clock::now();
+
+            if (!probe_row){
+                stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+                return nullptr;
+            }
+
+            stats.rows_in++;
+            current_probe_row_ = probe_row;
+            bucket_idx_ = 0;
+
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+        }
+    }
 }
 
-void HashJoinNode::close() {}
+void HashJoinNode::close() {
+    left_->close();
+    right_->close();
+    hash_table_.clear();
+}
 
 const Schema& HashJoinNode::outputSchema() const {
     return output_schema_;

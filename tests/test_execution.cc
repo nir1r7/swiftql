@@ -391,12 +391,133 @@ TEST(LimitNode, LimitsOutput) {
 
 // ===== HashJoinNode =====
 
-TEST(HashJoinNode, ThrowsNotImplemented) {
-    Schema schema = makeSchema({{"id", TypeId::INT}});
-    Schema out_schema = makeSchema({{"id", TypeId::INT}, {"val", TypeId::INT}});
+TEST(HashJoinNode, BasicInnerJoin) {
+    // LEFT (probe) — 3 laps rows: 2 with driver_id=1 (match), 1 with driver_id=99 (no match)
+    Schema left_schema = makeSchema({
+        {"lap_id",    TypeId::INT},
+        {"driver_id", TypeId::INT},
+        {"speed",     TypeId::DOUBLE}
+    });
+    std::vector<Row> left_rows = {
+        {Value(int64_t(1)), Value(int64_t(1)),  Value(200.0)},
+        {Value(int64_t(2)), Value(int64_t(1)),  Value(210.0)},
+        {Value(int64_t(3)), Value(int64_t(99)), Value(180.0)}, // no match
+    };
 
-    HashJoinNode join(makeScan({}, schema), makeScan({}, schema), "id", "id", out_schema);
-    EXPECT_THROW(join.open(), std::runtime_error);
+    // RIGHT (build) — 1 driver row, driver_id=1
+    Schema right_schema = makeSchema({
+        {"driver_id", TypeId::INT},
+        {"name",      TypeId::STRING}
+    });
+    std::vector<Row> right_rows = {
+        {Value(int64_t(1)), Value(std::string("Hamilton"))},
+    };
+
+    // merged schema mirrors what the planner produces: left columns then right columns
+    // driver_id appears twice; indexOf() returns the first (left) occurrence
+    Schema merged = makeSchema({
+        {"lap_id",    TypeId::INT},
+        {"driver_id", TypeId::INT},   // [1] from left
+        {"speed",     TypeId::DOUBLE},
+        {"driver_id", TypeId::INT},   // [3] from right (duplicate name)
+        {"name",      TypeId::STRING} // [4]
+    });
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        "driver_id", "driver_id",
+        merged);
+
+    auto result = drainAll(&join);
+
+    // only driver_id=1 rows join; driver_id=99 has no match
+    ASSERT_EQ(result.size(), 2u);
+
+    // each joined row: [lap_id, driver_id(L), speed, driver_id(R), name]
+    EXPECT_EQ(result[0][0].asInt(), 1);
+    EXPECT_DOUBLE_EQ(result[0][2].asDouble(), 200.0);
+    EXPECT_EQ(result[0][4].asString(), "Hamilton");
+
+    EXPECT_EQ(result[1][0].asInt(), 2);
+    EXPECT_DOUBLE_EQ(result[1][2].asDouble(), 210.0);
+    EXPECT_EQ(result[1][4].asString(), "Hamilton");
+}
+
+TEST(HashJoinNode, NoMatch) {
+    // probe keys (1, 2) do not appear in the build side (99) — empty result
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+    std::vector<Row> right_rows = {{Value(int64_t(99))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        "pid", "bid", merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+TEST(HashJoinNode, MultipleMatchesPerKey) {
+    // build side has 2 rows with the same key — the single probe row must emit 2 joined rows.
+    // this tests that next() correctly tracks bucket_idx_ across consecutive calls.
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"name", TypeId::STRING}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}, {"name", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(5))}};
+    std::vector<Row> right_rows = {
+        {Value(int64_t(5)), Value(std::string("A"))},
+        {Value(int64_t(5)), Value(std::string("B"))},
+    };
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        "pid", "bid", merged);
+
+    auto result = drainAll(&join);
+    ASSERT_EQ(result.size(), 2u);
+
+    std::vector<std::string> names = {result[0][2].asString(), result[1][2].asString()};
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(names[0], "A");
+    EXPECT_EQ(names[1], "B");
+}
+
+TEST(HashJoinNode, EmptyBuildSide) {
+    // hash table is empty — no probe row can ever match
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    std::vector<Row> left_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+
+    HashJoinNode join(
+        makeScan(left_rows, left_schema),
+        makeScan({},        right_schema),
+        "pid", "bid", merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+TEST(HashJoinNode, EmptyProbeSide) {
+    // nothing to probe even though the hash table is populated
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    std::vector<Row> right_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+
+    HashJoinNode join(
+        makeScan({},         left_schema),
+        makeScan(right_rows, right_schema),
+        "pid", "bid", merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
 }
 
 // ===== full pipeline =====
@@ -472,4 +593,89 @@ TEST(Pipeline, CheckpointQuery) {
 
     EXPECT_EQ(result[1][0].asString(), "RedBull");
     EXPECT_DOUBLE_EQ(result[1][1].asDouble(), 320.0);
+}
+
+TEST(Pipeline, HashJoinWithFilterAndAggregate) {
+    // SELECT team, AVG(speed)
+    // FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id
+    // WHERE speed > 200.0
+    // GROUP BY team
+
+    Schema laps_schema = makeSchema({
+        {"driver_id", TypeId::INT},
+        {"team",      TypeId::STRING},
+        {"speed",     TypeId::DOUBLE}
+    });
+    std::vector<Row> laps_rows = {
+        {Value(int64_t(1)), Value(std::string("Ferrari")), Value(300.0)},   // joins, passes WHERE
+        {Value(int64_t(1)), Value(std::string("Ferrari")), Value(150.0)},   // joins, fails WHERE
+        {Value(int64_t(2)), Value(std::string("McLaren")), Value(250.0)},   // joins, passes WHERE
+        {Value(int64_t(99)), Value(std::string("RedBull")), Value(400.0)},  // no join match
+    };
+
+    Schema drivers_schema = makeSchema({
+        {"driver_id", TypeId::INT},
+        {"name",      TypeId::STRING}
+    });
+    std::vector<Row> drivers_rows = {
+        {Value(int64_t(1)), Value(std::string("Hamilton"))},
+        {Value(int64_t(2)), Value(std::string("Norris"))},
+    };
+
+    // merged schema: laps columns then drivers columns
+    Schema merged = makeSchema({
+        {"driver_id", TypeId::INT},   // [0] from laps
+        {"team",      TypeId::STRING},
+        {"speed",     TypeId::DOUBLE},
+        {"driver_id", TypeId::INT},   // [3] from drivers (duplicate name, indexOf returns first)
+        {"name",      TypeId::STRING}
+    });
+
+    // HashJoin
+    auto join = std::make_unique<HashJoinNode>(
+        makeScan(laps_rows,    laps_schema),
+        makeScan(drivers_rows, drivers_schema),
+        "driver_id", "driver_id",
+        merged);
+
+    // WHERE speed > 200.0
+    auto filter = std::make_unique<FilterNode>(
+        std::move(join),
+        makeBinary(">", colRef("speed"), lit(Value(200.0))));
+
+    // GROUP BY team, AVG(speed)
+    Schema agg_schema = makeSchema({{"team", TypeId::STRING}, {"AVG(speed)", TypeId::DOUBLE}});
+    auto agg = std::make_unique<HashAggregateNode>(
+        std::move(filter),
+        std::vector<std::string>{"team"},
+        std::vector<AggregateSpec>{{"AVG", "speed", false}},
+        agg_schema);
+
+    // SELECT team, AVG(speed)
+    std::vector<std::unique_ptr<Expr>> proj_exprs;
+    proj_exprs.push_back(colRef("team"));
+    proj_exprs.push_back(aggExpr("AVG", "speed"));
+    Schema proj_schema = makeSchema({{"team", TypeId::STRING}, {"AVG(speed)", TypeId::DOUBLE}});
+    ProjectNode project(std::move(agg), std::move(proj_exprs), proj_schema);
+
+    auto result = drainAll(&project);
+
+    // Ferrari: 300.0 row survives WHERE (150.0 filtered out); AVG = 300.0
+    // McLaren: 250.0 survives; AVG = 250.0
+    // RedBull: no join match — absent from results
+    ASSERT_EQ(result.size(), 2u);
+
+    Row* ferrari = nullptr;
+    Row* mclaren = nullptr;
+    for (auto& r : result) {
+        if (r[0].asString() == "Ferrari") ferrari = &r;
+        if (r[0].asString() == "McLaren") mclaren = &r;
+    }
+    ASSERT_NE(ferrari, nullptr);
+    ASSERT_NE(mclaren, nullptr);
+    EXPECT_EQ(result.end(), std::find_if(result.begin(), result.end(),
+        [](const Row& r){ return r[0].asString() == "RedBull"; }));
+
+    EXPECT_DOUBLE_EQ((*ferrari)[1].asDouble(), 300.0);
+    EXPECT_DOUBLE_EQ((*mclaren)[1].asDouble(), 250.0);
 }

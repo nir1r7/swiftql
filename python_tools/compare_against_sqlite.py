@@ -39,6 +39,9 @@ QUERIES = [
     "SELECT DISTINCT team, season FROM laps ORDER BY team, season LIMIT 10",
     "SELECT team, COUNT(*) FROM laps GROUP BY team ORDER BY COUNT(*) LIMIT 5",
     "SELECT team, AVG(speed) FROM laps WHERE speed IS NOT NULL GROUP BY team HAVING AVG(speed) > 305 ORDER BY team",
+    "SELECT name, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
+    "SELECT name, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY name ORDER BY name",
+    "SELECT name, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY name ORDER BY name",
 ]
 
 # SQLite setup
