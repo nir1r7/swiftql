@@ -45,9 +45,6 @@ env/
 .vscode/
 !.vscode/extensions.json
 
-.claude/
-CLAUDE.md
-
 # Generated data files (use python_tools/generate_data.py to recreate)
 data/*.csv
 
