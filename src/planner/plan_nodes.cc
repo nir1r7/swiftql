@@ -265,7 +265,7 @@ void HashAggregateNode::open() {
                 int64_t n = spec.is_star ? acc.count : acc.non_null_count;
                 result_row.push_back(Value(n));
             } else if (spec.function == "SUM") {
-                result_row.push_back(Value(acc.sum));
+                result_row.push_back(acc.non_null_count > 0 ? Value(acc.sum) : Value::null());
             } else if (spec.function == "AVG") {
                 Value avg_val = acc.non_null_count > 0
                     ? Value(acc.sum / static_cast<double>(acc.non_null_count))

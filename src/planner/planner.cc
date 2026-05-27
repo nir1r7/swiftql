@@ -133,7 +133,12 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         node = std::make_unique<HavingNode>(std::move(node), std::move(stmt.having));
     }
 
-    // project; SELECT list — placed before Distinct/Sort/Limit so DISTINCT deduplicates projected rows
+    // sort (ORDER BY) — must evaluate against pre-projection schema
+    if (!stmt.order_by.empty()) {
+        node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
+    }
+
+    // project; SELECT list — placed after Sort so sort expressions resolve against full schema
     if (stmt.select_star) {
         const Schema& child_schema = node->outputSchema();
         std::vector<std::unique_ptr<Expr>> star_exprs;
@@ -154,11 +159,6 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // DISTINCT — runs on projected rows
     if (stmt.distinct) {
         node = std::make_unique<DistinctNode>(std::move(node));
-    }
-
-    // sort (ORDER BY)
-    if (!stmt.order_by.empty()) {
-        node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
     }
 
     // limit
