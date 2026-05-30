@@ -67,6 +67,9 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // narrow down schema
     Schema scan_schema = narrowSchema(meta.schema, required);
 
+    // capture before std::move transfers ownership into SeqScanNode
+    int from_row_count = columnar_tables.count(stmt.from_table) > 0 ? columnar_tables.at(stmt.from_table).num_rows : (int)table_rows.at(stmt.from_table).size();
+
     // build seqScan (bottom of tree) using narrowed schema
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
@@ -81,6 +84,11 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
         Schema right_scan_schema = narrowSchema(join_meta.schema, required);
 
+        // capture before std::move transfers ownership into SeqScanNode
+        int join_row_count = columnar_tables.count(stmt.join->join_table) > 0
+            ? columnar_tables.at(stmt.join->join_table).num_rows
+            : (int)table_rows.at(stmt.join->join_table).size();
+
         std::unique_ptr<PlanNode> right;
         if (columnar_tables.count(stmt.join->join_table) > 0) {
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), right_scan_schema, nullptr);
@@ -88,15 +96,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
         }
 
-        // build merged schema for join output
-        std::vector<ColumnDef> merged_cols = node->outputSchema().columns();
-        for (const auto& col : right->outputSchema().columns()) {
-            merged_cols.push_back(col);
-        }
-        Schema merged_schema(merged_cols);
-
         // extract join column names from ON condition
-        // for phase 1 assume ON is always col = col
+        // assumes ON is always col = col
         std::string left_col, right_col;
         if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
             if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get()))
@@ -105,7 +106,24 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
                 right_col = rc->column_name;
         }
 
-        node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), left_col, right_col, merged_schema);
+        // put the smaller table on the build side (right_) to minimise hash table memory
+        // Option A: output schema order follows probe side (see memory: hash-join-schema-ordering-debt)
+        bool swap = from_row_count < join_row_count;
+        if (swap) {
+            // FROM table is smaller — FROM becomes build (right_), JOIN becomes probe (left_)
+            std::vector<ColumnDef> merged_cols = right->outputSchema().columns();
+            for (const auto& col : node->outputSchema().columns())
+                merged_cols.push_back(col);
+            Schema merged_schema(merged_cols);
+            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), right_col, left_col, merged_schema);
+        } else {
+            // JOIN table is smaller (or equal) — JOIN stays build (right_), FROM stays probe (left_)
+            std::vector<ColumnDef> merged_cols = node->outputSchema().columns();
+            for (const auto& col : right->outputSchema().columns())
+                merged_cols.push_back(col);
+            Schema merged_schema(merged_cols);
+            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), left_col, right_col, merged_schema);
+        }
     }
 
     // fliter (WHERE)
