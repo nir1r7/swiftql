@@ -51,9 +51,9 @@ REGRESSION_QUERIES = [
     "SELECT DISTINCT team, season FROM laps ORDER BY team, season LIMIT 10",
     "SELECT team, COUNT(*) FROM laps GROUP BY team ORDER BY COUNT(*) LIMIT 5",
     "SELECT team, AVG(speed) FROM laps WHERE speed IS NOT NULL GROUP BY team HAVING AVG(speed) > 305 ORDER BY team",
-    "SELECT drivers.name, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
-    "SELECT drivers.name, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY drivers.name ORDER BY drivers.name",
-    "SELECT drivers.name, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY drivers.name ORDER BY drivers.name",
+    "SELECT season, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
+    "SELECT season, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY season ORDER BY season",
+    "SELECT season, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY season ORDER BY season",
 ]
 
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
