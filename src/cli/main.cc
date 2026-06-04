@@ -28,6 +28,7 @@ struct Args {
     bool explain_analyze = false;
     bool no_cache = false;
     bool no_optimize = false; // accepted, ignored in Phase 1
+    bool storage_stats = false;  // print columnar byte sizes and exit
     std::string storage = "row"; // default to row
     std::string execution = "volcano";
 };
@@ -44,6 +45,7 @@ Args parseArgs(int argc, char* argv[]) {
         else if (flag == "--explain-analyze") args.explain_analyze = true;
         else if (flag == "--no-cache") args.no_cache = true;
         else if (flag == "--no-optimize") args.no_optimize = true;
+        else if (flag == "--storage-stats") args.storage_stats = true;
         else std::cerr << "Unknown argument: " << flag << "\n";
     }
     return args;
@@ -54,15 +56,19 @@ void printResults(const std::vector<Row>& rows, const Schema& schema) {
     int ncols = static_cast<int>(cols.size());
 
     std::vector<size_t> widths(ncols);
-    for (int i = 0; i < ncols; ++i)
+    for (int i = 0; i < ncols; ++i){
         widths[i] = cols[i].name.size();
-    for (const auto& row : rows)
-        for (int i = 0; i < ncols; ++i)
+    }
+    for (const auto& row : rows){
+        for (int i = 0; i < ncols; ++i){
             widths[i] = std::max(widths[i], row[i].toString().size());
+        }
+    }
 
     // header
-    for (int i = 0; i < ncols; ++i)
+    for (int i = 0; i < ncols; ++i){
         std::cout << std::left << std::setw(static_cast<int>(widths[i]) + 2) << cols[i].name;
+    }
     std::cout << "\n";
 
     // separator
@@ -72,8 +78,9 @@ void printResults(const std::vector<Row>& rows, const Schema& schema) {
 
     // rows
     for (const auto& row : rows) {
-        for (int i = 0; i < ncols; ++i)
+        for (int i = 0; i < ncols; ++i){
             std::cout << std::left << std::setw(static_cast<int>(widths[i]) + 2) << row[i].toString();
+        }
         std::cout << "\n";
     }
 }
@@ -100,21 +107,23 @@ void collectNodes(PlanNode* node, int depth, bool analyze,
     NodeLine line;
     line.label = std::string(depth * 2, ' ') + node->explain();
     if (analyze) {
-        if (node->stats.rows_in > 0)
+        if (node->stats.rows_in > 0){
             line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
-        if (node->stats.rows_out > 0)
+        }
+        if (node->stats.rows_out > 0){
             line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
+        }
         line.time = "time=" + formatMicros(node->stats.elapsed_us) + "µs";
         if (exec_total_us > 0.0) {
             std::ostringstream p;
-            p << std::fixed << std::setprecision(1)
-              << (node->stats.elapsed_us / exec_total_us * 100.0);
+            p << std::fixed << std::setprecision(1) << (node->stats.elapsed_us / exec_total_us * 100.0);
             line.pct = "(" + p.str() + "%)";
         }
     }
     out.push_back(std::move(line));
-    for (PlanNode* child : node->children())
+    for (PlanNode* child : node->children()){
         collectNodes(child, depth + 1, analyze, exec_total_us, out);
+    }
 }
 
 void printAligned(const std::vector<NodeLine>& lines) {
@@ -134,15 +143,15 @@ void printAligned(const std::vector<NodeLine>& lines) {
     const size_t gap = 3;
 
     for (const auto& l : lines) {
-        std::cout << l.label
-                  << std::string(w_label - dispLen(l.label) + gap, ' ');
-        if (w_ri > 0)
+        std::cout << l.label << std::string(w_label - dispLen(l.label) + gap, ' ');
+        if (w_ri > 0){
             std::cout << std::left << std::setw(static_cast<int>(w_ri + gap)) << l.rows_in;
-        if (w_ro > 0)
+        }
+        if (w_ro > 0){
             std::cout << std::setw(static_cast<int>(w_ro + gap)) << l.rows_out;
+        }
         if (!l.time.empty()) {
-            std::cout << l.time
-                      << std::string(w_time - dispLen(l.time) + gap, ' ');
+            std::cout << l.time << std::string(w_time - dispLen(l.time) + gap, ' ');
         }
         std::cout << l.pct << "\n";
     }
@@ -162,15 +171,15 @@ int main(int argc, char* argv[]) {
         bool multi = args.queries.size() > 1;
 
         for (const auto& query : args.queries) {
-            if (multi)
+            if (multi){
                 std::cout << "\n-- " << query << "\n";
+            }
 
             // time parsing
             auto parse_start = std::chrono::high_resolution_clock::now();
             Parser parser(query);
             auto stmt = parser.parse();
-            double parse_us = std::chrono::duration<double, std::micro>(
-                std::chrono::high_resolution_clock::now() - parse_start).count();
+            double parse_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - parse_start).count();
 
             // load CSV data (excluded from timing, per benchmark methodology)
             std::unordered_map<std::string, std::vector<Row>> table_rows;
@@ -190,6 +199,14 @@ int main(int argc, char* argv[]) {
                     columnar_tables.emplace(name, CSVToColumnar::convert(rows, s));
                 }
                 table_rows.clear(); // row data no longer needed; free before plan timer starts
+            
+                if (args.storage_stats) {
+                    for (const auto& [name, ct] : columnar_tables) {
+                        size_t mb = columnarTableByteSize(ct) / (1024 * 1024);
+                        std::cout << name << " (columnar): " << mb << " MB\n";
+                    }
+                    return 0;  // exit after first query; storage size doesn't change per query
+                }
             }
 
             // time planning

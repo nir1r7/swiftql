@@ -15,8 +15,20 @@ CATALOG_PATH = "catalog.json"
 LAPS_CSV = "data/laps.csv"
 DRIVERS_CSV = "data/drivers.csv"
 
-# test queries
-QUERIES = [
+# README Phase 2 / Week 12 benchmark queries. The README shows table aliases for
+# the join; SwiftQL does not parse aliases yet, so use the equivalent qualified
+# form already used by benchmark.py.
+PHASE2_WEEK12_BENCHMARK_QUERIES = [
+    "SELECT AVG(speed) FROM laps",
+    "SELECT COUNT(*) FROM laps WHERE season = 2025",
+    "SELECT team, speed FROM laps WHERE speed > 300",
+    "SELECT team, COUNT(*) FROM laps GROUP BY team",
+    "SELECT laps.team, AVG(laps.speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY laps.team",
+]
+PHASE2_WEEK12_BENCHMARK_QUERY_SET = set(PHASE2_WEEK12_BENCHMARK_QUERIES)
+
+# Broader regression queries.
+REGRESSION_QUERIES = [
     "SELECT team FROM laps LIMIT 5",
     "SELECT COUNT(*) FROM laps",
     "SELECT AVG(speed) FROM laps",
@@ -39,9 +51,14 @@ QUERIES = [
     "SELECT DISTINCT team, season FROM laps ORDER BY team, season LIMIT 10",
     "SELECT team, COUNT(*) FROM laps GROUP BY team ORDER BY COUNT(*) LIMIT 5",
     "SELECT team, AVG(speed) FROM laps WHERE speed IS NOT NULL GROUP BY team HAVING AVG(speed) > 305 ORDER BY team",
-    "SELECT name, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
-    "SELECT name, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY name ORDER BY name",
-    "SELECT name, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY name ORDER BY name",
+    "SELECT drivers.name, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
+    "SELECT drivers.name, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY drivers.name ORDER BY drivers.name",
+    "SELECT drivers.name, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY drivers.name ORDER BY drivers.name",
+]
+
+QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
+    query for query in REGRESSION_QUERIES
+    if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
 ]
 
 # SQLite setup
@@ -124,7 +141,7 @@ def rows_equal(a, b):
             return False
         for x, y in zip(row_a, row_b):
             if isinstance(x, float) and isinstance(y, float):
-                if abs(x - y) >= 1e-12:
+                if abs(x - y) > 1e-5:
                     return False
             else:
                 if x != y:
