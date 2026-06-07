@@ -16,6 +16,8 @@ class VecPlanNode {
         VecNodeStats stats;
 
         virtual ~VecPlanNode() = default;
+
+        virtual void open() = 0;
         // returns a pointer to operator's internal chunk
         // reused on next call
         virtual DataChunk* nextChunk() = 0;
