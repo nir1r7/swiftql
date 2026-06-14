@@ -19,7 +19,8 @@ class VecPlanNode {
 
         virtual void open() = 0;
         // returns a pointer to operator's internal chunk
-        // reused on next call
+        // reused on next call — any reference into the returned chunk's data
+        // (e.g. const auto& v = chunk->columns[i].data) is invalidated on the next call
         virtual DataChunk* nextChunk() = 0;
         virtual void close() = 0;
 

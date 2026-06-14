@@ -31,9 +31,8 @@ struct DataChunk {
     int num_rows = 0;
 };
 
-// indices of rows within a DataCHunk that have passed a dilter
+// indices of rows within a DataChunk that have passed a filter
 // produced by VecFilterNode
 struct SelectionVector {
     std::vector<int> indices;
-    int size = 0;
 };

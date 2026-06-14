@@ -5,6 +5,7 @@ add_executable(swiftql_tests
     test_parser.cc
     test_planner.cc
     test_execution.cc
+    test_vectorized.cc
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)

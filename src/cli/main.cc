@@ -12,10 +12,12 @@
 #include "parser/parser.h"
 #include "planner/planner.h"
 #include "planner/plan_nodes.h"
+#include "planner/vec_plan_node.h"
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
 #include "common/schema.h"
 #include "common/value.h"
+#include "execution/vec_scan_node.h"
 
 // result cache: raw SQL to {schema, rows}
 static std::unordered_map<std::string, std::pair<Schema, std::vector<Row>>> result_cache;
@@ -208,6 +210,38 @@ int main(int argc, char* argv[]) {
                     return 0;  // exit after first query; storage size doesn't change per query
                 }
             }
+
+            if (args.execution == "vectorized"){
+                if (args.storage != "columnar"){
+                    std::cerr << "Error: --execution vectorized requires --storage columnar\n";
+                    return 1;
+                }
+
+                const TableMetadata& meta = catalog.getTable(stmt.from_table);
+                auto vec_scan = std::make_unique<VecScanNode>(stmt.from_table, columnar_tables.at(stmt.from_table), meta.schema);
+
+                vec_scan->open();
+                std::vector<Row> rows;
+
+                // temporary, will be reaplced in week 14
+                while (DataChunk* chunk = vec_scan->nextChunk()){
+                    for (int r = 0; r < chunk->num_rows; ++r){
+                        Row row;
+                        row.reserve(chunk->columns.size());
+                        for (const auto& cv : chunk->columns){
+                            std::visit([&](const auto& vec){
+                                row.push_back(Value(vec[r]));
+                            }, cv.data);
+                        }
+                        rows.push_back(std::move(row));
+                    }
+                }
+                vec_scan->close();
+
+                printResults(rows, meta.schema);
+                continue;
+            }
+            
 
             // time planning
             auto plan_start = std::chrono::high_resolution_clock::now();
