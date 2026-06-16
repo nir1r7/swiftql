@@ -29,6 +29,7 @@ struct ColumnVector {
 struct DataChunk {
     std::vector<ColumnVector> columns;
     int num_rows = 0;
+    SelectionVector sel;
 };
 
 // indices of rows within a DataChunk that have passed a filter
