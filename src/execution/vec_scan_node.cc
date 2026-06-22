@@ -18,6 +18,9 @@ DataChunk* VecScanNode::nextChunk(){
     int count = std::min(BATCH_SIZE, columnar_table_.num_rows - start);
     row_cursor_ += count;
 
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+
     // rebuild cols each call
     current_chunk_.num_rows = count;
     current_chunk_.columns.clear();
@@ -62,6 +65,9 @@ DataChunk* VecScanNode::nextChunk(){
 
         current_chunk_.columns.push_back(std::move(cv));
     }
+
+    stats.rows_out += count;
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 
     return &current_chunk_;
 }

@@ -128,6 +128,29 @@ void collectNodes(PlanNode* node, int depth, bool analyze,
     }
 }
 
+void collectVecNodes(VecPlanNode* node, int depth, bool analyze, double exec_total_us, std::vector<NodeLine>& out) {
+    NodeLine line;
+    line.label = std::string(depth * 2, ' ') + node->explain();
+    if (analyze) {
+        if (node->stats.rows_in > 0){
+            line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
+        }
+        if (node->stats.rows_out > 0){
+            line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
+        }
+        line.time = "time=" + formatMicros(node->stats.elapsed_us) + "µs";
+        if (exec_total_us > 0.0) {
+            std::ostringstream p;
+            p << std::fixed << std::setprecision(1) << (node->stats.elapsed_us / exec_total_us * 100.0);
+            line.pct = "(" + p.str() + "%)";
+        }
+    }
+    out.push_back(std::move(line));
+    for (VecPlanNode* child : node->children()){
+        collectVecNodes(child, depth + 1, analyze, exec_total_us, out);
+    }
+}
+
 void printAligned(const std::vector<NodeLine>& lines) {
     auto dispLen = [](const std::string& s) {
         size_t extra = 0;
