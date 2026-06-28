@@ -23,17 +23,25 @@ struct ColumnVector {
     }
 };
 
-// batch of rows
-// column i corrsponds to schema column i in order
-// numbers of rows may be less than batch size for final chunk
-struct DataChunk {
-    std::vector<ColumnVector> columns;
-    int num_rows = 0;
-    SelectionVector sel;
-};
-
 // indices of rows within a DataChunk that have passed a filter
 // produced by VecFilterNode
 struct SelectionVector {
     std::vector<int> indices;
+    int size = 0;  // mirrors indices.size(); updated by VecFilterNode after each predicate loop
+};
+
+// batch of rows
+// column i corresponds to schema column i in order
+// num_rows may be less than BATCH_SIZE for the final chunk
+//
+// filter_applied: set true by VecFilterNode after evaluating a predicate.
+// When false (e.g. chunk came directly from VecScanNode), sel.indices is
+// meaningless and all num_rows rows are valid.
+// When true, sel.indices is authoritative — an empty sel.indices means
+// zero rows passed the filter, NOT "all rows valid".
+struct DataChunk {
+    std::vector<ColumnVector> columns;
+    int num_rows = 0;
+    SelectionVector sel;
+    bool filter_applied = false;
 };
