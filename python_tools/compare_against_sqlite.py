@@ -149,26 +149,22 @@ def rows_equal(a, b):
     return True
 
 
-def run_swiftql(query: str):
-    result = subprocess.run(
-        [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache", "--query", query],
-        capture_output=True, text=True
-    )
+def run_swiftql(query: str, extra_args: list = None):
+    args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache", "--query", query]
+    if extra_args:
+        args = args[:4] + extra_args + args[4:]  # insert after --no-cache
+    result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"SwiftQL error: {result.stderr.strip()}")
+        raise RuntimeError(result.stderr.strip())
     return parse_swiftql_output(result.stdout)
 
-# main
-def main():
-    conn = load_sqlite()
-    passed = 0
-    failed = 0
-    errors = 0
 
-    for query in QUERIES:
+def run_query_suite(conn, queries, label: str, extra_args: list = None):
+    passed = failed = errors = 0
+    print(f"\n--- {label} ---")
+    for query in queries:
         try:
-            swift_rows = run_swiftql(query)
-
+            swift_rows = run_swiftql(query, extra_args)
             sqlite_cursor = conn.execute(query)
             cols = [d[0] for d in sqlite_cursor.description]
             sqlite_rows = [dict(zip(cols, r)) for r in sqlite_cursor.fetchall()]
@@ -184,9 +180,24 @@ def main():
         except Exception as e:
             print(f"  ERROR {query[:70]}\n    {e}")
             errors += 1
+    print(f"{passed} passed, {failed} failed, {errors} errors")
+    return passed, failed, errors
 
-    print(f"\n{passed} passed, {failed} failed, {errors} errors out of {len(QUERIES)} queries")
-    if failed > 0 or errors > 0:
+
+# main
+def main():
+    conn = load_sqlite()
+
+    p1, f1, e1 = run_query_suite(conn, QUERIES, "Default (row storage, Volcano)")
+    p2, f2, e2 = run_query_suite(
+        conn, QUERIES, "Vectorized (columnar storage, vec path)",
+        extra_args=["--execution", "vectorized", "--storage", "columnar"],
+    )
+
+    total_failed = f1 + f2
+    total_errors = e1 + e2
+    print(f"\nTotal: {p1 + p2} passed, {total_failed} failed, {total_errors} errors")
+    if total_failed > 0 or total_errors > 0:
         sys.exit(1)
 
 if __name__ == "__main__":
