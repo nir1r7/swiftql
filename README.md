@@ -502,14 +502,17 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 
 **Checkpoint:** Selection vector pattern working. Late materialization documented in `EXPLAIN ANALYZE` output. Vectorized path correct.
 
-### Week 15 — Vectorized Aggregate + Vectorized Hash Join + Phase 3 Benchmarks
+### Week 15 — Vectorized Aggregate + Vectorized Hash Join + Full Vectorized Path + Phase 3 Benchmarks
 
 - `VecHashAggregateNode` — processes one chunk at a time, updates group-by hash map in batch; dictionary-encoded string columns use integer ID comparison in the hot loop
 - `VecHashJoinNode` — probe phase operates over `DataChunk`, batch lookup into build-side hash map
+- `VecLimitNode` — tracks rows emitted across chunks, truncates the final chunk when the limit is reached; enables early termination of the scan without reading the full table
+- `VecSortNode` — blocking operator: collects all chunks into a flat buffer, sorts surviving rows by ORDER BY column indices, re-emits as `DataChunk`s
+- `VecDistinctNode` — blocking operator: collects all surviving rows, deduplicates via row-hash set, re-emits as `DataChunk`s
 - Benchmark: same 5 queries across all three supported mode combinations
 - Batch size experiment on `SELECT AVG(speed) FROM laps`: sizes 128, 256, 512, 1024, 2048 — latency recorded for each, sweet spot documented
 
-**Checkpoint:** All three execution mode combinations benchmarked. Batch size sensitivity documented. Vectorized hash join correct.
+**Checkpoint:** All three execution mode combinations benchmarked. Batch size sensitivity documented. Vectorized hash join correct. Full query suite (including ORDER BY, DISTINCT, LIMIT) runs end-to-end on the vectorized path with no Volcano fallthrough.
 
 ---
 
