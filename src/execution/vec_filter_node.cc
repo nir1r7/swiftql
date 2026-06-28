@@ -1,5 +1,5 @@
 #include "execution/vec_filter_node.h"
-#include "execution/evaluator.h"
+#include "execution/columnar_eval.h"
 #include "parser/expr_utils.h"
 #include <chrono>
 
@@ -22,27 +22,14 @@ DataChunk* VecFilterNode::nextChunk(){
     auto t0 = std::chrono::high_resolution_clock::now();
 
     // copy child columns into our owned buffer
-    // child reuses its internal DataCHunk on next call
+    // child reuses its internal DataChunk on next call
     out_chunk_ = *raw;
-    out_chunk_.sel.indices.clear();
 
-    const Schema& schema = child_->outputSchema();
+    out_chunk_.sel = evalPredicate(predicate_.get(), *raw, child_->outputSchema());
 
-    // tight loop to evaluate predicate over every row in the batch.
-    for (int r = 0; r < raw->num_rows; ++r) {
-        // reconstruct a temporary Row for this row idx
-        Row tmp;
-        tmp.reserve(raw->columns.size());
-        for (const auto& cv : raw->columns) {
-            std::visit([&](const auto& vec) {
-                tmp.push_back(Value(vec[r]));
-            }, cv.data);
-        }
-        Value v = evaluate(predicate_.get(), tmp, schema);
-        if (!v.isNull() && v.asInt() != 0) {
-            out_chunk_.sel.indices.push_back(r);
-        }
-    }
+    // mark that a filter was applied so VecProjectNode treats empty
+    // sel.indices as "zero rows passed" rather than "all rows valid"
+    out_chunk_.filter_applied = true;
 
     stats.rows_in  += raw->num_rows;
     stats.rows_out += static_cast<int>(out_chunk_.sel.indices.size());
