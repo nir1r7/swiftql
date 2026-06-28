@@ -18,9 +18,9 @@ class Planner {
             std::unordered_map<std::string, std::vector<Row>> table_rows,
             std::unordered_map<std::string, ColumnarTable> columnar_tables = {}
         );
-    private:
         // build the schema of the project node's output based on the select statement and input table schema
         static Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema);
+    private:
 
         // extract aggregate specifications from the select statement (for building the HashAggregateNode)
         static std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt);

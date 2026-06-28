@@ -34,6 +34,9 @@ add_library(swiftql_lib
     src/execution/evaluator.cc
     src/storage/csv_to_columnar.cc
     src/execution/vec_scan_node.cc
+    src/execution/vec_filter_node.cc
+    src/execution/vec_project_node.cc
+    src/execution/columnar_eval.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 

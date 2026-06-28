@@ -18,6 +18,8 @@
 #include "common/schema.h"
 #include "common/value.h"
 #include "execution/vec_scan_node.h"
+#include "execution/vec_filter_node.h"
+#include "execution/vec_project_node.h"
 
 // result cache: raw SQL to {schema, rows}
 static std::unordered_map<std::string, std::pair<Schema, std::vector<Row>>> result_cache;
@@ -240,29 +242,108 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
 
-                const TableMetadata& meta = catalog.getTable(stmt.from_table);
-                auto vec_scan = std::make_unique<VecScanNode>(stmt.from_table, columnar_tables.at(stmt.from_table), meta.schema);
-
-                vec_scan->open();
-                std::vector<Row> rows;
-
-                // temporary, will be reaplced in week 14
-                while (DataChunk* chunk = vec_scan->nextChunk()){
-                    for (int r = 0; r < chunk->num_rows; ++r){
-                        Row row;
-                        row.reserve(chunk->columns.size());
-                        for (const auto& cv : chunk->columns){
-                            std::visit([&](const auto& vec){
-                                row.push_back(Value(vec[r]));
-                            }, cv.data);
-                        }
-                        rows.push_back(std::move(row));
+                // Week 14: VecScan->VecFilter->VecProject only.
+                // Aggregates, joins, HAVING, ORDER BY, DISTINCT, LIMIT fall through to Volcano.
+                bool can_vec = !stmt.join.has_value() &&
+                               stmt.group_by.empty() &&
+                               !stmt.having &&
+                               stmt.order_by.empty() &&
+                               !stmt.distinct &&
+                               !stmt.limit.has_value();
+                if (can_vec) {
+                    for (const auto& expr : stmt.select_list) {
+                        if (dynamic_cast<AggregateExpr*>(expr.get())) { can_vec = false; break; }
                     }
                 }
-                vec_scan->close();
 
-                printResults(rows, meta.schema);
-                continue;
+                if (can_vec) {
+                    auto plan_start = std::chrono::high_resolution_clock::now();
+
+                    auto vec_scan = std::make_unique<VecScanNode>(
+                        stmt.from_table,
+                        std::move(columnar_tables.at(stmt.from_table)),
+                        meta.schema);
+
+                    std::unique_ptr<VecPlanNode> vec_node = std::move(vec_scan);
+                    if (stmt.where) {
+                        vec_node = std::make_unique<VecFilterNode>(std::move(vec_node), std::move(stmt.where));
+                    }
+
+                    std::vector<std::unique_ptr<Expr>> project_exprs;
+                    Schema project_schema = [&]() -> Schema {
+                        if (stmt.select_star) {
+                            for (const auto& col : meta.schema.columns()) {
+                                auto ref = std::make_unique<ColumnRef>();
+                                ref->column_name = col.name;
+                                project_exprs.push_back(std::move(ref));
+                            }
+                            return meta.schema;
+                        } else {
+                            Schema s = Planner::buildProjectSchema(stmt, meta.schema);
+                            project_exprs = std::move(stmt.select_list);
+                            return s;
+                        }
+                    }();
+                    auto vec_proj = std::make_unique<VecProjectNode>(
+                        std::move(vec_node), std::move(project_exprs), project_schema);
+
+                    double plan_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::high_resolution_clock::now() - plan_start).count();
+
+                    if (args.explain) {
+                        std::vector<NodeLine> lines;
+                        collectVecNodes(vec_proj.get(), 0, false, 0.0, lines);
+                        printAligned(lines);
+                        continue;
+                    }
+
+                    if (!args.no_cache && !args.explain_analyze) {
+                        auto it = result_cache.find(query);
+                        if (it != result_cache.end()) {
+                            std::cout << "[cache hit]\n";
+                            printResults(it->second.second, it->second.first);
+                            continue;
+                        }
+                    }
+
+                    auto exec_start = std::chrono::high_resolution_clock::now();
+                    vec_proj->open();
+                    std::vector<Row> rows;
+                    while (DataChunk* chunk = vec_proj->nextChunk()) {
+                        for (int r = 0; r < chunk->num_rows; ++r) {
+                            Row row;
+                            row.reserve(chunk->columns.size());
+                            for (const auto& cv : chunk->columns) {
+                                std::visit([&](const auto& vec) {
+                                    row.push_back(Value(vec[r]));
+                                }, cv.data);
+                            }
+                            rows.push_back(std::move(row));
+                        }
+                    }
+                    vec_proj->close();
+                    double total_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::high_resolution_clock::now() - exec_start).count();
+
+                    if (args.explain_analyze) {
+                        std::vector<NodeLine> lines;
+                        collectVecNodes(vec_proj.get(), 0, true, total_us, lines);
+                        printAligned(lines);
+                        std::cout << "\n";
+                        std::cout << "Rows returned: " << rows.size() << "\n\n";
+                        std::cout << "Parse:     " << std::fixed << std::setprecision(1) << parse_us  << "µs\n";
+                        std::cout << "Plan:      " << std::fixed << std::setprecision(1) << plan_us   << "µs\n";
+                        std::cout << "Execution: " << std::fixed << std::setprecision(1) << total_us  << "µs\n";
+                        continue;
+                    }
+
+                    if (!args.no_cache) {
+                        result_cache.emplace(query, std::make_pair(project_schema, rows));
+                    }
+                    printResults(rows, project_schema);
+                    continue;
+                }
+                // can_vec == false: fall through to Volcano path
             }
             
 
