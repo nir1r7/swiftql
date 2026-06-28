@@ -1,7 +1,6 @@
 #include "execution/vec_project_node.h"
 #include "execution/evaluator.h"
 #include <chrono>
-#include <stdexcept>
 #include <numeric>
 
 VecProjectNode::VecProjectNode(std::unique_ptr<VecPlanNode> child, std::vector<std::unique_ptr<Expr>> expressions, Schema output_schema) : child_(std::move(child)), expressions_(std::move(expressions)), output_schema_(std::move(output_schema)) {}
@@ -20,23 +19,25 @@ DataChunk* VecProjectNode::nextChunk(){
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // determine which row indices to materialize
-    // empty sel.indices means "all rows"
+    // determine which row indices to materialize.
+    // filter_applied=true: sel.indices is authoritative (empty = 0 rows passed)
+    // filter_applied=false (i.e, chunk from VecScan): all num_rows rows are valid
     const std::vector<int>* indices_ptr = nullptr;
     std::vector<int> all_indices;
 
-    if (!filtered->sel.indices.empty()){
+    if (filtered->filter_applied) {
         indices_ptr = &filtered->sel.indices;
-    }
-    else{
+    } else {
         all_indices.resize(filtered->num_rows);
         std::iota(all_indices.begin(), all_indices.end(), 0);
         indices_ptr = &all_indices;
     }
 
-    // rebuild output columns
+    // rebuild output columns, must clear between calls since out_chunk_ is reused
     out_chunk_.columns.clear();
     out_chunk_.sel.indices.clear();
+    out_chunk_.sel.size = 0;
+    out_chunk_.filter_applied = false; // output is fully materialized; no filter pending
 
     // pre allocate one COlumnVector per output expression
     for (int c = 0; c < output_schema_.size(); ++c){
@@ -55,19 +56,41 @@ DataChunk* VecProjectNode::nextChunk(){
 
     const Schema& child_schema = child_->outputSchema();
 
-    // reconstruct survivings rows
-    for (int r : *indices_ptr){
+    // preclassify each output expression once before the per row loop
+    // src_col[c] >= 0: pure ColumnRef, read directly from source column array, no Row needed
+    // src_col[c] == -1: complex expression, requires evaluate(), which needs a full Row
+    std::vector<int> src_col(expressions_.size(), -1);
+    for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
+        if (auto* cr = dynamic_cast<const ColumnRef*>(expressions_[c].get())){
+            src_col[c] = child_schema.indexOf(cr->column_name);
+        }
+    }
+    bool has_complex = false;
+    for (int idx : src_col) if (idx < 0) {
+        has_complex = true;
+        break;
+    }
+
+    for (int r : *indices_ptr) {
+        // build the full Row only when at least one expression needs evaluate().
         Row tmp;
-        tmp.reserve(filtered->columns.size());
-        for (const auto& cv : filtered->columns){
-            std::visit([&](const auto& vec){
-                tmp.push_back(Value(vec[r]));
-            }, cv.data);
+        if (has_complex) {
+            tmp.reserve(filtered->columns.size());
+            for (const auto& cv : filtered->columns){
+                std::visit([&](const auto& vec){
+                    tmp.push_back(Value(vec[r]));
+                }, cv.data);
+            }
         }
 
         for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
-            Value v = evaluate(expressions_[c].get(), tmp, child_schema);
-            // Append v to the right ColumnVector using the output schema type.
+            Value v;
+            if (src_col[c] >= 0) {
+                // direct columnar read, no Row, no evaluate() call
+                std::visit([&](const auto& vec){ v = Value(vec[r]); }, filtered->columns[src_col[c]].data);
+            } else {
+                v = evaluate(expressions_[c].get(), tmp, child_schema);
+            }
             switch (output_schema_.column(c).type) {
                 case TypeId::INT:
                     std::get<std::vector<int64_t>>(out_chunk_.columns[c].data).push_back(v.asInt()); break;
