@@ -1,6 +1,6 @@
 # Phase 2 Benchmark Results
 
-Row vs columnar storage, 1M rows, avg of 5 runs. Both modes use the Volcano (row-at-a-time) iterator model — Phase 3 vectorized execution is where batch processing will change the picture.
+Row vs columnar storage, 1M rows, avg of 5 runs. Both modes use the Volcano (row-at-a-time) iterator model — Phase 3 vectorized execution is where batch processing will change the picture. **Build: Debug (no -O flags).** Absolute timings are not comparable to Phase 3 numbers; ratios within this doc are valid.
 
 ## Dataset
 
@@ -15,6 +15,25 @@ Compression:      6.0x
 ```
 
 Dictionary encoding (strings → int32 IDs) and RLE (repeated season/round values across sorted runs) account for most of the reduction. This 6x smaller footprint means more of the working set fits in cache — a benefit that barely shows up under Volcano but will compound in Phase 3 once execution processes data in column-array batches.
+
+## Benchmark Queries
+
+```sql
+-- 1. Full scan aggregate
+SELECT AVG(speed) FROM laps
+
+-- 2. Selective filter + zone-map pruning
+SELECT COUNT(*) FROM laps WHERE season = 2025
+
+-- 3. Projection pushdown (2 of 9 cols)
+SELECT team, speed FROM laps WHERE speed > 300
+
+-- 4. GROUP BY dictionary-encoded string
+SELECT team, COUNT(*) FROM laps GROUP BY team
+
+-- 5. Hash join + aggregate
+SELECT laps.team, AVG(laps.speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY laps.team
+```
 
 ## Results
 
