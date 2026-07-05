@@ -2,6 +2,11 @@
 #include "execution/vec_scan_node.h"
 #include "execution/vec_filter_node.h"
 #include "execution/vec_project_node.h"
+#include "execution/vec_limit_node.h"
+#include "execution/vec_sort_node.h"
+#include "execution/vec_distinct_node.h"
+#include "execution/vec_hash_aggregate_node.h"
+#include "execution/vec_hash_join_node.h"
 #include "execution/vec_types.h"
 #include "storage/columnar_table.h"
 #include "storage/rle_column.h"
@@ -1583,4 +1588,653 @@ TEST(VecEndToEnd, LargeTable_WithFilter_MultiChunk) {
 
     ASSERT_EQ(vec.size(), 1500u);
     expectRowsEqual(vol, vec);
+}
+
+// ============================================================
+// makeScan: build a multi-column VecScanNode from a Row set
+// ============================================================
+static std::unique_ptr<VecScanNode> makeScan(const Schema& schema,
+                                              const std::vector<Row>& rows) {
+    int n = static_cast<int>(rows.size());
+    ColumnarTable ct(schema, n);
+    for (int c = 0; c < schema.size(); ++c) {
+        const std::string& name = schema.column(c).name;
+        switch (schema.column(c).type) {
+            case TypeId::INT: {
+                std::vector<int64_t> cv;
+                cv.reserve(n);
+                for (const auto& row : rows) cv.push_back(row[c].asInt());
+                ct.columns[name] = std::move(cv);
+                break;
+            }
+            case TypeId::DOUBLE: {
+                std::vector<double> cv;
+                cv.reserve(n);
+                for (const auto& row : rows) cv.push_back(row[c].asDouble());
+                ct.columns[name] = std::move(cv);
+                break;
+            }
+            case TypeId::STRING: {
+                std::vector<std::string> cv;
+                cv.reserve(n);
+                for (const auto& row : rows) cv.push_back(row[c].asString());
+                ct.columns[name] = std::move(cv);
+                break;
+            }
+        }
+    }
+    return std::make_unique<VecScanNode>("t", std::move(ct), schema);
+}
+
+// ============================================================
+// VecLimit
+// ============================================================
+
+TEST(VecLimit, ExactLimit) {
+    auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
+    auto lim = std::make_unique<VecLimitNode>(std::move(scan), 5);
+    auto rows = drainRows(*lim);
+    ASSERT_EQ(rows.size(), 5u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1);
+}
+
+TEST(VecLimit, LimitLessThanChunk) {
+    auto scan = makeIntScan("id", {10, 20, 30, 40, 50});
+    auto lim = std::make_unique<VecLimitNode>(std::move(scan), 3);
+    lim->open();
+    DataChunk* chunk = lim->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->num_rows, 3);
+    ASSERT_EQ(std::get<std::vector<int64_t>>(chunk->columns[0].data).size(), 3u);
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    lim->close();
+}
+
+TEST(VecLimit, LimitMoreThanRows) {
+    auto scan = makeIntScan("id", {1, 2, 3});
+    auto lim = std::make_unique<VecLimitNode>(std::move(scan), 100);
+    auto rows = drainRows(*lim);
+    ASSERT_EQ(rows.size(), 3u);
+}
+
+TEST(VecLimit, LimitZero) {
+    auto scan = makeIntScan("id", {1, 2, 3});
+    auto lim = std::make_unique<VecLimitNode>(std::move(scan), 0);
+    lim->open();
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    lim->close();
+}
+
+TEST(VecLimit, LimitAcrossChunkBoundary) {
+    int total = BATCH_SIZE + 100;
+    int limit  = BATCH_SIZE + 50;
+    std::vector<int64_t> vals(total);
+    std::iota(vals.begin(), vals.end(), 0LL);
+    auto lim = std::make_unique<VecLimitNode>(makeIntScan("id", vals), limit);
+    auto rows = drainRows(*lim);
+    ASSERT_EQ(static_cast<int>(rows.size()), limit);
+    EXPECT_EQ(rows[0][0].asInt(), 0);
+    EXPECT_EQ(rows[limit - 1][0].asInt(), limit - 1);
+}
+
+TEST(VecLimit, EarlyTermination) {
+    auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
+    auto lim = std::make_unique<VecLimitNode>(std::move(scan), 2);
+    lim->open();
+    DataChunk* first = lim->nextChunk();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->num_rows, 2);
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    lim->close();
+}
+
+TEST(VecLimit, OpenResetsState) {
+    Schema schema = vecSchema({{"id", TypeId::INT}});
+    std::vector<Row> rows;
+    for (int i = 1; i <= 5; ++i) rows.push_back({Value(static_cast<int64_t>(i))});
+    auto lim = std::make_unique<VecLimitNode>(makeScan(schema, rows), 3);
+    auto r1 = drainRows(*lim);
+    auto r2 = drainRows(*lim);
+    ASSERT_EQ(r1.size(), 3u);
+    ASSERT_EQ(r2.size(), 3u);
+    for (size_t i = 0; i < r1.size(); ++i)
+        EXPECT_EQ(r1[i][0].asInt(), r2[i][0].asInt());
+}
+
+// ============================================================
+// VecSort
+// ============================================================
+
+TEST(VecSort, SingleColumnAscending) {
+    auto scan = makeIntScan("id", {5, 3, 1, 4, 2});
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 5u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1) << "row " << i;
+}
+
+TEST(VecSort, MultiColumnSort) {
+    Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(3LL)},
+        {Value(1LL), Value(1LL)},
+        {Value(2LL), Value(2LL)},
+        {Value(2LL), Value(1LL)},
+    };
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("a"));
+    exprs.push_back(col("b"));
+    auto sort = std::make_unique<VecSortNode>(makeScan(schema, input), std::move(exprs));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 4u);
+    EXPECT_EQ(rows[0][0].asInt(), 1); EXPECT_EQ(rows[0][1].asInt(), 1);
+    EXPECT_EQ(rows[1][0].asInt(), 1); EXPECT_EQ(rows[1][1].asInt(), 3);
+    EXPECT_EQ(rows[2][0].asInt(), 2); EXPECT_EQ(rows[2][1].asInt(), 1);
+    EXPECT_EQ(rows[3][0].asInt(), 2); EXPECT_EQ(rows[3][1].asInt(), 2);
+}
+
+TEST(VecSort, AlreadySorted) {
+    auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 5u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1);
+}
+
+TEST(VecSort, ReverseSorted) {
+    auto scan = makeIntScan("id", {5, 4, 3, 2, 1});
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 5u);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1);
+}
+
+TEST(VecSort, MultiChunkInput) {
+    int n = BATCH_SIZE + 100;
+    std::vector<int64_t> vals(n);
+    for (int i = 0; i < n; ++i) vals[i] = static_cast<int64_t>(n - 1 - i);
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(makeIntScan("id", vals), std::move(exprs));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(static_cast<int>(rows.size()), n);
+    for (int i = 0; i < n; ++i) EXPECT_EQ(rows[i][0].asInt(), i) << "i=" << i;
+}
+
+TEST(VecSort, EmptyInput) {
+    auto scan = makeIntScan("id", {});
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    sort->open();
+    EXPECT_EQ(sort->nextChunk(), nullptr);
+    sort->close();
+}
+
+TEST(VecSort, OutputSchemaUnchanged) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::DOUBLE}});
+    std::vector<Row> rows = {{Value(1LL), Value(2.0)}};
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("x"));
+    auto sort = std::make_unique<VecSortNode>(makeScan(schema, rows), std::move(exprs));
+    EXPECT_EQ(sort->outputSchema().size(), 2);
+    EXPECT_EQ(sort->outputSchema().column(0).name, "x");
+    EXPECT_EQ(sort->outputSchema().column(1).name, "y");
+}
+
+TEST(VecSort, OpenResetsState) {
+    auto scan = makeIntScan("id", {3, 1, 2});
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("id"));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    auto r1 = drainRows(*sort);
+    auto r2 = drainRows(*sort);
+    ASSERT_EQ(r1.size(), 3u);
+    ASSERT_EQ(r2.size(), 3u);
+    for (size_t i = 0; i < r1.size(); ++i)
+        EXPECT_EQ(r1[i][0].asInt(), r2[i][0].asInt());
+}
+
+// ============================================================
+// VecDistinct
+// ============================================================
+
+TEST(VecDistinct, AllUnique) {
+    auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
+    auto dist = std::make_unique<VecDistinctNode>(std::move(scan));
+    auto rows = drainRows(*dist);
+    EXPECT_EQ(rows.size(), 5u);
+}
+
+TEST(VecDistinct, AllDuplicate) {
+    auto scan = makeIntScan("id", {7, 7, 7, 7, 7});
+    auto dist = std::make_unique<VecDistinctNode>(std::move(scan));
+    auto rows = drainRows(*dist);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 7);
+}
+
+TEST(VecDistinct, PartialDuplicates) {
+    auto scan = makeIntScan("id", {1, 2, 2, 3, 3, 3});
+    auto dist = std::make_unique<VecDistinctNode>(std::move(scan));
+    auto rows = drainRows(*dist);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_EQ(rows[2][0].asInt(), 3);
+}
+
+TEST(VecDistinct, MultiChunkInput) {
+    // 2*BATCH_SIZE rows: [0..BATCH_SIZE-1] then [0..BATCH_SIZE-1] again
+    // Duplicates span the chunk boundary; after dedup: BATCH_SIZE unique rows
+    int n = BATCH_SIZE;
+    std::vector<int64_t> vals;
+    vals.reserve(2 * n);
+    for (int i = 0; i < n; ++i) vals.push_back(static_cast<int64_t>(i));
+    for (int i = 0; i < n; ++i) vals.push_back(static_cast<int64_t>(i));
+    auto dist = std::make_unique<VecDistinctNode>(makeIntScan("id", vals));
+    auto rows = drainRows(*dist);
+    ASSERT_EQ(static_cast<int>(rows.size()), n);
+    for (int i = 0; i < n; ++i) EXPECT_EQ(rows[i][0].asInt(), i);
+}
+
+TEST(VecDistinct, MultiColumnKey) {
+    // (1,1),(1,2),(1,1),(2,1) → distinct on all cols → (1,1),(1,2),(2,1)
+    Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(1LL)},
+        {Value(1LL), Value(2LL)},
+        {Value(1LL), Value(1LL)},
+        {Value(2LL), Value(1LL)},
+    };
+    auto dist = std::make_unique<VecDistinctNode>(makeScan(schema, input));
+    auto rows = drainRows(*dist);
+    ASSERT_EQ(rows.size(), 3u);
+}
+
+TEST(VecDistinct, EmptyInput) {
+    auto scan = makeIntScan("id", {});
+    auto dist = std::make_unique<VecDistinctNode>(std::move(scan));
+    dist->open();
+    EXPECT_EQ(dist->nextChunk(), nullptr);
+    dist->close();
+}
+
+TEST(VecDistinct, OutputSchemaUnchanged) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::STRING}});
+    std::vector<Row> rows = {{Value(1LL), Value(std::string("a"))}};
+    auto dist = std::make_unique<VecDistinctNode>(makeScan(schema, rows));
+    EXPECT_EQ(dist->outputSchema().size(), 2);
+    EXPECT_EQ(dist->outputSchema().column(0).name, "x");
+    EXPECT_EQ(dist->outputSchema().column(1).name, "y");
+}
+
+// ============================================================
+// VecHashAggregate
+// ============================================================
+
+TEST(VecHashAggregate, CountStar_NoGroupBy) {
+    auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
+    Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        std::move(scan), std::vector<std::string>{}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 5);
+}
+
+TEST(VecHashAggregate, CountStar_WithGroupBy) {
+    Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(std::string("a")), Value(1LL)},
+        {Value(std::string("a")), Value(2LL)},
+        {Value(std::string("b")), Value(1LL)},
+        {Value(std::string("b")), Value(2LL)},
+        {Value(std::string("b")), Value(3LL)},
+        {Value(std::string("c")), Value(1LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asString(), "a"); EXPECT_EQ(rows[0][1].asInt(), 2);
+    EXPECT_EQ(rows[1][0].asString(), "b"); EXPECT_EQ(rows[1][1].asInt(), 3);
+    EXPECT_EQ(rows[2][0].asString(), "c"); EXPECT_EQ(rows[2][1].asInt(), 1);
+}
+
+TEST(VecHashAggregate, SumGroupBy) {
+    Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(10LL)},
+        {Value(1LL), Value(20LL)},
+        {Value(2LL), Value(30LL)},
+        {Value(2LL), Value(40LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"total", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 30.0);
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_DOUBLE_EQ(rows[1][1].asDouble(), 70.0);
+}
+
+TEST(VecHashAggregate, AvgGroupBy) {
+    Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(10LL)},
+        {Value(1LL), Value(20LL)},
+        {Value(2LL), Value(30LL)},
+        {Value(2LL), Value(40LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {{"AVG", "val", false}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 15.0);
+    EXPECT_DOUBLE_EQ(rows[1][1].asDouble(), 35.0);
+}
+
+TEST(VecHashAggregate, MinMax) {
+    Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(30LL)},
+        {Value(1LL), Value(10LL)},
+        {Value(1LL), Value(20LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"mn", TypeId::DOUBLE}, {"mx", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {{"MIN", "val", false}, {"MAX", "val", false}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 10.0);
+    EXPECT_DOUBLE_EQ(rows[0][2].asDouble(), 30.0);
+}
+
+TEST(VecHashAggregate, MultiChunkInput) {
+    int n = BATCH_SIZE + 100;
+    std::vector<int64_t> vals(n, 0LL);
+    Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeIntScan("id", vals), std::vector<std::string>{}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), n);
+}
+
+TEST(VecHashAggregate, EmptyInput) {
+    auto scan = makeIntScan("id", {});
+    Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        std::move(scan), std::vector<std::string>{}, specs, out_schema);
+    agg->open();
+    EXPECT_EQ(agg->nextChunk(), nullptr);
+    agg->close();
+}
+
+TEST(VecHashAggregate, InsertionOrderPreserved) {
+    Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(std::string("c")), Value(1LL)},
+        {Value(std::string("a")), Value(1LL)},
+        {Value(std::string("b")), Value(1LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asString(), "c");
+    EXPECT_EQ(rows[1][0].asString(), "a");
+    EXPECT_EQ(rows[2][0].asString(), "b");
+}
+
+TEST(VecHashAggregate, OutputSchemaCorrect) {
+    Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
+    Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"total", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
+    std::vector<Row> rows = {{Value(1LL), Value(10LL)}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, rows), std::vector<std::string>{"grp"}, specs, out_schema);
+    EXPECT_EQ(agg->outputSchema().size(), 2);
+    EXPECT_EQ(agg->outputSchema().column(0).name, "grp");
+    EXPECT_EQ(agg->outputSchema().column(1).name, "total");
+}
+
+// ============================================================
+// VecHashJoin
+// ============================================================
+
+TEST(VecHashJoin, BasicInnerJoin) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
+                                      {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    std::vector<Row> probe_rows = {
+        {Value(1LL), Value(std::string("p1"))},
+        {Value(2LL), Value(std::string("p2"))},
+        {Value(3LL), Value(std::string("p3"))},
+    };
+    std::vector<Row> build_rows = {
+        {Value(1LL), Value(std::string("b1"))},
+        {Value(2LL), Value(std::string("b2"))},
+        {Value(3LL), Value(std::string("b3"))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 3u);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i][0].asInt(), static_cast<int64_t>(i + 1));
+        EXPECT_EQ(rows[i][2].asInt(), static_cast<int64_t>(i + 1));
+    }
+}
+
+TEST(VecHashJoin, NoMatch) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> build_rows = {{Value(3LL)}, {Value(4LL)}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    EXPECT_TRUE(rows.empty());
+}
+
+TEST(VecHashJoin, MultipleMatchesPerKey) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(1LL)}};
+    std::vector<Row> build_rows = {
+        {Value(1LL), Value(std::string("x"))},
+        {Value(1LL), Value(std::string("y"))},
+        {Value(1LL), Value(std::string("z"))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 3u);
+    for (const auto& r : rows) EXPECT_EQ(r[0].asInt(), 1);
+}
+
+TEST(VecHashJoin, EmptyBuildSide) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> build_rows;
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    EXPECT_TRUE(rows.empty());
+}
+
+TEST(VecHashJoin, EmptyProbeSide) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows;
+    std::vector<Row> build_rows = {{Value(1LL)}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    join->open();
+    EXPECT_EQ(join->nextChunk(), nullptr);
+    join->close();
+}
+
+TEST(VecHashJoin, ProbeColsFirst) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pname", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bname", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pname", TypeId::STRING},
+                                      {"bid", TypeId::INT}, {"bname", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(1LL), Value(std::string("probe"))}};
+    std::vector<Row> build_rows = {{Value(1LL), Value(std::string("build"))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    const Schema& s = join->outputSchema();
+    ASSERT_EQ(s.size(), 4);
+    EXPECT_EQ(s.column(0).name, "pid");
+    EXPECT_EQ(s.column(1).name, "pname");
+    EXPECT_EQ(s.column(2).name, "bid");
+    EXPECT_EQ(s.column(3).name, "bname");
+}
+
+TEST(VecHashJoin, MultiChunkProbe) {
+    // probe: ids 0..BATCH_SIZE+4; build: ids 1 and BATCH_SIZE+2
+    // id=1 is in the first probe chunk; id=BATCH_SIZE+2 is in the second
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    int n = BATCH_SIZE + 5;
+    std::vector<Row> probe_rows;
+    probe_rows.reserve(n);
+    for (int i = 0; i < n; ++i)
+        probe_rows.push_back({Value(static_cast<int64_t>(i))});
+    std::vector<Row> build_rows = {
+        {Value(1LL)},
+        {Value(static_cast<int64_t>(BATCH_SIZE + 2))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    std::vector<int64_t> pids;
+    for (const auto& r : rows) pids.push_back(r[0].asInt());
+    std::sort(pids.begin(), pids.end());
+    EXPECT_EQ(pids[0], 1);
+    EXPECT_EQ(pids[1], static_cast<int64_t>(BATCH_SIZE + 2));
+}
+
+TEST(VecHashJoin, KeyByName) {
+    // probe schema: {pval, pid} — pid is at index 1, not 0
+    // verifies that VecHashJoinNode uses indexOf("pid"), not position 0
+    Schema probe_schema = vecSchema({{"pval", TypeId::INT}, {"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bdesc", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pval", TypeId::INT}, {"pid", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bdesc", TypeId::STRING}});
+    std::vector<Row> probe_rows = {
+        {Value(99LL),  Value(1LL)},
+        {Value(100LL), Value(2LL)},
+        {Value(101LL), Value(99LL)},  // pid=99 has no build match
+    };
+    std::vector<Row> build_rows = {
+        {Value(1LL), Value(std::string("one"))},
+        {Value(2LL), Value(std::string("two"))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][1].asInt(), 1);
+    EXPECT_EQ(rows[1][1].asInt(), 2);
+}
+
+// T1: LIMIT exactly at one full chunk boundary — available == remaining, non-truncating path.
+TEST(VecLimit, LimitAtChunkBoundary) {
+    std::vector<int64_t> vals(BATCH_SIZE);
+    std::iota(vals.begin(), vals.end(), 0LL);
+    auto lim = std::make_unique<VecLimitNode>(makeIntScan("id", vals), BATCH_SIZE);
+    lim->open();
+    DataChunk* chunk = lim->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->num_rows, BATCH_SIZE);
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    lim->close();
+}
+
+// T4: LIMIT receiving filter_applied=true input — truncation must not resize column vectors.
+TEST(VecLimit, FilteredInputTruncation) {
+    // scan [0,1,2,3,4]; filter id >= 1 → sel.indices=[1,2,3,4]; limit 2
+    // expected: chunk with filter_applied=true, sel.indices=[1,2] (first 2 passing rows)
+    auto scan   = makeIntScan("id", {0, 1, 2, 3, 4});
+    auto filter = std::make_unique<VecFilterNode>(
+        std::move(scan), binOp(">=", col("id"), intLit(1)));
+    auto lim = std::make_unique<VecLimitNode>(std::move(filter), 2);
+    lim->open();
+    DataChunk* chunk = lim->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_TRUE(chunk->filter_applied);
+    ASSERT_EQ(static_cast<int>(chunk->sel.indices.size()), 2);
+    EXPECT_EQ(chunk->sel.indices[0], 1);  // physical row 1 → id=1
+    EXPECT_EQ(chunk->sel.indices[1], 2);  // physical row 2 → id=2
+    // column vector must still hold all 5 original rows (not resized to 2)
+    EXPECT_EQ(std::get<std::vector<int64_t>>(chunk->columns[0].data).size(), 5u);
+    EXPECT_EQ(lim->nextChunk(), nullptr);
+    lim->close();
+}
+
+// T2: VecHashJoin with a filtered build side — regression test for Fix 1.
+TEST(VecHashJoin, FilteredBuildSide) {
+    // build scan has rows bid=1,2,3; filter bid != 2 → only 1 and 3 enter hash table
+    // probe has pid=1,2,3; expected matches: pid=1↔bid=1, pid=3↔bid=3 (pid=2 has no match)
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    auto build_scan     = makeScan(build_schema, {{Value(1LL)}, {Value(2LL)}, {Value(3LL)}});
+    auto build_filtered = std::make_unique<VecFilterNode>(
+        std::move(build_scan), binOp("!=", col("bid"), intLit(2)));
+    auto probe_scan     = makeScan(probe_schema, {{Value(1LL)}, {Value(2LL)}, {Value(3LL)}});
+
+    auto join = std::make_unique<VecHashJoinNode>(
+        std::move(probe_scan), std::move(build_filtered),
+        "pid", "bid", out_schema);
+
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    std::vector<int64_t> pids;
+    for (const auto& r : rows) pids.push_back(r[0].asInt());
+    std::sort(pids.begin(), pids.end());
+    EXPECT_EQ(pids[0], 1);
+    EXPECT_EQ(pids[1], 3);
 }
