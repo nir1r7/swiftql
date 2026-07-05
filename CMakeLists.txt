@@ -37,6 +37,11 @@ add_library(swiftql_lib
     src/execution/vec_filter_node.cc
     src/execution/vec_project_node.cc
     src/execution/columnar_eval.cc
+    src/execution/vec_limit_node.cc
+    src/execution/vec_sort_node.cc
+    src/execution/vec_distinct_node.cc
+    src/execution/vec_hash_aggregate_node.cc
+    src/execution/vec_hash_join_node.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 

@@ -20,6 +20,11 @@
 #include "execution/vec_scan_node.h"
 #include "execution/vec_filter_node.h"
 #include "execution/vec_project_node.h"
+#include "execution/vec_limit_node.h"
+#include "execution/vec_sort_node.h"
+#include "execution/vec_distinct_node.h"
+#include "execution/vec_hash_aggregate_node.h"
+#include "execution/vec_hash_join_node.h"
 
 // result cache: raw SQL to {schema, rows}
 static std::unordered_map<std::string, std::pair<Schema, std::vector<Row>>> result_cache;
@@ -242,108 +247,171 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
 
-                // Week 14: VecScan->VecFilter->VecProject only.
-                // Aggregates, joins, HAVING, ORDER BY, DISTINCT, LIMIT fall through to Volcano.
-                bool can_vec = !stmt.join.has_value() &&
-                               stmt.group_by.empty() &&
-                               !stmt.having &&
-                               stmt.order_by.empty() &&
-                               !stmt.distinct &&
-                               !stmt.limit.has_value();
-                if (can_vec) {
-                    for (const auto& expr : stmt.select_list) {
-                        if (dynamic_cast<AggregateExpr*>(expr.get())) { can_vec = false; break; }
+                // Capture row counts before columnar tables are moved into scan nodes
+                int from_row_count = columnar_tables.at(stmt.from_table).num_rows;
+                int join_row_count = (stmt.join.has_value() && columnar_tables.count(stmt.join->join_table))
+                    ? columnar_tables.at(stmt.join->join_table).num_rows : 0;
+
+                auto plan_start = std::chrono::high_resolution_clock::now();
+
+                // Step 1: Base scan
+                std::unique_ptr<VecPlanNode> vec_node = std::make_unique<VecScanNode>(
+                    stmt.from_table,
+                    std::move(columnar_tables.at(stmt.from_table)),
+                    meta.schema);
+
+                // Step 2: Join
+                if (stmt.join.has_value()) {
+                    const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
+                    auto join_scan = std::make_unique<VecScanNode>(
+                        stmt.join->join_table,
+                        std::move(columnar_tables.at(stmt.join->join_table)),
+                        join_meta.schema);
+
+                    std::string left_col, right_col;
+                    if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
+                        if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get()))
+                            left_col = lc->column_name;
+                        if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get()))
+                            right_col = rc->column_name;
+                    }
+
+                    bool swap = (from_row_count < join_row_count);
+                    if (swap) {
+                        // FROM is smaller: FROM becomes build, JOIN becomes probe
+                        std::vector<ColumnDef> merged_cols = join_scan->outputSchema().columns();
+                        for (const auto& col : vec_node->outputSchema().columns())
+                            merged_cols.push_back(col);
+                        vec_node = std::make_unique<VecHashJoinNode>(
+                            std::move(join_scan), std::move(vec_node),
+                            right_col, left_col, Schema(merged_cols));
+                    } else {
+                        // JOIN is smaller or equal: JOIN stays build, FROM stays probe
+                        std::vector<ColumnDef> merged_cols = vec_node->outputSchema().columns();
+                        for (const auto& col : join_scan->outputSchema().columns())
+                            merged_cols.push_back(col);
+                        vec_node = std::make_unique<VecHashJoinNode>(
+                            std::move(vec_node), std::move(join_scan),
+                            left_col, right_col, Schema(merged_cols));
                     }
                 }
 
-                if (can_vec) {
-                    auto plan_start = std::chrono::high_resolution_clock::now();
+                // Step 3: Filter (WHERE)
+                if (stmt.where) {
+                    vec_node = std::make_unique<VecFilterNode>(
+                        std::move(vec_node), std::move(stmt.where));
+                }
 
-                    auto vec_scan = std::make_unique<VecScanNode>(
-                        stmt.from_table,
-                        std::move(columnar_tables.at(stmt.from_table)),
-                        meta.schema);
+                // Step 4: Aggregate (GROUP BY / aggregates in SELECT)
+                bool has_aggs = false;
+                for (const auto& expr : stmt.select_list) {
+                    if (dynamic_cast<AggregateExpr*>(expr.get())) { has_aggs = true; break; }
+                }
+                if (!stmt.group_by.empty() || has_aggs) {
+                    Schema agg_schema = Planner::buildAggregateSchema(stmt, vec_node->outputSchema());
+                    auto specs = Planner::extractAggregates(stmt);
+                    vec_node = std::make_unique<VecHashAggregateNode>(
+                        std::move(vec_node), stmt.group_by, std::move(specs), agg_schema);
+                }
 
-                    std::unique_ptr<VecPlanNode> vec_node = std::move(vec_scan);
-                    if (stmt.where) {
-                        vec_node = std::make_unique<VecFilterNode>(std::move(vec_node), std::move(stmt.where));
-                    }
+                // Step 5: Having
+                if (stmt.having) {
+                    vec_node = std::make_unique<VecFilterNode>(
+                        std::move(vec_node), std::move(stmt.having));
+                }
 
-                    std::vector<std::unique_ptr<Expr>> project_exprs;
-                    Schema project_schema = [&]() -> Schema {
-                        if (stmt.select_star) {
-                            for (const auto& col : meta.schema.columns()) {
-                                auto ref = std::make_unique<ColumnRef>();
-                                ref->column_name = col.name;
-                                project_exprs.push_back(std::move(ref));
-                            }
-                            return meta.schema;
-                        } else {
-                            Schema s = Planner::buildProjectSchema(stmt, meta.schema);
-                            project_exprs = std::move(stmt.select_list);
-                            return s;
+                // Step 6: Sort (ORDER BY)
+                if (!stmt.order_by.empty()) {
+                    vec_node = std::make_unique<VecSortNode>(
+                        std::move(vec_node), std::move(stmt.order_by));
+                }
+
+                // Step 7: Project — schema is final after agg/sort, so outputSchema() is correct here
+                {
+                    if (stmt.select_star) {
+                        Schema star_schema = vec_node->outputSchema();
+                        std::vector<std::unique_ptr<Expr>> star_exprs;
+                        for (const auto& col : star_schema.columns()) {
+                            auto ref = std::make_unique<ColumnRef>();
+                            ref->column_name = col.name;
+                            star_exprs.push_back(std::move(ref));
                         }
-                    }();
-                    auto vec_proj = std::make_unique<VecProjectNode>(
-                        std::move(vec_node), std::move(project_exprs), project_schema);
-
-                    double plan_us = std::chrono::duration<double, std::micro>(
-                        std::chrono::high_resolution_clock::now() - plan_start).count();
-
-                    if (args.explain) {
-                        std::vector<NodeLine> lines;
-                        collectVecNodes(vec_proj.get(), 0, false, 0.0, lines);
-                        printAligned(lines);
-                        continue;
+                        vec_node = std::make_unique<VecProjectNode>(
+                            std::move(vec_node), std::move(star_exprs), star_schema);
+                    } else {
+                        Schema proj_schema = Planner::buildProjectSchema(stmt, vec_node->outputSchema());
+                        vec_node = std::make_unique<VecProjectNode>(
+                            std::move(vec_node), std::move(stmt.select_list), proj_schema);
                     }
+                }
 
-                    if (!args.no_cache && !args.explain_analyze) {
-                        auto it = result_cache.find(query);
-                        if (it != result_cache.end()) {
-                            std::cout << "[cache hit]\n";
-                            printResults(it->second.second, it->second.first);
-                            continue;
-                        }
-                    }
+                // Step 8: Distinct
+                if (stmt.distinct) {
+                    vec_node = std::make_unique<VecDistinctNode>(std::move(vec_node));
+                }
 
-                    auto exec_start = std::chrono::high_resolution_clock::now();
-                    vec_proj->open();
-                    std::vector<Row> rows;
-                    while (DataChunk* chunk = vec_proj->nextChunk()) {
-                        for (int r = 0; r < chunk->num_rows; ++r) {
-                            Row row;
-                            row.reserve(chunk->columns.size());
-                            for (const auto& cv : chunk->columns) {
-                                std::visit([&](const auto& vec) {
-                                    row.push_back(Value(vec[r]));
-                                }, cv.data);
-                            }
-                            rows.push_back(std::move(row));
-                        }
-                    }
-                    vec_proj->close();
-                    double total_us = std::chrono::duration<double, std::micro>(
-                        std::chrono::high_resolution_clock::now() - exec_start).count();
+                // Step 9: Limit
+                if (stmt.limit.has_value()) {
+                    vec_node = std::make_unique<VecLimitNode>(
+                        std::move(vec_node), stmt.limit.value());
+                }
 
-                    if (args.explain_analyze) {
-                        std::vector<NodeLine> lines;
-                        collectVecNodes(vec_proj.get(), 0, true, total_us, lines);
-                        printAligned(lines);
-                        std::cout << "\n";
-                        std::cout << "Rows returned: " << rows.size() << "\n\n";
-                        std::cout << "Parse:     " << std::fixed << std::setprecision(1) << parse_us  << "µs\n";
-                        std::cout << "Plan:      " << std::fixed << std::setprecision(1) << plan_us   << "µs\n";
-                        std::cout << "Execution: " << std::fixed << std::setprecision(1) << total_us  << "µs\n";
-                        continue;
-                    }
+                double plan_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - plan_start).count();
 
-                    if (!args.no_cache) {
-                        result_cache.emplace(query, std::make_pair(project_schema, rows));
-                    }
-                    printResults(rows, project_schema);
+                if (args.explain) {
+                    std::vector<NodeLine> lines;
+                    collectVecNodes(vec_node.get(), 0, false, 0.0, lines);
+                    printAligned(lines);
                     continue;
                 }
-                // can_vec == false: fall through to Volcano path
+
+                if (!args.no_cache && !args.explain_analyze) {
+                    auto it = result_cache.find(query);
+                    if (it != result_cache.end()) {
+                        std::cout << "[cache hit]\n";
+                        printResults(it->second.second, it->second.first);
+                        continue;
+                    }
+                }
+
+                auto exec_start = std::chrono::high_resolution_clock::now();
+                vec_node->open();
+                std::vector<Row> rows;
+                while (DataChunk* chunk = vec_node->nextChunk()) {
+                    for (int r = 0; r < chunk->num_rows; ++r) {
+                        Row row;
+                        row.reserve(chunk->columns.size());
+                        for (const auto& cv : chunk->columns) {
+                            std::visit([&](const auto& vec) {
+                                row.push_back(Value(vec[r]));
+                            }, cv.data);
+                        }
+                        rows.push_back(std::move(row));
+                    }
+                }
+                vec_node->close();
+                double total_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - exec_start).count();
+
+                if (args.explain_analyze) {
+                    std::vector<NodeLine> lines;
+                    collectVecNodes(vec_node.get(), 0, true, total_us, lines);
+                    printAligned(lines);
+                    std::cout << "\n";
+                    std::cout << "Rows returned: " << rows.size() << "\n\n";
+                    std::cout << "Parse:     " << std::fixed << std::setprecision(1) << parse_us  << "µs\n";
+                    std::cout << "Plan:      " << std::fixed << std::setprecision(1) << plan_us   << "µs\n";
+                    std::cout << "Execution: " << std::fixed << std::setprecision(1) << total_us  << "µs\n";
+                    continue;
+                }
+
+                const Schema& out_schema = vec_node->outputSchema();
+                if (!args.no_cache) {
+                    result_cache.emplace(query, std::make_pair(out_schema, rows));
+                }
+                printResults(rows, out_schema);
+                continue;
             }
             
 
