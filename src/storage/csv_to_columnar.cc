@@ -91,8 +91,7 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
                 break;
             }
         }
-        std::cout << "  " << name << ": " << formatKB(before_bytes) << " -> "
-                  << formatKB(columnByteSize(table.columns[name])) << "\n";
+        std::cerr << "  " << name << ": " << formatKB(before_bytes) << " -> " << formatKB(columnByteSize(table.columns[name])) << "\n";
 
         // build zone maps
         std::vector<ColumnChunk> chunks;
@@ -116,10 +115,10 @@ ColumnarTable CSVToColumnar::convert(const std::vector<Row>& rows, const Schema&
 
     // calculate storage after encoding (for sstats)
     size_t encoded_bytes = columnarTableByteSize(table);
-    std::cout << "[columnar] raw=" << formatKB(raw_bytes);
-    std::cout << "  encoded=" << formatKB(encoded_bytes);
-    std::cout << "  ratio=" << std::fixed << std::setprecision(2);
-    std::cout << (double)encoded_bytes / raw_bytes << "\n";
+    std::cerr << "[columnar] raw=" << formatKB(raw_bytes);
+    std::cerr << "  encoded=" << formatKB(encoded_bytes);
+    std::cerr << "  ratio=" << std::fixed << std::setprecision(2);
+    std::cerr << (double)encoded_bytes / raw_bytes << "\n";
 
     return table;
 }
