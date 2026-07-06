@@ -1,15 +1,28 @@
 #include "execution/vec_scan_node.h"
 #include "storage/rle_column.h"
 #include "storage/dictionary_encoder.h"
+#include "storage/chunk_pruner.h"
 #include <algorithm>
 
-VecScanNode::VecScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)) {}
+VecScanNode::VecScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where)
+    : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), pruning_where_(pruning_where) {}
 
 void VecScanNode::open(){
     row_cursor_ = 0;
+    skipped_chunks_ = 0;
 }
 
 DataChunk* VecScanNode::nextChunk(){
+    // skip zone-map chunks (CHUNK_SIZE=8192) that cannot contain matching rows
+    while (pruning_where_ && row_cursor_ < columnar_table_.num_rows
+           && row_cursor_ % CHUNK_SIZE == 0) {
+        int chunk_idx = row_cursor_ / CHUNK_SIZE;
+        if (!ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx))
+            break;
+        row_cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - row_cursor_);
+        ++skipped_chunks_;
+    }
+
     if (row_cursor_ >= columnar_table_.num_rows){
         return nullptr;
     }
@@ -79,7 +92,12 @@ const Schema& VecScanNode::outputSchema() const {
 }
 
 std::string VecScanNode::explain() const {
-    return "VecScan [" + table_name_ + ", " + std::to_string(schema_.size()) + " columns]";
+    std::string s = "VecScan [" + table_name_ + ", " + std::to_string(schema_.size()) + " columns]";
+    if (pruning_where_) {
+        int total = (columnar_table_.num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        s += " chunks_skipped=" + std::to_string(skipped_chunks_) + "/" + std::to_string(total);
+    }
+    return s;
 }
 
 std::vector<VecPlanNode*> VecScanNode::children() const {
