@@ -3,6 +3,7 @@
 #include "parser/expr_utils.h"
 #include <chrono>
 
+
 VecFilterNode::VecFilterNode(std::unique_ptr<VecPlanNode> child, std::unique_ptr<Expr> predicate) : child_(std::move(child)), predicate_(std::move(predicate)) {}
 
 void VecFilterNode::open(){
@@ -25,7 +26,9 @@ DataChunk* VecFilterNode::nextChunk(){
     // child reuses its internal DataChunk on next call
     out_chunk_ = *raw;
 
-    out_chunk_.sel = evalPredicate(predicate_.get(), *raw, child_->outputSchema());
+    // pass input_sel so evalPredicate skips rows already rejected by an upstream filter
+    const SelectionVector* input_sel = raw->filter_applied ? &raw->sel : nullptr;
+    out_chunk_.sel = evalPredicate(predicate_.get(), *raw, child_->outputSchema(), input_sel);
 
     // mark that a filter was applied so VecProjectNode treats empty
     // sel.indices as "zero rows passed" rather than "all rows valid"

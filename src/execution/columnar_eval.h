@@ -13,4 +13,12 @@
 // fallback (row reconstruction + scalar evaluate()):
 // IS NULL/IS NOT NULL, arithmetic subexpressions, col op col,
 // literal op col, type mismatches, any unrecognised shape
-SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Schema& schema);
+// input_sel: when non-null, only rows in input_sel->indices are evaluated.
+// Pass &raw->sel when the incoming chunk has filter_applied=true so rejected
+// rows are never touched (late-materialization contract).
+SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Schema& schema,
+                              const SelectionVector* input_sel = nullptr);
+
+// O(n+m) intersection of two ascending-ordered SelectionVectors.
+// Used internally by evalPredicate for AND composition.
+SelectionVector sv_intersect(const SelectionVector& a, const SelectionVector& b);

@@ -14,7 +14,7 @@ class VecFilterNode : public VecPlanNode{
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
     private:
+    std::unique_ptr<Expr> predicate_;      // declared before child_ so child_ is destroyed first
     std::unique_ptr<VecPlanNode> child_;
-    std::unique_ptr<Expr> predicate_;
     DataChunk out_chunk_;
 };
