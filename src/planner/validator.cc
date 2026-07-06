@@ -92,8 +92,8 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // ORDER BY: validate ColumnRef nodes against the base table schema.
     // Aggregate expressions (e.g. COUNT(*)) resolve against the post-aggregate
     // output schema at execution time and are not checked here.
-    for (const auto& expr : stmt.order_by) {
-        if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
+    for (const auto& item : stmt.order_by) {
+        if (auto* col = dynamic_cast<const ColumnRef*>(item.expr.get())) {
             if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
                 throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
             }

@@ -8,7 +8,10 @@ namespace {
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
         for (const auto& v : key) {
-            result += v.toString();
+            std::string s = v.toString();
+            result += std::to_string(s.size());
+            result += ':';
+            result += s;
             result += '\x01';
         }
         return result;
@@ -243,7 +246,7 @@ std::string VecHashAggregateNode::explain() const {
             s += specs_[i].function + "(" + (specs_[i].is_star ? "*" : specs_[i].column) + ")";
         }
     }
-    return s + "]";
+    return s + "] (materialize)";
 }
 
 std::vector<VecPlanNode*> VecHashAggregateNode::children() const {

@@ -7,7 +7,7 @@
 
 class VecSortNode : public VecPlanNode {
     public:
-        VecSortNode(std::unique_ptr<VecPlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs);
+        VecSortNode(std::unique_ptr<VecPlanNode> child, std::vector<OrderByItem> order_by);
 
         void open() override;
         DataChunk* nextChunk() override;
@@ -18,7 +18,7 @@ class VecSortNode : public VecPlanNode {
 
     private:
         std::unique_ptr<VecPlanNode> child_;
-        std::vector<std::unique_ptr<Expr>> sort_exprs_;
+        std::vector<OrderByItem> order_by_;
         std::vector<Row> flat_buffer_;
         int cursor_ = 0;
         bool materialized_ = false;

@@ -26,5 +26,9 @@ class Planner {
 
         // build the schema of the aggregate node's output based on the select statement and input table schema
         static Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema);
+
+        // compute the narrowed scan schema for a single table: only columns referenced by the query
+        // returns full_schema unchanged for SELECT *
+        static Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
     private:
 };

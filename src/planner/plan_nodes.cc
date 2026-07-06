@@ -20,8 +20,11 @@ namespace {
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
         for (const auto& v : key) {
-            result += v.toString();
-            result += '\x01'; // non-printable separator unlikely to appear in data
+            std::string s = v.toString();
+            result += std::to_string(s.size());
+            result += ':';
+            result += s;
+            result += '\x01';
         }
         return result;
     }
@@ -374,10 +377,12 @@ Row* DistinctNode::next() {
             return nullptr;
         }
         stats.rows_in++;
-        // serialize the row to a string key
         std::string key;
         for (const auto& val : *row) {
-            key += val.toString();
+            std::string s = val.toString();
+            key += std::to_string(s.size());
+            key += ':';
+            key += s;
             key += '\x01';
         }
         if (seen_.insert(key).second) {
@@ -409,7 +414,7 @@ std::vector<PlanNode*> DistinctNode::children() const {
 
 
 // SortNode
-SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs) : child_(std::move(child)), sort_exprs_(std::move(sort_exprs)), cursor_(0) {}
+SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by) : child_(std::move(child)), order_by_(std::move(order_by)), cursor_(0) {}
 
 void SortNode::open() {
     child_->open();  // child time excluded from self-clock
@@ -430,14 +435,14 @@ void SortNode::open() {
     // sort — self-work only, no child calls
     auto t0 = std::chrono::high_resolution_clock::now();
     const Schema& schema = child_->outputSchema();
-    std::sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
-        for (const auto& expr : sort_exprs_) {
-            Value va = evaluate(expr.get(), a, schema);
-            Value vb = evaluate(expr.get(), b, schema);
-            if (va < vb) return true;
-            if (vb < va) return false;
+    std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
+        for (const auto& item : order_by_) {
+            Value va = evaluate(item.expr.get(), a, schema);
+            Value vb = evaluate(item.expr.get(), b, schema);
+            if (va < vb) return !item.desc;
+            if (vb < va) return  item.desc;
         }
-        return false;  // equal
+        return false;
     });
     cursor_ = 0;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -459,9 +464,10 @@ const Schema& SortNode::outputSchema() const {
 
 std::string SortNode::explain() const {
     std::string s = "Sort [";
-    for (size_t i = 0; i < sort_exprs_.size(); ++i) {
+    for (size_t i = 0; i < order_by_.size(); ++i) {
         if (i) s += ", ";
-        s += exprToString(sort_exprs_[i].get());
+        s += exprToString(order_by_[i].expr.get());
+        if (order_by_[i].desc) s += " DESC";
     }
     return s + "]";
 }

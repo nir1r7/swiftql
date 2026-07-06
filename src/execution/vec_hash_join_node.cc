@@ -156,7 +156,7 @@ const Schema& VecHashJoinNode::outputSchema() const {
 }
 
 std::string VecHashJoinNode::explain() const {
-    return "VecHashJoin [" + probe_join_col_ + " = " + build_join_col_ + "]";
+    return "VecHashJoin [" + probe_join_col_ + " = " + build_join_col_ + "] (materialize)";
 }
 
 std::vector<VecPlanNode*> VecHashJoinNode::children() const {

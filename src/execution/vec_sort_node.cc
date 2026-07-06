@@ -5,7 +5,7 @@
 #include <chrono>
 #include <numeric>
 
-VecSortNode::VecSortNode(std::unique_ptr<VecPlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs) : child_(std::move(child)), sort_exprs_(std::move(sort_exprs)) {}
+VecSortNode::VecSortNode(std::unique_ptr<VecPlanNode> child, std::vector<OrderByItem> order_by) : child_(std::move(child)), order_by_(std::move(order_by)) {}
 
 void VecSortNode::open() {
     child_->open();
@@ -41,13 +41,12 @@ void VecSortNode::consumeAndSort() {
         }
     }
 
-    // sort ascending on each sort expression, matches Volcano SortNode exactly
-    std::sort(flat_buffer_.begin(), flat_buffer_.end(), [&](const Row& a, const Row& b) {
-            for (const auto& expr : sort_exprs_) {
-                Value va = evaluate(expr.get(), a, schema);
-                Value vb = evaluate(expr.get(), b, schema);
-                if (va < vb) return true;
-                if (vb < va) return false;
+    std::stable_sort(flat_buffer_.begin(), flat_buffer_.end(), [&](const Row& a, const Row& b) {
+            for (const auto& item : order_by_) {
+                Value va = evaluate(item.expr.get(), a, schema);
+                Value vb = evaluate(item.expr.get(), b, schema);
+                if (va < vb) return !item.desc;
+                if (vb < va) return  item.desc;
             }
             return false;
         });
@@ -112,11 +111,12 @@ const Schema& VecSortNode::outputSchema() const {
 
 std::string VecSortNode::explain() const {
     std::string s = "VecSort [";
-    for (size_t i = 0; i < sort_exprs_.size(); ++i) {
+    for (size_t i = 0; i < order_by_.size(); ++i) {
         if (i) s += ", ";
-        s += exprToString(sort_exprs_[i].get());
+        s += exprToString(order_by_[i].expr.get());
+        if (order_by_[i].desc) s += " DESC";
     }
-    return s + "]";
+    return s + "] (materialize)";
 }
 
 std::vector<VecPlanNode*> VecSortNode::children() const {

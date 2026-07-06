@@ -32,11 +32,13 @@ int VecDistinctNode::consumeAndDedup() {
 
         rows_consumed += static_cast<int>(indices_ptr->size());
         for (int r : *indices_ptr) {
-            // serialize row, same separator as Volcano DistinctNode ('\x01')
             std::string key;
             for (const auto& cv : chunk->columns) {
                 std::visit([&](const auto& vec) {
-                    key += Value(vec[r]).toString();
+                    std::string s = Value(vec[r]).toString();
+                    key += std::to_string(s.size());
+                    key += ':';
+                    key += s;
                     key += '\x01';
                 }, cv.data);
             }
@@ -113,7 +115,7 @@ const Schema& VecDistinctNode::outputSchema() const {
 }
 
 std::string VecDistinctNode::explain() const {
-    return "VecDistinct";
+    return "VecDistinct (materialize)";
 }
 
 std::vector<VecPlanNode*> VecDistinctNode::children() const {

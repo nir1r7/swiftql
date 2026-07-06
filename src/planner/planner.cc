@@ -56,8 +56,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         }
         collectCols(stmt.having.get(), required);
 
-        for (const auto& expr : stmt.order_by){
-            collectCols(expr.get(), required);
+        for (const auto& item : stmt.order_by){
+            collectCols(item.expr.get(), required);
         }
         if (stmt.join.has_value()){
             collectCols(stmt.join->condition.get(), required);
@@ -97,13 +97,24 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         }
 
         // extract join column names from ON condition
-        // assumes ON is always col = col
-        std::string left_col, right_col;
+        std::string left_col, right_col, left_table, right_table;
         if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
-            if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get()))
-                left_col = lc->column_name;
-            if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get()))
-                right_col = rc->column_name;
+            if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
+                left_col   = lc->column_name;
+                left_table = lc->table_name;
+            }
+            if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
+                right_col   = rc->column_name;
+                right_table = rc->table_name;
+            }
+        }
+        // If table qualifiers are present, route by table name so that
+        // ON join_table.col = from_table.col is handled correctly.
+        // Without qualifiers, fall back to positional assumption (left=FROM, right=JOIN).
+        std::string from_col = left_col, join_col = right_col;
+        if (!left_table.empty() && !right_table.empty()) {
+            if (left_table == stmt.join->join_table)
+                std::swap(from_col, join_col);
         }
 
         // put the smaller table on the build side (right_) to minimise hash table memory
@@ -115,14 +126,14 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             for (const auto& col : node->outputSchema().columns())
                 merged_cols.push_back(col);
             Schema merged_schema(merged_cols);
-            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), right_col, left_col, merged_schema);
+            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_col, from_col, merged_schema);
         } else {
             // JOIN table is smaller (or equal) — JOIN stays build (right_), FROM stays probe (left_)
             std::vector<ColumnDef> merged_cols = node->outputSchema().columns();
             for (const auto& col : right->outputSchema().columns())
                 merged_cols.push_back(col);
             Schema merged_schema(merged_cols);
-            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), left_col, right_col, merged_schema);
+            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_col, join_col, merged_schema);
         }
     }
 
@@ -235,6 +246,19 @@ std::vector<AggregateSpec> Planner::extractAggregates(const SelectStatement& stm
     }
 
     return specs;
+}
+
+
+Schema Planner::buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
+    if (stmt.select_star) return full_schema;
+    std::unordered_set<std::string> required;
+    for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
+    collectCols(stmt.where.get(), required);
+    for (const auto& col_name : stmt.group_by) required.insert(col_name);
+    collectCols(stmt.having.get(), required);
+    for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
+    if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
+    return narrowSchema(full_schema, required);
 }
 
 

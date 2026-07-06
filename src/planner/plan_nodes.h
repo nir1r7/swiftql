@@ -150,7 +150,7 @@ class DistinctNode : public PlanNode {
 // sort rows by specified expressions (apply ORDER BY)
 class SortNode : public PlanNode {
     public:
-        SortNode(std::unique_ptr<PlanNode> child, std::vector<std::unique_ptr<Expr>> sort_exprs);
+        SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by);
 
         void open() override;
         Row* next() override;
@@ -160,7 +160,7 @@ class SortNode : public PlanNode {
         std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
-        std::vector<std::unique_ptr<Expr>> sort_exprs_;
+        std::vector<OrderByItem> order_by_;
         std::vector<Row> sorted_rows_;
         int cursor_;
 };
