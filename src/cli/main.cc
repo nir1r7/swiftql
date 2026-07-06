@@ -247,6 +247,9 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
 
+                // Fix #3: validate before plan construction (same guarantee as Volcano path via Planner::plan)
+                Validator::validate(stmt, catalog);
+
                 // Capture row counts before columnar tables are moved into scan nodes
                 int from_row_count = columnar_tables.at(stmt.from_table).num_rows;
                 int join_row_count = (stmt.join.has_value() && columnar_tables.count(stmt.join->join_table))
@@ -254,26 +257,44 @@ int main(int argc, char* argv[]) {
 
                 auto plan_start = std::chrono::high_resolution_clock::now();
 
-                // Step 1: Base scan
+                // Fix #2: narrow scan schema to only required columns (mirrors Planner::plan narrowSchema logic)
+                Schema from_scan_schema = Planner::buildScanSchema(stmt, meta.schema);
+
+                // Fix #1: pass WHERE predicate for zone-map chunk pruning (non-owning; VecFilterNode takes
+                // ownership of the same expr at step 3, and is an ancestor of VecScanNode in the tree)
                 std::unique_ptr<VecPlanNode> vec_node = std::make_unique<VecScanNode>(
                     stmt.from_table,
                     std::move(columnar_tables.at(stmt.from_table)),
-                    meta.schema);
+                    from_scan_schema,
+                    stmt.where.get());
 
                 // Step 2: Join
                 if (stmt.join.has_value()) {
                     const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
+                    Schema join_scan_schema = Planner::buildScanSchema(stmt, join_meta.schema);
                     auto join_scan = std::make_unique<VecScanNode>(
                         stmt.join->join_table,
                         std::move(columnar_tables.at(stmt.join->join_table)),
-                        join_meta.schema);
+                        join_scan_schema);
 
-                    std::string left_col, right_col;
+                    std::string left_col, right_col, left_table, right_table;
                     if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
-                        if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get()))
-                            left_col = lc->column_name;
-                        if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get()))
-                            right_col = rc->column_name;
+                        if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
+                            left_col   = lc->column_name;
+                            left_table = lc->table_name;
+                        }
+                        if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
+                            right_col   = rc->column_name;
+                            right_table = rc->table_name;
+                        }
+                    }
+                    // If table qualifiers are present, route by table name so that
+                    // ON join_table.col = from_table.col is handled correctly.
+                    // Without qualifiers, fall back to positional assumption (left=FROM, right=JOIN).
+                    std::string from_col = left_col, join_col = right_col;
+                    if (!left_table.empty() && !right_table.empty()) {
+                        if (left_table == stmt.join->join_table)
+                            std::swap(from_col, join_col);
                     }
 
                     bool swap = (from_row_count < join_row_count);
@@ -284,7 +305,7 @@ int main(int argc, char* argv[]) {
                             merged_cols.push_back(col);
                         vec_node = std::make_unique<VecHashJoinNode>(
                             std::move(join_scan), std::move(vec_node),
-                            right_col, left_col, Schema(merged_cols));
+                            join_col, from_col, Schema(merged_cols));
                     } else {
                         // JOIN is smaller or equal: JOIN stays build, FROM stays probe
                         std::vector<ColumnDef> merged_cols = vec_node->outputSchema().columns();
@@ -292,7 +313,7 @@ int main(int argc, char* argv[]) {
                             merged_cols.push_back(col);
                         vec_node = std::make_unique<VecHashJoinNode>(
                             std::move(vec_node), std::move(join_scan),
-                            left_col, right_col, Schema(merged_cols));
+                            from_col, join_col, Schema(merged_cols));
                     }
                 }
 
@@ -379,7 +400,11 @@ int main(int argc, char* argv[]) {
                 vec_node->open();
                 std::vector<Row> rows;
                 while (DataChunk* chunk = vec_node->nextChunk()) {
-                    for (int r = 0; r < chunk->num_rows; ++r) {
+                    int n = chunk->filter_applied
+                        ? static_cast<int>(chunk->sel.indices.size())
+                        : chunk->num_rows;
+                    for (int i = 0; i < n; ++i) {
+                        int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
                         Row row;
                         row.reserve(chunk->columns.size());
                         for (const auto& cv : chunk->columns) {
