@@ -43,6 +43,12 @@ struct AggregateExpr : Expr {
     bool is_star;
 };
 
+// one ORDER BY entry: an expression plus sort direction
+struct OrderByItem {
+    std::unique_ptr<Expr> expr;
+    bool desc = false;
+};
+
 // the full parsed query
 struct SelectStatement {
     bool distinct = false;
@@ -69,7 +75,7 @@ struct SelectStatement {
     std::unique_ptr<Expr> having; // nullptr if no HAVING
 
     // optional ORDER BY
-    std::vector<std::unique_ptr<Expr>> order_by;
+    std::vector<OrderByItem> order_by;
 
     // optional LIMIT
     std::optional<int> limit;

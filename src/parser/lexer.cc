@@ -174,6 +174,8 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     {"AND",      TokenType::AND},
     {"OR",       TokenType::OR},
     {"AS",       TokenType::AS},
+    {"ASC",      TokenType::ASC},
+    {"DESC",     TokenType::DESC},
     {"NULL",     TokenType::NULL_KW},
     {"COUNT",    TokenType::COUNT},
     {"SUM",      TokenType::SUM},

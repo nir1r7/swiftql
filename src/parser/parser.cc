@@ -99,9 +99,19 @@ SelectStatement Parser::parseSelect(){
 
     if (match(TokenType::ORDER)){
         expect(TokenType::BY, "BY");
-        stmt.order_by.push_back(parsePrimary());
+        {
+            OrderByItem item;
+            item.expr = parsePrimary();
+            item.desc = match(TokenType::DESC);
+            if (!item.desc) match(TokenType::ASC);
+            stmt.order_by.push_back(std::move(item));
+        }
         while (match(TokenType::COMMA)) {
-            stmt.order_by.push_back(parsePrimary());
+            OrderByItem item;
+            item.expr = parsePrimary();
+            item.desc = match(TokenType::DESC);
+            if (!item.desc) match(TokenType::ASC);
+            stmt.order_by.push_back(std::move(item));
         }
     }
 

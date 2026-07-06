@@ -5,7 +5,7 @@
 enum class TokenType {
     // keywords
     SELECT, FROM, WHERE, GROUP, BY, HAVING, ORDER,
-    LIMIT, DISTINCT, JOIN, ON, IS, NOT, AND, OR, AS, 
+    LIMIT, DISTINCT, JOIN, ON, IS, NOT, AND, OR, AS, ASC, DESC,
     NULL_KW, // NULL_KW because NULL is reserved in C++
 
     // aggregate functions
