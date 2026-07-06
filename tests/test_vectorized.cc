@@ -472,14 +472,21 @@ static std::unique_ptr<Expr> binOp(const std::string& op,
     return b;
 }
 
+// OrderByItem helpers for VecSortNode tests
+static OrderByItem orderAsc(std::unique_ptr<Expr> e) { return {std::move(e), false}; }
+static OrderByItem orderDesc(std::unique_ptr<Expr> e) { return {std::move(e), true}; }
+
 // Drain a VecPlanNode fully, collect all materialized rows.
-// Assumes each ColumnVector in the output chunk holds typed elements
-// accessible row-by-row via std::visit.
+// Respects filter_applied so it works correctly with or without a SelectionVector.
 static std::vector<Row> drainRows(VecPlanNode& node) {
     node.open();
     std::vector<Row> result;
     while (DataChunk* chunk = node.nextChunk()) {
-        for (int r = 0; r < chunk->num_rows; ++r) {
+        int n = chunk->filter_applied
+            ? static_cast<int>(chunk->sel.indices.size())
+            : chunk->num_rows;
+        for (int i = 0; i < n; ++i) {
+            int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
             Row row;
             row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
@@ -1111,6 +1118,32 @@ TEST(VecFilter, SelectionVectorSizeZeroWhenNonePass) {
     filter.close();
 }
 
+// Two VecFilterNodes stacked: second filter sees filter_applied=true from first.
+// Only rows passing BOTH predicates should survive.
+// id > 1 AND id < 5  →  rows 2, 3, 4  (out of 1..6)
+TEST(VecFilter, StackedFiltersCompose) {
+    Schema schema = vecSchema({{"id", TypeId::INT}});
+    ColumnarTable ct(schema, 6);
+    ct.columns["id"] = std::vector<int64_t>{1, 2, 3, 4, 5, 6};
+
+    auto inner = std::make_unique<VecFilterNode>(
+        std::make_unique<VecScanNode>("t", ct, schema),
+        binOp(">", col("id"), intLit(1)));   // passes rows 2,3,4,5,6
+
+    VecFilterNode outer(std::move(inner),
+        binOp("<", col("id"), intLit(5)));   // of those, keeps 2,3,4
+
+    outer.open();
+    DataChunk* chunk = outer.nextChunk();
+    ASSERT_NE(chunk, nullptr);
+    ASSERT_TRUE(chunk->filter_applied);
+    ASSERT_EQ(static_cast<int>(chunk->sel.indices.size()), 3);
+    EXPECT_EQ(chunk->sel.indices[0], 1);  // physical row 1  → id=2
+    EXPECT_EQ(chunk->sel.indices[1], 2);  // physical row 2  → id=3
+    EXPECT_EQ(chunk->sel.indices[2], 3);  // physical row 3  → id=4
+    outer.close();
+}
+
 // ============================================================
 // End-to-end correctness: Volcano vs Vectorized pipeline
 // Each test builds the same query on both paths and asserts identical results.
@@ -1708,12 +1741,25 @@ TEST(VecLimit, OpenResetsState) {
 
 TEST(VecSort, SingleColumnAscending) {
     auto scan = makeIntScan("id", {5, 3, 1, 4, 2});
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
     auto rows = drainRows(*sort);
     ASSERT_EQ(rows.size(), 5u);
     for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1) << "row " << i;
+}
+
+TEST(VecSort, SingleColumnDescending) {
+    auto scan = makeIntScan("id", {3, 1, 4, 1, 5});
+    std::vector<OrderByItem> ob; ob.push_back(orderDesc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 5u);
+    // expected DESC order: 5, 4, 3, 1, 1
+    EXPECT_EQ(rows[0][0].asInt(), 5);
+    EXPECT_EQ(rows[1][0].asInt(), 4);
+    EXPECT_EQ(rows[2][0].asInt(), 3);
+    EXPECT_EQ(rows[3][0].asInt(), 1);
+    EXPECT_EQ(rows[4][0].asInt(), 1);
 }
 
 TEST(VecSort, MultiColumnSort) {
@@ -1724,10 +1770,10 @@ TEST(VecSort, MultiColumnSort) {
         {Value(2LL), Value(2LL)},
         {Value(2LL), Value(1LL)},
     };
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("a"));
-    exprs.push_back(col("b"));
-    auto sort = std::make_unique<VecSortNode>(makeScan(schema, input), std::move(exprs));
+    std::vector<OrderByItem> ob;
+    ob.push_back(orderAsc(col("a")));
+    ob.push_back(orderAsc(col("b")));
+    auto sort = std::make_unique<VecSortNode>(makeScan(schema, input), std::move(ob));
     auto rows = drainRows(*sort);
     ASSERT_EQ(rows.size(), 4u);
     EXPECT_EQ(rows[0][0].asInt(), 1); EXPECT_EQ(rows[0][1].asInt(), 1);
@@ -1738,9 +1784,8 @@ TEST(VecSort, MultiColumnSort) {
 
 TEST(VecSort, AlreadySorted) {
     auto scan = makeIntScan("id", {1, 2, 3, 4, 5});
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
     auto rows = drainRows(*sort);
     ASSERT_EQ(rows.size(), 5u);
     for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1);
@@ -1748,9 +1793,8 @@ TEST(VecSort, AlreadySorted) {
 
 TEST(VecSort, ReverseSorted) {
     auto scan = makeIntScan("id", {5, 4, 3, 2, 1});
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
     auto rows = drainRows(*sort);
     ASSERT_EQ(rows.size(), 5u);
     for (int i = 0; i < 5; ++i) EXPECT_EQ(rows[i][0].asInt(), i + 1);
@@ -1760,9 +1804,8 @@ TEST(VecSort, MultiChunkInput) {
     int n = BATCH_SIZE + 100;
     std::vector<int64_t> vals(n);
     for (int i = 0; i < n; ++i) vals[i] = static_cast<int64_t>(n - 1 - i);
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(makeIntScan("id", vals), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(makeIntScan("id", vals), std::move(ob));
     auto rows = drainRows(*sort);
     ASSERT_EQ(static_cast<int>(rows.size()), n);
     for (int i = 0; i < n; ++i) EXPECT_EQ(rows[i][0].asInt(), i) << "i=" << i;
@@ -1770,9 +1813,8 @@ TEST(VecSort, MultiChunkInput) {
 
 TEST(VecSort, EmptyInput) {
     auto scan = makeIntScan("id", {});
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
     sort->open();
     EXPECT_EQ(sort->nextChunk(), nullptr);
     sort->close();
@@ -1781,9 +1823,8 @@ TEST(VecSort, EmptyInput) {
 TEST(VecSort, OutputSchemaUnchanged) {
     Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::DOUBLE}});
     std::vector<Row> rows = {{Value(1LL), Value(2.0)}};
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("x"));
-    auto sort = std::make_unique<VecSortNode>(makeScan(schema, rows), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("x")));
+    auto sort = std::make_unique<VecSortNode>(makeScan(schema, rows), std::move(ob));
     EXPECT_EQ(sort->outputSchema().size(), 2);
     EXPECT_EQ(sort->outputSchema().column(0).name, "x");
     EXPECT_EQ(sort->outputSchema().column(1).name, "y");
@@ -1791,9 +1832,8 @@ TEST(VecSort, OutputSchemaUnchanged) {
 
 TEST(VecSort, OpenResetsState) {
     auto scan = makeIntScan("id", {3, 1, 2});
-    std::vector<std::unique_ptr<Expr>> exprs;
-    exprs.push_back(col("id"));
-    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(exprs));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(scan), std::move(ob));
     auto r1 = drainRows(*sort);
     auto r2 = drainRows(*sort);
     ASSERT_EQ(r1.size(), 3u);
@@ -2205,6 +2245,7 @@ TEST(VecLimit, FilteredInputTruncation) {
     ASSERT_NE(chunk, nullptr);
     EXPECT_TRUE(chunk->filter_applied);
     ASSERT_EQ(static_cast<int>(chunk->sel.indices.size()), 2);
+    EXPECT_EQ(chunk->sel.size, 2);        // sel.size must stay in sync with indices
     EXPECT_EQ(chunk->sel.indices[0], 1);  // physical row 1 → id=1
     EXPECT_EQ(chunk->sel.indices[1], 2);  // physical row 2 → id=2
     // column vector must still hold all 5 original rows (not resized to 2)
@@ -2237,4 +2278,131 @@ TEST(VecHashJoin, FilteredBuildSide) {
     std::sort(pids.begin(), pids.end());
     EXPECT_EQ(pids[0], 1);
     EXPECT_EQ(pids[1], 3);
+}
+
+// ============================================================
+// Coverage-gap tests: filter_applied=true paths into pipeline breakers
+// ============================================================
+
+// VecHashAggregateNode must read only sel.indices rows when filter_applied=true.
+TEST(VecHashAggregate, FilteredInput) {
+    // rows: grp=a(val=1,2), grp=b(val=3,4,5). Filter val > 2 leaves b:3,4,5.
+    // COUNT(*) GROUP BY grp → exactly one group "b" with count=3.
+    Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(std::string("a")), Value(1LL)},
+        {Value(std::string("a")), Value(2LL)},
+        {Value(std::string("b")), Value(3LL)},
+        {Value(std::string("b")), Value(4LL)},
+        {Value(std::string("b")), Value(5LL)},
+    };
+    auto filter = std::make_unique<VecFilterNode>(
+        makeScan(schema, input), binOp(">", col("val"), intLit(2)));
+    Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        std::move(filter), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asString(), "b");
+    EXPECT_EQ(rows[0][1].asInt(), 3);
+}
+
+// VecSortNode must extract only sel.indices rows when filter_applied=true.
+TEST(VecSort, FilteredInput) {
+    // scan [5,3,1,4,2]; filter id > 2 → physical rows 0(5),1(3),3(4) pass.
+    // sort ASC → 3, 4, 5.
+    auto filter = std::make_unique<VecFilterNode>(
+        makeIntScan("id", {5, 3, 1, 4, 2}), binOp(">", col("id"), intLit(2)));
+    std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("id")));
+    auto sort = std::make_unique<VecSortNode>(std::move(filter), std::move(ob));
+    auto rows = drainRows(*sort);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asInt(), 3);
+    EXPECT_EQ(rows[1][0].asInt(), 4);
+    EXPECT_EQ(rows[2][0].asInt(), 5);
+}
+
+// VecHashJoinNode output_cursor_ slice path: one probe key matches >BATCH_SIZE build rows.
+TEST(VecHashJoin, ProbeOutputOverflow) {
+    int n = BATCH_SIZE + 10;
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(1LL)}};
+    std::vector<Row> build_rows;
+    for (int i = 0; i < n; ++i) build_rows.push_back({Value(1LL)});
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "pid", "bid", out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(static_cast<int>(rows.size()), n);
+    for (const auto& r : rows) {
+        EXPECT_EQ(r[0].asInt(), 1);
+        EXPECT_EQ(r[1].asInt(), 1);
+    }
+}
+
+// AVG denominator correctness: groups of sizes 1, 2, 3 have different divisors.
+TEST(VecHashAggregate, AvgDivisorCorrectness) {
+    Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(1LL), Value(6LL)},
+        {Value(2LL), Value(1LL)}, {Value(2LL), Value(3LL)},
+        {Value(3LL), Value(2LL)}, {Value(3LL), Value(4LL)}, {Value(3LL), Value(6LL)},
+    };
+    Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {{"AVG", "val", false}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 6.0);   // 6/1
+    EXPECT_DOUBLE_EQ(rows[1][1].asDouble(), 2.0);   // (1+3)/2
+    EXPECT_DOUBLE_EQ(rows[2][1].asDouble(), 4.0);   // (2+4+6)/3
+}
+
+// ============================================================
+// VecHaving — HAVING via VecFilterNode on aggregate output
+// ============================================================
+
+// GROUP BY grp, COUNT(*) HAVING COUNT(*) > 1
+// grp=A: 1 row  → filtered out
+// grp=B: 2 rows → kept
+// grp=C: 3 rows → kept
+TEST(VecHaving, FilterAggregateGroups) {
+    Schema in_schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(std::string("A")), Value((int64_t)10)},
+        {Value(std::string("B")), Value((int64_t)20)},
+        {Value(std::string("B")), Value((int64_t)30)},
+        {Value(std::string("C")), Value((int64_t)40)},
+        {Value(std::string("C")), Value((int64_t)50)},
+        {Value(std::string("C")), Value((int64_t)60)},
+    };
+
+    Schema agg_schema = vecSchema({{"grp", TypeId::STRING}, {"COUNT(*)", TypeId::INT}});
+    std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(in_schema, input), std::vector<std::string>{"grp"}, specs, agg_schema);
+
+    // HAVING COUNT(*) > 1  →  col index 1 > literal 1
+    auto having_pred = std::make_unique<BinaryExpr>();
+    having_pred->op = ">";
+    auto count_ref = std::make_unique<ColumnRef>(); count_ref->column_name = "COUNT(*)";
+    having_pred->left = std::move(count_ref);
+    having_pred->right = std::make_unique<Literal>(Value((int64_t)1));
+
+    auto having = std::make_unique<VecFilterNode>(std::move(agg), std::move(having_pred));
+    auto rows = drainRows(*having);
+
+    ASSERT_EQ(rows.size(), 2u);
+    // grp B (count=2) and grp C (count=3) survive; A (count=1) is filtered
+    bool saw_B = false, saw_C = false;
+    for (const auto& r : rows) {
+        if (r[0].asString() == "B") { saw_B = true; EXPECT_EQ(r[1].asInt(), 2); }
+        if (r[0].asString() == "C") { saw_C = true; EXPECT_EQ(r[1].asInt(), 3); }
+    }
+    EXPECT_TRUE(saw_B);
+    EXPECT_TRUE(saw_C);
 }

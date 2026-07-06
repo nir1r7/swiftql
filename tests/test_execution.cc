@@ -354,9 +354,9 @@ TEST(SortNode, SortsRows) {
     };
 
     // multicolumn sort: a ASC, then b ASC
-    std::vector<std::unique_ptr<Expr>> sort_exprs;
-    sort_exprs.push_back(colRef("a"));
-    sort_exprs.push_back(colRef("b"));
+    std::vector<OrderByItem> sort_exprs;
+    sort_exprs.push_back({colRef("a"), false});
+    sort_exprs.push_back({colRef("b"), false});
     SortNode sort(makeScan(rows, schema), std::move(sort_exprs));
     auto result = drainAll(&sort);
 
@@ -366,8 +366,8 @@ TEST(SortNode, SortsRows) {
     EXPECT_EQ(result[2][0].asInt(), 2); EXPECT_EQ(result[2][1].asInt(), 10);
     EXPECT_EQ(result[3][0].asInt(), 2); EXPECT_EQ(result[3][1].asInt(), 20);
 
-    std::vector<std::unique_ptr<Expr>> empty_exprs;
-    empty_exprs.push_back(colRef("a"));
+    std::vector<OrderByItem> empty_exprs;
+    empty_exprs.push_back({colRef("a"), false});
     SortNode empty_sort(makeScan({}, schema), std::move(empty_exprs));
     EXPECT_TRUE(drainAll(&empty_sort).empty());
 }
@@ -574,8 +574,8 @@ TEST(Pipeline, CheckpointQuery) {
     auto distinct = std::make_unique<DistinctNode>(std::move(project));
 
     // ORDER BY team
-    std::vector<std::unique_ptr<Expr>> pipeline_sort_exprs;
-    pipeline_sort_exprs.push_back(colRef("team"));
+    std::vector<OrderByItem> pipeline_sort_exprs;
+    pipeline_sort_exprs.push_back({colRef("team"), false});
     auto sort = std::make_unique<SortNode>(
         std::move(distinct), std::move(pipeline_sort_exprs));
 
