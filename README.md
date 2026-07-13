@@ -15,8 +15,9 @@ A toy analytical SQL engine built in C++, designed as a learning project targeti
 - [Phase 1 — Correct Row-Based Engine](#phase-1--correct-row-based-engine-weeks-17)
 - [Phase 2 — Columnar Storage + Hash Join](#phase-2--columnar-storage--hash-join-weeks-812)
 - [Phase 3 — Vectorized Execution](#phase-3--vectorized-execution-weeks-1315)
-- [Phase 4 — Cost-Based Optimizer](#phase-4--cost-based-optimizer-weeks-1618)
-- [20-Week Plan](#20-week-plan)
+- [Phase 4 — Vectorized Cost-Based Optimizer](#phase-4--vectorized-cost-based-optimizer-weeks-1623)
+- [Phase 5 — TPC-H Compatibility + Benchmarks](#phase-5--tpc-h-compatibility--benchmarks-weeks-2437)
+- [37-Week Plan](#37-week-plan)
 - [Benchmarks](#benchmarks)
 - [Build Instructions](#build-instructions)
 - [Usage](#usage)
@@ -29,14 +30,15 @@ A toy analytical SQL engine built in C++, designed as a learning project targeti
 
 SwiftQL is a **single-process analytical query engine**. It is not a full DBMS — there are no transactions, no multi-user sessions, and no write path. It is purely a **read query engine**, which is exactly the right scope for understanding how analytical database systems like Snowflake and Databricks work internally.
 
-The project is structured in four progressive phases, each leaving a working and demonstrable system before moving to the next:
+The project is structured in five progressive phases, each leaving a working and demonstrable system before moving to the next:
 
 | Phase | Focus | Key Idea |
 |---|---|---|
 | 1 | Correct row-based SQL engine | Make it work |
 | 2 | Columnar storage + encodings + pruning + hash join | Make storage smarter |
 | 3 | Vectorized execution + late materialization | Make execution faster |
-| 4 | Cost-based optimizer + predicate pushdown | Make planning smarter |
+| 4 | Vectorized cost-based optimizer | Make planning smarter |
+| 5 | TPC-H SQL coverage + benchmarks | Test the complete system |
 
 **Tech stack:**
 - Core engine: C++
@@ -61,14 +63,13 @@ The project is structured in four progressive phases, each leaving a working and
 - `--storage row | columnar` — switches the storage backend
 - `--execution volcano | vectorized` — switches the execution model
 - Query result cache — identical queries served from cache without re-execution
-- Cost-based optimizer — uses table and column statistics to reorder predicates and select join sides (Phase 4)
-- Formal predicate pushdown — filters pushed as close to the scan as possible (Phase 4)
+- Cost-based optimizer for vectorized execution — statistics, cardinality estimation, predicate pushdown, and physical join selection (Phase 4)
+- Multi-way joins, richer expressions, subqueries, and TPC-H benchmarking (Phase 5)
 - CSV-based table storage with a `catalog.json` metadata file
 
 ### Explicitly Out of Scope
 
 - `CREATE TABLE` SQL — tables registered via catalog only
-- Subqueries
 - Transactions / writes (`INSERT`, `UPDATE`, `DELETE`)
 - Indexes
 - Distributed execution
@@ -122,7 +123,7 @@ Everything else depends on this layer. No module reaches past it.
 The engine's directory of what tables exist.
 
 - `TableMetadata` — table name, file path, Schema
-- `TableStats` — row count, per-column statistics (min, max, distinct count) — populated at load time, used by the Phase 4 optimizer
+- `TableStats` — row count and per-column min, max, distinct count, null count, and average width — populated at load time for the Phase 4 optimizer
 - `Catalog` — loads and stores all `TableMetadata` and `TableStats`; answers "does table X exist?", "what columns does it have?", "where is its file?"
 - Backed by `catalog.json` on disk — no SQL DDL
 
@@ -238,10 +239,12 @@ Project [team, AVG(speed)]
           SeqScan [drivers, 5 columns]
 ```
 
-**Phase 4 — Optimizer pass (applied between planning and execution):**
-- Formal predicate pushdown — `FilterNode`s moved as close to `SeqScanNode` as possible
-- Predicate reordering — most selective predicates evaluated first using column distinct counts
-- Join side selection — smaller table by row count chosen as build side
+**Phase 4 — Vectorized optimizer pipeline:**
+- Binder resolves aliases and columns to stable identities
+- Logical plan separates query meaning from executable operators
+- Statistics and cardinality estimates drive predicate placement and physical join selection
+- `VectorizedPlanBuilder` lowers the optimized plan into `VecPlanNode`s
+- Volcano execution remains the correctness baseline and is not optimized
 
 ### Layer 6 — Execution Engine
 
@@ -516,40 +519,179 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 
 ---
 
-## Phase 4 — Cost-Based Optimizer (Weeks 16–18)
+## Phase 4 — Vectorized Cost-Based Optimizer (Weeks 16–23)
 
-**Goal:** Replace the rule-based planner with a statistics-driven optimizer. Use table and column statistics to make smarter planning decisions. Measure the impact independently of storage and execution changes.
+**Goal:** Add a statistics-driven optimizer to the columnar/vectorized path. Preserve Volcano execution as the correctness baseline and measure optimizer gains independently.
 
-### Week 16 — Statistics Collection
+### Week 16 — Binder + Planning Correctness
 
-- `ColumnStats` — min, max, distinct count per column
-- `TableStats` — row count + map of column name → `ColumnStats`
-- Statistics computed at table load time and stored in `Catalog`
-- `EXPLAIN ANALYZE` updated to show estimated vs actual row counts per plan node
+- Resolve table aliases and qualified columns to stable relation/column identities
+- Reject ambiguous references and preserve logical output order across join-side swaps
+- Fix cache configuration keys, 64-bit row metrics, and zero-row plan reporting
 
-**Checkpoint:** Stats populated for all tables on load. Visible in `EXPLAIN ANALYZE` output.
+**Checkpoint:** Bound expressions are unambiguous and existing queries remain correct.
 
-### Week 17 — Optimizer Rules
+### Week 17 — Logical Plan
 
-- **Formal predicate pushdown** — `FilterNode`s moved as close to `SeqScanNode` as possible in the plan tree, reducing rows flowing through upstream operators
-- **Predicate reordering** — when multiple predicates exist in `WHERE`, most selective predicate (lowest `distinct_count / row_count` ratio) evaluated first
-- **Join side selection** — smaller table by `row_count` chosen as build side in `HashJoinNode`; optimizer can override the order tables appear in the query
-- Optimizer implemented as a plan tree rewrite pass between planning and execution
+- Add execution-independent scan, filter, join, aggregate, project, sort, distinct, and limit nodes
+- Build logical plans from the bound AST without moving data into execution operators
 
-**Checkpoint:** Plan trees visibly reordered by optimizer. `EXPLAIN` shows pre- and post-optimization plans. Predicate ordering and join sides correct.
+**Checkpoint:** Existing vectorized queries produce complete logical plans.
 
-### Week 18 — Phase 4 Benchmarks + Full Project Benchmark Suite
+### Week 18 — Vectorized Physical Planning
 
-- Benchmark optimizer gains in isolation: same queries, same storage and execution mode, optimizer on vs off via `--no-optimize`
-- Document which query types benefit most, which are unaffected, and why
-- Full 4-phase benchmark comparison — every benchmark query across every phase
-- `benchmark.py` generates final comparison plots: latency by phase, rows/sec by phase, batch size sensitivity curve, optimizer impact
+- Add `VectorizedPlanBuilder` to lower logical plans into `VecPlanNode`s
+- Remove vectorized tree construction from `main.cc`
+- Wire `--no-optimize` through the shared logical and physical planning path
 
-**Checkpoint:** Optimizer gains isolated and documented. Full benchmark suite complete. All plots generated.
+**Checkpoint:** Optimized and unoptimized modes share one vectorized plan builder.
+
+### Week 19 — Statistics Collection
+
+- Collect row count plus column min, max, distinct count, null count, and average width
+- Store statistics in `Catalog` after table loading
+
+**Checkpoint:** Statistics are populated and tested for every loaded table.
+
+### Week 20 — Cardinality Estimation
+
+- Estimate scan, equality, range, conjunction, join, and aggregate cardinalities
+- Use documented fallback selectivities for unsupported expressions
+
+**Checkpoint:** Estimated row counts propagate through the logical plan.
+
+### Week 21 — Predicate Optimization
+
+- Split conjunctions and classify predicates by referenced relation
+- Push filters to the lowest legal plan node
+- Order scan-local predicates by expected work and cascade selection vectors
+
+**Checkpoint:** Both join inputs are filtered before the join when legal.
+
+### Week 22 — Cost Model + Physical Join Selection
+
+- Add explicit CPU, data-volume, and hash-table memory costs
+- Choose filtered hash-join build side; compare hash and nested-loop joins
+- Keep logical schema order independent of physical build/probe order
+
+**Checkpoint:** The cheapest supported single-join plan is selected from estimates.
+
+### Week 23 — Explainability + Phase 4 Benchmarks
+
+- Show logical and optimized plans, estimated rows, costs, and optimizer decisions
+- Compare estimates with actual rows in `EXPLAIN ANALYZE`
+- Benchmark vectorized execution with and without optimization
+
+**Checkpoint:** Phase 4 gains and estimation errors are measured and documented.
 
 ---
 
-## 20-Week Plan
+## Phase 5 — TPC-H Compatibility + Benchmarks (Weeks 24–37)
+
+**Goal:** Extend SwiftQL to a documented TPC-H SQL dialect, optimize multi-table queries, and publish correctness and performance results.
+
+### Week 24 — General Expressions
+
+- Add arithmetic precedence, unary minus, expression aliases, and expression type checking
+- Support expressions in projection, aggregation, grouping, and ordering
+
+**Checkpoint:** TPC-H revenue expressions parse, bind, and execute.
+
+### Week 25 — Predicates + Scalar Functions
+
+- Add `BETWEEN`, `LIKE`, `IN`, `CASE`, and `SUBSTRING`
+- Add ISO date literals and constant-folded interval arithmetic
+
+**Checkpoint:** Required non-subquery TPC-H expressions execute correctly.
+
+### Week 26 — Multi-Way Join Language + Binding
+
+- Parse multiple explicit `JOIN ... ON` clauses
+- Extend binding and logical planning to arbitrary relation counts
+
+**Checkpoint:** Multi-table queries produce a qualified logical join tree.
+
+### Week 27 — Multi-Way Join Execution
+
+- Lower general logical join trees to vectorized hash joins
+- Build a join graph and assign local and join predicates
+
+**Checkpoint:** Three-or-more-table joins execute correctly.
+
+### Week 28 — Join Enumeration
+
+- Add left-deep dynamic-programming join ordering with a configurable limit
+- Use a greedy fallback for larger join graphs
+
+**Checkpoint:** `EXPLAIN` shows cost-based multiway join order decisions.
+
+### Week 29 — Outer Join
+
+- Add logical and vectorized left outer hash join
+- Preserve unmatched rows and stable output slots
+
+**Checkpoint:** TPC-H Q13 join semantics are supported.
+
+### Week 30 — Subquery Parsing + Binding
+
+- Add nested query AST nodes and scoped name resolution
+- Represent scalar, set-returning, and correlated subqueries
+
+**Checkpoint:** Required TPC-H subquery forms bind correctly.
+
+### Week 31 — Scalar + Uncorrelated Subqueries
+
+- Execute scalar subqueries and materialized uncorrelated subqueries
+- Validate scalar cardinality at runtime
+
+**Checkpoint:** Uncorrelated TPC-H subqueries execute correctly.
+
+### Week 32 — Semi-Joins + Anti-Joins
+
+- Add vectorized semi-join and anti-join operators
+- Lower `IN`, `NOT IN`, `EXISTS`, and `NOT EXISTS` where applicable
+
+**Checkpoint:** Set-membership subqueries avoid nested-loop execution.
+
+### Week 33 — Correlated Subqueries
+
+- Decorrelate the correlated patterns required by TPC-H
+- Retain a correct fallback for unsupported patterns
+
+**Checkpoint:** Required correlated TPC-H queries execute correctly.
+
+### Week 34 — Derived Tables + Distinct Aggregates
+
+- Bind and execute subqueries in `FROM`
+- Add per-group state for `COUNT(DISTINCT ...)`
+
+**Checkpoint:** Rewritten Q15 and distinct aggregates are supported.
+
+### Week 35 — TPC-H Data + Harness
+
+- Add the TPC-H schema, pipe-delimited loader, and scale-factor workflow
+- Add parameterized queries, warmups, repetitions, and reference comparison
+
+**Checkpoint:** TPC-H data generation and automated query runs are reproducible.
+
+### Week 36 — Query Coverage + Correctness
+
+- Port queries to the documented SwiftQL dialect
+- Close query-specific parser, execution, and optimizer correctness gaps
+- Document supported scale and memory limits
+
+**Checkpoint:** Supported TPC-H queries match reference results within numeric tolerance.
+
+### Week 37 — TPC-H Benchmarks + Final Documentation
+
+- Measure per-query latency, throughput, optimizer impact, and estimate accuracy
+- Publish coverage, limitations, plans, and benchmark plots
+
+**Checkpoint:** TPC-H results are reproducible and the full project story is documented.
+
+---
+
+## 37-Week Plan
 
 | Week | Focus | Checkpoint |
 |---|---|---|
@@ -568,19 +710,36 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 | 13 | DataChunk + VecScan | Batch reads correct, row count verified |
 | 14 | VecFilter + VecProject + late materialization | Selection vector pattern correct, materialization documented |
 | 15 | VecAggregate + VecHashJoin + Phase 3 benchmarks | All 3 mode combos benchmarked, batch size tuned |
-| 16 | TableStats + ColumnStats | Stats populated on load, visible in EXPLAIN ANALYZE |
-| 17 | Optimizer rules | Predicate pushdown, reordering, join side selection working |
-| 18 | Phase 4 benchmarks + full suite | Optimizer gains isolated, all plots generated |
-| 19 | Full integration pass | All modes correct, full test suite passing, clean build |
-| 20 | README final + verbal prep | Project recruiting-ready |
+| 16 | Binder + planning correctness | Stable qualified column identities |
+| 17 | Logical plan | Vectorized queries represented independently of execution |
+| 18 | Vectorized physical planning | Shared builder replaces planning in `main.cc` |
+| 19 | Statistics collection | Catalog statistics populated on load |
+| 20 | Cardinality estimation | Estimates propagate through logical plans |
+| 21 | Predicate optimization | Filters pushed down and evaluated incrementally |
+| 22 | Cost model + join selection | Filtered build side and join algorithm costed |
+| 23 | Phase 4 explain + benchmarks | Optimizer gains and estimate errors documented |
+| 24 | General expressions | Arithmetic and aliased expressions execute |
+| 25 | Predicates + scalar functions | Required TPC-H expressions supported |
+| 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly |
+| 27 | Multi-way join execution | General vectorized join trees execute |
+| 28 | Join enumeration | DP join ordering with greedy fallback works |
+| 29 | Outer join | Left outer hash join correct |
+| 30 | Subquery parsing + binding | Nested scopes and subquery forms bind |
+| 31 | Scalar + uncorrelated subqueries | Uncorrelated subqueries execute |
+| 32 | Semi-joins + anti-joins | Set-membership subqueries optimized |
+| 33 | Correlated subqueries | Required TPC-H patterns decorrelated |
+| 34 | Derived tables + distinct aggregates | Q15 rewrite and `COUNT(DISTINCT)` supported |
+| 35 | TPC-H data + harness | Reproducible data and query workflow |
+| 36 | Query coverage + correctness | Supported queries match reference results |
+| 37 | TPC-H benchmarks + documentation | Coverage and performance published |
 
 ---
 
 ## Benchmarks
 
-*To be populated during Weeks 12, 15, and 18.*
+*To be populated during Weeks 12, 15, 23, and 37.*
 
-> **Note:** All benchmark times measured after CSV load to isolate query execution performance. Once the MVP is complete, TPC-H benchmark queries will be used for formal evaluation.
+> **Note:** Phase benchmarks exclude data loading to isolate query execution. Phase 5 adds formal TPC-H correctness and performance measurements.
 
 ### Phase Comparison
 
@@ -650,7 +809,7 @@ make -j$(nproc)
 # Bypass the result cache
 ./swiftql --catalog catalog.json --query "..." --no-cache
 
-# Disable the optimizer
+# Disable the vectorized optimizer
 ./swiftql --catalog catalog.json --query "..." --no-optimize
 ```
 
@@ -699,7 +858,7 @@ Execution: 72.0ms
 - Null handling scoped to `IS NULL` / `IS NOT NULL` predicates — full three-valued logic not implemented
 - Commas inside string values not supported in CSV input
 - No persistence beyond CSV files and catalog JSON
-- Optimizer uses simple heuristics — no dynamic programming join ordering
+- Cost-based optimization applies only to columnar/vectorized execution
 - Result cache invalidation not implemented — cache is cleared on process restart only
 
 ---
@@ -710,6 +869,9 @@ If the project completes ahead of schedule, the following extensions are candida
 
 - **Binary columnar file format** — serialize `ColumnarTable` to a simple binary format on first load, read from binary on subsequent runs; eliminates CSV parsing overhead on cold start, analogous to how Parquet works
 - **Parallel scan + parallel aggregation** — partition table chunks across threads using a thread pool; per-thread aggregation maps merged at the end; expected 2–4× speedup on scan-heavy workloads on multi-core systems
+- **Richer optimizer statistics** — histograms, multi-column correlation statistics, and adaptive reoptimization
+- **Larger-than-memory execution** — spill-capable hash joins, aggregates, and sorts
+- **TPC-DS** — extend the SQL dialect and benchmark harness beyond TPC-H
 
 ---
 
