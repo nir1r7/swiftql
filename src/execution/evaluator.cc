@@ -2,6 +2,16 @@
 #include <stdexcept>
 
 
+int resolveColumnIndex(const ColumnRef& col, const Schema& schema){
+    if (col.relation_slot >= 0) {
+        int idx = schema.indexOf(col.column_name, col.relation_slot);
+        if (idx != -1) return idx;
+        // slot-qualified miss (e.g. post-aggregate/projected schema that no
+        // longer carries the original slot): fall back to bare name.
+    }
+    return schema.indexOf(col.column_name);
+}
+
 Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     // literal
     if (auto* lit = dynamic_cast<const Literal*>(expr)) {
@@ -10,7 +20,7 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
 
     // column reference
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        int idx = schema.indexOf(col->column_name);
+        int idx = resolveColumnIndex(*col, schema);
         if (idx == -1)
             throw std::runtime_error("Column not found in schema: " + col->column_name);
         return row[idx];

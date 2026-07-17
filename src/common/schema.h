@@ -13,6 +13,11 @@ using Row = std::vector<Value>;
 struct ColumnDef {
     std::string name;
     TypeId type;
+    // Relation identity: 0 = FROM side (default, so all single-relation schemas
+    // are slot 0 automatically), 1 = JOIN side. Stamped on the merged join
+    // schema so qualified column references resolve to the correct side even
+    // when both sides share a column name (incl. self-joins).
+    int relation_slot = 0;
 };
 
 class Schema {
@@ -28,8 +33,13 @@ class Schema {
         // return all ColumnDef(s)
         const std::vector<ColumnDef>& columns() const;
 
-        // return a ColumnDef's index by name
+        // return a ColumnDef's index by name (first match; slot-agnostic)
         int indexOf(const std::string& name) const;
+
+        // return a ColumnDef's index by (relation_slot, name).
+        // Used for qualified column resolution where a bare name may be
+        // ambiguous across join sides. Returns -1 if no column matches both.
+        int indexOf(const std::string& name, int relation_slot) const;
 
         // has ColumnDef
         bool hasColumn(const std::string& name) const;

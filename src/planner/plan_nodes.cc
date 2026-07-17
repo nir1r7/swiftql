@@ -234,7 +234,11 @@ void HashAggregateNode::open() {
             acc.count++;
 
             if (!spec.is_star) {
-                Value val = (*row)[child_schema.indexOf(spec.column)];
+                int agg_idx = spec.relation_slot >= 0
+                    ? child_schema.indexOf(spec.column, spec.relation_slot)
+                    : -1;
+                if (agg_idx < 0) agg_idx = child_schema.indexOf(spec.column);
+                Value val = (*row)[agg_idx];
                 // skip NULLs (except COUNT(*))
                 if (!val.isNull()) {
                     acc.non_null_count++;

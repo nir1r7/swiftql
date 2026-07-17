@@ -44,7 +44,13 @@ void VecHashAggregateNode::consumeAll() {
 
     std::vector<int> agg_idxs;
     for (const auto& spec : specs_){
-        agg_idxs.push_back(spec.is_star ? -1 : child_schema.indexOf(spec.column));
+        if (spec.is_star) { agg_idxs.push_back(-1); continue; }
+        // slot-aware: distinguishes join sides sharing a column name (e.g. AVG(l2.speed))
+        int idx = spec.relation_slot >= 0
+            ? child_schema.indexOf(spec.column, spec.relation_slot)
+            : -1;
+        if (idx < 0) idx = child_schema.indexOf(spec.column);
+        agg_idxs.push_back(idx);
     }
 
     while (DataChunk* chunk = child_->nextChunk()) {

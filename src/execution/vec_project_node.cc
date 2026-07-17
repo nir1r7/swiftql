@@ -62,7 +62,7 @@ DataChunk* VecProjectNode::nextChunk(){
     std::vector<int> src_col(expressions_.size(), -1);
     for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
         if (auto* cr = dynamic_cast<const ColumnRef*>(expressions_[c].get())){
-            src_col[c] = child_schema.indexOf(cr->column_name);
+            src_col[c] = resolveColumnIndex(*cr, child_schema);
         }
     }
     bool has_complex = false;

@@ -18,10 +18,15 @@ namespace {
             return;
         }
 
-        // accept ColumnRef operator Literal
+        // accept ColumnRef operator Literal.
+        // Pruning only ever runs against the FROM-side scan's zone maps, so a
+        // predicate over a JOIN-side column (relation_slot == 1) must be
+        // ignored here — otherwise a shared column name (e.g. both tables have
+        // `team`) would prune the FROM table on the JOIN table's value.
+        // slot < 1 covers FROM (0) and unresolved/single-table (-1).
         const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
         const auto* lit = dynamic_cast<const Literal*>(bin->right.get());
-        if (col && lit){
+        if (col && lit && col->relation_slot < 1){
             out.emplace_back(col->column_name, bin->op, lit->value);
         }
     }

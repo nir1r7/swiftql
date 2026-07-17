@@ -29,6 +29,13 @@ int Schema::indexOf(const std::string& name) const {
     return -1;
 }
 
+int Schema::indexOf(const std::string& name, int relation_slot) const {
+    for (int i = 0; i < size(); i++){
+        if (columns_[i].name == name && columns_[i].relation_slot == relation_slot) return i;
+    }
+    return -1;
+}
+
 bool Schema::hasColumn(const std::string& name) const {
     return indexOf(name) != -1;
 }

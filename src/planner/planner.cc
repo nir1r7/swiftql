@@ -174,6 +174,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         for (const auto& col : child_schema.columns()) {
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
+            ref->relation_slot = col.relation_slot; // preserve side so SELECT * on a self-join emits both sides
             star_exprs.push_back(std::move(ref));
         }
         node = std::make_unique<ProjectNode>(std::move(node), std::move(star_exprs), child_schema);
@@ -204,7 +205,12 @@ Schema Planner::buildProjectSchema(const SelectStatement& stmt, const Schema& ta
 
     for (const auto& expr : stmt.select_list) {
         if (auto* col = dynamic_cast<ColumnRef*>(expr.get())) {
-            int idx = table_schema.indexOf(col->column_name);
+            // resolve slot-first (correct side on a join with shared names),
+            // falling back to bare name against post-aggregate schemas
+            int idx = col->relation_slot >= 0
+                ? table_schema.indexOf(col->column_name, col->relation_slot)
+                : -1;
+            if (idx < 0) idx = table_schema.indexOf(col->column_name);
             if (idx >= 0) {
                 cols.push_back(table_schema.column(idx));
             } else {
@@ -238,6 +244,7 @@ std::vector<AggregateSpec> Planner::extractAggregates(const SelectStatement& stm
             if (!agg->is_star && agg->argument) {
                 if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
                     spec.column = col->column_name;
+                    spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
                 }
             }
 

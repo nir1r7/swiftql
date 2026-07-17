@@ -119,7 +119,7 @@ SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Sc
         return evalFallback(pred, chunk, schema, input_sel);
     }
 
-    int col_idx = schema.indexOf(cr->column_name);
+    int col_idx = resolveColumnIndex(*cr, schema);
     if (col_idx < 0){
         return evalFallback(pred, chunk, schema, input_sel);
     }
