@@ -15,9 +15,8 @@ CATALOG_PATH = "catalog.json"
 LAPS_CSV = "data/laps.csv"
 DRIVERS_CSV = "data/drivers.csv"
 
-# README Phase 2 / Week 12 benchmark queries. The README shows table aliases for
-# the join; SwiftQL does not parse aliases yet, so use the equivalent qualified
-# form already used by benchmark.py.
+# README Phase 2 / Week 12 benchmark queries. (SwiftQL now parses table aliases;
+# the qualified form here matches benchmark.py and stays alias-free for parity.)
 PHASE2_WEEK12_BENCHMARK_QUERIES = [
     "SELECT AVG(speed) FROM laps",
     "SELECT COUNT(*) FROM laps WHERE season = 2025",
@@ -56,10 +55,24 @@ REGRESSION_QUERIES = [
     "SELECT season, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY season ORDER BY season",
 ]
 
+# Self-join + qualified-column disambiguation (Week 16 alias/binder work).
+# Self-joins use the unique key lap_id (1:1) so output stays bounded, then
+# aggregate down. Aggregate/projected columns have distinct names so the
+# harness compares them positionally (duplicate names collapse in its dict-based
+# row model). Correctness of distinct same-named side values is locked by unit
+# tests (SelfJoin.DistinctSideValuesResolveIndependently).
+SELF_JOIN_QUERIES = [
+    "SELECT COUNT(*) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.lap_id",
+    "SELECT l1.season, COUNT(*) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.lap_id GROUP BY l1.season ORDER BY l1.season",
+    "SELECT l1.team, AVG(l2.speed) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.lap_id GROUP BY l1.team ORDER BY l1.team",
+    # qualified column disambiguation: drivers.team resolves to the JOIN side
+    "SELECT drivers.team, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY drivers.team ORDER BY drivers.team",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
-]
+] + SELF_JOIN_QUERIES
 
 # SQLite setup
 def load_sqlite():
