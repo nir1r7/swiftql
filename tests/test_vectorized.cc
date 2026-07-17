@@ -2167,6 +2167,28 @@ TEST(VecHashJoin, ProbeColsFirst) {
     EXPECT_EQ(s.column(3).name, "bname");
 }
 
+// When the FROM table is the smaller (build) side, the planner passes
+// swapped=true. Output rows must still follow logical [FROM, JOIN] order
+// (FROM values first) even though FROM is physically the build side.
+TEST(VecHashJoin, SwappedEmitsFromSideFirst) {
+    // Physical: probe = JOIN side (fid), build = FROM side (fromid).
+    // Logical output schema is [FROM cols, JOIN cols].
+    Schema probe_schema = vecSchema({{"jid", TypeId::INT}, {"jname", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING},
+                                      {"jid", TypeId::INT}, {"jname", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(1LL), Value(std::string("joinrow"))}};
+    std::vector<Row> build_rows = {{Value(1LL), Value(std::string("fromrow"))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        "jid", "fid", out_schema, /*swapped=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 1u);
+    // FROM (build) columns must come first despite being the physical build side
+    EXPECT_EQ(rows[0][1].asString(), "fromrow"); // FROM side fname
+    EXPECT_EQ(rows[0][3].asString(), "joinrow"); // JOIN side jname
+}
+
 TEST(VecHashJoin, MultiChunkProbe) {
     // probe: ids 0..BATCH_SIZE+4; build: ids 1 and BATCH_SIZE+2
     // id=1 is in the first probe chunk; id=BATCH_SIZE+2 is in the second
