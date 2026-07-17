@@ -1,6 +1,7 @@
 #pragma once
 
 #include "plan_node.h"
+#include "logical_plan.h"
 #include "parser/ast.h"
 #include "storage/csv_loader.h"
 #include "storage/columnar_table.h"
@@ -79,17 +80,6 @@ class ProjectNode : public PlanNode {
         Row current_row_;
 };
 
-
-// aggregate specification for a single aggregate function
-struct AggregateSpec {
-    std::string function; // i.e, AVG, SUM, ...
-    std::string column; // empty for star param
-    bool is_star;
-    // relation slot of the argument column (binder-assigned): distinguishes
-    // join sides that share a column name, e.g. AVG(l2.speed) on a self-join.
-    // -1 = unresolved/single-relation (resolve by bare name).
-    int relation_slot = -1;
-};
 
 // group rows by specified columns and compute aggregates (apply GROUP BY)
 class HashAggregateNode : public PlanNode {

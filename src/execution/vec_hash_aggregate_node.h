@@ -1,6 +1,6 @@
 #pragma once
 #include "planner/vec_plan_node.h"
-#include "planner/plan_nodes.h"
+#include "planner/logical_plan.h"
 #include <memory>
 #include <string>
 #include <unordered_map>
