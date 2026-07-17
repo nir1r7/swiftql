@@ -12,8 +12,13 @@ struct Expr {
 
 // reference to a column
 struct ColumnRef : Expr {
-    std::string table_name; 
+    std::string table_name;
     std::string column_name;
+    // Relation identity assigned by the Binder: 0 = FROM side, 1 = JOIN side,
+    // -1 = unresolved. Distinguishes self-join occurrences (l1 vs l2) that
+    // share a canonical table_name. Evaluation resolves by (slot, name) when
+    // slot >= 0, falling back to bare name otherwise.
+    int relation_slot = -1;
 };
 
 // literal or constant
@@ -57,10 +62,12 @@ struct SelectStatement {
     std::vector<std::unique_ptr<Expr>> select_list;
 
     std::string from_table;
+    std::string from_alias; // empty if FROM table has no alias
 
     // optional JOIN
     struct JoinClause {
         std::string join_table;
+        std::string alias; // empty if JOIN table has no alias
         std::unique_ptr<Expr> condition; // the ON expression
     };
     std::optional<JoinClause> join;

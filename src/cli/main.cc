@@ -11,6 +11,7 @@
 #include "catalog/catalog.h"
 #include "parser/parser.h"
 #include "planner/planner.h"
+#include "planner/binder.h"
 #include "planner/plan_nodes.h"
 #include "planner/vec_plan_node.h"
 #include "storage/csv_loader.h"
@@ -227,6 +228,7 @@ int main(int argc, char* argv[]) {
             auto parse_start = std::chrono::high_resolution_clock::now();
             Parser parser(query);
             auto stmt = parser.parse();
+            Binder::bind(stmt, catalog);
             double parse_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - parse_start).count();
 
             CacheKey cache_key{query, args.storage, args.execution, args.no_optimize};

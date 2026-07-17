@@ -64,21 +64,26 @@ SelectStatement Parser::parseSelect(){
     stmt.from_table = expect(TokenType::IDENTIFIER, "table name").value;
 
     // optional table alias (e.g. FROM laps l)
-    // consume and discard the alias (for now hopefully)
-    if (check(TokenType::IDENTIFIER) && 
-        !check(TokenType::JOIN) && 
+    if (check(TokenType::IDENTIFIER) &&
+        !check(TokenType::JOIN) &&
         !check(TokenType::WHERE) &&
         !check(TokenType::GROUP) &&
         !check(TokenType::ORDER) &&
         !check(TokenType::LIMIT) &&
         !check(TokenType::HAVING) &&
         !check(TokenType::END_OF_FILE)) {
-        consume(); // discard alias
+        stmt.from_alias = consume().value;
     }
 
     if (match(TokenType::JOIN)){
         SelectStatement::JoinClause join;
         join.join_table = expect(TokenType::IDENTIFIER, "join table name").value;
+
+        // optional join table alias (i.e, JOIN drivers d)
+        if (check(TokenType::IDENTIFIER)) {
+            join.alias = consume().value;
+        }
+
         expect(TokenType::ON, "ON");
         join.condition = parseExpr();
         stmt.join = std::move(join);
