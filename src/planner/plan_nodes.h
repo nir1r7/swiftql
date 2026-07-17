@@ -190,10 +190,11 @@ class LimitNode : public PlanNode {
 
 
 // perform inner join (apply JOIN)
-// not to be implemented yet
+// left_ probes, right_ builds. output_schema stays in logical FROM/JOIN order;
+// swapped_ means physical build/probe order is reversed and output must swap.
 class HashJoinNode : public PlanNode {
     public:
-        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema);
+        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema, bool swapped = false);
 
         void open() override;
         Row* next() override;
@@ -207,6 +208,7 @@ class HashJoinNode : public PlanNode {
         std::string left_col_; // join column from left table
         std::string right_col_; // join column from right table
         Schema output_schema_;
+        bool swapped_; // true: right_ (build) is logically first; see class comment
 
         std::unordered_map<std::string, std::vector<Row>> hash_table_;
         

@@ -272,8 +272,17 @@ int main(int argc, char* argv[]) {
 
                 // Capture row counts before columnar tables are moved into scan nodes
                 int from_row_count = columnar_tables.at(stmt.from_table).num_rows;
-                int join_row_count = (stmt.join.has_value() && columnar_tables.count(stmt.join->join_table))
-                    ? columnar_tables.at(stmt.join->join_table).num_rows : 0;
+
+                // Self-join: preserve a copy of the shared table for the JOIN
+                // scan, since the FROM scan below moves it out of the map.
+                bool self_join = stmt.join.has_value() && stmt.join->join_table == stmt.from_table;
+                std::optional<ColumnarTable> self_join_columnar;
+                if (self_join) self_join_columnar = columnar_tables.at(stmt.from_table);
+
+                int join_row_count = self_join
+                    ? from_row_count
+                    : ((stmt.join.has_value() && columnar_tables.count(stmt.join->join_table))
+                        ? columnar_tables.at(stmt.join->join_table).num_rows : 0);
 
                 auto plan_start = std::chrono::high_resolution_clock::now();
 
@@ -294,46 +303,56 @@ int main(int argc, char* argv[]) {
                     Schema join_scan_schema = Planner::buildScanSchema(stmt, join_meta.schema);
                     auto join_scan = std::make_unique<VecScanNode>(
                         stmt.join->join_table,
-                        std::move(columnar_tables.at(stmt.join->join_table)),
+                        self_join ? std::move(*self_join_columnar)
+                                  : std::move(columnar_tables.at(stmt.join->join_table)),
                         join_scan_schema);
 
-                    std::string left_col, right_col, left_table, right_table;
+                    // extract join column names + binder-assigned slots from ON condition
+                    std::string left_col, right_col;
+                    int left_slot = -1, right_slot = -1;
                     if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
                         if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
-                            left_col   = lc->column_name;
-                            left_table = lc->table_name;
+                            left_col  = lc->column_name;
+                            left_slot = lc->relation_slot;
                         }
                         if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
-                            right_col   = rc->column_name;
-                            right_table = rc->table_name;
+                            right_col  = rc->column_name;
+                            right_slot = rc->relation_slot;
                         }
                     }
-                    // If table qualifiers are present, route by table name so that
-                    // ON join_table.col = from_table.col is handled correctly.
-                    // Without qualifiers, fall back to positional assumption (left=FROM, right=JOIN).
-                    std::string from_col = left_col, join_col = right_col;
-                    if (!left_table.empty() && !right_table.empty()) {
-                        if (left_table == stmt.join->join_table)
-                            std::swap(from_col, join_col);
+                    // Route each ON column to its side by binder-assigned slot
+                    // (0=FROM, 1=JOIN) — the only way to disambiguate a
+                    // self-join's two occurrences. Positional fallback otherwise.
+                    std::string from_col, join_col;
+                    if (left_slot >= 0 && right_slot >= 0 && left_slot != right_slot) {
+                        from_col = (left_slot == 0) ? left_col : right_col;
+                        join_col = (left_slot == 0) ? right_col : left_col;
+                    } else {
+                        from_col = left_col;
+                        join_col = right_col;
                     }
+
+                    // Output schema order is always [FROM columns, JOIN columns],
+                    // fixed logical order, independent of build/probe swap.
+                    // JOIN-side columns stamped slot 1 for qualified resolution.
+                    std::vector<ColumnDef> merged_cols = vec_node->outputSchema().columns();
+                    for (ColumnDef col : join_scan->outputSchema().columns()) {
+                        col.relation_slot = 1;
+                        merged_cols.push_back(col);
+                    }
+                    Schema merged_schema(merged_cols);
 
                     bool swap = (from_row_count < join_row_count);
                     if (swap) {
                         // FROM is smaller: FROM becomes build, JOIN becomes probe
-                        std::vector<ColumnDef> merged_cols = join_scan->outputSchema().columns();
-                        for (const auto& col : vec_node->outputSchema().columns())
-                            merged_cols.push_back(col);
                         vec_node = std::make_unique<VecHashJoinNode>(
                             std::move(join_scan), std::move(vec_node),
-                            join_col, from_col, Schema(merged_cols));
+                            join_col, from_col, merged_schema, /*swapped=*/true);
                     } else {
                         // JOIN is smaller or equal: JOIN stays build, FROM stays probe
-                        std::vector<ColumnDef> merged_cols = vec_node->outputSchema().columns();
-                        for (const auto& col : join_scan->outputSchema().columns())
-                            merged_cols.push_back(col);
                         vec_node = std::make_unique<VecHashJoinNode>(
                             std::move(vec_node), std::move(join_scan),
-                            from_col, join_col, Schema(merged_cols));
+                            from_col, join_col, merged_schema, /*swapped=*/false);
                     }
                 }
 
@@ -375,6 +394,7 @@ int main(int argc, char* argv[]) {
                         for (const auto& col : star_schema.columns()) {
                             auto ref = std::make_unique<ColumnRef>();
                             ref->column_name = col.name;
+                            ref->relation_slot = col.relation_slot; // preserve side for SELECT * on self-join
                             star_exprs.push_back(std::move(ref));
                         }
                         vec_node = std::make_unique<VecProjectNode>(

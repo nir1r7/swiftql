@@ -530,7 +530,7 @@ std::vector<PlanNode*> LimitNode::children() const {
 
 
 // HashJoinNode
-HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema) : left_(std::move(left)), right_(std::move(right)), left_col_(std::move(left_col)), right_col_(std::move(right_col)), output_schema_(std::move(output_schema)) {}
+HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema, bool swapped) : left_(std::move(left)), right_(std::move(right)), left_col_(std::move(left_col)), right_col_(std::move(right_col)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
 
 void HashJoinNode::open() {
     left_->open();
@@ -577,8 +577,13 @@ Row* HashJoinNode::next() {
                 const Row& build_row = it->second[bucket_idx_++];
 
                 current_row_.clear();
-                for (const Value& v : *current_probe_row_) current_row_.push_back(v);
-                for (const Value& v : build_row) current_row_.push_back(v);
+                if (swapped_) {
+                    for (const Value& v : build_row) current_row_.push_back(v);
+                    for (const Value& v : *current_probe_row_) current_row_.push_back(v);
+                } else {
+                    for (const Value& v : *current_probe_row_) current_row_.push_back(v);
+                    for (const Value& v : build_row) current_row_.push_back(v);
+                }
 
                 stats.rows_out++;
                 stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();

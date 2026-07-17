@@ -70,6 +70,20 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // capture before std::move transfers ownership into SeqScanNode
     int from_row_count = columnar_tables.count(stmt.from_table) > 0 ? columnar_tables.at(stmt.from_table).num_rows : (int)table_rows.at(stmt.from_table).size();
 
+    // Self-join: both scans read the same catalog table, keyed once in the
+    // map. The FROM scan below moves that data out, so preserve a copy for the
+    // JOIN scan. (A copy — not shared ownership — keeps this a minimal change;
+    // it costs one extra table copy, acceptable at this project's scale.)
+    bool self_join = stmt.join.has_value() && stmt.join->join_table == stmt.from_table;
+    std::optional<ColumnarTable> self_join_columnar;
+    std::optional<std::vector<Row>> self_join_rows;
+    if (self_join) {
+        if (columnar_tables.count(stmt.from_table) > 0)
+            self_join_columnar = columnar_tables.at(stmt.from_table);
+        else
+            self_join_rows = table_rows.at(stmt.from_table);
+    }
+
     // build seqScan (bottom of tree) using narrowed schema
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
@@ -85,55 +99,68 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         Schema right_scan_schema = narrowSchema(join_meta.schema, required);
 
         // capture before std::move transfers ownership into SeqScanNode
-        int join_row_count = columnar_tables.count(stmt.join->join_table) > 0
-            ? columnar_tables.at(stmt.join->join_table).num_rows
-            : (int)table_rows.at(stmt.join->join_table).size();
+        int join_row_count = self_join
+            ? from_row_count
+            : (columnar_tables.count(stmt.join->join_table) > 0
+                ? columnar_tables.at(stmt.join->join_table).num_rows
+                : (int)table_rows.at(stmt.join->join_table).size());
 
         std::unique_ptr<PlanNode> right;
-        if (columnar_tables.count(stmt.join->join_table) > 0) {
+        if (self_join) {
+            // read from the copy preserved before the FROM scan moved the data
+            if (self_join_columnar.has_value())
+                right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(*self_join_columnar), right_scan_schema, nullptr);
+            else
+                right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(*self_join_rows), join_meta.schema);
+        } else if (columnar_tables.count(stmt.join->join_table) > 0) {
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), right_scan_schema, nullptr);
         } else {
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
         }
 
-        // extract join column names from ON condition
-        std::string left_col, right_col, left_table, right_table;
+        // extract join column names + binder-assigned slots from ON condition
+        std::string left_col, right_col;
+        int left_slot = -1, right_slot = -1;
         if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
             if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
-                left_col   = lc->column_name;
-                left_table = lc->table_name;
+                left_col  = lc->column_name;
+                left_slot = lc->relation_slot;
             }
             if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
-                right_col   = rc->column_name;
-                right_table = rc->table_name;
+                right_col  = rc->column_name;
+                right_slot = rc->relation_slot;
             }
         }
-        // If table qualifiers are present, route by table name so that
-        // ON join_table.col = from_table.col is handled correctly.
-        // Without qualifiers, fall back to positional assumption (left=FROM, right=JOIN).
-        std::string from_col = left_col, join_col = right_col;
-        if (!left_table.empty() && !right_table.empty()) {
-            if (left_table == stmt.join->join_table)
-                std::swap(from_col, join_col);
+        // Route each ON column to its side by binder-assigned slot (0=FROM,
+        // 1=JOIN). This is the only way to disambiguate a self-join's two
+        // occurrences (both share the canonical table name). Falls back to
+        // positional (left=FROM, right=JOIN) when slots are unset.
+        std::string from_col, join_col;
+        if (left_slot >= 0 && right_slot >= 0 && left_slot != right_slot) {
+            from_col = (left_slot == 0) ? left_col : right_col;
+            join_col = (left_slot == 0) ? right_col : left_col;
+        } else {
+            from_col = left_col;
+            join_col = right_col;
         }
 
-        // put the smaller table on the build side (right_) to minimise hash table memory
-        // Option A: output schema order follows probe side (see memory: hash-join-schema-ordering-debt)
+        // put the smaller table on the build side (right_) to minimise hash table memory.
+        // Output schema order is always [FROM columns, JOIN columns] — fixed
+        // logical order, independent of which side is physically build.
+        // JOIN-side columns are stamped slot 1 so qualified references resolve
+        // to the correct side even when both sides share a column name.
+        std::vector<ColumnDef> merged_cols = node->outputSchema().columns();
+        for (ColumnDef col : right->outputSchema().columns()) {
+            col.relation_slot = 1;
+            merged_cols.push_back(col);
+        }
+        Schema merged_schema(merged_cols);
+
         bool swap = from_row_count < join_row_count;
         if (swap) {
-            // FROM table is smaller — FROM becomes build (right_), JOIN becomes probe (left_)
-            std::vector<ColumnDef> merged_cols = right->outputSchema().columns();
-            for (const auto& col : node->outputSchema().columns())
-                merged_cols.push_back(col);
-            Schema merged_schema(merged_cols);
-            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_col, from_col, merged_schema);
+            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_col, from_col, merged_schema, /*swapped=*/true);
         } else {
-            // JOIN table is smaller (or equal) — JOIN stays build (right_), FROM stays probe (left_)
-            std::vector<ColumnDef> merged_cols = node->outputSchema().columns();
-            for (const auto& col : right->outputSchema().columns())
-                merged_cols.push_back(col);
-            Schema merged_schema(merged_cols);
-            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_col, join_col, merged_schema);
+            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_col, join_col, merged_schema, /*swapped=*/false);
         }
     }
 

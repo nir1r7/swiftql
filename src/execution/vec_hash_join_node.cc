@@ -3,7 +3,7 @@
 #include <chrono>
 #include <numeric>
 
-VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_join_col_(std::move(probe_join_col)), build_join_col_(std::move(build_join_col)), output_schema_(std::move(output_schema)) {}
+VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema, bool swapped) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_join_col_(std::move(probe_join_col)), build_join_col_(std::move(build_join_col)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
 
 void VecHashJoinNode::open() {
     probe_child_->open();
@@ -114,17 +114,29 @@ DataChunk* VecHashJoinNode::nextChunk() {
             if (it == hash_table_.end()) continue;
 
             for (const Row& build_row : it->second) {
-                // output row: probe columns first, then build columns matches the merged schema constructed in planner wiring
+                // output row order always matches output_schema_'s fixed
+                // [FROM, JOIN] logical order — reorder here when the FROM
+                // table ended up on the build side (swapped_).
                 Row out_row;
                 out_row.reserve(output_schema_.size());
 
-                for (const auto& cv : probe_chunk->columns) {
-                    std::visit([&](const auto& vec) {
-                        out_row.push_back(Value(vec[r]));
-                    }, cv.data);
-                }
-                for (const Value& v : build_row) {
-                    out_row.push_back(v);
+                auto append_probe = [&]() {
+                    for (const auto& cv : probe_chunk->columns) {
+                        std::visit([&](const auto& vec) {
+                            out_row.push_back(Value(vec[r]));
+                        }, cv.data);
+                    }
+                };
+                auto append_build = [&]() {
+                    for (const Value& v : build_row) out_row.push_back(v);
+                };
+
+                if (swapped_) {
+                    append_build();
+                    append_probe();
+                } else {
+                    append_probe();
+                    append_build();
                 }
                 output_buffer_.push_back(std::move(out_row));
             }
