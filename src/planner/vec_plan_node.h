@@ -6,8 +6,8 @@
 #include <string>
 
 struct VecNodeStats {
-    int rows_in = 0;
-    int rows_out = 0;
+    int64_t rows_in = 0;
+    int64_t rows_out = 0;
     double elapsed_us = 0.0;
 };
 

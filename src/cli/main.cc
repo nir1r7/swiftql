@@ -116,12 +116,8 @@ void collectNodes(PlanNode* node, int depth, bool analyze,
     NodeLine line;
     line.label = std::string(depth * 2, ' ') + node->explain();
     if (analyze) {
-        if (node->stats.rows_in > 0){
-            line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
-        }
-        if (node->stats.rows_out > 0){
-            line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
-        }
+        line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
+        line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
         line.time = "time=" + formatMicros(node->stats.elapsed_us) + "µs";
         if (exec_total_us > 0.0) {
             std::ostringstream p;
@@ -139,12 +135,10 @@ void collectVecNodes(VecPlanNode* node, int depth, bool analyze, double exec_tot
     NodeLine line;
     line.label = std::string(depth * 2, ' ') + node->explain();
     if (analyze) {
-        if (node->stats.rows_in > 0){
-            line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
-        }
-        if (node->stats.rows_out > 0){
-            line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
-        }
+        // analyze mode implies full execution, so print rows_in/rows_out
+        // unconditionally — a real 0 must be visible.
+        line.rows_in = "rows_in=" + std::to_string(node->stats.rows_in);
+        line.rows_out = "rows_out=" + std::to_string(node->stats.rows_out);
         line.time = "time=" + formatMicros(node->stats.elapsed_us) + "µs";
         if (exec_total_us > 0.0) {
             std::ostringstream p;
