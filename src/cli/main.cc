@@ -26,8 +26,30 @@
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/vec_hash_join_node.h"
 
-// result cache: raw SQL to {schema, rows}
-static std::unordered_map<std::string, std::pair<Schema, std::vector<Row>>> result_cache;
+// result cache key: query text plus every flag
+struct CacheKey {
+    std::string query;
+    std::string storage;
+    std::string execution;
+    bool no_optimize;
+
+    bool operator==(const CacheKey& other) const {
+        return query == other.query && storage == other.storage &&
+               execution == other.execution && no_optimize == other.no_optimize;
+    }
+};
+
+struct CacheKeyHash {
+    size_t operator()(const CacheKey& k) const {
+        size_t h = std::hash<std::string>{}(k.query);
+        h ^= std::hash<std::string>{}(k.storage) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<std::string>{}(k.execution) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(k.no_optimize) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static std::unordered_map<CacheKey, std::pair<Schema, std::vector<Row>>, CacheKeyHash> result_cache;
 
 // argument parsing
 struct Args {
@@ -207,6 +229,8 @@ int main(int argc, char* argv[]) {
             auto stmt = parser.parse();
             double parse_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - parse_start).count();
 
+            CacheKey cache_key{query, args.storage, args.execution, args.no_optimize};
+
             // load CSV data (excluded from timing, per benchmark methodology)
             std::unordered_map<std::string, std::vector<Row>> table_rows;
             const TableMetadata& meta = catalog.getTable(stmt.from_table);
@@ -382,7 +406,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (!args.no_cache && !args.explain_analyze) {
-                    auto it = result_cache.find(query);
+                    auto it = result_cache.find(cache_key);
                     if (it != result_cache.end()) {
                         std::cout << "[cache hit]\n";
                         printResults(it->second.second, it->second.first);
@@ -427,7 +451,7 @@ int main(int argc, char* argv[]) {
 
                 const Schema& out_schema = vec_node->outputSchema();
                 if (!args.no_cache) {
-                    result_cache.emplace(query, std::make_pair(out_schema, rows));
+                    result_cache.emplace(cache_key, std::make_pair(out_schema, rows));
                 }
                 printResults(rows, out_schema);
                 continue;
@@ -448,7 +472,7 @@ int main(int argc, char* argv[]) {
 
             // cache lookup (skip for --explain-analyze and --no-cache)
             if (!args.no_cache && !args.explain_analyze) {
-                auto it = result_cache.find(query);
+                auto it = result_cache.find(cache_key);
                 if (it != result_cache.end()) {
                     std::cout << "[cache hit]\n";
                     printResults(it->second.second, it->second.first);
@@ -479,7 +503,7 @@ int main(int argc, char* argv[]) {
             }
 
             if (!args.no_cache){
-                result_cache.emplace(query, std::make_pair(plan->outputSchema(), rows));
+                result_cache.emplace(cache_key, std::make_pair(plan->outputSchema(), rows));
             }
 
             printResults(rows, plan->outputSchema());
