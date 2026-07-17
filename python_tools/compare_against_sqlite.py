@@ -55,6 +55,22 @@ REGRESSION_QUERIES = [
     "SELECT season, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY season ORDER BY season",
 ]
 
+# Week 6 checkpoint query: full operator pipeline in one statement
+# (WHERE + IS NOT NULL + GROUP BY + HAVING + DISTINCT + ORDER BY + LIMIT).
+WEEK6_CHECKPOINT_QUERIES = [
+    "SELECT DISTINCT team, AVG(speed) FROM laps WHERE season = 2025 AND speed IS NOT NULL "
+    "GROUP BY team HAVING AVG(speed) > 300 ORDER BY team LIMIT 10",
+]
+
+# Week 10 zone-map pruning: chunk-boundary predicates the pruner must evaluate
+# without dropping matching rows (`<` was previously untested; only `=`/`>` were covered).
+# Week 16 zero-row plan reporting: predicate matches nothing in any chunk.
+ZONE_MAP_QUERIES = [
+    "SELECT COUNT(*) FROM laps WHERE speed < 290",
+    "SELECT team FROM laps WHERE speed < 290 ORDER BY team LIMIT 5",
+    "SELECT team FROM laps WHERE season = 1900",
+]
+
 # Self-join + qualified-column disambiguation (Week 16 alias/binder work).
 # Self-joins use the unique key lap_id (1:1) so output stays bounded, then
 # aggregate down. Aggregate/projected columns have distinct names so the
@@ -72,7 +88,7 @@ SELF_JOIN_QUERIES = [
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
-] + SELF_JOIN_QUERIES
+] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -203,13 +219,18 @@ def main():
 
     p1, f1, e1 = run_query_suite(conn, QUERIES, "Default (row storage, Volcano)")
     p2, f2, e2 = run_query_suite(
+        conn, QUERIES, "Volcano (columnar storage, Week 8 storage-mode checkpoint)",
+        extra_args=["--storage", "columnar"],
+    )
+    p3, f3, e3 = run_query_suite(
         conn, QUERIES, "Vectorized (columnar storage, vec path)",
         extra_args=["--execution", "vectorized", "--storage", "columnar"],
     )
 
-    total_failed = f1 + f2
-    total_errors = e1 + e2
-    print(f"\nTotal: {p1 + p2} passed, {total_failed} failed, {total_errors} errors")
+    total_passed = p1 + p2 + p3
+    total_failed = f1 + f2 + f3
+    total_errors = e1 + e2 + e3
+    print(f"\nTotal: {total_passed} passed, {total_failed} failed, {total_errors} errors")
     if total_failed > 0 or total_errors > 0:
         sys.exit(1)
 
