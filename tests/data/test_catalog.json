@@ -25,6 +25,15 @@
         {"name": "team",        "type": "STRING"},
         {"name": "age",         "type": "INT"}
       ]
+    },
+    {
+      "name": "sj",
+      "file": "sj.csv",
+      "columns": [
+        {"name": "id",  "type": "INT"},
+        {"name": "grp", "type": "INT"},
+        {"name": "val", "type": "INT"}
+      ]
     }
   ]
 }
