@@ -12,20 +12,13 @@
 #include "parser/parser.h"
 #include "planner/planner.h"
 #include "planner/binder.h"
-#include "planner/plan_nodes.h"
+#include "planner/logical_plan.h"
 #include "planner/vec_plan_node.h"
+#include "planner/vectorized_plan_builder.h"
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
 #include "common/schema.h"
 #include "common/value.h"
-#include "execution/vec_scan_node.h"
-#include "execution/vec_filter_node.h"
-#include "execution/vec_project_node.h"
-#include "execution/vec_limit_node.h"
-#include "execution/vec_sort_node.h"
-#include "execution/vec_distinct_node.h"
-#include "execution/vec_hash_aggregate_node.h"
-#include "execution/vec_hash_join_node.h"
 
 // result cache key: query text plus every flag
 struct CacheKey {
@@ -267,155 +260,20 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
 
-                // Fix #3: validate before plan construction (same guarantee as Volcano path via Planner::plan)
-                Validator::validate(stmt, catalog);
-
-                // Capture row counts before columnar tables are moved into scan nodes
-                int from_row_count = columnar_tables.at(stmt.from_table).num_rows;
-
-                // Self-join: preserve a copy of the shared table for the JOIN
-                // scan, since the FROM scan below moves it out of the map.
-                bool self_join = stmt.join.has_value() && stmt.join->join_table == stmt.from_table;
-                std::optional<ColumnarTable> self_join_columnar;
-                if (self_join) self_join_columnar = columnar_tables.at(stmt.from_table);
-
-                int join_row_count = self_join
-                    ? from_row_count
-                    : ((stmt.join.has_value() && columnar_tables.count(stmt.join->join_table))
-                        ? columnar_tables.at(stmt.join->join_table).num_rows : 0);
-
                 auto plan_start = std::chrono::high_resolution_clock::now();
 
-                // Fix #2: narrow scan schema to only required columns (mirrors Planner::plan narrowSchema logic)
-                Schema from_scan_schema = Planner::buildScanSchema(stmt, meta.schema);
+                // bind → logical plan (validates internally) → optimize → lower
+                auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
 
-                // Fix #1: pass WHERE predicate for zone-map chunk pruning (non-owning; VecFilterNode takes
-                // ownership of the same expr at step 3, and is an ancestor of VecScanNode in the tree)
-                std::unique_ptr<VecPlanNode> vec_node = std::make_unique<VecScanNode>(
-                    stmt.from_table,
-                    std::move(columnar_tables.at(stmt.from_table)),
-                    from_scan_schema,
-                    stmt.where.get());
-
-                // Step 2: Join
-                if (stmt.join.has_value()) {
-                    const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
-                    Schema join_scan_schema = Planner::buildScanSchema(stmt, join_meta.schema);
-                    auto join_scan = std::make_unique<VecScanNode>(
-                        stmt.join->join_table,
-                        self_join ? std::move(*self_join_columnar)
-                                  : std::move(columnar_tables.at(stmt.join->join_table)),
-                        join_scan_schema);
-
-                    // extract join column names + binder-assigned slots from ON condition
-                    std::string left_col, right_col;
-                    int left_slot = -1, right_slot = -1;
-                    if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
-                        if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
-                            left_col  = lc->column_name;
-                            left_slot = lc->relation_slot;
-                        }
-                        if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
-                            right_col  = rc->column_name;
-                            right_slot = rc->relation_slot;
-                        }
-                    }
-                    // Route each ON column to its side by binder-assigned slot
-                    // (0=FROM, 1=JOIN) — the only way to disambiguate a
-                    // self-join's two occurrences. Positional fallback otherwise.
-                    std::string from_col, join_col;
-                    if (left_slot >= 0 && right_slot >= 0 && left_slot != right_slot) {
-                        from_col = (left_slot == 0) ? left_col : right_col;
-                        join_col = (left_slot == 0) ? right_col : left_col;
-                    } else {
-                        from_col = left_col;
-                        join_col = right_col;
-                    }
-
-                    // Output schema order is always [FROM columns, JOIN columns],
-                    // fixed logical order, independent of build/probe swap.
-                    // JOIN-side columns stamped slot 1 for qualified resolution.
-                    std::vector<ColumnDef> merged_cols = vec_node->outputSchema().columns();
-                    for (ColumnDef col : join_scan->outputSchema().columns()) {
-                        col.relation_slot = 1;
-                        merged_cols.push_back(col);
-                    }
-                    Schema merged_schema(merged_cols);
-
-                    bool swap = (from_row_count < join_row_count);
-                    if (swap) {
-                        // FROM is smaller: FROM becomes build, JOIN becomes probe
-                        vec_node = std::make_unique<VecHashJoinNode>(
-                            std::move(join_scan), std::move(vec_node),
-                            join_col, from_col, merged_schema, /*swapped=*/true);
-                    } else {
-                        // JOIN is smaller or equal: JOIN stays build, FROM stays probe
-                        vec_node = std::make_unique<VecHashJoinNode>(
-                            std::move(vec_node), std::move(join_scan),
-                            from_col, join_col, merged_schema, /*swapped=*/false);
-                    }
+                if (!args.no_optimize) {
+                    // Weeks 20–22: optimizer passes rewrite `logical` here.
+                    // Week 18: intentionally empty — both modes share the
+                    // lowering below, which is the point: --no-optimize skips
+                    // rewrites, never the builder.
                 }
 
-                // Step 3: Filter (WHERE)
-                if (stmt.where) {
-                    vec_node = std::make_unique<VecFilterNode>(
-                        std::move(vec_node), std::move(stmt.where));
-                }
-
-                // Step 4: Aggregate (GROUP BY / aggregates in SELECT)
-                bool has_aggs = false;
-                for (const auto& expr : stmt.select_list) {
-                    if (dynamic_cast<AggregateExpr*>(expr.get())) { has_aggs = true; break; }
-                }
-                if (!stmt.group_by.empty() || has_aggs) {
-                    Schema agg_schema = Planner::buildAggregateSchema(stmt, vec_node->outputSchema());
-                    auto specs = Planner::extractAggregates(stmt);
-                    vec_node = std::make_unique<VecHashAggregateNode>(
-                        std::move(vec_node), stmt.group_by, std::move(specs), agg_schema);
-                }
-
-                // Step 5: Having
-                if (stmt.having) {
-                    vec_node = std::make_unique<VecFilterNode>(
-                        std::move(vec_node), std::move(stmt.having));
-                }
-
-                // Step 6: Sort (ORDER BY)
-                if (!stmt.order_by.empty()) {
-                    vec_node = std::make_unique<VecSortNode>(
-                        std::move(vec_node), std::move(stmt.order_by));
-                }
-
-                // Step 7: Project — schema is final after agg/sort, so outputSchema() is correct here
-                {
-                    if (stmt.select_star) {
-                        Schema star_schema = vec_node->outputSchema();
-                        std::vector<std::unique_ptr<Expr>> star_exprs;
-                        for (const auto& col : star_schema.columns()) {
-                            auto ref = std::make_unique<ColumnRef>();
-                            ref->column_name = col.name;
-                            ref->relation_slot = col.relation_slot; // preserve side for SELECT * on self-join
-                            star_exprs.push_back(std::move(ref));
-                        }
-                        vec_node = std::make_unique<VecProjectNode>(
-                            std::move(vec_node), std::move(star_exprs), star_schema);
-                    } else {
-                        Schema proj_schema = Planner::buildProjectSchema(stmt, vec_node->outputSchema());
-                        vec_node = std::make_unique<VecProjectNode>(
-                            std::move(vec_node), std::move(stmt.select_list), proj_schema);
-                    }
-                }
-
-                // Step 8: Distinct
-                if (stmt.distinct) {
-                    vec_node = std::make_unique<VecDistinctNode>(std::move(vec_node));
-                }
-
-                // Step 9: Limit
-                if (stmt.limit.has_value()) {
-                    vec_node = std::make_unique<VecLimitNode>(
-                        std::move(vec_node), stmt.limit.value());
-                }
+                std::unique_ptr<VecPlanNode> vec_node = VectorizedPlanBuilder::build(
+                    std::move(logical), std::move(columnar_tables));
 
                 double plan_us = std::chrono::duration<double, std::micro>(
                     std::chrono::high_resolution_clock::now() - plan_start).count();
