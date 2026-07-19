@@ -1,71 +1,15 @@
 #include "planner.h"
 
-// collecting column names from expressions
-static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
-    if (!expr) return;
-    if (auto* cr = dynamic_cast<const ColumnRef*>(expr)){
-        out.insert(cr->column_name);
-        return;
-    }
-    
-    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)){
-        collectCols(bin->left.get(), out);
-        collectCols(bin->right.get(), out);
-        return;
-    }
-    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)){
-        collectCols(agg->argument.get(), out);
-        return;
-    }
-    if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)){
-        collectCols(isnull->operand.get(), out);
-        return;
-    }
-}
-
-// build schema using only required columns
-static Schema narrowSchema(const Schema& full, const std::unordered_set<std::string>& required) {
-    std::vector<ColumnDef> cols;
-    for (int i = 0; i < full.size(); ++i) {
-        if (required.count(full.column(i).name))
-            cols.push_back(full.column(i));
-    }
-    return Schema(cols);
-}
-
 std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
     // validate
     Validator::validate(stmt, catalog);
 
     const TableMetadata& meta = catalog.getTable(stmt.from_table);
 
-    // get required columns only
-    std::unordered_set<std::string> required;
-    if (stmt.select_star) {
-        for (const auto& col : meta.schema.columns()){
-            required.insert(col.name);
-        }
-    } else {
-        for (const auto& expr : stmt.select_list){
-            collectCols(expr.get(), required);
-        }
-        collectCols(stmt.where.get(), required);
-
-        for (const auto& col_name : stmt.group_by){
-            required.insert(col_name);
-        }
-        collectCols(stmt.having.get(), required);
-
-        for (const auto& item : stmt.order_by){
-            collectCols(item.expr.get(), required);
-        }
-        if (stmt.join.has_value()){
-            collectCols(stmt.join->condition.get(), required);
-        }
-    }
-
-    // narrow down schema
-    Schema scan_schema = narrowSchema(meta.schema, required);
+    // narrowed scan schema via the shared logical-layer helper — this also
+    // fixes SELECT * + JOIN under columnar storage, which previously narrowed
+    // the join table by the FROM table's column names
+    Schema scan_schema = buildScanSchema(stmt, meta.schema);
 
     // capture before std::move transfers ownership into SeqScanNode
     int from_row_count = columnar_tables.count(stmt.from_table) > 0 ? columnar_tables.at(stmt.from_table).num_rows : (int)table_rows.at(stmt.from_table).size();
@@ -96,7 +40,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     if (stmt.join.has_value()){
         const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
 
-        Schema right_scan_schema = narrowSchema(join_meta.schema, required);
+        Schema right_scan_schema = buildScanSchema(stmt, join_meta.schema);
 
         // capture before std::move transfers ownership into SeqScanNode
         int join_row_count = self_join
@@ -227,102 +171,3 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 }
 
 
-Schema Planner::buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema){
-    std::vector<ColumnDef> cols;
-
-    for (const auto& expr : stmt.select_list) {
-        if (auto* col = dynamic_cast<ColumnRef*>(expr.get())) {
-            // resolve slot-first (correct side on a join with shared names),
-            // falling back to bare name against post-aggregate schemas
-            int idx = col->relation_slot >= 0
-                ? table_schema.indexOf(col->column_name, col->relation_slot)
-                : -1;
-            if (idx < 0) idx = table_schema.indexOf(col->column_name);
-            if (idx >= 0) {
-                cols.push_back(table_schema.column(idx));
-            } else {
-                cols.push_back({col->column_name, TypeId::STRING});
-            }
-        } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            // aggregates on numeric columns produce DOUBLE
-            // COUNT always produces INT
-            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-            
-            std::string col_name = agg->function_name + "(";
-            col_name += agg->is_star ? "*" : dynamic_cast<ColumnRef*>(agg->argument.get())->column_name;
-            col_name += ")";
-            cols.push_back({col_name, result_type});
-        }
-    }
-
-    return Schema(cols);
-}
-
-
-std::vector<AggregateSpec> Planner::extractAggregates(const SelectStatement& stmt){
-    std::vector<AggregateSpec> specs;
-
-    for (const auto& expr : stmt.select_list) {
-        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            AggregateSpec spec;
-            spec.function = agg->function_name;
-            spec.is_star = agg->is_star;
-
-            if (!agg->is_star && agg->argument) {
-                if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
-                    spec.column = col->column_name;
-                    spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
-                }
-            }
-
-            specs.push_back(spec);
-        }
-    }
-
-    return specs;
-}
-
-
-Schema Planner::buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
-    if (stmt.select_star) return full_schema;
-    std::unordered_set<std::string> required;
-    for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
-    collectCols(stmt.where.get(), required);
-    for (const auto& col_name : stmt.group_by) required.insert(col_name);
-    collectCols(stmt.having.get(), required);
-    for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
-    if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
-    return narrowSchema(full_schema, required);
-}
-
-
-Schema Planner::buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema){
-    std::vector<ColumnDef> cols;
-
-    // group-by colums in order
-    for (const auto& col_name : stmt.group_by) {
-        int idx = table_schema.indexOf(col_name);
-        if (idx >= 0) {
-            cols.push_back(table_schema.column(idx));
-        }
-    }
-
-    // one output column per aggregate in the SELECT list
-    for (const auto& expr : stmt.select_list) {
-        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-
-            std::string col_name = agg->function_name + "(";
-            if (agg->is_star) {
-                col_name += "*";
-            } else if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
-                col_name += col->column_name;
-            }
-            col_name += ")";
-
-            cols.push_back({col_name, result_type});
-        }
-    }
-
-    return Schema(cols);
-}

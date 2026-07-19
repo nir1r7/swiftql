@@ -18,17 +18,6 @@ class Planner {
             std::unordered_map<std::string, std::vector<Row>> table_rows,
             std::unordered_map<std::string, ColumnarTable> columnar_tables = {}
         );
-        // build the schema of the project node's output based on the select statement and input table schema
-        static Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema);
-
-        // extract aggregate specifications from the select statement (for building the HashAggregateNode)
-        static std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt);
-
-        // build the schema of the aggregate node's output based on the select statement and input table schema
-        static Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema);
-
-        // compute the narrowed scan schema for a single table: only columns referenced by the query
-        // returns full_schema unchanged for SELECT *
-        static Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
-    private:
+        // schema helpers (buildScanSchema/buildProjectSchema/buildAggregateSchema/
+        // extractAggregates) live in the logical layer — see logical_plan.h
 };

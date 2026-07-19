@@ -117,6 +117,23 @@ struct LogicalLimit : LogicalPlanNode {
     std::string explain() const override;
 };
 
+// logical schema helpers — shared by LogicalPlanBuilder and the Volcano
+// Planner (relocated from Planner in Week 18 so the logical layer no longer
+// includes physical operator headers)
+
+// narrowed scan schema for one table: only columns the query references;
+// returns full_schema unchanged for SELECT *
+Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
+
+// schema of the project node's output based on the select list
+Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema);
+
+// schema of the aggregate node's output: group-by columns, then one column per aggregate
+Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema);
+
+// extract aggregate specifications from the select list
+std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt);
+
 // validates the statement, then builds an execution-independent logical plan tree
 // moves expressions out of stmt (select list, predicates, order by) rather than copying
 // precondition: Binder::bind has run on stmt; relation slots drive join-key routing,

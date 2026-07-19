@@ -1,12 +1,143 @@
 #include "logical_plan.h"
-// planner.h is included only for the four static schema helpers
-// (buildScanSchema/buildAggregateSchema/buildProjectSchema/extractAggregates).
-// Week 18 (once main.cc stops calling them) relocates those helpers into this
-// layer and drops this include — keeping the logical layer free of the
-// physical operator headers at the TU level too.
-#include "planner.h"
 #include "validator.h"
 #include "parser/expr_utils.h"
+#include <unordered_set>
+
+
+// collecting column names from expressions
+static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
+    if (!expr) return;
+    if (auto* cr = dynamic_cast<const ColumnRef*>(expr)){
+        out.insert(cr->column_name);
+        return;
+    }
+
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)){
+        collectCols(bin->left.get(), out);
+        collectCols(bin->right.get(), out);
+        return;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)){
+        collectCols(agg->argument.get(), out);
+        return;
+    }
+    if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)){
+        collectCols(isnull->operand.get(), out);
+        return;
+    }
+}
+
+// build schema using only required columns
+// copies whole ColumnDefs so order and relation_slot stamps are preserved
+static Schema narrowSchema(const Schema& full, const std::unordered_set<std::string>& required) {
+    std::vector<ColumnDef> cols;
+    for (int i = 0; i < full.size(); ++i) {
+        if (required.count(full.column(i).name))
+            cols.push_back(full.column(i));
+    }
+    return Schema(cols);
+}
+
+
+Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
+    if (stmt.select_star) return full_schema;
+    std::unordered_set<std::string> required;
+    for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
+    collectCols(stmt.where.get(), required);
+    for (const auto& col_name : stmt.group_by) required.insert(col_name);
+    collectCols(stmt.having.get(), required);
+    for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
+    if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
+    return narrowSchema(full_schema, required);
+}
+
+
+Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema){
+    std::vector<ColumnDef> cols;
+
+    for (const auto& expr : stmt.select_list) {
+        if (auto* col = dynamic_cast<ColumnRef*>(expr.get())) {
+            // resolve slot-first (correct side on a join with shared names),
+            // falling back to bare name against post-aggregate schemas
+            int idx = col->relation_slot >= 0
+                ? table_schema.indexOf(col->column_name, col->relation_slot)
+                : -1;
+            if (idx < 0) idx = table_schema.indexOf(col->column_name);
+            if (idx >= 0) {
+                cols.push_back(table_schema.column(idx));
+            } else {
+                cols.push_back({col->column_name, TypeId::STRING});
+            }
+        } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
+            // aggregates on numeric columns produce DOUBLE
+            // COUNT always produces INT
+            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
+
+            std::string col_name = agg->function_name + "(";
+            col_name += agg->is_star ? "*" : dynamic_cast<ColumnRef*>(agg->argument.get())->column_name;
+            col_name += ")";
+            cols.push_back({col_name, result_type});
+        }
+    }
+
+    return Schema(cols);
+}
+
+
+Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema){
+    std::vector<ColumnDef> cols;
+
+    // group-by colums in order
+    for (const auto& col_name : stmt.group_by) {
+        int idx = table_schema.indexOf(col_name);
+        if (idx >= 0) {
+            cols.push_back(table_schema.column(idx));
+        }
+    }
+
+    // one output column per aggregate in the SELECT list
+    for (const auto& expr : stmt.select_list) {
+        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
+            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
+
+            std::string col_name = agg->function_name + "(";
+            if (agg->is_star) {
+                col_name += "*";
+            } else if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
+                col_name += col->column_name;
+            }
+            col_name += ")";
+
+            cols.push_back({col_name, result_type});
+        }
+    }
+
+    return Schema(cols);
+}
+
+
+std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
+    std::vector<AggregateSpec> specs;
+
+    for (const auto& expr : stmt.select_list) {
+        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
+            AggregateSpec spec;
+            spec.function = agg->function_name;
+            spec.is_star = agg->is_star;
+
+            if (!agg->is_star && agg->argument) {
+                if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
+                    spec.column = col->column_name;
+                    spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
+                }
+            }
+
+            specs.push_back(spec);
+        }
+    }
+
+    return specs;
+}
 
 
 // LogicalScan
@@ -115,14 +246,14 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     // FROM scan, narrowed to only the columns the query actually needs
     std::unique_ptr<LogicalPlanNode> node = std::make_unique<LogicalScan>(
         stmt.from_table,
-        Planner::buildScanSchema(stmt, catalog.getTable(stmt.from_table).schema));
+        buildScanSchema(stmt, catalog.getTable(stmt.from_table).schema));
 
     // join
     if (stmt.join.has_value()) {
         const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
         auto join_scan = std::make_unique<LogicalScan>(
             stmt.join->join_table,
-            Planner::buildScanSchema(stmt, join_meta.schema));
+            buildScanSchema(stmt, join_meta.schema));
 
         std::string from_col, join_col;
         extractJoinKeys(stmt.join->condition.get(), from_col, join_col);
@@ -158,8 +289,8 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     }
 
     if (!stmt.group_by.empty() || has_aggs) {
-        Schema agg_schema = Planner::buildAggregateSchema(stmt, node->output_schema);
-        node = std::make_unique<LogicalAggregate>(std::move(node), stmt.group_by, Planner::extractAggregates(stmt), agg_schema);
+        Schema agg_schema = buildAggregateSchema(stmt, node->output_schema);
+        node = std::make_unique<LogicalAggregate>(std::move(node), stmt.group_by, extractAggregates(stmt), agg_schema);
     }
 
     // HAVING — filter above the aggregate; no dedicated node
@@ -184,7 +315,7 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         }
         node = std::make_unique<LogicalProject>(std::move(node), std::move(star_exprs), child_schema);
     } else {
-        Schema proj_schema = Planner::buildProjectSchema(stmt, node->output_schema);
+        Schema proj_schema = buildProjectSchema(stmt, node->output_schema);
         node = std::make_unique<LogicalProject>(std::move(node), std::move(stmt.select_list), proj_schema);
     }
 

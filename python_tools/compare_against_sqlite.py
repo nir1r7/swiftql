@@ -53,6 +53,11 @@ REGRESSION_QUERIES = [
     "SELECT season, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
     "SELECT season, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY season ORDER BY season",
     "SELECT season, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY season ORDER BY season",
+    # SELECT * + JOIN regression (Week 18): the columnar Volcano path used to
+    # narrow the join-side scan by the FROM table's column names, silently
+    # dropping drivers.name/nationality/age from the output. Bounded via a
+    # WHERE (not LIMIT) so both engines produce the same row set.
+    "SELECT * FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE lap_id < 6",
 ]
 
 # Week 6 checkpoint query: full operator pipeline in one statement
