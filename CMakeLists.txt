@@ -31,6 +31,7 @@ add_library(swiftql_lib
     src/planner/validator.cc
     src/planner/binder.cc
     src/planner/logical_plan.cc
+    src/planner/vectorized_plan_builder.cc
     src/planner/planner.cc
     src/planner/plan_nodes.cc
     src/execution/evaluator.cc
