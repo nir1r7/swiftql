@@ -230,9 +230,17 @@ int main(int argc, char* argv[]) {
             std::unordered_map<std::string, std::vector<Row>> table_rows;
             const TableMetadata& meta = catalog.getTable(stmt.from_table);
             table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+            // Week 19: statistics are table-scoped, not query-scoped — compute once
+            // per process, before columnar conversion frees the row data
+            if (!catalog.hasStats(stmt.from_table)) {
+                catalog.setStats(stmt.from_table, TableStats::compute(table_rows[stmt.from_table], meta.schema));
+            }
             if (stmt.join.has_value()) {
                 const TableMetadata& jmeta = catalog.getTable(stmt.join->join_table);
                 table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+                if (!catalog.hasStats(stmt.join->join_table)) {
+                    catalog.setStats(stmt.join->join_table, TableStats::compute(table_rows[stmt.join->join_table], jmeta.schema));
+                }
             }
 
             // build columnar tables if --storage columnar
@@ -262,7 +270,7 @@ int main(int argc, char* argv[]) {
 
                 auto plan_start = std::chrono::high_resolution_clock::now();
 
-                // bind → logical plan (validates internally) → optimize → lower
+                // bind -> logical plan (validates internally) -> optimize -> lower
                 auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
 
                 if (!args.no_optimize) {
