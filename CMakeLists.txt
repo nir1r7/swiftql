@@ -25,6 +25,7 @@ add_library(swiftql_lib
     src/common/value.cc
     src/common/schema.cc
     src/catalog/catalog.cc
+    src/catalog/table_stats.cc
     src/storage/csv_loader.cc
     src/parser/lexer.cc
     src/parser/parser.cc

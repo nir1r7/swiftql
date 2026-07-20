@@ -48,6 +48,25 @@ const TableMetadata& Catalog::getTable(const std::string& name) const {
     return tables_.at(name);
 }
 
+void Catalog::setStats(const std::string& table_name, TableStats stats) {
+    if (!hasTable(table_name)) {
+        throw std::runtime_error("Cannot set stats for unknown table: " + table_name);
+    }
+    stats_[table_name] = std::move(stats);
+}
+
+bool Catalog::hasStats(const std::string& table_name) const {
+    return stats_.find(table_name) != stats_.end();
+}
+
+const TableStats& Catalog::getStats(const std::string& table_name) const {
+    auto it = stats_.find(table_name);
+    if (it == stats_.end()) {
+        throw std::runtime_error("No statistics for table: " + table_name);
+    }
+    return it->second;
+}
+
 TypeId Catalog::parseTypeId(const std::string& type_str) const {
     if (type_str == "INT")    return TypeId::INT;
     if (type_str == "DOUBLE") return TypeId::DOUBLE;
