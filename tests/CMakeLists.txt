@@ -11,6 +11,7 @@ add_executable(swiftql_tests
     test_vec_plan_builder.cc
     test_stats.cc
     test_cardinality.cc
+    test_predicate_pushdown.cc
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)

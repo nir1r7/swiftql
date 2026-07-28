@@ -33,6 +33,7 @@ add_library(swiftql_lib
     src/planner/binder.cc
     src/planner/logical_plan.cc
     src/planner/cardinality_estimator.cc
+    src/planner/predicate_pushdown.cc
     src/planner/vectorized_plan_builder.cc
     src/planner/planner.cc
     src/planner/plan_nodes.cc

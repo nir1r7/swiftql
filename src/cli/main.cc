@@ -14,6 +14,7 @@
 #include "planner/binder.h"
 #include "planner/logical_plan.h"
 #include "planner/cardinality_estimator.h"
+#include "planner/predicate_pushdown.h"
 #include "planner/vec_plan_node.h"
 #include "planner/vectorized_plan_builder.h"
 #include "storage/csv_loader.h"
@@ -53,7 +54,7 @@ struct Args {
     bool explain = false;
     bool explain_analyze = false;
     bool no_cache = false;
-    bool no_optimize = false; // accepted, ignored in Phase 1
+    bool no_optimize = false; // gates the vectorized optimizer (Week 21 pushdown + Week 20 estimates)
     bool storage_stats = false;  // print columnar byte sizes and exit
     std::string storage = "row"; // default to row
     std::string execution = "volcano";
@@ -275,10 +276,14 @@ int main(int argc, char* argv[]) {
                 auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
 
                 if (!args.no_optimize) {
-                    // Week 20: annotate the logical plan with estimated row
-                    // counts. Weeks 21–22 rewrites consume these estimates;
-                    // nothing reads them yet, so output is unchanged.
-                    // --no-optimize skips this, never the builder below.
+                    // Week 21: push single-relation WHERE predicates onto their
+                    // own scan and order scan-local conjuncts by expected work.
+                    // Reshapes the tree first so the estimator below annotates
+                    // the final shape. --no-optimize skips this entirely.
+                    logical = PredicatePushdown::apply(std::move(logical), catalog);
+
+                    // Week 20: annotate the (possibly rewritten) logical plan
+                    // with estimated row counts.
                     CardinalityEstimator::estimate(*logical, catalog);
                 }
 

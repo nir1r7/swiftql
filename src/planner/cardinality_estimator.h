@@ -39,11 +39,12 @@ class CardinalityEstimator {
     public:
         static void estimate(LogicalPlanNode& root, const Catalog& catalog);
 
+        // fraction of input rows a predicate keeps, in [0, 1]. Public so the
+        // Week 21 pushdown pass can order scan-local conjuncts by expected work.
+        static double selectivity(const Expr* pred, const StatsContext& ctx);
+
     private:
         // recursive worker: stamps node.estimated_rows, returns the column
         // stats visible above this node
         static StatsContext estimateNode(LogicalPlanNode& node, const Catalog& catalog);
-
-        // fraction of input rows a predicate keeps, in [0, 1]
-        static double selectivity(const Expr* pred, const StatsContext& ctx);
 };
