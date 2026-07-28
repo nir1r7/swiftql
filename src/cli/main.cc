@@ -13,6 +13,7 @@
 #include "planner/planner.h"
 #include "planner/binder.h"
 #include "planner/logical_plan.h"
+#include "planner/cardinality_estimator.h"
 #include "planner/vec_plan_node.h"
 #include "planner/vectorized_plan_builder.h"
 #include "storage/csv_loader.h"
@@ -274,10 +275,11 @@ int main(int argc, char* argv[]) {
                 auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
 
                 if (!args.no_optimize) {
-                    // Weeks 20–22: optimizer passes rewrite `logical` here.
-                    // Week 18: intentionally empty — both modes share the
-                    // lowering below, which is the point: --no-optimize skips
-                    // rewrites, never the builder.
+                    // Week 20: annotate the logical plan with estimated row
+                    // counts. Weeks 21–22 rewrites consume these estimates;
+                    // nothing reads them yet, so output is unchanged.
+                    // --no-optimize skips this, never the builder below.
+                    CardinalityEstimator::estimate(*logical, catalog);
                 }
 
                 std::unique_ptr<VecPlanNode> vec_node = VectorizedPlanBuilder::build(
