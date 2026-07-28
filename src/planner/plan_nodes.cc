@@ -258,6 +258,13 @@ void HashAggregateNode::open() {
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
 
+    // SQL: a scalar aggregate (no GROUP BY) over empty input still emits one row
+    // (COUNT -> 0, SUM/AVG/MIN/MAX -> NULL). A default accumulator yields exactly that.
+    if (group_by_cols_.empty() && accumulators.empty()) {
+        accumulators[""].resize(aggregates_.size());
+        group_keys[""] = {};
+    }
+
     // materialize results — self-work only, no child calls
     auto t0 = std::chrono::high_resolution_clock::now();
     results_.clear();

@@ -303,6 +303,35 @@ TEST(HashAggregateNode, AllFunctionsAndNullHandling) {
     EXPECT_DOUBLE_EQ((*rb)[6].asDouble(), 300.0); // MAX
 }
 
+TEST(HashAggregateNode, ScalarAggregateOverEmptyInputEmitsOneRow) {
+    // SQL: a scalar aggregate (no GROUP BY) over empty input still emits one row —
+    // COUNT -> 0, SUM/AVG/MIN/MAX -> NULL. (GROUP BY over empty input emits zero rows.)
+    Schema schema = makeSchema({{"team", TypeId::STRING}, {"speed", TypeId::DOUBLE}});
+    std::vector<AggregateSpec> specs = {
+        {"COUNT", "", true},
+        {"SUM", "speed", false},
+        {"AVG", "speed", false},
+        {"MIN", "speed", false},
+        {"MAX", "speed", false},
+    };
+    Schema out_schema = makeSchema({
+        {"COUNT(*)", TypeId::INT},
+        {"SUM(speed)", TypeId::DOUBLE},
+        {"AVG(speed)", TypeId::DOUBLE},
+        {"MIN(speed)", TypeId::DOUBLE},
+        {"MAX(speed)", TypeId::DOUBLE},
+    });
+
+    HashAggregateNode agg(makeScan({}, schema), {}, specs, out_schema);
+    auto result = drainAll(&agg);
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result[0][0].asInt(), 0);   // COUNT(*)
+    EXPECT_TRUE(result[0][1].isNull());   // SUM
+    EXPECT_TRUE(result[0][2].isNull());   // AVG
+    EXPECT_TRUE(result[0][3].isNull());   // MIN
+    EXPECT_TRUE(result[0][4].isNull());   // MAX
+}
+
 // ===== HavingNode =====
 
 TEST(HavingNode, FiltersGroups) {

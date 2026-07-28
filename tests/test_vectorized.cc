@@ -2020,14 +2020,15 @@ TEST(VecHashAggregate, MultiChunkInput) {
 }
 
 TEST(VecHashAggregate, EmptyInput) {
+    // SQL: a scalar aggregate (no GROUP BY) over empty input emits one row, COUNT = 0
     auto scan = makeIntScan("id", {});
     Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
         std::move(scan), std::vector<std::string>{}, specs, out_schema);
-    agg->open();
-    EXPECT_EQ(agg->nextChunk(), nullptr);
-    agg->close();
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 0);
 }
 
 TEST(VecHashAggregate, InsertionOrderPreserved) {

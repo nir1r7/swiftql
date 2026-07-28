@@ -126,6 +126,14 @@ void VecHashAggregateNode::consumeAll() {
 
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
+
+    // SQL: a scalar aggregate (no GROUP BY) over empty input still emits one row
+    // (COUNT -> 0, SUM/AVG/MIN/MAX -> NULL). A default accumulator yields exactly that.
+    if (group_by_cols_.empty() && groups_.empty()) {
+        auto [it, inserted] = groups_.try_emplace("");
+        it->second.per_spec.resize(specs_.size());
+        group_order_.push_back("");
+    }
 }
 
 void VecHashAggregateNode::materializeResults() {
