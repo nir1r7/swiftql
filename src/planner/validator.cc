@@ -51,9 +51,14 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         validateExpr(stmt.where.get(), schema, "WHERE", /*allow_aggregates=*/false);
     }
 
-    // GROUP BY columns must exist
+    // GROUP BY columns must exist in the FROM table or, when a join is present,
+    // the joined table — columns resolve against the merged FROM+JOIN schema at plan time
     for (const auto& col : stmt.group_by) {
-        if (!schema.hasColumn(col)) {
+        bool found = schema.hasColumn(col);
+        if (!found && stmt.join.has_value()) {
+            found = catalog.getTable(stmt.join->join_table).schema.hasColumn(col);
+        }
+        if (!found) {
             throw std::runtime_error(
                 "GROUP BY column not found: '" + col + "'");
         }
