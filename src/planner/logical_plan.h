@@ -29,6 +29,9 @@ struct AggregateSpec {
 struct LogicalPlanNode {
     LogicalNodeType type;
     Schema output_schema;
+    // estimated output row count (Week 20 CardinalityEstimator);
+    // -1 = not estimated (e.g. --no-optimize skips the pass)
+    double estimated_rows = -1.0;
     std::vector<std::unique_ptr<LogicalPlanNode>> children;
 
     LogicalPlanNode(LogicalNodeType t, Schema schema) : type(t), output_schema(std::move(schema)) {}
