@@ -26,27 +26,11 @@ static SelectionVector scanColumn(const DataChunk& chunk, int col_idx, const T& 
     return sv;
 }
 
-// AND/OR
-// both inputs have indices in ascending order (preserved from forward scan),
-// so intersection and union are O(n+m) merge operations
-SelectionVector sv_intersect(const SelectionVector& a, const SelectionVector& b) {
-    SelectionVector result;
-    int i = 0, j = 0;
-    while (i < a.size && j < b.size) {
-        if (a.indices[i] == b.indices[j]){
-            result.indices.push_back(a.indices[i++]); ++j;
-        }
-        else if (a.indices[i] <  b.indices[j]){
-            ++i;
-        }
-        else{
-            ++j;
-        }
-    }
-    result.size = static_cast<int>(result.indices.size());
-    return result;
-}
-
+// OR: both inputs have indices in ascending order (preserved from forward
+// scan), so the union is an O(n+m) merge. AND no longer needs a set intersect —
+// it cascades the left operand's SelectionVector into the right (see
+// evalPredicate), which is equivalent for AND but evaluates the right over
+// survivors only.
 static SelectionVector sv_union(const SelectionVector& a, const SelectionVector& b) {
     SelectionVector result;
     int i = 0, j = 0;
@@ -101,10 +85,13 @@ SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Sc
     // not a BinaryExpr (IsNullExpr, AggregateExpr, ...), scalar fallback
     if (!bin) return evalFallback(pred, chunk, schema, input_sel);
 
-    // AND/OR, recurse on each side with the same input_sel, then compose
+    // AND: cascade the selection vector — evaluate the right operand only over
+    // rows the left kept. Equivalent to intersect for AND, but the right touches
+    // only survivors, so ordering the most-selective conjunct left (Week 21
+    // pushdown) pays off. OR must stay a union — it cannot cascade.
     if (bin->op == "AND"){
-        return sv_intersect(evalPredicate(bin->left.get(), chunk, schema, input_sel),
-                            evalPredicate(bin->right.get(), chunk, schema, input_sel));
+        SelectionVector left = evalPredicate(bin->left.get(), chunk, schema, input_sel);
+        return evalPredicate(bin->right.get(), chunk, schema, &left);
     }
     if (bin->op == "OR"){
         return sv_union(evalPredicate(bin->left.get(), chunk, schema, input_sel),

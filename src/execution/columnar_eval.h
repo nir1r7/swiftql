@@ -18,7 +18,3 @@
 // rows are never touched (late-materialization contract).
 SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Schema& schema,
                               const SelectionVector* input_sel = nullptr);
-
-// O(n+m) intersection of two ascending-ordered SelectionVectors.
-// Used internally by evalPredicate for AND composition.
-SelectionVector sv_intersect(const SelectionVector& a, const SelectionVector& b);

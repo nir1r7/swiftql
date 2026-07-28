@@ -1514,7 +1514,8 @@ TEST(VecEndToEnd, IntFilter_GtEqPredicate) {
 TEST(VecEndToEnd, AndComposition_BothFastPath) {
     // SELECT id FROM t WHERE season = 2025 AND id > 2
     // Both predicates are col-op-literal — both hit the fast path.
-    // The AND composition via sv_intersect must return only rows satisfying both.
+    // AND cascades the left operand's SelectionVector into the right; the result
+    // must be exactly the rows satisfying both.
     Schema schema = vecSchema({{"id", TypeId::INT}, {"season", TypeId::INT}});
     auto makeTable = [&]() {
         ColumnarTable ct(schema, 5);
@@ -1540,6 +1541,44 @@ TEST(VecEndToEnd, AndComposition_BothFastPath) {
     auto vec = runVec(makeTable(), schema, pred(), makeExprs(), out_schema);
     ASSERT_EQ(vec.size(), 1u);
     EXPECT_EQ(vec[0][0].asInt(), 4);
+    expectRowsEqual(vol, vec);
+}
+
+TEST(VecEndToEnd, AndCascade_DifferingSurvivorSets) {
+    // Guards the AND cascade (columnar_eval.cc): the left operand narrows the
+    // rows, the right is evaluated only over survivors, and the result must be
+    // the exact intersection — not the union, not the left, not the right.
+    // Left and right keep genuinely different row sets so a broken cascade
+    // (e.g. dropping one side) cannot accidentally produce the right answer.
+    Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
+    auto makeTable = [&]() {
+        ColumnarTable ct(schema, 6);
+        ct.columns["a"] = std::vector<int64_t>{1, 5, 2, 6, 3, 7};
+        ct.columns["b"] = std::vector<int64_t>{10, 40, 20, 25, 50, 15};
+        return ct;
+    };
+    auto makeExprs = [&]() {
+        std::vector<std::unique_ptr<Expr>> e;
+        e.push_back(col("a"));
+        return e;
+    };
+    Schema out_schema = vecSchema({{"a", TypeId::INT}});
+
+    // a > 2  → rows {1,3,4,5} (a = 5,6,3,7)
+    // b < 30 → rows {0,2,3,5} (b = 10,20,25,15)
+    // intersection → rows {3,5} → a = 6, 7
+    auto pred = [&]() {
+        return binOp("AND",
+            binOp(">", col("a"), intLit(2)),
+            binOp("<", col("b"), intLit(30)));
+    };
+
+    auto vol = runVolcano(makeTable(), schema, pred(), makeExprs(), out_schema);
+    auto vec = runVec(makeTable(), schema, pred(), makeExprs(), out_schema);
+    ASSERT_EQ(vec.size(), 2u);
+    std::vector<int64_t> got{vec[0][0].asInt(), vec[1][0].asInt()};
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<int64_t>{6, 7}));
     expectRowsEqual(vol, vec);
 }
 
