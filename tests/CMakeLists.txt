@@ -12,6 +12,7 @@ add_executable(swiftql_tests
     test_stats.cc
     test_cardinality.cc
     test_predicate_pushdown.cc
+    test_cost_model.cc
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)
