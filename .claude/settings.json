@@ -1,28 +1,3 @@
 {
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash /Users/nir/workspace/dev/swiftql/.claude/hooks/skill-router.sh",
-            "timeout": 5,
-            "statusMessage": "Routing to relevant skills..."
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash /Users/nir/workspace/dev/swiftql/.claude/hooks/invariant-reminder.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
+  "hooks": {}
 }
