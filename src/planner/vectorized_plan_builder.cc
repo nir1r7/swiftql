@@ -7,6 +7,7 @@
 #include "execution/vec_distinct_node.h"
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/vec_hash_join_node.h"
+#include "planner/cost_model.h"
 #include <stdexcept>
 
 namespace {
@@ -17,6 +18,7 @@ namespace {
 struct Lowering {
     std::unordered_map<std::string, ColumnarTable>& tables;
     std::unordered_map<std::string, int> scan_uses;
+    const Catalog& catalog;   // borrowed, read-only: build-side width stats
 
     std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where);
 };
@@ -40,6 +42,23 @@ const std::string& leafScanTable(const LogicalPlanNode* node) {
     return static_cast<const LogicalScan*>(node)->table_name;
 }
 
+// estimated bytes per row on one join input, for the hash-table memory cost.
+// Sums the real per-column avg_width (Week 19 stats) over the input's output
+// columns; a filter-over-scan child shares its scan's schema, all from one
+// table. Falls back to 8 bytes/column when stats are absent (e.g. unit tests
+// that don't seed them) — the same proxy the pre-Gap-3 code always used.
+double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
+    const std::string& table = leafScanTable(child);
+    if (!catalog.hasStats(table)) return child->output_schema.size() * 8.0;
+    const TableStats& ts = catalog.getStats(table);
+    double width = 0.0;
+    for (const auto& col : child->output_schema.columns()) {
+        auto it = ts.columns.find(col.name);
+        width += (it != ts.columns.end()) ? it->second.avg_width : 8.0;
+    }
+    return width;
+}
+
 std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* pruning_where) {
     switch (node->type) {
         case LogicalNodeType::SCAN: {
@@ -55,19 +74,42 @@ std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* 
 
         case LogicalNodeType::JOIN: {
             auto* join = static_cast<LogicalJoin*>(node);
-            // row counts must be read before lowering moves the tables away
-            int from_rows = tables.at(leafScanTable(join->children[0].get())).num_rows;
-            int join_rows = tables.at(leafScanTable(join->children[1].get())).num_rows;
+
+            // Week 22: choose the build side from filtered cardinality estimates.
+            // Post-pushdown, a child may be a LogicalFilter, so its estimated_rows
+            // is the count *after* the WHERE — which can invert the raw table-size
+            // ordering (a big filtered table can become the smaller input). Under
+            // --no-optimize the estimator never ran (estimated_rows == -1), so fall
+            // back to the raw table sizes the pre-Week-22 heuristic used.
+            double from_est = join->children[0]->estimated_rows;
+            double join_est = join->children[1]->estimated_rows;
+            if (from_est < 0 || join_est < 0) {
+                from_est = tables.at(leafScanTable(join->children[0].get())).num_rows;
+                join_est = tables.at(leafScanTable(join->children[1].get())).num_rows;
+            }
+            // per-side row width from real avg_width stats (Gap 3); this feeds
+            // the hash-table memory term, so with equal row counts the narrower
+            // input becomes the cheaper build side
+            double from_w = rowWidth(join->children[0].get(), catalog);
+            double join_w = rowWidth(join->children[1].get(), catalog);
 
             // pruning hint routes to the FROM side only
             auto from_child = lower(join->children[0].get(), pruning_where);
             auto join_child = lower(join->children[1].get(), nullptr);
 
-            // smaller input builds; output schema stays in fixed logical
-            // order [FROM, JOIN] regardless — swapped tells the join to
-            // reorder columns when assembling output. Week 22 replaces this
-            // row-count heuristic with a cost-based decision.
-            if (from_rows < join_rows) {
+            // cost each build assignment; the memory + build-CPU terms make the
+            // smaller input the cheaper build side. Hash is the only physical
+            // join operator SwiftQL lowers at single-equi-join scope, so only
+            // the build side is decided here. (Week 23.5 adds a SIMD loop-join
+            // operator and a real algorithm choice against it.)
+            double cost_from_builds = hashJoinCost(from_est, from_w, join_est);
+            double cost_join_builds = hashJoinCost(join_est, join_w, from_est);
+
+            // output schema stays in fixed logical order [FROM, JOIN] regardless
+            // of which side physically builds; swapped tells the join to reorder
+            // columns when assembling output.
+            if (cost_from_builds < cost_join_builds) {
+                // FROM builds: JOIN side probes (swapped)
                 return std::make_unique<VecHashJoinNode>(
                     std::move(join_child), std::move(from_child),
                     join->join_col, join->from_col, join->output_schema, /*swapped=*/true);
@@ -131,8 +173,9 @@ std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* 
 
 std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
-        std::unordered_map<std::string, ColumnarTable> columnar_tables) {
-    Lowering lowering{columnar_tables, {}};
+        std::unordered_map<std::string, ColumnarTable> columnar_tables,
+        const Catalog& catalog) {
+    Lowering lowering{columnar_tables, {}, catalog};
     countScans(logical.get(), lowering.scan_uses);
     return lowering.lower(logical.get(), nullptr);
 }

@@ -113,7 +113,7 @@ static std::unique_ptr<VecPlanNode> buildPushedVec(const std::string& sql, const
     auto tables = loadColumnar(stmt, cat);
     auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
     logical = PredicatePushdown::apply(std::move(logical), cat);
-    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables));
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
 }
 
 // Collect every node in the vectorized plan tree.

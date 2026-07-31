@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "planner/vectorized_plan_builder.h"
 #include "planner/logical_plan.h"
+#include "planner/predicate_pushdown.h"
+#include "planner/cardinality_estimator.h"
 #include "planner/binder.h"
 #include "planner/planner.h"
 #include "parser/parser.h"
@@ -41,7 +43,7 @@ static std::unique_ptr<VecPlanNode> buildVec(const std::string& sql, const Catal
     Binder::bind(stmt, cat);
     auto tables = loadColumnar(stmt, cat);
     auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
-    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables));
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
 }
 
 // Drain a vectorized plan into materialized rows (same loop as main.cc).
@@ -274,4 +276,147 @@ TEST(VecPlanBuilder, VolcanoColumnarSelectStarJoinKeepsJoinColumns) {
     plan->close();
     ASSERT_FALSE(rows.empty());
     EXPECT_EQ(rows[0].size(), 14u);
+}
+
+// ===== Week 22: cost-based build-side selection =====
+
+// Full vectorized pipeline WITH the optimizer passes (pushdown + estimate), so
+// the join's children carry estimated_rows and the cost model — not raw table
+// size — picks the build side. buildVec above deliberately omits these passes.
+static std::unique_ptr<VecPlanNode> buildVecOptimized(const std::string& sql, const Catalog& cat) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    logical = PredicatePushdown::apply(std::move(logical), cat);
+    CardinalityEstimator::estimate(*logical, cat);
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+}
+
+// Descend children()[0] to the join node.
+static const VecPlanNode* findJoin(const VecPlanNode* root) {
+    const VecPlanNode* n = root;
+    while (n && n->explain().rfind("VecHashJoin", 0) != 0) {
+        auto kids = n->children();
+        n = kids.empty() ? nullptr : kids[0];
+    }
+    return n;
+}
+
+// Table read by the build child (children()[1]): descend to its leaf scan and
+// return its explain() string, which names the table. The build child may be a
+// VecFilter over the scan once a predicate is pushed down.
+static std::string buildSideScan(const VecPlanNode* join) {
+    const VecPlanNode* build = join->children()[1];  // children() == {probe, build}
+    while (!build->children().empty()) build = build->children()[0];
+    return build->explain();
+}
+
+// laps: 1000 rows, speed DOUBLE in [200,400]. Enough for the estimator to size
+// a scan-local filter; execution is not run, so real row count is irrelevant.
+static void seedCostStats(Catalog& cat) {
+    TableStats laps;
+    laps.row_count = 1000;
+    ColumnStats speed;
+    speed.min_val = Value(200.0);
+    speed.max_val = Value(400.0);
+    speed.distinct_count = 900;
+    speed.null_count = 0;
+    laps.columns.emplace("speed", speed);
+    cat.setStats("laps", std::move(laps));
+
+    TableStats drivers;   // 20 rows; no per-column stats needed for the choice
+    drivers.row_count = 20;
+    cat.setStats("drivers", std::move(drivers));
+}
+
+// Without a filter, laps (1000) > drivers (20): the smaller JOIN side builds.
+TEST(VecPlanBuilder, UnfilteredJoinBuildsSmallerRawSide) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(buildSideScan(join).find("drivers"), std::string::npos)
+        << "unfiltered: smaller drivers table should build";
+}
+
+// A selective WHERE on laps (speed > 399 ≈ 0.5% of 1000 ≈ 5 rows) makes the
+// FILTERED laps side smaller than drivers (20) — the build side must flip to
+// laps, which the raw-row-count heuristic could never do. This is the Week 22
+// checkpoint expressed as a plan-shape assertion.
+TEST(VecPlanBuilder, FilteredJoinFlipsBuildSideToFilteredTable) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 399", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(buildSideScan(join).find("laps"), std::string::npos)
+        << "filtered laps (~5 rows) is now smaller than drivers (20) and should build";
+}
+
+// Requirement #3: output column order is fixed [FROM=laps (slot 0), JOIN=drivers
+// (slot 1)] even though the filter flipped laps onto the physical build side.
+// The merged schema must still list every FROM column before every JOIN column.
+TEST(VecPlanBuilder, FlippedBuildSideKeepsLogicalSchemaOrder) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 399", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    // sanity: this really is the flipped case (filtered laps is the build side)
+    ASSERT_NE(buildSideScan(join).find("laps"), std::string::npos);
+
+    // every slot-0 (FROM=laps) column precedes every slot-1 (JOIN=drivers) column
+    const Schema& merged = join->outputSchema();
+    int last_from = -1, first_join = merged.size();
+    for (int i = 0; i < merged.size(); ++i) {
+        if (merged.column(i).relation_slot == 0) last_from = i;
+        else if (merged.column(i).relation_slot == 1 && i < first_join) first_join = i;
+    }
+    EXPECT_LT(last_from, first_join) << "FROM columns must precede JOIN columns";
+    EXPECT_LT(merged.indexOf("lap_id"), merged.indexOf("name"));
+}
+
+// Gap 3: with EQUAL row counts, the hash-table memory term must break the tie
+// toward the physically narrower side (less footprint). Both tables are seeded
+// to 100 rows, but drivers' projected column (name) is far wider than laps'
+// two INT columns — so laps builds. This fails under the old size()*8 proxy
+// (which sees 2 columns each, a tie, and builds the JOIN side), so it pins the
+// real-avg_width fix.
+TEST(VecPlanBuilder, EqualRowsBuildNarrowerSideByRealWidth) {
+    Catalog cat(CATALOG);
+    TableStats laps;                 // 100 rows, two 8-byte INT projected columns
+    laps.row_count = 100;
+    ColumnStats i8; i8.avg_width = 8.0; i8.distinct_count = 100;
+    laps.columns.emplace("lap_id", i8);
+    laps.columns.emplace("driver_id", i8);
+    cat.setStats("laps", std::move(laps));
+
+    TableStats drivers;              // 100 rows, but a very wide string column
+    drivers.row_count = 100;
+    ColumnStats id; id.avg_width = 8.0; id.distinct_count = 100;
+    ColumnStats name; name.avg_width = 100.0; name.distinct_count = 100;
+    drivers.columns.emplace("driver_id", id);
+    drivers.columns.emplace("name", std::move(name));
+    cat.setStats("drivers", std::move(drivers));
+
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(buildSideScan(join).find("laps"), std::string::npos)
+        << "equal rows: the narrower laps side should build, not wide drivers";
 }

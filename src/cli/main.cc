@@ -288,7 +288,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 std::unique_ptr<VecPlanNode> vec_node = VectorizedPlanBuilder::build(
-                    std::move(logical), std::move(columnar_tables));
+                    std::move(logical), std::move(columnar_tables), catalog);
 
                 double plan_us = std::chrono::duration<double, std::micro>(
                     std::chrono::high_resolution_clock::now() - plan_start).count();
