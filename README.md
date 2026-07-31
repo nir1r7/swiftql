@@ -571,10 +571,18 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 ### Week 22 — Cost Model + Physical Join Selection
 
 - Add explicit CPU, data-volume, and hash-table memory costs
-- Choose filtered hash-join build side; compare hash and nested-loop joins
+- Choose the filtered hash-join build side from cost estimates (hash is the only physical join algorithm at this stage; a second operator and the cost-based choice between algorithms are deferred to Week 23.5)
 - Keep logical schema order independent of physical build/probe order
 
 **Checkpoint:** The cheapest supported single-join plan is selected from estimates.
+
+> **Scope note (data-volume cost):** The Week 22 cost model implements the CPU and
+> hash-table memory terms; the data-volume (bytes-materialized) term is deferred to
+> Week 28. At single-join scope both build-side options move the same data volume, so
+> the term cannot change the decision and is not testable here — it first affects a
+> plan choice in Week 28, where differing intermediate-result widths across join
+> orderings make it discriminate. The hash-table memory term already uses real
+> per-column `avg_width` statistics, so build-side selection accounts for row width.
 
 ### Week 23 — Explainability + Phase 4 Benchmarks
 
@@ -583,6 +591,18 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 - Benchmark vectorized execution with and without optimization
 
 **Checkpoint:** Phase 4 gains and estimation errors are measured and documented.
+
+### Week 23.5 — SIMD Small-Build Loop Join
+
+Inserted extension. Gives the Week 22 cost-based optimizer a real second physical
+join algorithm to choose against, so the "compare join algorithms" decision stops
+being hypothetical.
+
+- Add `VecSimdLoopJoinNode` — a vectorized inner equi-join that holds the small build side's INT keys in a flat contiguous buffer and probes them with SIMD comparisons (NEON on ARM, AVX2 on x86), materializing the payload late via the existing `SelectionVector`
+- Cost the SIMD loop against the hash join and let the optimizer pick per join from cardinality estimates; restrict SIMD selection to INT keys with a small build side, falling back to hash join otherwise (STRING/DOUBLE keys, large builds)
+- Ship a scalar reference path behind the same operator and calibrate the cost crossover from on-device measurement
+
+**Checkpoint:** The optimizer selects the SIMD loop join over the hash join when the build side is small, its results match the hash join and SQLite, and the measured hash/SIMD crossover point is documented.
 
 ---
 
@@ -718,6 +738,7 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 | 21 | Predicate optimization | Filters pushed down and evaluated incrementally |
 | 22 | Cost model + join selection | Filtered build side and join algorithm costed |
 | 23 | Phase 4 explain + benchmarks | Optimizer gains and estimate errors documented |
+| 23.5 | SIMD small-build loop join (extension) | Optimizer picks hash vs SIMD-loop, crossover measured |
 | 24 | General expressions | Arithmetic and aliased expressions execute |
 | 25 | Predicates + scalar functions | Required TPC-H expressions supported |
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly |
