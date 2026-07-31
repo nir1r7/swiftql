@@ -15,6 +15,13 @@ predicates on one or both join sides, mixed cross-relation residuals, OR pushed 
 multi-conjunct scan-local filters that the executor cascades). The optimizer must not change any
 result vs SQLite or vs --no-optimize.
 
+Week 22 (cost-based physical join selection) picks the hash-join build side from filtered
+cardinality estimates instead of raw table size, so a WEEK22_QUERIES block exercises joins whose
+selective single-side WHERE makes the larger table the smaller *filtered* input — flipping the
+build side to the side the pre-Week-22 row-count heuristic would never build. The build side is
+internal and result-invariant, so these queries assert the same two properties as Week 21: output
+matches SQLite, and optimized output matches --no-optimize (which still uses raw counts).
+
 Skills applied:
   - execution-state-simulation: traced Volcano open/next/close for each query category
   - invariant-extraction: verified schema width, row-count monotonicity, iterator lifecycle
@@ -259,6 +266,40 @@ WEEK21_QUERIES = [
 ]
 
 
+# ─── Week 22: cost-based physical join selection ─────────────────────────────
+# Each join pairs laps (10k rows) with drivers (20 rows). A highly selective
+# filter on the laps side drops its *estimated* rows below 20, so the cost model
+# builds the hash table on filtered laps — the reverse of the raw-count heuristic
+# (which always builds the 20-row drivers side). Results are build-side-invariant,
+# so these must match SQLite and match --no-optimize (raw counts, no flip).
+#   flip_from_side       → laps is FROM; filter flips build to filtered laps
+#   flip_join_side       → laps is JOIN; filter flips build to filtered laps
+#   no_flip_control       → weak filter keeps drivers the smaller side (no flip)
+#   flip_with_aggregate  → flipped build side feeding a GROUP BY still correct
+#   flip_both_filtered   → both sides filtered; FROM still smaller, builds
+WEEK22_QUERIES = [
+    ("w22_flip_from_side",
+     "SELECT drivers.name, laps.speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+     "WHERE laps.speed > 344.94 ORDER BY drivers.name, laps.speed"),
+
+    ("w22_flip_join_side",
+     "SELECT drivers.name, laps.speed FROM drivers JOIN laps ON drivers.driver_id = laps.driver_id "
+     "WHERE laps.speed > 344.94 ORDER BY drivers.name, laps.speed"),
+
+    ("w22_no_flip_control",
+     "SELECT l.team, COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.season = 2025 GROUP BY l.team ORDER BY l.team"),
+
+    ("w22_flip_with_aggregate",
+     "SELECT d.nationality, COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.speed > 344.9 GROUP BY d.nationality ORDER BY d.nationality"),
+
+    ("w22_flip_both_filtered",
+     "SELECT drivers.name, laps.speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+     "WHERE laps.speed > 344.9 AND drivers.age > 25 ORDER BY drivers.name, laps.speed"),
+]
+
+
 def load_sqlite():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -389,7 +430,7 @@ def run_optimizer_invariant(queries):
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES
 
     # existing surface on the default row/Volcano path
     r1 = run_suite(conn, QUERIES, "Default (row storage, Volcano)")
