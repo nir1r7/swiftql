@@ -8,6 +8,8 @@
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/vec_hash_join_node.h"
 #include "planner/cost_model.h"
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -93,7 +95,8 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // back to the raw table sizes the pre-Week-22 heuristic used.
             double from_est = join->children[0]->estimated_rows;
             double join_est = join->children[1]->estimated_rows;
-            if (from_est < 0 || join_est < 0) {
+            bool estimate_driven = from_est >= 0 && join_est >= 0;
+            if (!estimate_driven) {
                 from_est = tables.at(leafScanTable(join->children[0].get())).num_rows;
                 join_est = tables.at(leafScanTable(join->children[1].get())).num_rows;
             }
@@ -114,19 +117,36 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // operator and a real algorithm choice against it.)
             double cost_from_builds = hashJoinCost(from_est, from_w, join_est);
             double cost_join_builds = hashJoinCost(join_est, join_w, from_est);
+            bool from_builds = cost_from_builds < cost_join_builds;
+
+            // Week 23: hand the costed decision to the node for explain output —
+            // but only when cardinality estimates drove it. The raw-table-size
+            // fallback is the pre-Week-22 heuristic, and printing cost= under
+            // --no-optimize would claim an optimizer decision that never happened.
+            // Costs are unitless (cost_model.h) — never append a time unit.
+            std::string decision;
+            if (estimate_driven) {
+                std::ostringstream d;
+                d << std::fixed << std::setprecision(0)
+                  << "build=" << leafScanTable(join->children[from_builds ? 0 : 1].get())
+                  << " cost=" << (from_builds ? cost_from_builds : cost_join_builds)
+                  << " (alt=" << (from_builds ? cost_join_builds : cost_from_builds) << ")";
+                decision = d.str();
+            }
 
             // output schema stays in fixed logical order [FROM, JOIN] regardless
             // of which side physically builds; swapped tells the join to reorder
             // columns when assembling output.
-            if (cost_from_builds < cost_join_builds) {
+            std::unique_ptr<VecHashJoinNode> join_node = from_builds
                 // FROM builds: JOIN side probes (swapped)
-                return std::make_unique<VecHashJoinNode>(
-                    std::move(join_child), std::move(from_child),
-                    join->join_col, join->from_col, join->output_schema, /*swapped=*/true);
-            }
-            return std::make_unique<VecHashJoinNode>(
-                std::move(from_child), std::move(join_child),
-                join->from_col, join->join_col, join->output_schema, /*swapped=*/false);
+                ? std::make_unique<VecHashJoinNode>(
+                      std::move(join_child), std::move(from_child),
+                      join->join_col, join->from_col, join->output_schema, /*swapped=*/true)
+                : std::make_unique<VecHashJoinNode>(
+                      std::move(from_child), std::move(join_child),
+                      join->from_col, join->join_col, join->output_schema, /*swapped=*/false);
+            join_node->setCostDecision(std::move(decision));
+            return join_node;
         }
 
         case LogicalNodeType::FILTER: {

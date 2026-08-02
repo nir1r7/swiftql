@@ -23,7 +23,13 @@ public:
     std::string explain() const override;
     std::vector<VecPlanNode*> children() const override;
 
+    // Week 23: builder-supplied cost-decision summary ("build=<table> cost=...
+    // (alt=...)"), appended to explain(). Only VectorizedPlanBuilder knows the
+    // hashJoinCost numbers; bare constructions leave it empty and print nothing.
+    void setCostDecision(std::string decision) { cost_decision_ = std::move(decision); }
+
 private:
+    std::string cost_decision_;
     std::unique_ptr<VecPlanNode> probe_child_;
     std::unique_ptr<VecPlanNode> build_child_;
     std::string probe_join_col_;
