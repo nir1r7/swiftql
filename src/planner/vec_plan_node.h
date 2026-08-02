@@ -14,6 +14,9 @@ struct VecNodeStats {
 class VecPlanNode {
     public:
         VecNodeStats stats;
+        // estimated output rows carried across lowering from the logical node
+        // (Week 20 CardinalityEstimator); -1 = estimator never ran (--no-optimize)
+        double estimated_rows = -1.0;
 
         virtual ~VecPlanNode() = default;
 

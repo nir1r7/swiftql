@@ -21,6 +21,7 @@ struct Lowering {
     const Catalog& catalog;   // borrowed, read-only: build-side width stats
 
     std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where);
+    std::unique_ptr<VecPlanNode> lowerNode(LogicalPlanNode* node, const Expr* pruning_where);
 };
 
 // count how many LogicalScans read each table (pre-pass over the whole tree)
@@ -59,7 +60,16 @@ double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
     return width;
 }
 
+// Week 23: every physical node inherits its logical counterpart's estimate so
+// EXPLAIN ANALYZE can print est= next to rows_out. The wrapper stamps once for
+// all eight cases (the JOIN case has two returns); -1 stays -1 under --no-optimize.
 std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* pruning_where) {
+    std::unique_ptr<VecPlanNode> phys = lowerNode(node, pruning_where);
+    phys->estimated_rows = node->estimated_rows;
+    return phys;
+}
+
+std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Expr* pruning_where) {
     switch (node->type) {
         case LogicalNodeType::SCAN: {
             auto* scan = static_cast<LogicalScan*>(node);
