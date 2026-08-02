@@ -300,6 +300,44 @@ WEEK22_QUERIES = [
 ]
 
 
+# Week 23.5 selects a join ALGORITHM per join (hash vs SIMD loop) from the same
+# estimates. The choice is a result-invariant internal, so these queries assert
+# output equality across optimized / --no-optimize (hash-only) / SQLite while
+# steering the planner to each algorithm:
+#   simd_unfiltered_join → 20-row drivers build side: SIMD loop selected
+#   simd_filtered_probe  → selective filter shrinks the probe; SIMD still correct
+#   simd_swapped_build   → filtered laps becomes a tiny build side (flip + SIMD)
+#   hash_string_key      → STRING join key: SIMD ineligible, hash join runs
+WEEK23_5_QUERIES = [
+    ("w23_5_simd_unfiltered_join",
+     "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+     "ORDER BY laps.lap_id LIMIT 50"),
+
+    ("w23_5_simd_filtered_probe",
+     "SELECT drivers.name, laps.speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+     "WHERE laps.speed > 340 ORDER BY drivers.name, laps.speed"),
+
+    ("w23_5_simd_swapped_build",
+     "SELECT drivers.name, laps.speed FROM drivers JOIN laps ON drivers.driver_id = laps.driver_id "
+     "WHERE laps.speed > 344.94 ORDER BY drivers.name, laps.speed"),
+
+    ("w23_5_hash_string_key",
+     "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers ON laps.team = drivers.team "
+     "WHERE laps.speed > 344.9 ORDER BY laps.lap_id, drivers.name"),
+]
+
+# The join operator each steering comment above claims — asserted from
+# --explain's Physical Plan (see run_join_steering), so the steering stays
+# true as data stats or cost constants drift instead of silently all
+# degrading to one algorithm while the output checks keep passing.
+WEEK23_5_EXPECTED_JOIN = {
+    "w23_5_simd_unfiltered_join": "VecSimdLoopJoin",
+    "w23_5_simd_filtered_probe":  "VecSimdLoopJoin",
+    "w23_5_simd_swapped_build":   "VecSimdLoopJoin",
+    "w23_5_hash_string_key":      "VecHashJoin",
+}
+
+
 def load_sqlite():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -427,10 +465,36 @@ def run_optimizer_invariant(queries):
     return passed, failed, errors, fail_list
 
 
+def run_join_steering(queries):
+    """Week 23.5: assert each query's planned join operator matches what its
+    steering comment claims, read from --explain's Physical Plan section."""
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    passed, failed = 0, 0
+    fail_list = []
+    print(f"\n--- Week 23.5 join-algorithm steering (--explain) ---")
+    for label, query in queries:
+        expected = WEEK23_5_EXPECTED_JOIN[label]
+        other = "VecSimdLoopJoin" if expected == "VecHashJoin" else "VecHashJoin"
+        args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache",
+                *VEC, "--explain", "--query", query]
+        result = subprocess.run(args, capture_output=True, text=True)
+        physical = result.stdout.split("=== Physical Plan ===")[-1]
+        if result.returncode == 0 and expected in physical and other not in physical:
+            print(f"  PASS  [{label}]  plans {expected}")
+            passed += 1
+        else:
+            planned = other if other in physical else "neither operator"
+            print(f"  FAIL  [{label}]  expected {expected}, planned {planned}")
+            failed += 1
+            fail_list.append((f"steering:{label}", query, planned, expected))
+    print(f"  {passed} passed, {failed} failed, 0 errors")
+    return passed, failed, 0, fail_list
+
+
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES
 
     # existing surface on the default row/Volcano path
     r1 = run_suite(conn, QUERIES, "Default (row storage, Volcano)")
@@ -438,15 +502,18 @@ def main():
     r2 = run_suite(conn, all_queries, "Vectorized (columnar, optimizer ON)", extra_args=VEC)
     # Week 21 result-preserving invariant
     r3 = run_optimizer_invariant(all_queries)
+    # Week 23.5 plan-shape steering
+    r4 = run_join_steering(WEEK23_5_QUERIES)
 
-    passed = r1[0] + r2[0] + r3[0]
-    failed = r1[1] + r2[1] + r3[1]
-    errors = r1[2] + r2[2] + r3[2]
-    fail_list = r1[3] + r2[3] + r3[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
-          f"({len(QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant)")
+          f"({len(QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
+          f"+ {len(WEEK23_5_QUERIES)} steering)")
 
     if fail_list:
         print(f"\n{'='*70}")
