@@ -294,10 +294,16 @@ static std::unique_ptr<VecPlanNode> buildVecOptimized(const std::string& sql, co
     return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
 }
 
-// Descend children()[0] to the join node.
+// Descend children()[0] to the join node (either physical join operator —
+// Week 23.5 added VecSimdLoopJoin alongside VecHashJoin).
+static bool isJoinNode(const VecPlanNode* n) {
+    const std::string e = n->explain();
+    return e.rfind("VecHashJoin", 0) == 0 || e.rfind("VecSimdLoopJoin", 0) == 0;
+}
+
 static const VecPlanNode* findJoin(const VecPlanNode* root) {
     const VecPlanNode* n = root;
-    while (n && n->explain().rfind("VecHashJoin", 0) != 0) {
+    while (n && !isJoinNode(n)) {
         auto kids = n->children();
         n = kids.empty() ? nullptr : kids[0];
     }
@@ -506,4 +512,123 @@ TEST(VecPlanBuilder, BareJoinExplainHasNoCostDecision) {
     const VecPlanNode* join = findJoin(plan.get());
     ASSERT_NE(join, nullptr);
     EXPECT_EQ(join->explain().find("cost="), std::string::npos);
+}
+
+// ===== Week 23.5: cost-based join algorithm selection =====
+
+// Stats that make the SIMD choice decisive rather than marginal: drivers is a
+// 4-row build side, so simdLoopJoinCost beats hashJoinCost for any plausible
+// calibration of CPU_SIMD_COMPARE (< 0.25), and the tests survive Stage 2's
+// constant tuning.
+static void seedSimdStats(Catalog& cat) {
+    TableStats laps;
+    laps.row_count = 1000;
+    ColumnStats speed;
+    speed.min_val = Value(200.0);
+    speed.max_val = Value(400.0);
+    speed.distinct_count = 900;
+    speed.null_count = 0;
+    laps.columns.emplace("speed", speed);
+    cat.setStats("laps", std::move(laps));
+
+    TableStats drivers;   // tiny INT-keyed build side — prime SIMD territory
+    drivers.row_count = 4;
+    cat.setStats("drivers", std::move(drivers));
+}
+
+// The Week 23.5 checkpoint as a plan-shape assertion: a tiny INT-keyed build
+// side must lower to the SIMD loop join, and explain() must name both the
+// chosen algorithm and the rejected hash alternative.
+TEST(VecPlanBuilder, TinyIntKeyBuildSelectsSimdLoopJoin) {
+    Catalog cat(CATALOG);
+    seedSimdStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    std::string e = join->explain();
+    EXPECT_EQ(e.rfind("VecSimdLoopJoin", 0), 0u) << e;
+    EXPECT_NE(e.find("algo=simd"), std::string::npos) << e;
+    EXPECT_NE(e.find("hash="), std::string::npos) << e;   // rejected alternative shown
+}
+
+// A large build side prices the quadratic probe term out — hash must stay,
+// and the explain records that the algorithm choice went to hash.
+TEST(VecPlanBuilder, LargeIntKeyBuildKeepsHashJoin) {
+    Catalog cat(CATALOG);
+    TableStats laps;
+    laps.row_count = 100000;
+    cat.setStats("laps", std::move(laps));
+    TableStats drivers;
+    drivers.row_count = 5000;
+    cat.setStats("drivers", std::move(drivers));
+
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    std::string e = join->explain();
+    EXPECT_EQ(e.rfind("VecHashJoin", 0), 0u) << e;
+    EXPECT_NE(e.find("algo=hash"), std::string::npos) << e;
+}
+
+// STRING join keys are ineligible regardless of build size — ColumnVector
+// carries decoded strings, which the flat int64 key buffer cannot represent —
+// so no algorithm choice is live and explain() must not print one.
+TEST(VecPlanBuilder, StringKeyKeepsHashJoinEvenWhenTiny) {
+    Catalog cat(CATALOG);
+    TableStats laps;
+    laps.row_count = 1000;
+    cat.setStats("laps", std::move(laps));
+    TableStats drivers;
+    drivers.row_count = 5;
+    cat.setStats("drivers", std::move(drivers));
+
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.team = drivers.team", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    std::string e = join->explain();
+    EXPECT_EQ(e.rfind("VecHashJoin", 0), 0u) << e;
+    EXPECT_EQ(e.find("algo="), std::string::npos) << e;
+}
+
+// SIMD selection is an optimizer decision: without the estimator (--no-optimize)
+// even a 3-row build side must keep the pre-Week-22 hash lowering.
+TEST(VecPlanBuilder, UnoptimizedLoweringNeverSelectsSimd) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(   // buildVec deliberately omits pushdown + estimator
+        "SELECT drivers.name, laps.lap_id FROM drivers JOIN laps "
+        "ON drivers.driver_id = laps.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain().rfind("VecHashJoin", 0), 0u) << join->explain();
+}
+
+// Result preservation (invariant #11): the SIMD-selected plan returns exactly
+// what the row-storage Volcano baseline returns — even though the seeded
+// estimates (1000-row laps) wildly disagree with the real 5-row test table.
+// Bad estimates may cost performance, never correctness.
+TEST(VecPlanBuilder, SimdSelectedPlanMatchesVolcanoBaseline) {
+    Catalog cat(CATALOG);
+    seedSimdStats(cat);
+    const std::string sql =
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300";
+
+    auto plan = buildVecOptimized(sql, cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->explain().rfind("VecSimdLoopJoin", 0), 0u) << join->explain();
+
+    auto vec_rows  = serialize(drainVec(*plan), true);
+    auto volc_rows = serialize(runVolcanoRow(sql, cat), true);
+    EXPECT_EQ(vec_rows, volc_rows);
 }

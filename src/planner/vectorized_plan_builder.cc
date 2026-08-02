@@ -7,7 +7,9 @@
 #include "execution/vec_distinct_node.h"
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/vec_hash_join_node.h"
+#include "execution/vec_simd_loop_join_node.h"
 #include "planner/cost_model.h"
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -110,14 +112,34 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             auto from_child = lower(join->children[0].get(), pruning_where);
             auto join_child = lower(join->children[1].get(), nullptr);
 
-            // cost each build assignment; the memory + build-CPU terms make the
-            // smaller input the cheaper build side. Hash is the only physical
-            // join operator SwiftQL lowers at single-equi-join scope, so only
-            // the build side is decided here. (Week 23.5 adds a SIMD loop-join
-            // operator and a real algorithm choice against it.)
-            double cost_from_builds = hashJoinCost(from_est, from_w, join_est);
-            double cost_join_builds = hashJoinCost(join_est, join_w, from_est);
-            bool from_builds = cost_from_builds < cost_join_builds;
+            // Week 22 (build side) + Week 23.5 (algorithm): cost every legal
+            // (side, algorithm) assignment and take the cheapest jointly. With
+            // the current constants each algorithm prefers the same side — the
+            // side-preference deltas coincide because CPU_HASH_BUILD -
+            // CPU_HASH_PROBE == CPU_LOOP_BUILD (the SIMD quadratic term is
+            // symmetric under side swap and cancels) — but that is a property
+            // of the tuned weights, not a structural guarantee, so all four are
+            // costed to keep future recalibration safe. SIMD eligibility is
+            // hard (INT keys only: ColumnVector carries decoded strings, and
+            // DOUBLE bitwise equality is a trap) and gated on estimate_driven
+            // so --no-optimize keeps the pre-Week-22 hash-only lowering as the
+            // unchanged baseline.
+            const Schema& from_schema = join->children[0]->output_schema;
+            const Schema& jn_schema   = join->children[1]->output_schema;
+            bool int_keys =
+                from_schema.column(from_schema.indexOf(join->from_col)).type == TypeId::INT &&
+                jn_schema.column(jn_schema.indexOf(join->join_col)).type == TypeId::INT;
+
+            double cost_hash_from = hashJoinCost(from_est, from_w, join_est);
+            double cost_hash_join = hashJoinCost(join_est, join_w, from_est);
+            double cost_simd_from = simdLoopJoinCost(from_est, from_w, join_est);
+            double cost_simd_join = simdLoopJoinCost(join_est, join_w, from_est);
+
+            double best_hash = std::min(cost_hash_from, cost_hash_join);
+            double best_simd = std::min(cost_simd_from, cost_simd_join);
+            bool use_simd = estimate_driven && int_keys && best_simd < best_hash;
+            bool from_builds = use_simd ? cost_simd_from < cost_simd_join
+                                        : cost_hash_from < cost_hash_join;
 
             // Week 23: hand the costed decision to the node for explain output —
             // but only when cardinality estimates drove it. The raw-table-size
@@ -126,17 +148,40 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // Costs are unitless (cost_model.h) — never append a time unit.
             std::string decision;
             if (estimate_driven) {
+                // first clause: side decision within the winning algorithm;
+                // second clause (INT keys only): the algorithm decision, with
+                // the rejected algorithm's best cost
+                double side_cost = use_simd ? (from_builds ? cost_simd_from : cost_simd_join)
+                                            : (from_builds ? cost_hash_from : cost_hash_join);
+                double side_alt  = use_simd ? (from_builds ? cost_simd_join : cost_simd_from)
+                                            : (from_builds ? cost_hash_join : cost_hash_from);
                 std::ostringstream d;
                 d << std::fixed << std::setprecision(0)
                   << "build=" << leafScanTable(join->children[from_builds ? 0 : 1].get())
-                  << " cost=" << (from_builds ? cost_from_builds : cost_join_builds)
-                  << " (alt=" << (from_builds ? cost_join_builds : cost_from_builds) << ")";
+                  << " cost=" << side_cost << " (alt=" << side_alt << ")";
+                if (int_keys) {
+                    d << " algo=" << (use_simd ? "simd" : "hash")
+                      << " (" << (use_simd ? "hash=" : "simd=")
+                      << (use_simd ? best_hash : best_simd) << ")";
+                }
                 decision = d.str();
             }
 
             // output schema stays in fixed logical order [FROM, JOIN] regardless
             // of which side physically builds; swapped tells the join to reorder
             // columns when assembling output.
+            if (use_simd) {
+                std::unique_ptr<VecSimdLoopJoinNode> join_node = from_builds
+                    // FROM builds: JOIN side probes (swapped)
+                    ? std::make_unique<VecSimdLoopJoinNode>(
+                          std::move(join_child), std::move(from_child),
+                          join->join_col, join->from_col, join->output_schema, /*swapped=*/true)
+                    : std::make_unique<VecSimdLoopJoinNode>(
+                          std::move(from_child), std::move(join_child),
+                          join->from_col, join->join_col, join->output_schema, /*swapped=*/false);
+                join_node->setCostDecision(std::move(decision));
+                return join_node;
+            }
             std::unique_ptr<VecHashJoinNode> join_node = from_builds
                 // FROM builds: JOIN side probes (swapped)
                 ? std::make_unique<VecHashJoinNode>(
