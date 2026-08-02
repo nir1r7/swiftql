@@ -420,3 +420,90 @@ TEST(VecPlanBuilder, EqualRowsBuildNarrowerSideByRealWidth) {
     EXPECT_NE(buildSideScan(join).find("laps"), std::string::npos)
         << "equal rows: the narrower laps side should build, not wide drivers";
 }
+
+// ===== Week 23: explainability — estimates survive lowering =====
+
+// Collect every node of a physical tree (any child order).
+static void collectAllVec(const VecPlanNode* n, std::vector<const VecPlanNode*>& out) {
+    out.push_back(n);
+    for (const VecPlanNode* c : n->children()) collectAllVec(c, out);
+}
+
+// Lowering consumes the logical tree, so EXPLAIN ANALYZE can only compare
+// estimates against actuals if each physical node inherits its logical
+// counterpart's estimated_rows. Root must match exactly; every node ≥ 0.
+TEST(VecPlanBuilder, EstimatesSurviveLowering) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+
+    // inline buildVecOptimized so the logical root estimate can be captured
+    Parser parser("SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+                  "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    logical = PredicatePushdown::apply(std::move(logical), cat);
+    CardinalityEstimator::estimate(*logical, cat);
+    double root_est = logical->estimated_rows;
+    ASSERT_GE(root_est, 0.0) << "estimator must have stamped the logical root";
+
+    auto plan = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+
+    EXPECT_DOUBLE_EQ(plan->estimated_rows, root_est);
+    std::vector<const VecPlanNode*> nodes;
+    collectAllVec(plan.get(), nodes);
+    for (const VecPlanNode* n : nodes) {
+        EXPECT_GE(n->estimated_rows, 0.0) << "unstamped node: " << n->explain();
+    }
+}
+
+// --no-optimize skips the estimator entirely: the -1 sentinel must survive
+// lowering unchanged so EXPLAIN hides the est= column instead of printing -1.
+TEST(VecPlanBuilder, UnoptimizedLoweringLeavesEstimatesUnset) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300", cat);
+
+    std::vector<const VecPlanNode*> nodes;
+    collectAllVec(plan.get(), nodes);
+    for (const VecPlanNode* n : nodes) {
+        EXPECT_DOUBLE_EQ(n->estimated_rows, -1.0) << n->explain();
+    }
+}
+
+// ===== Week 23: explainability — the join names its costed decision =====
+
+// The two hashJoinCost values exist only inside lowering; the builder must
+// hand the chosen/alternative costs and build side to the join node, and
+// explain() must show them. Reuses the Week 22 flip scenario so the shown
+// build side is the one only the cost model could pick.
+TEST(VecPlanBuilder, JoinExplainShowsCostDecision) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 399", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    std::string e = join->explain();
+    EXPECT_NE(e.find("build=laps"), std::string::npos) << e;
+    EXPECT_NE(e.find("cost="), std::string::npos) << e;
+    EXPECT_NE(e.find("alt="), std::string::npos) << e;
+}
+
+// Without the estimator the builder falls back to raw table sizes — the
+// pre-Week-22 heuristic, not an optimizer decision — so explain() must not
+// claim a cost-based choice (--no-optimize output stays clean).
+TEST(VecPlanBuilder, BareJoinExplainHasNoCostDecision) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain().find("cost="), std::string::npos);
+}
