@@ -63,3 +63,7 @@ target_link_libraries(swiftql_lib
 # CLI executable
 add_executable(swiftql src/cli/main.cc)
 target_link_libraries(swiftql swiftql_lib)
+
+# Week 23.5 calibration harness (run from a Release build — see file header)
+add_executable(calibrate_join_crossover benchmarks/calibrate_join_crossover.cc)
+target_link_libraries(calibrate_join_crossover swiftql_lib)
