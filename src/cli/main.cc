@@ -116,6 +116,7 @@ struct NodeLine {
     std::string label;
     std::string rows_in;
     std::string rows_out;
+    std::string est;      // "est=N" when the Week 20 estimator ran, else empty
     std::string time;
     std::string pct;
 };
@@ -152,6 +153,12 @@ void collectNodes(PlanNode* node, int depth, bool analyze,
 void collectVecNodes(VecPlanNode* node, int depth, bool analyze, double exec_total_us, std::vector<NodeLine>& out) {
     NodeLine line;
     line.label = std::string(depth * 2, ' ') + node->explain();
+    // estimates print in both --explain and --explain-analyze; the -1 sentinel
+    // (--no-optimize, Volcano) leaves the field empty and printAligned hides
+    // the whole column
+    if (node->estimated_rows >= 0.0) {
+        line.est = "est=" + std::to_string(std::llround(node->estimated_rows));
+    }
     if (analyze) {
         // analyze mode implies full execution, so print rows_in/rows_out
         // unconditionally — a real 0 must be visible.
@@ -170,6 +177,20 @@ void collectVecNodes(VecPlanNode* node, int depth, bool analyze, double exec_tot
     }
 }
 
+// Week 23: logical-plan walker for the --explain sections. The logical tree is
+// consumed by lowering, so callers must capture lines while it still exists.
+void collectLogicalNodes(const LogicalPlanNode* node, int depth, std::vector<NodeLine>& out) {
+    NodeLine line;
+    line.label = std::string(depth * 2, ' ') + node->explain();
+    if (node->estimated_rows >= 0.0) {
+        line.est = "est=" + std::to_string(std::llround(node->estimated_rows));
+    }
+    out.push_back(std::move(line));
+    for (const auto& child : node->children) {
+        collectLogicalNodes(child.get(), depth + 1, out);
+    }
+}
+
 void printAligned(const std::vector<NodeLine>& lines) {
     auto dispLen = [](const std::string& s) {
         size_t extra = 0;
@@ -177,11 +198,12 @@ void printAligned(const std::vector<NodeLine>& lines) {
         return s.size() - extra;
     };
 
-    size_t w_label = 0, w_ri = 0, w_ro = 0, w_time = 0;
+    size_t w_label = 0, w_ri = 0, w_ro = 0, w_est = 0, w_time = 0;
     for (const auto& l : lines) {
         w_label = std::max(w_label, dispLen(l.label));
         w_ri    = std::max(w_ri,    l.rows_in.size());
         w_ro    = std::max(w_ro,    l.rows_out.size());
+        w_est   = std::max(w_est,   l.est.size());
         w_time  = std::max(w_time,  dispLen(l.time));
     }
     const size_t gap = 3;
@@ -193,6 +215,12 @@ void printAligned(const std::vector<NodeLine>& lines) {
         }
         if (w_ro > 0){
             std::cout << std::setw(static_cast<int>(w_ro + gap)) << l.rows_out;
+        }
+        // est= sits directly after rows_out= — benchmark.py's q-error regex
+        // anchors on that adjacency. Explicit std::left: in plain --explain
+        // rows_in is empty, so the manipulator above never runs.
+        if (w_est > 0){
+            std::cout << std::left << std::setw(static_cast<int>(w_est + gap)) << l.est;
         }
         if (!l.time.empty()) {
             std::cout << l.time << std::string(w_time - dispLen(l.time) + gap, ' ');
@@ -275,6 +303,14 @@ int main(int argc, char* argv[]) {
                 // bind -> logical plan (validates internally) -> optimize -> lower
                 auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
 
+                // Week 23: pushdown rewrites and lowering both consume the tree,
+                // so each --explain section is captured as text while its stage
+                // still exists — pre-optimization here, optimized below.
+                std::vector<NodeLine> logical_lines;
+                if (args.explain) {
+                    collectLogicalNodes(logical.get(), 0, logical_lines);
+                }
+
                 if (!args.no_optimize) {
                     // Week 21: push single-relation WHERE predicates onto their
                     // own scan and order scan-local conjuncts by expected work.
@@ -287,6 +323,11 @@ int main(int argc, char* argv[]) {
                     CardinalityEstimator::estimate(*logical, catalog);
                 }
 
+                std::vector<NodeLine> optimized_lines;
+                if (args.explain && !args.no_optimize) {
+                    collectLogicalNodes(logical.get(), 0, optimized_lines);
+                }
+
                 std::unique_ptr<VecPlanNode> vec_node = VectorizedPlanBuilder::build(
                     std::move(logical), std::move(columnar_tables), catalog);
 
@@ -294,6 +335,13 @@ int main(int argc, char* argv[]) {
                     std::chrono::high_resolution_clock::now() - plan_start).count();
 
                 if (args.explain) {
+                    std::cout << "=== Logical Plan ===\n";
+                    printAligned(logical_lines);
+                    if (!optimized_lines.empty()) {
+                        std::cout << "\n=== Optimized Logical Plan ===\n";
+                        printAligned(optimized_lines);
+                    }
+                    std::cout << "\n=== Physical Plan ===\n";
                     std::vector<NodeLine> lines;
                     collectVecNodes(vec_node.get(), 0, false, 0.0, lines);
                     printAligned(lines);
