@@ -49,6 +49,7 @@ add_library(swiftql_lib
     src/execution/vec_distinct_node.cc
     src/execution/vec_hash_aggregate_node.cc
     src/execution/vec_hash_join_node.cc
+    src/execution/vec_simd_loop_join_node.cc
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 
