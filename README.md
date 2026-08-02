@@ -598,9 +598,14 @@ Inserted extension. Gives the Week 22 cost-based optimizer a real second physica
 join algorithm to choose against, so the "compare join algorithms" decision stops
 being hypothetical.
 
-- Add `VecSimdLoopJoinNode` — a vectorized inner equi-join that holds the small build side's INT keys in a flat contiguous buffer and probes them with SIMD comparisons (NEON on ARM, AVX2 on x86), materializing the payload late via the existing `SelectionVector`
+- Add `VecSimdLoopJoinNode` — a vectorized inner equi-join that holds the small build side's INT keys in a flat contiguous buffer and probes them with SIMD comparisons (NEON on ARM, AVX2 on x86); the probe hot loop scans only the key buffer, touching payload columns only for matched rows — output is materialized, as with the hash join
 - Cost the SIMD loop against the hash join and let the optimizer pick per join from cardinality estimates; restrict SIMD selection to INT keys with a small build side, falling back to hash join otherwise (STRING/DOUBLE keys, large builds)
 - Ship a scalar reference path behind the same operator and calibrate the cost crossover from on-device measurement
+
+> **Result (measured):** the SIMD loop join beats the hash join up to a crossover of
+> ≈ 52–57 build rows (Apple M4 Pro, stable across 100k and 1M probe rows), so
+> `CPU_SIMD_COMPARE = 0.02` models the crossover at 50. Methodology, full numbers, and
+> the constant inversion in [docs/hash-vs-simd-crossover.md](docs/hash-vs-simd-crossover.md).
 
 **Checkpoint:** The optimizer selects the SIMD loop join over the hash join when the build side is small, its results match the hash join and SQLite, and the measured hash/SIMD crossover point is documented.
 
