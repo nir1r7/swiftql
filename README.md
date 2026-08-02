@@ -58,8 +58,8 @@ The project is structured in five progressive phases, each leaving a working and
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- `EXPLAIN` — prints the query plan tree without executing
-- `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
+- `EXPLAIN` — prints the query plan tree without executing; on the vectorized path shows three sections (logical plan, optimized logical plan with estimated rows, physical plan with the join's cost decision)
+- `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, estimated rows (vectorized, optimizer on), exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
 - `--storage row | columnar` — switches the storage backend
 - `--execution volcano | vectorized` — switches the execution model
 - Query result cache — identical queries served from cache without re-execution
@@ -774,10 +774,15 @@ being hypothetical.
 
 ### Optimizer Impact (Phase 4, Col + Vectorized mode)
 
+Measured in Week 23 — 1M rows, avg of 5 runs, Release build. Full analysis including per-node estimation accuracy (q-error) in [docs/phase3-vs-phase4.md](docs/phase3-vs-phase4.md).
+
 | Query | No Optimizer (ms) | With Optimizer (ms) |
 |---|---|---|
-| `SELECT AVG(speed) FROM laps WHERE season = 2025 AND speed > 300` | — | — |
-| `SELECT l.team, COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id GROUP BY l.team` | — | — |
+| `SELECT AVG(speed) FROM laps WHERE season = 2025 AND speed > 300` | 3.4 | 3.5 |
+| `SELECT laps.team, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY laps.team` | 132.1 | 131.2 |
+| `... JOIN ... WHERE laps.season = 2025 AND drivers.age > 30 GROUP BY laps.team` | 32.5 | 23.0 |
+
+The unfiltered rows are flat by design — zone-map pruning already dominates query 1, and with no filter the cost model picks the same build side as the raw-size heuristic. The filtered join (row 3) is where pushdown + build-side selection pay: **1.41x**.
 
 ### Batch Size Sensitivity (Phase 3, `SELECT AVG(speed) FROM laps`)
 
