@@ -4,7 +4,7 @@ Row vs columnar storage, 1M rows, avg of 5 runs. Both modes use the Volcano (row
 
 ## Dataset
 
-F1 laps table, 9 columns, 1M rows. **Data is sorted by season** (all 2022 rows first, then 2023, 2024, 2025). This makes zone-map chunk pruning extremely effective for season-filtered queries — entire contiguous blocks of chunks can be skipped without reading a single row.
+F1 laps table, 9 columns, 1M rows. **Data is sorted by season** (all 2022 rows first, then 2023, 2024, 2025 — the default output of `generate_data.py`). This makes zone-map chunk pruning extremely effective for season-filtered queries — entire contiguous blocks of chunks can be skipped without reading a single row.
 
 ## Memory Footprint
 

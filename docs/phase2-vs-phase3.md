@@ -4,7 +4,7 @@ Row+Volcano vs columnar+Volcano vs columnar+Vectorized, 1M rows, single run per 
 
 ## Dataset
 
-Same F1 laps table as Phase 2: 9 columns, 1M rows, **sorted by season**. Zone-map chunk pruning (Phase 2) and vectorized execution (Phase 3) are independent optimizations — they compose, and the zone-map + vectorized result for the selective filter query shows exactly that.
+Same F1 laps table as Phase 2: 9 columns, 1M rows, **sorted by season** (the default output of `generate_data.py`). Zone-map chunk pruning (Phase 2) and vectorized execution (Phase 3) are independent optimizations — they compose, and the zone-map + vectorized result for the selective filter query shows exactly that.
 
 ## Memory Footprint
 

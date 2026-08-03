@@ -47,6 +47,9 @@ def write_csv(filepath, rows, fieldnames):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=1000)
+    parser.add_argument("--no-sort", action="store_true",
+                        help="keep random season order (benchmark docs assume "
+                             "season-sorted data so zone-map pruning can skip chunks)")
     args = parser.parse_args()
 
     drivers = generate_drivers()
@@ -54,8 +57,13 @@ if __name__ == "__main__":
               ["driver_id", "name", "nationality", "team", "age"])
 
     laps = generate_laps(args.rows, drivers)
+    if not args.no_sort:
+        # season-sorted by default: every benchmark doc measures against
+        # clustered seasons (zone maps can prove whole chunks irrelevant)
+        laps.sort(key=lambda r: r["season"])
     write_csv("data/laps.csv", laps,
-              ["lap_id", "driver_id", "team", "speed", 
+              ["lap_id", "driver_id", "team", "speed",
                "sector_1", "sector_2", "sector_3", "season", "round"])
 
-    print(f"Generated {args.rows} laps and {len(drivers)} drivers")
+    order = "random season order" if args.no_sort else "sorted by season"
+    print(f"Generated {args.rows} laps ({order}) and {len(drivers)} drivers")

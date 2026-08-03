@@ -586,7 +586,9 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 
 ### Week 23 — Explainability + Phase 4 Benchmarks
 
-- Show logical and optimized plans, estimated rows, costs, and optimizer decisions
+- Show logical and optimized plans, estimated rows, costs, and optimizer
+  decisions on the vectorized path (row/Volcano `--explain` prints the
+  physical plan only)
 - Compare estimates with actual rows in `EXPLAIN ANALYZE`
 - Benchmark vectorized execution with and without optimization
 
