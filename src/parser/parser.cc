@@ -266,15 +266,17 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
     throw ParseError("Expected an expression", current_);
 }
 
-std::vector<std::string> Parser::parseColumnList(){
-    auto parseOne = [&]() -> std::string {
-        std::string name = expect(TokenType::IDENTIFIER, "column name").value;
+std::vector<GroupByColumn> Parser::parseColumnList(){
+    auto parseOne = [&]() -> GroupByColumn {
+        GroupByColumn col;
+        col.column_name = expect(TokenType::IDENTIFIER, "column name").value;
         if (match(TokenType::DOT)) {
-            name = expect(TokenType::IDENTIFIER, "column name after '.'").value;
+            col.table_name = col.column_name;
+            col.column_name = expect(TokenType::IDENTIFIER, "column name after '.'").value;
         }
-        return name;
+        return col;
     };
-    std::vector<std::string> cols;
+    std::vector<GroupByColumn> cols;
     cols.push_back(parseOne());
     while (match(TokenType::COMMA)) {
         cols.push_back(parseOne());

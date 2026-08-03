@@ -105,8 +105,9 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     }
 
     if (!stmt.group_by.empty() || has_aggregates) {
-        auto agg_schema = buildAggregateSchema(stmt, node->outputSchema());
-        node = std::make_unique<HashAggregateNode>(std::move(node), stmt.group_by, extractAggregates(stmt), agg_schema);
+        std::vector<AggregateSpec> agg_specs = extractAggregates(stmt);
+        auto agg_schema = buildAggregateSchema(stmt.group_by, agg_specs, node->outputSchema());
+        node = std::make_unique<HashAggregateNode>(std::move(node), stmt.group_by, std::move(agg_specs), agg_schema);
     }
 
     // HAVING
@@ -123,13 +124,16 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     if (stmt.select_star) {
         const Schema& child_schema = node->outputSchema();
         std::vector<std::unique_ptr<Expr>> star_exprs;
+        std::vector<ColumnDef> star_cols;
         for (const auto& col : child_schema.columns()) {
+            if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
             ref->relation_slot = col.relation_slot; // preserve side so SELECT * on a self-join emits both sides
             star_exprs.push_back(std::move(ref));
+            star_cols.push_back(col);
         }
-        node = std::make_unique<ProjectNode>(std::move(node), std::move(star_exprs), child_schema);
+        node = std::make_unique<ProjectNode>(std::move(node), std::move(star_exprs), Schema(star_cols));
     } else {
         auto project_schema = buildProjectSchema(stmt, node->outputSchema());
         node = std::make_unique<ProjectNode>(

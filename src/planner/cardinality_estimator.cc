@@ -159,10 +159,10 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 node.estimated_rows = 1.0;  // global aggregate: exactly one row
             } else {
                 double groups = 1.0;
-                for (const auto& col : agg.group_by) {
-                    // bare-name lookup: GROUP BY qualifiers are unsupported, so
-                    // group_by entries are unqualified names
-                    const ColumnStatsEntry* e = child_ctx.find(col, -1);
+                for (const auto& g : agg.group_by) {
+                    // slot-first lookup mirrors execution: a qualified GROUP BY
+                    // reads NDV from the named join side
+                    const ColumnStatsEntry* e = child_ctx.find(g.column_name, g.relation_slot);
                     // unknown NDV contributes no reduction; the clamp bounds it
                     groups *= (e && e->stats->distinct_count > 0)
                             ? static_cast<double>(e->stats->distinct_count)

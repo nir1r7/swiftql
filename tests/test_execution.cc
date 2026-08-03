@@ -272,7 +272,7 @@ TEST(HashAggregateNode, AllFunctionsAndNullHandling) {
         {"MAX(speed)", TypeId::DOUBLE},
     });
 
-    HashAggregateNode agg(makeScan(rows, schema), {"team"}, specs, out_schema);
+    HashAggregateNode agg(makeScan(rows, schema), {{"", "team"}}, specs, out_schema);
     auto result = drainAll(&agg);
     ASSERT_EQ(result.size(), 2u);
 
@@ -582,7 +582,7 @@ TEST(Pipeline, CheckpointQuery) {
     Schema agg_schema = makeSchema({{"team", TypeId::STRING}, {"AVG(speed)", TypeId::DOUBLE}});
     auto aggregate = std::make_unique<HashAggregateNode>(
         std::move(filter),
-        std::vector<std::string>{"team"},
+        std::vector<GroupByColumn>{{"", "team"}},
         std::vector<AggregateSpec>{{"AVG", "speed", false}},
         agg_schema);
 
@@ -676,7 +676,7 @@ TEST(Pipeline, HashJoinWithFilterAndAggregate) {
     Schema agg_schema = makeSchema({{"team", TypeId::STRING}, {"AVG(speed)", TypeId::DOUBLE}});
     auto agg = std::make_unique<HashAggregateNode>(
         std::move(filter),
-        std::vector<std::string>{"team"},
+        std::vector<GroupByColumn>{{"", "team"}},
         std::vector<AggregateSpec>{{"AVG", "speed", false}},
         agg_schema);
 

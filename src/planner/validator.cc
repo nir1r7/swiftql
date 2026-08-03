@@ -1,5 +1,6 @@
 #include "validator.h"
 #include "join_condition.h"
+#include "parser/expr_utils.h"
 
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // FROM table must exist
@@ -54,22 +55,37 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         validateExpr(stmt.where.get(), schema, "WHERE", /*allow_aggregates=*/false);
     }
 
-    // GROUP BY columns must exist in the FROM table or, when a join is present,
-    // the joined table — columns resolve against the merged FROM+JOIN schema at plan time
-    for (const auto& col : stmt.group_by) {
-        bool found = schema.hasColumn(col);
-        if (!found && stmt.join.has_value()) {
-            found = catalog.getTable(stmt.join->join_table).schema.hasColumn(col);
+    // GROUP BY columns must exist. Binder-resolved entries (slot stamped) were
+    // already verified; the rest check against the FROM table or, when a join
+    // is present, the joined table.
+    for (const auto& g : stmt.group_by) {
+        if (g.relation_slot >= 0 && !g.table_name.empty()) continue; // binder verified
+        bool found;
+        if (!g.table_name.empty()) {
+            // qualified but unbound (validator-only callers that skip the Binder)
+            found = (g.table_name == stmt.from_table && schema.hasColumn(g.column_name))
+                 || (stmt.join.has_value() && g.table_name == stmt.join->join_table
+                     && catalog.getTable(stmt.join->join_table).schema.hasColumn(g.column_name));
+        } else {
+            found = schema.hasColumn(g.column_name);
+            if (!found && stmt.join.has_value()) {
+                found = catalog.getTable(stmt.join->join_table).schema.hasColumn(g.column_name);
+            }
         }
         if (!found) {
             throw std::runtime_error(
-                "GROUP BY column not found: '" + col + "'");
+                "GROUP BY column not found: '" + g.column_name + "'");
         }
     }
 
     // HAVING requires GROUP BY
     if (stmt.having && stmt.group_by.empty()) {
         throw std::runtime_error("HAVING requires GROUP BY");
+    }
+
+    // HAVING columns (and aggregate arguments) must exist
+    if (stmt.having) {
+        validateExpr(stmt.having.get(), schema, "HAVING", /*allow_aggregates=*/true);
     }
 
     // non aggregated SELECT columns must appear in GROUP BY when aggregates are present
@@ -84,8 +100,13 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         for (const auto& expr : stmt.select_list) {
             if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
                 bool in_group_by = false;
-                for (const auto& gb_col : stmt.group_by){
-                    if (gb_col == col->column_name) {
+                for (const auto& g : stmt.group_by){
+                    // name match plus slot compatibility: SELECT a.grp with
+                    // GROUP BY b.grp is a different column, not a match.
+                    // Unbound slots (-1) stay name-only for direct-validate callers.
+                    if (g.column_name == col->column_name &&
+                        (col->relation_slot < 0 || g.relation_slot < 0 ||
+                         col->relation_slot == g.relation_slot)) {
                         in_group_by = true;
                         break;
                     }
@@ -105,6 +126,18 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
             if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
                 throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
             }
+        }
+    }
+
+    // an ORDER BY aggregate needs an aggregation context to be computed in
+    if (stmt.group_by.empty() && !has_aggregates) {
+        std::vector<const AggregateExpr*> order_aggs;
+        for (const auto& item : stmt.order_by) {
+            collectAggregates(item.expr.get(), order_aggs);
+        }
+        if (!order_aggs.empty()) {
+            throw std::runtime_error(
+                "ORDER BY aggregate requires GROUP BY or an aggregated SELECT list");
         }
     }
 }

@@ -27,3 +27,31 @@ inline std::string exprToString(const Expr* expr) {
     }
     return "?";
 }
+
+// Output-column name for a computed aggregate.
+// Contract: schema construction (buildAggregateSchema / buildProjectSchema)
+// and evaluate()'s AggregateExpr lookup must agree byte-for-byte — both call
+// this on the bound AST. Qualified arguments keep their as-typed qualifier,
+// which keeps self-join aggregates like AVG(l1.id) / AVG(l2.id) distinct in
+// the aggregate output schema.
+inline std::string aggregateOutputName(const AggregateExpr* agg) {
+    return exprToString(agg);
+}
+
+// Collect every AggregateExpr in an expression tree (aggregates cannot nest,
+// so an AggregateExpr terminates the walk).
+inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*>& out) {
+    if (!expr) return;
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        out.push_back(agg);
+        return;
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        collectAggregates(bin->left.get(), out);
+        collectAggregates(bin->right.get(), out);
+        return;
+    }
+    if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
+        collectAggregates(isnull->operand.get(), out);
+    }
+}

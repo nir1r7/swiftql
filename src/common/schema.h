@@ -18,6 +18,9 @@ struct ColumnDef {
     // schema so qualified column references resolve to the correct side even
     // when both sides share a column name (incl. self-joins).
     int relation_slot = 0;
+    // true for aggregate outputs referenced only in HAVING/ORDER BY: they are
+    // computed and flow through Filter/Sort, but SELECT * synthesis skips them
+    bool hidden = false;
 };
 
 class Schema {

@@ -380,3 +380,68 @@ TEST(JoinOnValidation, SameRelationBothSidesRejected) {
         "SELECT a.id FROM sj a JOIN sj b ON a.id = a.grp", cat);
     EXPECT_NE(err.find("each joined table"), std::string::npos) << err;
 }
+
+// ===== GROUP BY / aggregate resolution (Phase 4 audit fixes) =====
+
+// C4: self-join aggregates over the same column must not collapse to one value.
+TEST(AggregateResolution, SelfJoinDuplicateAggregatesKeepDistinctValues) {
+    Catalog cat(CATALOG);
+    // join pairs (a,b): (1,1) (2,1) (3,2) -> AVG(a.id)=2.0, AVG(b.id)=4/3
+    auto rows = runVolcano(
+        "SELECT AVG(a.id), AVG(b.id) FROM sj a JOIN sj b ON a.grp = b.id", cat);
+    ASSERT_EQ(rows.size(), 1u);
+    ASSERT_EQ(rows[0].size(), 2u);
+    EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 2.0);
+    EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 4.0 / 3.0);
+}
+
+// C3: a qualified GROUP BY must group by the named side, not silently by FROM.
+TEST(AggregateResolution, QualifiedGroupByGroupsByNamedSide) {
+    Catalog cat(CATALOG);
+    // join pairs (a,b) on a.id = b.grp: (1,b1) (1,b2) (2,b3)
+    // GROUP BY b.grp -> {1: 2 rows, 2: 1 row}; grouping by a.grp gives {1: 3}
+    auto rows = runVolcano(
+        "SELECT b.grp, COUNT(*) FROM sj a JOIN sj b ON a.id = b.grp GROUP BY b.grp", cat);
+    ASSERT_EQ(rows.size(), 2u);
+    std::vector<std::pair<int64_t, int64_t>> got;
+    for (const auto& r : rows) got.push_back({r[0].asInt(), r[1].asInt()});
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got[0], (std::pair<int64_t, int64_t>{1, 2}));
+    EXPECT_EQ(got[1], (std::pair<int64_t, int64_t>{2, 1}));
+}
+
+// M2: an unqualified GROUP BY column present on both join sides is ambiguous.
+TEST(AggregateResolution, AmbiguousUnqualifiedGroupByRejected) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT COUNT(*) FROM sj a JOIN sj b ON a.id = b.id GROUP BY val");
+    auto stmt = p.parse();
+    EXPECT_THROW(Binder::bind(stmt, cat), std::runtime_error);
+}
+
+// C3 companion: selecting one side while grouping by the other must be rejected.
+TEST(AggregateResolution, SelectedSideMustMatchGroupBySide) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.grp, COUNT(*) FROM sj a JOIN sj b ON a.id = b.id GROUP BY b.grp", cat);
+    EXPECT_NE(err.find("GROUP BY"), std::string::npos) << err;
+}
+
+// M1: aggregates referenced only in HAVING are computed, not projected.
+TEST(AggregateResolution, HavingOnlyAggregateExecutes) {
+    Catalog cat(CATALOG);
+    // teams: McLaren x2, Ferrari x2, Mercedes x1
+    auto rows = runVolcano(
+        "SELECT team FROM laps GROUP BY team HAVING COUNT(*) > 1", cat);
+    ASSERT_EQ(rows.size(), 2u);
+    for (const auto& r : rows) EXPECT_EQ(r.size(), 1u);  // COUNT(*) not projected
+}
+
+// M1: aggregates referenced only in ORDER BY are computed, not projected.
+TEST(AggregateResolution, OrderByOnlyAggregateExecutes) {
+    Catalog cat(CATALOG);
+    auto rows = runVolcano(
+        "SELECT team FROM laps GROUP BY team ORDER BY COUNT(*) DESC", cat);
+    ASSERT_EQ(rows.size(), 3u);
+    for (const auto& r : rows) EXPECT_EQ(r.size(), 1u);
+    EXPECT_EQ(rows[2][0].asString(), "Mercedes");  // the single-lap team sorts last
+}

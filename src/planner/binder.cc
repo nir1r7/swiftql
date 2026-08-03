@@ -37,6 +37,16 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         for (auto& expr : stmt.select_list) bindExpr(expr.get(), range_table);
     }
     bindExpr(stmt.where.get(), range_table);
+    // GROUP BY items resolve through the same machinery as column refs:
+    // qualified names pick their side, ambiguous unqualified names throw
+    for (auto& g : stmt.group_by) {
+        ColumnRef tmp;
+        tmp.table_name = g.table_name;
+        tmp.column_name = g.column_name;
+        resolveColumnRef(&tmp, range_table);
+        g.table_name = tmp.table_name;
+        g.relation_slot = tmp.relation_slot;
+    }
     bindExpr(stmt.having.get(), range_table);
     for (auto& item : stmt.order_by) bindExpr(item.expr.get(), range_table);
     if (stmt.join.has_value()) bindExpr(stmt.join->condition.get(), range_table);
@@ -69,7 +79,10 @@ void Binder::resolveColumnRef(ColumnRef* col, const std::vector<RangeEntry>& ran
                     throw std::runtime_error(
                         "column '" + col->column_name + "' not found in '" + rte.ref_name + "'");
                 }
-                col->table_name = rte.table_name; // normalize alias -> canonical table name
+                // keep the as-typed qualifier (alias or table name): aggregate
+                // output names are built from it, and self-join occurrences
+                // are only distinguishable by their aliases. Routing uses the
+                // slot, never the qualifier text.
                 col->relation_slot = slot;        // 0 = FROM, 1 = JOIN
                 return;
             }

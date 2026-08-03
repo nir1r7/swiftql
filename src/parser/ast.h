@@ -54,6 +54,14 @@ struct OrderByItem {
     bool desc = false;
 };
 
+// one GROUP BY entry: optionally qualified, slot-stamped by the binder
+// (plain value struct — keeps SelectStatement's move semantics simple)
+struct GroupByColumn {
+    std::string table_name;   // as typed; empty if unqualified
+    std::string column_name;
+    int relation_slot = -1;   // 0 = FROM, 1 = JOIN; -1 = unresolved
+};
+
 // the full parsed query
 struct SelectStatement {
     bool distinct = false;
@@ -76,7 +84,7 @@ struct SelectStatement {
     std::unique_ptr<Expr> where; // nullptr if no WHERE
 
     // optional GROUP BY
-    std::vector<std::string> group_by;
+    std::vector<GroupByColumn> group_by;
 
     // optional HAVING
     std::unique_ptr<Expr> having; // nullptr if no HAVING

@@ -45,7 +45,7 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     std::unordered_set<std::string> required;
     for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
     collectCols(stmt.where.get(), required);
-    for (const auto& col_name : stmt.group_by) required.insert(col_name);
+    for (const auto& g : stmt.group_by) required.insert(g.column_name);
     collectCols(stmt.having.get(), required);
     for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
     if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
@@ -73,11 +73,7 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
             // aggregates on numeric columns produce DOUBLE
             // COUNT always produces INT
             TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-
-            std::string col_name = agg->function_name + "(";
-            col_name += agg->is_star ? "*" : dynamic_cast<ColumnRef*>(agg->argument.get())->column_name;
-            col_name += ")";
-            cols.push_back({col_name, result_type});
+            cols.push_back({aggregateOutputName(agg), result_type});
         }
     }
 
@@ -85,32 +81,32 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
 }
 
 
-Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema){
+// Consumes the specs extractAggregates produced so schema and node can never
+// disagree on column order or names.
+Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
+                            const std::vector<AggregateSpec>& aggregates,
+                            const Schema& table_schema){
     std::vector<ColumnDef> cols;
 
-    // group-by colums in order
-    for (const auto& col_name : stmt.group_by) {
-        int idx = table_schema.indexOf(col_name);
+    // group-by columns in order, resolved slot-first so a qualified GROUP BY
+    // picks the named join side even when both sides share the column name
+    for (const auto& g : group_by) {
+        int idx = g.relation_slot >= 0
+            ? table_schema.indexOf(g.column_name, g.relation_slot)
+            : -1;
+        if (idx < 0) idx = table_schema.indexOf(g.column_name);
         if (idx >= 0) {
             cols.push_back(table_schema.column(idx));
         }
     }
 
-    // one output column per aggregate in the SELECT list
-    for (const auto& expr : stmt.select_list) {
-        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-
-            std::string col_name = agg->function_name + "(";
-            if (agg->is_star) {
-                col_name += "*";
-            } else if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
-                col_name += col->column_name;
-            }
-            col_name += ")";
-
-            cols.push_back({col_name, result_type});
-        }
+    // one output column per aggregate, in spec order (SELECT-list aggregates
+    // first, then hidden HAVING/ORDER-BY-only aggregates at the tail)
+    for (const auto& spec : aggregates) {
+        TypeId result_type = (spec.function == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
+        ColumnDef def{spec.output_name, result_type};
+        def.hidden = spec.hidden;
+        cols.push_back(def);
     }
 
     return Schema(cols);
@@ -120,21 +116,41 @@ Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_sch
 std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
     std::vector<AggregateSpec> specs;
 
+    auto makeSpec = [](const AggregateExpr* agg, bool hidden) {
+        AggregateSpec spec;
+        spec.function = agg->function_name;
+        spec.is_star = agg->is_star;
+        spec.output_name = aggregateOutputName(agg);
+        spec.hidden = hidden;
+        if (!agg->is_star && agg->argument) {
+            if (auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get())) {
+                spec.column = col->column_name;
+                spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
+            }
+        }
+        return spec;
+    };
+
     for (const auto& expr : stmt.select_list) {
         if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            AggregateSpec spec;
-            spec.function = agg->function_name;
-            spec.is_star = agg->is_star;
-
-            if (!agg->is_star && agg->argument) {
-                if (auto* col = dynamic_cast<ColumnRef*>(agg->argument.get())) {
-                    spec.column = col->column_name;
-                    spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
-                }
-            }
-
-            specs.push_back(spec);
+            specs.push_back(makeSpec(agg, /*hidden=*/false));
         }
+    }
+
+    // aggregates referenced only in HAVING or ORDER BY are computed too, as
+    // hidden tail columns the final projection drops. Dedupe by output_name —
+    // the name is how evaluate() finds the column, so name-identical
+    // references share one output column.
+    std::vector<const AggregateExpr*> referenced;
+    collectAggregates(stmt.having.get(), referenced);
+    for (const auto& item : stmt.order_by) collectAggregates(item.expr.get(), referenced);
+    for (const AggregateExpr* agg : referenced) {
+        std::string name = aggregateOutputName(agg);
+        bool known = false;
+        for (const auto& s : specs) {
+            if (s.output_name == name) { known = true; break; }
+        }
+        if (!known) specs.push_back(makeSpec(agg, /*hidden=*/true));
     }
 
     return specs;
@@ -165,7 +181,8 @@ std::string LogicalAggregate::explain() const {
     if (!group_by.empty()) {
         for (size_t i = 0; i < group_by.size(); ++i) {
             if (i) s += ", ";
-            s += group_by[i];
+            if (!group_by[i].table_name.empty()) s += group_by[i].table_name + ".";
+            s += group_by[i].column_name;
         }
         s += " | ";
     }
@@ -265,8 +282,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     }
 
     if (!stmt.group_by.empty() || has_aggs) {
-        Schema agg_schema = buildAggregateSchema(stmt, node->output_schema);
-        node = std::make_unique<LogicalAggregate>(std::move(node), stmt.group_by, extractAggregates(stmt), agg_schema);
+        std::vector<AggregateSpec> agg_specs = extractAggregates(stmt);
+        Schema agg_schema = buildAggregateSchema(stmt.group_by, agg_specs, node->output_schema);
+        node = std::make_unique<LogicalAggregate>(std::move(node), stmt.group_by, std::move(agg_specs), agg_schema);
     }
 
     // HAVING — filter above the aggregate; no dedicated node
@@ -283,13 +301,16 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     if (stmt.select_star) {
         const Schema& child_schema = node->output_schema;
         std::vector<std::unique_ptr<Expr>> star_exprs;
+        std::vector<ColumnDef> star_cols;
         for (const auto& col : child_schema.columns()) {
+            if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
             ref->relation_slot = col.relation_slot; // preserve side so SELECT * on a self-join emits both sides
             star_exprs.push_back(std::move(ref));
+            star_cols.push_back(col);
         }
-        node = std::make_unique<LogicalProject>(std::move(node), std::move(star_exprs), child_schema);
+        node = std::make_unique<LogicalProject>(std::move(node), std::move(star_exprs), Schema(star_cols));
     } else {
         Schema proj_schema = buildProjectSchema(stmt, node->output_schema);
         node = std::make_unique<LogicalProject>(std::move(node), std::move(stmt.select_list), proj_schema);

@@ -34,5 +34,5 @@ class Parser {
         std::unique_ptr<Expr> parseAndExpr();
         std::unique_ptr<Expr> parseCompare();
         std::unique_ptr<Expr> parsePrimary();
-        std::vector<std::string> parseColumnList();
+        std::vector<GroupByColumn> parseColumnList();
 };

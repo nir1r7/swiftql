@@ -1,4 +1,5 @@
 #include "execution/evaluator.h"
+#include "parser/expr_utils.h"
 #include <stdexcept>
 
 
@@ -65,17 +66,10 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     }
 
     // aggregate expression
-    // note: aggregated values are pre-computed
+    // note: aggregated values are pre-computed; the output column is found by
+    // the shared name contract (see aggregateOutputName)
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
-        // reconstruct the canonical name, i.e, AVG(speed) or COUNT(*)
-        std::string col_name;
-        if (agg->is_star) {
-            col_name = agg->function_name + "(*)";
-        } else {
-            // agg->argument must be a ColumnRef
-            auto* inner = dynamic_cast<const ColumnRef*>(agg->argument.get());
-            col_name = agg->function_name + "(" + inner->column_name + ")";
-        }
+        std::string col_name = aggregateOutputName(agg);
         int idx = schema.indexOf(col_name);
         if (idx == -1)
             throw std::runtime_error("Column not found in schema: " + col_name);

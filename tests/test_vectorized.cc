@@ -1964,7 +1964,7 @@ TEST(VecHashAggregate, CountStar_NoGroupBy) {
     Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        std::move(scan), std::vector<std::string>{}, specs, out_schema);
+        std::move(scan), std::vector<GroupByColumn>{}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0].asInt(), 5);
@@ -1983,7 +1983,7 @@ TEST(VecHashAggregate, CountStar_WithGroupBy) {
     Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows[0][0].asString(), "a"); EXPECT_EQ(rows[0][1].asInt(), 2);
@@ -2002,7 +2002,7 @@ TEST(VecHashAggregate, SumGroupBy) {
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"total", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0][0].asInt(), 1);
@@ -2022,7 +2022,7 @@ TEST(VecHashAggregate, AvgGroupBy) {
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"AVG", "val", false}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 15.0);
@@ -2039,7 +2039,7 @@ TEST(VecHashAggregate, MinMax) {
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"mn", TypeId::DOUBLE}, {"mx", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"MIN", "val", false}, {"MAX", "val", false}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 10.0);
@@ -2052,7 +2052,7 @@ TEST(VecHashAggregate, MultiChunkInput) {
     Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeIntScan("id", vals), std::vector<std::string>{}, specs, out_schema);
+        makeIntScan("id", vals), std::vector<GroupByColumn>{}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0].asInt(), n);
@@ -2064,7 +2064,7 @@ TEST(VecHashAggregate, EmptyInput) {
     Schema out_schema = vecSchema({{"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        std::move(scan), std::vector<std::string>{}, specs, out_schema);
+        std::move(scan), std::vector<GroupByColumn>{}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0].asInt(), 0);
@@ -2080,7 +2080,7 @@ TEST(VecHashAggregate, InsertionOrderPreserved) {
     Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows[0][0].asString(), "c");
@@ -2094,7 +2094,7 @@ TEST(VecHashAggregate, OutputSchemaCorrect) {
     std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
     std::vector<Row> rows = {{Value(1LL), Value(10LL)}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, rows), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, rows), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     EXPECT_EQ(agg->outputSchema().size(), 2);
     EXPECT_EQ(agg->outputSchema().column(0).name, "grp");
     EXPECT_EQ(agg->outputSchema().column(1).name, "total");
@@ -2363,7 +2363,7 @@ TEST(VecHashAggregate, FilteredInput) {
     Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        std::move(filter), std::vector<std::string>{"grp"}, specs, out_schema);
+        std::move(filter), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0].asString(), "b");
@@ -2416,7 +2416,7 @@ TEST(VecHashAggregate, AvgDivisorCorrectness) {
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"AVG", "val", false}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(schema, input), std::vector<std::string>{"grp"}, specs, out_schema);
+        makeScan(schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     auto rows = drainRows(*agg);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_DOUBLE_EQ(rows[0][1].asDouble(), 6.0);   // 6/1
@@ -2446,7 +2446,7 @@ TEST(VecHaving, FilterAggregateGroups) {
     Schema agg_schema = vecSchema({{"grp", TypeId::STRING}, {"COUNT(*)", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
     auto agg = std::make_unique<VecHashAggregateNode>(
-        makeScan(in_schema, input), std::vector<std::string>{"grp"}, specs, agg_schema);
+        makeScan(in_schema, input), std::vector<GroupByColumn>{{"", "grp"}}, specs, agg_schema);
 
     // HAVING COUNT(*) > 1  →  col index 1 > literal 1
     auto having_pred = std::make_unique<BinaryExpr>();

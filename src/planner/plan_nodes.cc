@@ -197,7 +197,7 @@ std::vector<PlanNode*> ProjectNode::children() const {
 
 
 // HashAggregateNode
-HashAggregateNode::HashAggregateNode(std::unique_ptr<PlanNode> child,std::vector<std::string> group_by_cols, std::vector<AggregateSpec> aggregates, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), aggregates_(std::move(aggregates)), output_schema_(std::move(output_schema)), cursor_(0) {}
+HashAggregateNode::HashAggregateNode(std::unique_ptr<PlanNode> child,std::vector<GroupByColumn> group_by_cols, std::vector<AggregateSpec> aggregates, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), aggregates_(std::move(aggregates)), output_schema_(std::move(output_schema)), cursor_(0) {}
 
 void HashAggregateNode::open() {
     child_->open();  // child time excluded from self-clock
@@ -214,10 +214,15 @@ void HashAggregateNode::open() {
             break;
         }
         stats.rows_in++;
-        // build group key
+        // build group key, resolved slot-first so a qualified GROUP BY reads
+        // the named join side even when both sides share the column name
         std::vector<Value> key;
-        for (const auto& col : group_by_cols_) {
-            key.push_back((*row)[child_schema.indexOf(col)]);
+        for (const auto& g : group_by_cols_) {
+            int idx = g.relation_slot >= 0
+                ? child_schema.indexOf(g.column_name, g.relation_slot)
+                : -1;
+            if (idx < 0) idx = child_schema.indexOf(g.column_name);
+            key.push_back((*row)[idx]);
         }
         std::string key_str = serializeKey(key);
 
@@ -315,7 +320,8 @@ std::string HashAggregateNode::explain() const {
     std::string s = "Aggregate [group_by=";
     for (size_t i = 0; i < group_by_cols_.size(); ++i) {
         if (i) s += ", ";
-        s += group_by_cols_[i];
+        if (!group_by_cols_[i].table_name.empty()) s += group_by_cols_[i].table_name + ".";
+        s += group_by_cols_[i].column_name;
     }
     for (const auto& agg : aggregates_) {
         s += ", agg=" + agg.function + "(" + (agg.is_star ? "*" : agg.column) + ")";

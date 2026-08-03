@@ -85,7 +85,7 @@ class ProjectNode : public PlanNode {
 class HashAggregateNode : public PlanNode {
     public:
         HashAggregateNode(std::unique_ptr<PlanNode> child,
-            std::vector<std::string> group_by_cols,
+            std::vector<GroupByColumn> group_by_cols,
             std::vector<AggregateSpec> aggregates,
             Schema output_schema);
 
@@ -97,7 +97,7 @@ class HashAggregateNode : public PlanNode {
         std::vector<PlanNode*> children() const override;
     private:
         std::unique_ptr<PlanNode> child_;
-        std::vector<std::string> group_by_cols_; // columns to group by
+        std::vector<GroupByColumn> group_by_cols_; // columns to group by
         std::vector<AggregateSpec> aggregates_; // aggregate functions to compute
         Schema output_schema_;
 

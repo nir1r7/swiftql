@@ -8,7 +8,7 @@
 
 class VecHashAggregateNode : public VecPlanNode {
     public:
-        VecHashAggregateNode(std::unique_ptr<VecPlanNode> child, std::vector<std::string> group_by_cols, std::vector<AggregateSpec> specs, Schema output_schema);
+        VecHashAggregateNode(std::unique_ptr<VecPlanNode> child, std::vector<GroupByColumn> group_by_cols, std::vector<AggregateSpec> specs, Schema output_schema);
 
         void open() override;
         DataChunk* nextChunk() override;
@@ -19,7 +19,7 @@ class VecHashAggregateNode : public VecPlanNode {
 
     private:
         std::unique_ptr<VecPlanNode> child_;
-        std::vector<std::string> group_by_cols_;
+        std::vector<GroupByColumn> group_by_cols_;
         std::vector<AggregateSpec> specs_;
         Schema output_schema_;
 

@@ -326,6 +326,37 @@ WEEK23_5_QUERIES = [
      "WHERE laps.speed > 344.9 ORDER BY laps.lap_id, drivers.name"),
 ]
 
+# Phase 4 audit fixes: shapes both engines used to get silently wrong, so the
+# vec≡volcano equivalence could never catch them — SQLite is the oracle here.
+#   fix_c4_*  self-join aggregates over the same column collapsed to one value
+#             (asymmetric join key so the two averages genuinely differ)
+#   fix_c3_*  qualified GROUP BY silently grouped by the FROM side
+#   fix_m1_*  aggregates referenced only in HAVING / ORDER BY failed at execution
+AUDIT_FIXES_QUERIES = [
+    ("fix_c4_selfjoin_dup_aggs",
+     "SELECT AVG(l1.speed), AVG(l2.speed) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id"),
+
+    ("fix_c3_qualified_group_by_join_side",
+     "SELECT d.team, COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id GROUP BY d.team"),
+
+    ("fix_c3_qualified_group_by_selfjoin",
+     "SELECT l2.team, COUNT(*) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id GROUP BY l2.team"),
+
+    ("fix_m1_having_only_aggregate",
+     "SELECT team FROM laps GROUP BY team HAVING COUNT(*) > 1000"),
+
+    ("fix_m1_order_by_only_aggregate",
+     "SELECT team FROM laps GROUP BY team ORDER BY COUNT(*) DESC, team LIMIT 3"),
+
+    ("fix_m1_hidden_aggs_mixed",
+     "SELECT team, MIN(speed) FROM laps GROUP BY team HAVING AVG(speed) > 250 "
+     "ORDER BY MAX(speed) DESC, team"),
+
+    ("fix_c4_c3_m1_combined",
+     "SELECT l1.team, AVG(l1.speed), AVG(l2.speed) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
+     "GROUP BY l1.team HAVING COUNT(*) > 2 ORDER BY AVG(l2.speed) DESC"),
+]
+
 # The join operator each steering comment above claims — asserted from
 # --explain's Physical Plan (see run_join_steering), so the steering stays
 # true as data stats or cost constants drift instead of silently all
@@ -494,10 +525,11 @@ def run_join_steering(queries):
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES
 
-    # existing surface on the default row/Volcano path
-    r1 = run_suite(conn, QUERIES, "Default (row storage, Volcano)")
+    # existing surface on the default row/Volcano path (audit fixes affected
+    # both engines, so they run here too)
+    r1 = run_suite(conn, QUERIES + AUDIT_FIXES_QUERIES, "Default (row storage, Volcano)")
     # whole surface + Week 21 shapes on the vectorized path (where the optimizer runs)
     r2 = run_suite(conn, all_queries, "Vectorized (columnar, optimizer ON)", extra_args=VEC)
     # Week 21 result-preserving invariant
@@ -512,7 +544,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
-          f"({len(QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
+          f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
           f"+ {len(WEEK23_5_QUERIES)} steering)")
 
     if fail_list:

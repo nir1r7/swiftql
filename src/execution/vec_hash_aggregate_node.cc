@@ -22,7 +22,7 @@ namespace {
     }
 }
 
-VecHashAggregateNode::VecHashAggregateNode( std::unique_ptr<VecPlanNode> child, std::vector<std::string> group_by_cols, std::vector<AggregateSpec> specs, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), specs_(std::move(specs)), output_schema_(std::move(output_schema)) {}
+VecHashAggregateNode::VecHashAggregateNode( std::unique_ptr<VecPlanNode> child, std::vector<GroupByColumn> group_by_cols, std::vector<AggregateSpec> specs, Schema output_schema) : child_(std::move(child)), group_by_cols_(std::move(group_by_cols)), specs_(std::move(specs)), output_schema_(std::move(output_schema)) {}
 
 void VecHashAggregateNode::open() {
     child_->open();
@@ -36,10 +36,15 @@ void VecHashAggregateNode::open() {
 void VecHashAggregateNode::consumeAll() {
     const Schema& child_schema = child_->outputSchema();
 
-    // resolve column indices once outside the chunk loop
+    // resolve column indices once outside the chunk loop; slot-first so a
+    // qualified GROUP BY reads the named join side on shared column names
     std::vector<int> group_idxs;
-    for (const auto& col : group_by_cols_){
-        group_idxs.push_back(child_schema.indexOf(col));
+    for (const auto& g : group_by_cols_){
+        int idx = g.relation_slot >= 0
+            ? child_schema.indexOf(g.column_name, g.relation_slot)
+            : -1;
+        if (idx < 0) idx = child_schema.indexOf(g.column_name);
+        group_idxs.push_back(idx);
     }
 
     std::vector<int> agg_idxs;
@@ -249,7 +254,8 @@ std::string VecHashAggregateNode::explain() const {
         s += "group_by=";
         for (size_t i = 0; i < group_by_cols_.size(); ++i) {
             if (i) s += ",";
-            s += group_by_cols_[i];
+            if (!group_by_cols_[i].table_name.empty()) s += group_by_cols_[i].table_name + ".";
+            s += group_by_cols_[i].column_name;
         }
         if (!specs_.empty()) s += ", ";
     }

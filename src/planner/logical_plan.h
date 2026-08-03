@@ -21,6 +21,11 @@ struct AggregateSpec {
     // join sides that share a column name, e.g. AVG(l2.speed) on a self-join.
     // -1 = unresolved/single-relation (resolve by bare name).
     int relation_slot = -1;
+    // output-schema column name (aggregateOutputName of the bound expr);
+    // empty only for hand-built specs in tests (falls back to FUNC(column))
+    std::string output_name;
+    // true = referenced only in HAVING/ORDER BY: computed but never projected
+    bool hidden = false;
 };
 
 // execution independent plan node
@@ -73,10 +78,10 @@ struct LogicalFilter : LogicalPlanNode {
 
 // group rows by specified columns and compute aggregates
 struct LogicalAggregate : LogicalPlanNode {
-    std::vector<std::string> group_by;  // empty for global aggregates
+    std::vector<GroupByColumn> group_by;  // empty for global aggregates
     std::vector<AggregateSpec> aggregates;
 
-    LogicalAggregate(std::unique_ptr<LogicalPlanNode> child, std::vector<std::string> group_by, std::vector<AggregateSpec> aggregates, Schema output_schema) : LogicalPlanNode(LogicalNodeType::AGGREGATE, std::move(output_schema)), group_by(std::move(group_by)), aggregates(std::move(aggregates)) {
+    LogicalAggregate(std::unique_ptr<LogicalPlanNode> child, std::vector<GroupByColumn> group_by, std::vector<AggregateSpec> aggregates, Schema output_schema) : LogicalPlanNode(LogicalNodeType::AGGREGATE, std::move(output_schema)), group_by(std::move(group_by)), aggregates(std::move(aggregates)) {
         children.push_back(std::move(child));
     }
     std::string explain() const override;
@@ -132,7 +137,9 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
 Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema);
 
 // schema of the aggregate node's output: group-by columns, then one column per aggregate
-Schema buildAggregateSchema(const SelectStatement& stmt, const Schema& table_schema);
+Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
+                            const std::vector<AggregateSpec>& aggregates,
+                            const Schema& table_schema);
 
 // extract aggregate specifications from the select list
 std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt);

@@ -101,8 +101,17 @@ TEST(ParserTest, GroupBy) {
     Parser p("SELECT team, AVG(speed) FROM laps GROUP BY team");
     auto stmt = p.parse();
     EXPECT_EQ(stmt.group_by.size(), 1);
-    EXPECT_EQ(stmt.group_by[0], "team");
+    EXPECT_EQ(stmt.group_by[0].column_name, "team");
+    EXPECT_TRUE(stmt.group_by[0].table_name.empty());
     EXPECT_EQ(stmt.select_list.size(), 2);
+}
+
+TEST(ParserTest, GroupByPreservesQualifier) {
+    Parser p("SELECT b.grp, COUNT(*) FROM sj a JOIN sj b ON a.id = b.id GROUP BY b.grp");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.group_by.size(), 1);
+    EXPECT_EQ(stmt.group_by[0].table_name, "b");
+    EXPECT_EQ(stmt.group_by[0].column_name, "grp");
 }
 
 TEST(ParserTest, Distinct) {

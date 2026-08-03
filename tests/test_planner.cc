@@ -130,3 +130,20 @@ TEST(PlannerTest, BuildsJoinPlan) {
     EXPECT_NE(plan, nullptr);
     EXPECT_NO_THROW(plan->open());
 }
+// ===== Phase 4 audit fixes: validation gaps =====
+
+// N1: a HAVING column that exists nowhere must fail validation, not execution.
+TEST(ValidatorTest, HavingUnknownColumnRejected) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT team, COUNT(*) FROM laps GROUP BY team HAVING bogus > 5");
+    auto stmt = p.parse();
+    EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
+
+// M1 guard: an ORDER BY aggregate with no GROUP BY and no SELECT aggregate.
+TEST(ValidatorTest, OrderByAggregateWithoutGroupByRejected) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT team FROM laps ORDER BY COUNT(*)");
+    auto stmt = p.parse();
+    EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
