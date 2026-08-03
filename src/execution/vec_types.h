@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/type_id.h"
+#include <string>
 #include <variant>
 #include <vector>
 #include <cstdint>

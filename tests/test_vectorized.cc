@@ -947,7 +947,10 @@ TEST(VecProject, StatsTracked) {
 
     EXPECT_EQ(project.stats.rows_in,  5);
     EXPECT_EQ(project.stats.rows_out, 5);
-    EXPECT_GT(project.stats.elapsed_us, 0.0);
+    // 5 rows can legitimately complete within one clock tick at -O3, so this
+    // can't demand > 0 (flaked on Release builds); nonzero timing behavior is
+    // pinned by the 5000-row BuildPhaseIsTimed tests instead
+    EXPECT_GE(project.stats.elapsed_us, 0.0);
 }
 
 TEST(VecProject, MultiChunk_TotalRowCount) {
@@ -2600,4 +2603,67 @@ TEST(VecLimitPassThrough, TruncatesBothPaths) {
         limit.close();
         EXPECT_EQ(total, 30);
     }
+}
+
+// ===== evalPredicate AND-cascade (isolated; audit follow-up) =====
+// The AND path evaluates the right operand only over the left's survivors
+// (columnar_eval.cc): these pin the observable half — exact result sets for
+// fast-path, fallback-path, and nested OR-of-AND shapes on one VecFilterNode.
+
+// Two-column fixture: v = 0..n-1, w = f(v).
+static std::unique_ptr<VecScanNode> makeVWScan(int n, int64_t (*f)(int64_t)) {
+    Schema schema = vecSchema({{"v", TypeId::INT}, {"w", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(n);
+    for (int64_t i = 0; i < n; ++i) rows.push_back({Value(i), Value(f(i))});
+    return makeScan(schema, rows);
+}
+
+static int countSurvivors(VecPlanNode& node) {
+    node.open();
+    int total = 0;
+    int last = -1;
+    while (DataChunk* chunk = node.nextChunk()) {
+        EXPECT_TRUE(chunk->filter_applied);
+        last = -1;  // indices are chunk-local; ascending within each chunk
+        for (int idx : chunk->sel.indices) {
+            EXPECT_GT(idx, last) << "selection indices must stay ascending";
+            last = idx;
+            ++total;
+        }
+    }
+    node.close();
+    return total;
+}
+
+TEST(EvalPredicateCascade, AndWithFastPathRightOperand) {
+    // w = 2v; v >= 1000 AND w < 3000  ->  v in [1000, 1499]
+    auto scan = makeVWScan(3000, [](int64_t v) { return 2 * v; });
+    VecFilterNode filter(std::move(scan),
+        binOp("AND", binOp(">=", col("v"), intLit(1000)),
+                     binOp("<",  col("w"), intLit(3000))));
+    EXPECT_EQ(countSurvivors(filter), 500);
+}
+
+TEST(EvalPredicateCascade, AndWithFallbackRightOperand) {
+    // right operand is col-vs-col (no fast path): the fallback must honor the
+    // cascaded input_sel. w = v+1 below 1500 else 0; v >= 1000 AND v < w
+    // -> v in [1000, 1499]
+    auto scan = makeVWScan(3000, [](int64_t v) { return v < 1500 ? v + 1 : 0; });
+    VecFilterNode filter(std::move(scan),
+        binOp("AND", binOp(">=", col("v"), intLit(1000)),
+                     binOp("<",  col("v"), col("w"))));
+    EXPECT_EQ(countSurvivors(filter), 500);
+}
+
+TEST(EvalPredicateCascade, OrOfCascadedAndsMergesAscending) {
+    // (v < 100 AND w > 0) OR (v >= 2900 AND w > 0), w = v+1 (always > 0)
+    // -> v in [0,99] and [2900,2999]; sv_union requires ascending inputs
+    auto scan = makeVWScan(3000, [](int64_t v) { return v + 1; });
+    VecFilterNode filter(std::move(scan),
+        binOp("OR", binOp("AND", binOp("<",  col("v"), intLit(100)),
+                                 binOp(">",  col("w"), intLit(0))),
+                    binOp("AND", binOp(">=", col("v"), intLit(2900)),
+                                 binOp(">",  col("w"), intLit(0)))));
+    EXPECT_EQ(countSurvivors(filter), 200);
 }

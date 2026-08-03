@@ -3,6 +3,7 @@
 #include "storage/dictionary_encoder.h"
 #include "storage/chunk_pruner.h"
 #include <algorithm>
+#include <chrono>
 
 VecScanNode::VecScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where)
     : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), pruning_where_(pruning_where) {}

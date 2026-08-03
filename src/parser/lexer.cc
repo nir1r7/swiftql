@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "token.h"
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 

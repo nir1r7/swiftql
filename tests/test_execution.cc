@@ -182,7 +182,7 @@ TEST(SeqScanNode, ScanAndReset) {
     EXPECT_EQ(count, 3);
 
     // Empty table is immediately nullptr
-    SeqScanNode empty("test", {}, schema);
+    SeqScanNode empty("test", std::vector<Row>{}, schema);
     empty.open();
     EXPECT_EQ(empty.next(), nullptr);
     empty.close();

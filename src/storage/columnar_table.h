@@ -4,6 +4,7 @@
 #include "common/schema.h"
 #include "dictionary_encoder.h"
 #include "rle_column.h"
+#include <stdexcept>
 #include <variant>
 #include <vector>
 #include <string>

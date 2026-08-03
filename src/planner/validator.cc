@@ -1,5 +1,6 @@
 #include "validator.h"
 #include "join_condition.h"
+#include <stdexcept>
 #include "parser/expr_utils.h"
 
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
