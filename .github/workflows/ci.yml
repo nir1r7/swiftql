@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86-64: compiles and EXECUTES the AVX2 SIMD join path
+          # (__AVX2__ is only defined with -mavx2; all GitHub x86 runners
+          # have AVX2 hardware)
+          - name: linux-x86_64-avx2
+            os: ubuntu-latest
+            cxx_flags: "-mavx2"
+          # arm64: compiles and executes the NEON SIMD join path
+          - name: macos-arm64-neon
+            os: macos-latest
+            cxx_flags: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      # Guard against a vacuous pass: without -mavx2 the AVX2 branch never
+      # compiles in and the SIMD tests would silently exercise the scalar
+      # fallback. Require the AVX2 64-bit compare to exist in the binary.
+      - name: Verify AVX2 code was emitted
+        if: runner.os == 'Linux'
+        run: |
+          count=$(objdump -d build/tests/swiftql_tests | grep -c vpcmpeqq || true)
+          echo "vpcmpeqq instruction sites: $count"
+          test "$count" -ge 1
+
+      # tests resolve ../tests/data relative to the build directory
+      - name: Unit tests
+        run: ./tests/swiftql_tests
+        working-directory: build
+
+      - name: SQLite correctness oracle
+        run: python3 python_tools/compare_against_sqlite.py
+
+      - name: Regression harness (all modes + optimizer invariant)
+        run: python3 python_tools/test_new_queries.py
