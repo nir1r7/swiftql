@@ -1,4 +1,5 @@
 #include "planner.h"
+#include "join_condition.h"
 
 std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
     // validate
@@ -62,31 +63,11 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
         }
 
-        // extract join column names + binder-assigned slots from ON condition
-        std::string left_col, right_col;
-        int left_slot = -1, right_slot = -1;
-        if (auto* bin = dynamic_cast<BinaryExpr*>(stmt.join->condition.get())) {
-            if (auto* lc = dynamic_cast<ColumnRef*>(bin->left.get())) {
-                left_col  = lc->column_name;
-                left_slot = lc->relation_slot;
-            }
-            if (auto* rc = dynamic_cast<ColumnRef*>(bin->right.get())) {
-                right_col  = rc->column_name;
-                right_slot = rc->relation_slot;
-            }
-        }
-        // Route each ON column to its side by binder-assigned slot (0=FROM,
-        // 1=JOIN). This is the only way to disambiguate a self-join's two
-        // occurrences (both share the canonical table name). Falls back to
-        // positional (left=FROM, right=JOIN) when slots are unset.
-        std::string from_col, join_col;
-        if (left_slot >= 0 && right_slot >= 0 && left_slot != right_slot) {
-            from_col = (left_slot == 0) ? left_col : right_col;
-            join_col = (left_slot == 0) ? right_col : left_col;
-        } else {
-            from_col = left_col;
-            join_col = right_col;
-        }
+        // classifyJoinCondition routes keys by binder-assigned slot — the only
+        // way to disambiguate a self-join's two occurrences of the same table
+        JoinConditionKeys keys = classifyJoinCondition(stmt.join->condition.get());
+        std::string from_col = keys.from_col;
+        std::string join_col = keys.join_col;
 
         // put the smaller table on the build side (right_) to minimise hash table memory.
         // Output schema order is always [FROM columns, JOIN columns] — fixed

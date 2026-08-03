@@ -317,3 +317,66 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
     EXPECT_EQ(out[0][0].asInt(), 1);     // FROM k
     EXPECT_EQ(out[0][1].asInt(), 10);    // FROM v
 }
+
+// ===== JOIN ON condition validation =====
+// Phase 4 supports exactly one cross-relation equality (ColumnRef = ColumnRef).
+// Anything else must be rejected with a specific error instead of silently
+// executing as an equi-join (or worse). Multi-key / non-equality conditions
+// are deferred to the multi-way join work (Week 26+).
+
+#include "planner/validator.h"
+
+// Bind then validate, returning the error message ("" when accepted).
+static std::string joinOnValidationError(const std::string& sql, const Catalog& cat) {
+    Parser p(sql);
+    auto stmt = p.parse();
+    Binder::bind(stmt, cat);
+    try {
+        Validator::validate(stmt, cat);
+        return "";
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+}
+
+TEST(JoinOnValidation, SingleEquiJoinAccepted) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat), "");
+}
+
+TEST(JoinOnValidation, NonEqualityOperatorRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp < b.id", cat);
+    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, NotEqualOperatorRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id != b.id", cat);
+    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, CompoundConditionRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
+    EXPECT_NE(err.find("compound"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, LiteralOperandRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = 5", cat);
+    EXPECT_NE(err.find("column"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, SameRelationBothSidesRejected) {
+    Catalog cat(CATALOG);
+    // Previously executed silently as a.id = b.grp (cross-side reroute).
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = a.grp", cat);
+    EXPECT_NE(err.find("each joined table"), std::string::npos) << err;
+}

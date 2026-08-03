@@ -1,4 +1,5 @@
 #include "validator.h"
+#include "join_condition.h"
 
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // FROM table must exist
@@ -41,6 +42,8 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
                 "Join table not found: '" + stmt.join->join_table + "'");
         }
         if (stmt.join->condition) {
+            // shape first (single cross-relation equality), then column existence
+            classifyJoinCondition(stmt.join->condition.get());
             const Schema& right_schema = catalog.getTable(stmt.join->join_table).schema;
             validateJoinCondition(stmt.join->condition.get(), schema, stmt.from_table, right_schema, stmt.join->join_table);
         }

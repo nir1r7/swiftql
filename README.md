@@ -633,6 +633,9 @@ being hypothetical.
 
 - Parse multiple explicit `JOIN ... ON` clauses
 - Extend binding and logical planning to arbitrary relation counts
+- Lift the Phase 4 validator restriction on `ON` conditions (single
+  cross-relation equality, enforced by `classifyJoinCondition`): support
+  multi-key equi-joins (`ON a.x = b.x AND a.y = b.y`) — required for TPC-H Q9
 
 **Checkpoint:** Multi-table queries produce a qualified logical join tree.
 
@@ -640,6 +643,9 @@ being hypothetical.
 
 - Lower general logical join trees to vectorized hash joins
 - Build a join graph and assign local and join predicates
+- Route non-equality `ON` conjuncts (rejected since the Phase 4 audit) as
+  residual post-join filters during predicate assignment — required for
+  TPC-H Q21-style conditions
 
 **Checkpoint:** Three-or-more-table joins execute correctly.
 

@@ -1,4 +1,5 @@
 #include "logical_plan.h"
+#include "join_condition.h"
 #include "validator.h"
 #include "parser/expr_utils.h"
 #include <unordered_set>
@@ -211,34 +212,6 @@ std::string LogicalLimit::explain() const {
 }
 
 
-// extract join column names + binder-assigned slots from ON condition
-static void extractJoinKeys(const Expr* condition, std::string& from_col, std::string& join_col) {
-    std::string left_col, right_col;
-    int left_slot = -1, right_slot = -1;
-    if (auto* bin = dynamic_cast<const BinaryExpr*>(condition)) {
-        if (auto* lc = dynamic_cast<const ColumnRef*>(bin->left.get())) {
-            left_col  = lc->column_name;
-            left_slot = lc->relation_slot;
-        }
-        if (auto* rc = dynamic_cast<const ColumnRef*>(bin->right.get())) {
-            right_col  = rc->column_name;
-            right_slot = rc->relation_slot;
-        }
-    }
-    // Route each ON column to its side by binder-assigned slot (0=FROM,
-    // 1=JOIN). This is the only way to disambiguate a self-join's two
-    // occurrences (both share the canonical table name). Falls back to
-    // positional (left=FROM, right=JOIN) when slots are unset.
-    if (left_slot >= 0 && right_slot >= 0 && left_slot != right_slot) {
-        from_col = (left_slot == 0) ? left_col : right_col;
-        join_col = (left_slot == 0) ? right_col : left_col;
-    } else {
-        from_col = left_col;
-        join_col = right_col;
-    }
-}
-
-
 // LogicalPlanBuilder
 std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt, const Catalog& catalog) {
     Validator::validate(stmt, catalog);
@@ -255,8 +228,11 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
             stmt.join->join_table,
             buildScanSchema(stmt, join_meta.schema));
 
-        std::string from_col, join_col;
-        extractJoinKeys(stmt.join->condition.get(), from_col, join_col);
+        // classifyJoinCondition routes keys by binder-assigned slot — the only
+        // way to disambiguate a self-join's two occurrences of the same table
+        JoinConditionKeys keys = classifyJoinCondition(stmt.join->condition.get());
+        std::string from_col = keys.from_col;
+        std::string join_col = keys.join_col;
 
         // Output schema order is always [FROM columns, JOIN columns] — fixed
         // logical order. JOIN-side columns are stamped slot 1 so qualified
