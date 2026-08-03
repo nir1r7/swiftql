@@ -63,8 +63,11 @@ SelectStatement Parser::parseSelect(){
     expect(TokenType::FROM, "FROM");
     stmt.from_table = expect(TokenType::IDENTIFIER, "table name").value;
 
-    // optional table alias (e.g. FROM laps l)
-    if (check(TokenType::IDENTIFIER) &&
+    // optional table alias (e.g. FROM laps l / FROM laps AS l);
+    // an explicit AS makes the alias mandatory
+    if (match(TokenType::AS)) {
+        stmt.from_alias = expect(TokenType::IDENTIFIER, "table alias after AS").value;
+    } else if (check(TokenType::IDENTIFIER) &&
         !check(TokenType::JOIN) &&
         !check(TokenType::WHERE) &&
         !check(TokenType::GROUP) &&
@@ -79,8 +82,10 @@ SelectStatement Parser::parseSelect(){
         SelectStatement::JoinClause join;
         join.join_table = expect(TokenType::IDENTIFIER, "join table name").value;
 
-        // optional join table alias (i.e, JOIN drivers d)
-        if (check(TokenType::IDENTIFIER)) {
+        // optional join table alias (i.e, JOIN drivers d / JOIN drivers AS d)
+        if (match(TokenType::AS)) {
+            join.alias = expect(TokenType::IDENTIFIER, "table alias after AS").value;
+        } else if (check(TokenType::IDENTIFIER)) {
             join.alias = consume().value;
         }
 

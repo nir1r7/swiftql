@@ -658,3 +658,50 @@ TEST(VecPlanBuilder, NoOptimizeFallbackIsRowCountOnly) {
     EXPECT_NE(buildSideScan(join).find("drivers"), std::string::npos)
         << buildSideScan(join);
 }
+
+// A DOUBLE join key is SIMD-ineligible (bitwise equality on doubles is a
+// trap): even with a tiny build side that would otherwise favor the loop
+// join, lowering must fall back to the hash join. (STRING keys are covered
+// by the harness's w23_5_hash_string_key.)
+TEST(VecPlanBuilder, DoubleKeyJoinFallsBackToHashJoin) {
+    Catalog cat(CATALOG);
+    seedCostStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT a.lap_id FROM laps a JOIN laps b ON a.speed = b.speed", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain().rfind("VecHashJoin", 0), 0u) << join->explain();
+}
+
+// rowWidth()'s per-column fallback: a table WITH stats whose referenced
+// columns are missing from the stats map must count 8 bytes per missing
+// column, not 0. laps' two referenced columns (16B assumed) vs drivers' two
+// stated columns (4B) at equal row counts: drivers must build. A 0-byte
+// fallback would make laps look free and flip the decision.
+TEST(VecPlanBuilder, RowWidthFallsBackPerMissingColumn) {
+    Catalog cat(CATALOG);
+
+    TableStats laps;                       // hasStats true, no column entries
+    laps.row_count = 20;
+    cat.setStats("laps", std::move(laps));
+
+    TableStats drivers;
+    drivers.row_count = 20;
+    ColumnStats name;
+    name.avg_width = 2.0;
+    drivers.columns.emplace("name", name);
+    ColumnStats driver_id;
+    driver_id.avg_width = 2.0;
+    drivers.columns.emplace("driver_id", driver_id);
+    cat.setStats("drivers", std::move(drivers));
+
+    auto plan = buildVecOptimized(
+        "SELECT laps.team, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(buildSideScan(join).find("drivers"), std::string::npos)
+        << buildSideScan(join);
+}

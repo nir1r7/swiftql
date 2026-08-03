@@ -98,8 +98,10 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
 // and stat-less predicates (fallback selectivity) keep their original order.
 // "Expected work" is modeled as selectivity only — optimal when per-predicate
 // eval cost is uniform (true for fast-path col-op-literal comparisons). A
-// selectivity x eval-cost ranking (which would demote fallback-path predicates)
-// is deferred to Week 22, when the cost model provides per-predicate costs.
+// selectivity x eval-cost ranking (which would demote fallback-path predicates
+// like IS NULL or col-vs-col) is deferred to Week 28, where join enumeration
+// gives the cost model per-predicate costs; Week 22 wired costs into join
+// selection only.
 void orderByWork(std::vector<std::unique_ptr<Expr>>& conjuncts,
                  const LogicalPlanNode* scan_child, const Catalog& catalog) {
     StatsContext ctx = scanStats(scan_child, catalog);

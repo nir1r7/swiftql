@@ -161,3 +161,15 @@ TEST(ParserTest, BadQueryThrows) {
     Parser p("SELECT FROM laps");  // missing select list
     EXPECT_THROW(p.parse(), ParseError);
 }
+TEST(ParserTest, TableAliasWithAsKeyword) {
+    Parser p("SELECT l.team FROM laps AS l JOIN drivers AS d ON l.driver_id = d.driver_id");
+    auto stmt = p.parse();
+    EXPECT_EQ(stmt.from_alias, "l");
+    ASSERT_TRUE(stmt.join.has_value());
+    EXPECT_EQ(stmt.join->alias, "d");
+}
+
+TEST(ParserTest, AsWithoutAliasIsSyntaxError) {
+    Parser p("SELECT team FROM laps AS WHERE season = 2025");
+    EXPECT_THROW(p.parse(), ParseError);
+}
