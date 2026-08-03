@@ -632,3 +632,29 @@ TEST(VecPlanBuilder, SimdSelectedPlanMatchesVolcanoBaseline) {
     auto volc_rows = serialize(runVolcanoRow(sql, cat), true);
     EXPECT_EQ(vec_rows, volc_rows);
 }
+
+// ===== --no-optimize fallback is genuinely row-count-only (audit N5) =====
+
+// Without estimates (buildVec never runs the estimator) the build side must be
+// chosen by raw row count alone. A huge avg_width on the smaller table must
+// NOT flip the decision — widths are a Week 22 cost-model input, and the
+// fallback claims to reproduce the pre-Week-22 row-count heuristic.
+TEST(VecPlanBuilder, NoOptimizeFallbackIsRowCountOnly) {
+    Catalog cat(CATALOG);
+
+    TableStats drivers_ts;
+    drivers_ts.row_count = 3;
+    ColumnStats name;
+    name.avg_width = 5000.0;   // absurd width; must be ignored by the fallback
+    drivers_ts.columns.emplace("name", name);
+    cat.setStats("drivers", std::move(drivers_ts));
+
+    auto plan = buildVec(
+        "SELECT laps.team, drivers.name FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id",
+        cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    // drivers (3 rows) < laps (5 rows): row count says drivers builds
+    EXPECT_NE(buildSideScan(join).find("drivers"), std::string::npos)
+        << buildSideScan(join);
+}

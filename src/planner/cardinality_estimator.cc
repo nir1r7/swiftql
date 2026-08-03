@@ -23,7 +23,12 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     if (auto* isnull = dynamic_cast<const IsNullExpr*>(pred)) {
         auto* col = dynamic_cast<const ColumnRef*>(isnull->operand.get());
         const ColumnStatsEntry* e = col ? ctx.find(col->column_name, col->relation_slot) : nullptr;
-        if (!e || e->table_rows == 0) return FALLBACK_EQ_SELECTIVITY;
+        if (!e || e->table_rows == 0) {
+            // fallback is the assumed null fraction, so it must respect polarity:
+            // IS NOT NULL keeps ~everything, not ~nothing
+            return isnull->is_not_null ? 1.0 - FALLBACK_EQ_SELECTIVITY
+                                       : FALLBACK_EQ_SELECTIVITY;
+        }
         double null_frac = static_cast<double>(e->stats->null_count) / e->table_rows;
         return isnull->is_not_null ? 1.0 - null_frac : null_frac;
     }
@@ -77,9 +82,26 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
             return FALLBACK_RANGE_SELECTIVITY;
         double lo = e->stats->min_val.toNumeric();
         double hi = e->stats->max_val.toNumeric();
-        if (hi <= lo) return FALLBACK_RANGE_SELECTIVITY;  // single-value column
-        double below = std::clamp((lit->value.toNumeric() - lo) / (hi - lo), 0.0, 1.0);
-        return (op == "<" || op == "<=") ? below : 1.0 - below;
+        double v  = lit->value.toNumeric();
+        if (hi == lo) {
+            // single-value column: decidable from stats — all rows or none
+            bool match = (op == "<")  ? lo <  v
+                       : (op == "<=") ? lo <= v
+                       : (op == ">")  ? lo >  v
+                       :                lo >= v;
+            return match ? 1.0 : 0.0;
+        }
+        if (hi < lo) return FALLBACK_RANGE_SELECTIVITY;  // corrupt stats only
+        double below = std::clamp((v - lo) / (hi - lo), 0.0, 1.0);
+        // min/max come from real rows, so a closed comparison at the domain
+        // edge is guaranteed to match: floor it at the equality mass 1/ndv
+        double eq = e->stats->distinct_count > 0
+            ? 1.0 / e->stats->distinct_count
+            : FALLBACK_EQ_SELECTIVITY;
+        if (op == "<")  return below;
+        if (op == ">")  return 1.0 - below;
+        if (op == "<=") return v < lo ? 0.0 : std::max(below, eq);
+        return              v > hi ? 0.0 : std::max(1.0 - below, eq);   // ">="
     }
 
     return FALLBACK_SELECTIVITY;
@@ -114,8 +136,12 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
         case LogicalNodeType::FILTER: {
             auto& f = static_cast<LogicalFilter&>(node);
             StatsContext ctx = estimateNode(*node.children[0], catalog);
-            node.estimated_rows = node.children[0]->estimated_rows
-                                * selectivity(f.predicate.get(), ctx);
+            double child = node.children[0]->estimated_rows;
+            double est = child * selectivity(f.predicate.get(), ctx);
+            // ≥1-row floor (Postgres-style): a zero estimate poisons join
+            // costing downstream. Applied only when the child itself has rows,
+            // so FilterNeverExceedsChild monotonicity holds.
+            node.estimated_rows = (child >= 1.0) ? std::max(est, 1.0) : est;
             // independence assumption: column stats are not narrowed by the
             // filter; stacked predicates each see base-table distributions
             return ctx;
@@ -138,6 +164,10 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // no usable key NDV: assume the FK-like case (max) rather than a
             // cross product, which would explode and mislead Week 22 costing
             node.estimated_rows = (ndv > 0) ? (l * r) / ndv : std::max(l, r);
+            // ≥1-row floor, matching the FILTER case
+            if (l >= 1.0 && r >= 1.0) {
+                node.estimated_rows = std::max(node.estimated_rows, 1.0);
+            }
 
             // merge contexts [FROM ++ JOIN], restamping join-side entries to
             // slot 1 — mirrors the merged-schema construction in

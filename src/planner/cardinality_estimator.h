@@ -8,6 +8,9 @@
 // documented fallback selectivities, applied when statistics cannot answer
 // a predicate (missing stats, aggregate outputs, unrecognized expression
 // shapes). Values follow the System R defaults.
+// FALLBACK_EQ_SELECTIVITY also serves as the assumed null fraction for
+// IS [NOT] NULL without stats (IS NULL -> 0.1, IS NOT NULL -> 0.9) and as the
+// equality mass for guaranteed-match range edges when NDV is unknown.
 constexpr double FALLBACK_EQ_SELECTIVITY    = 0.1;       // equality, no usable NDV
 constexpr double FALLBACK_RANGE_SELECTIVITY = 1.0 / 3.0; // range, no numeric min/max
 constexpr double FALLBACK_SELECTIVITY       = 0.5;       // any other predicate
@@ -34,7 +37,9 @@ struct StatsContext {
 
 // annotates every logical node's estimated_rows in place, bottom-up.
 // runs after LogicalPlanBuilder::build and before VectorizedPlanBuilder::build
-// (lowering consumes the logical tree, so estimation must precede it)
+// (lowering consumes the logical tree, so estimation must precede it).
+// Stamped FILTER/JOIN estimates carry a ≥1-row floor (selectivities do not:
+// a true 0 is still the best conjunct-ordering signal for pushdown)
 class CardinalityEstimator {
     public:
         static void estimate(LogicalPlanNode& root, const Catalog& catalog);

@@ -40,8 +40,9 @@ static void collectAllNodes(const LogicalPlanNode* node, std::vector<const Logic
 // Deterministic stats so assertions below are exact arithmetic, not
 // fixture-coupled. Column names match tests/data/test_catalog.json.
 // laps: 1000 rows; season NDV 5 range [2020,2024]; speed range [200,400] NDV
-// 900, null_count 100; team NDV 10.
-static void seedLapsStats(Catalog& cat) {
+// 900, null_count 100; team NDV 10. driver_id NDV is parameterized so join
+// tests can pick a value where (l*r)/ndv differs from the max(l,r) fallback.
+static void seedLapsStats(Catalog& cat, int64_t driver_id_ndv = 20) {
     TableStats ts;
     ts.row_count = 1000;
 
@@ -69,7 +70,7 @@ static void seedLapsStats(Catalog& cat) {
     ColumnStats driver_id;
     driver_id.min_val = Value(int64_t(1));
     driver_id.max_val = Value(int64_t(20));
-    driver_id.distinct_count = 20;
+    driver_id.distinct_count = driver_id_ndv;
     driver_id.null_count = 0;
     ts.columns.emplace("driver_id", driver_id);
 
@@ -133,12 +134,14 @@ TEST(Cardinality, EqualityUsesNdv) {
     EXPECT_DOUBLE_EQ(filterEst(plan.get()), 200.0);  // 1000 * 1/5
 }
 
-TEST(Cardinality, EqualityOutOfRangeIsZero) {
+TEST(Cardinality, EqualityOutOfRangeFloorsToOneRow) {
     Catalog cat(CATALOG);
     seedLapsStats(cat);
     auto plan = buildLogical("SELECT team FROM laps WHERE season = 1999", cat);
     CardinalityEstimator::estimate(*plan, cat);
-    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 0.0);
+    // selectivity stays a true 0 (out of [min,max]); the stamped estimate is
+    // floored to one row so downstream join costing never sees a free input
+    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 1.0);
 }
 
 TEST(Cardinality, NotEqualIsComplement) {
@@ -157,12 +160,62 @@ TEST(Cardinality, RangeInterpolates) {
     EXPECT_DOUBLE_EQ(filterEst(plan.get()), 500.0);  // 1000 * (400-300)/(400-200)
 }
 
-TEST(Cardinality, RangeClampsBelowMin) {
+TEST(Cardinality, RangeClampsBelowMinFloorsToOneRow) {
     Catalog cat(CATALOG);
     seedLapsStats(cat);
     auto plan = buildLogical("SELECT team FROM laps WHERE speed < 200", cat);
     CardinalityEstimator::estimate(*plan, cat);
-    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 0.0);
+    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 1.0);  // 0-selectivity, ≥1-row floor
+}
+
+TEST(Cardinality, RangeAtMaxEdgeIsNotZero) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    // speed max is 400 and min/max come from real rows, so ">= max" is
+    // guaranteed to match: it gets the equality mass 1/ndv, not 0
+    auto plan = buildLogical("SELECT team FROM laps WHERE speed >= 400", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 1000.0 / 900.0);
+}
+
+TEST(Cardinality, RangeAtMinEdgeUsesEqMass) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildLogical("SELECT team FROM laps WHERE speed <= 200", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+    EXPECT_DOUBLE_EQ(filterEst(plan.get()), 1000.0 / 900.0);
+}
+
+// laps stats where season is a single-value column (min == max == 2022, NDV 1).
+static void seedConstantSeasonStats(Catalog& cat) {
+    TableStats ts;
+    ts.row_count = 1000;
+    ColumnStats season;
+    season.min_val = Value(int64_t(2022));
+    season.max_val = Value(int64_t(2022));
+    season.distinct_count = 1;
+    season.null_count = 0;
+    ts.columns.emplace("season", season);
+    cat.setStats("laps", std::move(ts));
+}
+
+TEST(Cardinality, SingleValueColumnRangeIsDecidable) {
+    // min == max makes every range predicate decidable from stats: all rows
+    // or none (floored to 1), never the blind 1/3 fallback
+    struct Case { const char* sql; double expected; };
+    const Case cases[] = {
+        {"SELECT season FROM laps WHERE season <= 2022", 1000.0},
+        {"SELECT season FROM laps WHERE season >= 2022", 1000.0},
+        {"SELECT season FROM laps WHERE season < 2022", 1.0},
+        {"SELECT season FROM laps WHERE season > 2022", 1.0},
+    };
+    for (const auto& c : cases) {
+        Catalog cat(CATALOG);
+        seedConstantSeasonStats(cat);
+        auto plan = buildLogical(c.sql, cat);
+        CardinalityEstimator::estimate(*plan, cat);
+        EXPECT_DOUBLE_EQ(filterEst(plan.get()), c.expected) << c.sql;
+    }
 }
 
 TEST(Cardinality, RangeAcceptsFlippedOperandOrder) {
@@ -172,6 +225,17 @@ TEST(Cardinality, RangeAcceptsFlippedOperandOrder) {
     auto plan = buildLogical("SELECT team FROM laps WHERE 300 < speed", cat);
     CardinalityEstimator::estimate(*plan, cat);
     EXPECT_DOUBLE_EQ(filterEst(plan.get()), 500.0);
+}
+
+TEST(Cardinality, IsNullFallbackIsPolarityAware) {
+    Catalog cat(CATALOG);  // no stats: both polarities hit the fallback
+    auto plan_null = buildLogical("SELECT team FROM laps WHERE speed IS NULL", cat);
+    CardinalityEstimator::estimate(*plan_null, cat);
+    EXPECT_DOUBLE_EQ(filterEst(plan_null.get()), 100.0);   // 1000 * 0.1
+
+    auto plan_not_null = buildLogical("SELECT team FROM laps WHERE speed IS NOT NULL", cat);
+    CardinalityEstimator::estimate(*plan_not_null, cat);
+    EXPECT_DOUBLE_EQ(filterEst(plan_not_null.get()), 900.0);  // 1000 * (1 - 0.1)
 }
 
 TEST(Cardinality, IsNotNullUsesNullFraction) {
@@ -221,17 +285,48 @@ TEST(Cardinality, DisjunctionUsesInclusionExclusion) {
 
 TEST(Cardinality, JoinDividesByMaxNdv) {
     Catalog cat(CATALOG);
-    seedLapsStats(cat);
+    // laps driver_id NDV 50 makes the formula (1000*20)/50 = 400, a value the
+    // max(l,r) = 1000 fallback cannot produce — the two paths stay distinguishable
+    seedLapsStats(cat, /*driver_id_ndv=*/50);
     seedDriversStats(cat);
     auto plan = buildLogical(
         "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
     CardinalityEstimator::estimate(*plan, cat);
     const LogicalPlanNode* j = findNode(plan.get(), LogicalNodeType::JOIN);
     ASSERT_NE(j, nullptr);
-    EXPECT_DOUBLE_EQ(j->estimated_rows, 1000.0);  // 1000 * 20 / max(20,20)
+    EXPECT_DOUBLE_EQ(j->estimated_rows, 400.0);  // 1000 * 20 / max(50,20)
     // both children were estimated (both-children recursion pinned here)
     EXPECT_GT(j->children[0]->estimated_rows, 0.0);
     EXPECT_GT(j->children[1]->estimated_rows, 0.0);
+}
+
+TEST(Cardinality, JoinEstimateFloorsToOneRow) {
+    Catalog cat(CATALOG);
+    // 2-row inputs with key NDV 20: (2*2)/20 = 0.2 — floored to one row
+    TableStats laps_ts;
+    laps_ts.row_count = 2;
+    ColumnStats key;
+    key.min_val = Value(int64_t(1));
+    key.max_val = Value(int64_t(20));
+    key.distinct_count = 20;
+    key.null_count = 0;
+    laps_ts.columns.emplace("driver_id", key);
+    ColumnStats team;
+    team.distinct_count = 2;
+    laps_ts.columns.emplace("team", team);
+    cat.setStats("laps", std::move(laps_ts));
+
+    TableStats drivers_ts;
+    drivers_ts.row_count = 2;
+    drivers_ts.columns.emplace("driver_id", key);
+    cat.setStats("drivers", std::move(drivers_ts));
+
+    auto plan = buildLogical(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+    const LogicalPlanNode* j = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(j, nullptr);
+    EXPECT_DOUBLE_EQ(j->estimated_rows, 1.0);
 }
 
 TEST(Cardinality, JoinFallsBackToMaxWithoutStats) {

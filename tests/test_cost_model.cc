@@ -12,8 +12,9 @@ TEST(CostModel, SmallerBuildSideIsCheaper) {
     EXPECT_LT(small_builds, large_builds);
 }
 
-// With equal widths the comparison reduces to pure row count, which is exactly
-// the pre-Week-22 heuristic the --no-optimize path must still reproduce.
+// With equal widths the comparison reduces to pure row count — the builder's
+// --no-optimize fallback pins widths to a uniform constant for exactly this
+// reason, so it reproduces the pre-Week-22 row-count heuristic.
 TEST(CostModel, EqualWidthReducesToRowCount) {
     // from=200, join=20: join is smaller, so building join is cheaper
     double from_builds = hashJoinCost(200, 8, 20);
@@ -60,4 +61,11 @@ TEST(CostModel, SimdProbeTermIsQuadratic) {
 TEST(CostModel, SimdZeroRowsAreFiniteAndNonNegative) {
     EXPECT_GE(simdLoopJoinCost(0, 16, 1000), 0.0);
     EXPECT_DOUBLE_EQ(simdLoopJoinCost(0, 16, 0), 0.0);
+}
+
+// Widths DO decide at equal row counts — which is exactly why the
+// --no-optimize fallback must feed uniform widths into the comparison to
+// reproduce the pure row-count heuristic (see VectorizedPlanBuilder).
+TEST(CostModel, UnequalWidthBreaksRowCountEquivalence) {
+    EXPECT_NE(hashJoinCost(100, 8, 100), hashJoinCost(100, 800, 100));
 }

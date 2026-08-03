@@ -106,7 +106,11 @@ def benchmark_query(binary, catalog, mode_args, label, query):
 def q_error(est: int, actual: int) -> float:
     """Standard cardinality-estimation error: max/min ratio, >= 1.0, symmetric."""
     lo, hi = min(est, actual), max(est, actual)
-    return hi / max(lo, 1)   # zero-guard: 0/0 -> 1.0, one-sided zero -> hi
+    if lo == 0:
+        # 0/0 is a perfect estimate; a one-sided zero is penalized (hi+1), never
+        # scored 1.0 — est=0 vs actual=1 used to read as a perfect estimate
+        return 1.0 if hi == 0 else float(hi + 1)
+    return hi / lo
 
 
 def estimate_errors(binary, catalog, query):

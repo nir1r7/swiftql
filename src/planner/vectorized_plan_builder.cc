@@ -94,19 +94,25 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // is the count *after* the WHERE — which can invert the raw table-size
             // ordering (a big filtered table can become the smaller input). Under
             // --no-optimize the estimator never ran (estimated_rows == -1), so fall
-            // back to the raw table sizes the pre-Week-22 heuristic used.
+            // back to raw table sizes AND uniform per-row widths: the fallback
+            // reproduces the pre-Week-22 pure row-count heuristic exactly (the
+            // width term is a Week 22 cost-model input and must not leak into
+            // the benchmark baseline; any equal constant cancels in the
+            // comparison, so ties keep the deterministic join-side build).
             double from_est = join->children[0]->estimated_rows;
             double join_est = join->children[1]->estimated_rows;
             bool estimate_driven = from_est >= 0 && join_est >= 0;
-            if (!estimate_driven) {
+            double from_w = 8.0, join_w = 8.0;
+            if (estimate_driven) {
+                // per-side row width from real avg_width stats (Gap 3); this
+                // feeds the hash-table memory term, so with equal row counts
+                // the narrower input becomes the cheaper build side
+                from_w = rowWidth(join->children[0].get(), catalog);
+                join_w = rowWidth(join->children[1].get(), catalog);
+            } else {
                 from_est = tables.at(leafScanTable(join->children[0].get())).num_rows;
                 join_est = tables.at(leafScanTable(join->children[1].get())).num_rows;
             }
-            // per-side row width from real avg_width stats (Gap 3); this feeds
-            // the hash-table memory term, so with equal row counts the narrower
-            // input becomes the cheaper build side
-            double from_w = rowWidth(join->children[0].get(), catalog);
-            double join_w = rowWidth(join->children[1].get(), catalog);
 
             // pruning hint routes to the FROM side only
             auto from_child = lower(join->children[0].get(), pruning_where);
