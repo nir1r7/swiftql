@@ -791,11 +791,11 @@ Measured in Week 23 — 1M rows, avg of 5 runs, Release build. Full analysis inc
 
 | Query | No Optimizer (ms) | With Optimizer (ms) |
 |---|---|---|
-| `SELECT AVG(speed) FROM laps WHERE season = 2025 AND speed > 300` | 3.4 | 3.5 |
-| `SELECT laps.team, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY laps.team` | 132.1 | 131.2 |
-| `... JOIN ... WHERE laps.season = 2025 AND drivers.age > 30 GROUP BY laps.team` | 32.5 | 23.0 |
+| `SELECT AVG(speed) FROM laps WHERE season = 2025 AND speed > 300` | 3.4 | 3.4 |
+| `SELECT laps.team, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY laps.team` | 131.5 | 123.1 |
+| `... JOIN ... WHERE laps.season = 2025 AND drivers.age > 30 GROUP BY laps.team` | 30.0 | 13.4 |
 
-The unfiltered rows are flat by design — zone-map pruning already dominates query 1, and with no filter the cost model picks the same build side as the raw-size heuristic. The filtered join (row 3) is where pushdown + build-side selection pay: **1.41x**.
+Query 1 is flat by design — zone-map pruning already dominates it. Query 2's modest gain is the Week 23.5 algorithm decision (SIMD loop join on the 20-row build side). The filtered join (row 3) is where pushdown + build-side + algorithm selection pay together: **2.23x**.
 
 ### Batch Size Sensitivity (Phase 3, `SELECT AVG(speed) FROM laps`)
 
