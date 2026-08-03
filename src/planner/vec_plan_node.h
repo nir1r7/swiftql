@@ -21,9 +21,16 @@ class VecPlanNode {
         virtual ~VecPlanNode() = default;
 
         virtual void open() = 0;
-        // returns a pointer to operator's internal chunk
-        // reused on next call — any reference into the returned chunk's data
-        // (e.g. const auto& v = chunk->columns[i].data) is invalidated on the next call
+        // returns a pointer to a chunk buffer, reused on the next call — any
+        // reference into the returned chunk's data (e.g. const auto& v =
+        // chunk->columns[i].data) is invalidated on the next call. The pointer
+        // may alias a DESCENDANT's buffer: VecFilter stamps sel/filter_applied
+        // onto its child's chunk and VecLimit truncates it in place, both
+        // passing the pointer through without copying (late materialization).
+        // Consequences for implementers: a direct parent may mutate sel,
+        // filter_applied, and (limit only) truncate data; nothing survives the
+        // next nextChunk() call; and every chunk producer must fully reset all
+        // chunk fields (columns, num_rows, sel, filter_applied) per emission.
         virtual DataChunk* nextChunk() = 0;
         virtual void close() = 0;
 

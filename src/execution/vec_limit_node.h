@@ -17,5 +17,4 @@ private:
     std::unique_ptr<VecPlanNode> child_;
     int limit_;
     int rows_emitted_ = 0;
-    DataChunk out_chunk_;
 };

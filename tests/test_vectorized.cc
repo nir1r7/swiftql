@@ -2487,3 +2487,117 @@ TEST(VecHashJoinTiming, BuildPhaseIsTimed) {
     join.close();
     EXPECT_GT(join.stats.elapsed_us, 0.0);
 }
+
+// ===== Late materialization: filter/limit must not copy chunk data (P5) =====
+
+// A filter stamps its SelectionVector onto the child's chunk and passes the
+// pointer through. Proof by address: the scan reuses one internal buffer for
+// every chunk, so a pass-through filter must return that same address.
+TEST(VecFilterPassThrough, ReturnsChildChunkPointer) {
+    Schema schema = vecSchema({{"v", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(2000);  // two BATCH_SIZE chunks from one scan buffer
+    for (int i = 0; i < 2000; ++i) rows.push_back({Value(int64_t(i))});
+
+    auto scan = makeScan(schema, rows);
+    VecScanNode* raw_scan = scan.get();
+    VecFilterNode filter(std::move(scan), binOp(">", col("v"), intLit(-1)));
+
+    filter.open();
+    DataChunk* through_filter = filter.nextChunk();     // chunk 1 via the filter
+    DataChunk* scan_buffer = raw_scan->nextChunk();     // chunk 2, same internal buffer
+    ASSERT_NE(through_filter, nullptr);
+    ASSERT_NE(scan_buffer, nullptr);
+    EXPECT_EQ(through_filter, scan_buffer)
+        << "filter must pass the child's chunk through, not copy it";
+    filter.close();
+}
+
+// Filter-over-filter over multiple batches: the second filter reads the first
+// filter's SelectionVector as input_sel on the same pass-through buffer.
+TEST(VecFilterPassThrough, CascadeOverMultipleBatchesStaysCorrect) {
+    Schema schema = vecSchema({{"v", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(3000);
+    for (int i = 0; i < 3000; ++i) rows.push_back({Value(int64_t(i))});
+
+    auto scan = makeScan(schema, rows);
+    auto f1 = std::make_unique<VecFilterNode>(
+        std::move(scan), binOp(">=", col("v"), intLit(1000)));
+    VecFilterNode f2(std::move(f1), binOp("<", col("v"), intLit(1500)));
+
+    int total = 0;
+    f2.open();
+    while (DataChunk* chunk = f2.nextChunk()) {
+        ASSERT_TRUE(chunk->filter_applied);
+        for (int idx : chunk->sel.indices) {
+            int64_t v = std::get<std::vector<int64_t>>(chunk->columns[0].data)[idx];
+            EXPECT_GE(v, 1000);
+            EXPECT_LT(v, 1500);
+            ++total;
+        }
+    }
+    f2.close();
+    EXPECT_EQ(total, 500);
+}
+
+// Chunks where zero rows pass must not corrupt later chunks (the scan buffer
+// is shared, so a stale SelectionVector would leak into the next batch).
+TEST(VecFilterPassThrough, ZeroPassChunksMidStream) {
+    Schema schema = vecSchema({{"v", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(3000);
+    for (int i = 0; i < 3000; ++i) rows.push_back({Value(int64_t(i))});
+
+    auto scan = makeScan(schema, rows);
+    VecFilterNode filter(std::move(scan), binOp("<", col("v"), intLit(500)));
+
+    int total = 0;
+    filter.open();
+    while (DataChunk* chunk = filter.nextChunk()) {
+        total += static_cast<int>(chunk->sel.indices.size());
+    }
+    filter.close();
+    EXPECT_EQ(total, 500);  // batches 2 and 3 pass zero rows
+}
+
+// Limit truncates in place on the pass-through chunk: both the sel-truncation
+// path (filtered input) and the column-resize path (unfiltered input).
+TEST(VecLimitPassThrough, TruncatesBothPaths) {
+    Schema schema = vecSchema({{"v", TypeId::INT}});
+    std::vector<Row> rows;
+    rows.reserve(2000);
+    for (int i = 0; i < 2000; ++i) rows.push_back({Value(int64_t(i))});
+
+    // filtered input: limit truncates sel.indices
+    {
+        auto scan = makeScan(schema, rows);
+        auto filter = std::make_unique<VecFilterNode>(
+            std::move(scan), binOp(">=", col("v"), intLit(100)));
+        VecLimitNode limit(std::move(filter), 20);
+        int total = 0;
+        limit.open();
+        while (DataChunk* chunk = limit.nextChunk()) {
+            total += chunk->filter_applied
+                ? static_cast<int>(chunk->sel.indices.size())
+                : chunk->num_rows;
+        }
+        limit.close();
+        EXPECT_EQ(total, 20);
+    }
+    // unfiltered input: limit resizes columns
+    {
+        auto scan = makeScan(schema, rows);
+        VecLimitNode limit(std::move(scan), 30);
+        int total = 0;
+        limit.open();
+        while (DataChunk* chunk = limit.nextChunk()) {
+            ASSERT_FALSE(chunk->filter_applied);
+            EXPECT_EQ(static_cast<int>(std::get<std::vector<int64_t>>(chunk->columns[0].data).size()),
+                      chunk->num_rows);
+            total += chunk->num_rows;
+        }
+        limit.close();
+        EXPECT_EQ(total, 30);
+    }
+}

@@ -35,10 +35,15 @@ DataChunk* VecScanNode::nextChunk(){
     auto t0 = std::chrono::high_resolution_clock::now();
 
 
-    // rebuild cols each call
+    // rebuild cols each call; sel/filter_applied must reset too — a parent
+    // VecFilterNode stamps them onto this buffer (pass-through), and stale
+    // state would leak into the next batch
     current_chunk_.num_rows = count;
     current_chunk_.columns.clear();
     current_chunk_.columns.reserve(schema_.size());
+    current_chunk_.filter_applied = false;
+    current_chunk_.sel.indices.clear();
+    current_chunk_.sel.size = 0;
 
     // iterate in schema order
     for (int i = 0; i < schema_.size(); ++i){

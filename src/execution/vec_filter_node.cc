@@ -22,23 +22,23 @@ DataChunk* VecFilterNode::nextChunk(){
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // copy child columns into our owned buffer
-    // child reuses its internal DataChunk on next call
-    out_chunk_ = *raw;
-
-    // pass input_sel so evalPredicate skips rows already rejected by an upstream filter
+    // late materialization: stamp the SelectionVector onto the child's chunk
+    // and pass the pointer through — no column data is copied. evalPredicate
+    // returns a fresh vector by value, so reading raw->sel as input_sel (rows
+    // already rejected upstream) before the assignment below is safe.
     const SelectionVector* input_sel = raw->filter_applied ? &raw->sel : nullptr;
-    out_chunk_.sel = evalPredicate(predicate_.get(), *raw, child_->outputSchema(), input_sel);
+    SelectionVector out = evalPredicate(predicate_.get(), *raw, child_->outputSchema(), input_sel);
+    raw->sel = std::move(out);
 
     // mark that a filter was applied so VecProjectNode treats empty
     // sel.indices as "zero rows passed" rather than "all rows valid"
-    out_chunk_.filter_applied = true;
+    raw->filter_applied = true;
 
     stats.rows_in  += raw->num_rows;
-    stats.rows_out += static_cast<int>(out_chunk_.sel.indices.size());
+    stats.rows_out += static_cast<int>(raw->sel.indices.size());
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 
-    return &out_chunk_;
+    return raw;
 }
 
 const Schema& VecFilterNode::outputSchema() const {

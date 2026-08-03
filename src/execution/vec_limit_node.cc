@@ -22,23 +22,23 @@ DataChunk* VecLimitNode::nextChunk() {
         : chunk->num_rows;
     int remaining = limit_ - rows_emitted_;
 
-    // copy child's chunk into our owned buffer, child reuses its buffer on next call
-    out_chunk_ = *chunk;
-
+    // late materialization: truncate the child's chunk in place and pass the
+    // pointer through — safe because once the limit is hit this node never
+    // pulls again, and every producer rebuilds its buffer per emission
     if (available <= remaining) {
         rows_emitted_ += available;
         stats.rows_in += available;
         stats.rows_out += available;
     } else {
         // final partial chunk: keep only the first `remaining` passing rows
-        if (out_chunk_.filter_applied) {
+        if (chunk->filter_applied) {
             // columns hold all physical rows; sel.indices are positions into them.
             // only truncate sel.indices — resizing columns would invalidate the indices.
-            out_chunk_.sel.indices.resize(remaining);
-            out_chunk_.sel.size = remaining;
+            chunk->sel.indices.resize(remaining);
+            chunk->sel.size = remaining;
         } else {
-            out_chunk_.num_rows = remaining;
-            for (auto& cv : out_chunk_.columns) {
+            chunk->num_rows = remaining;
+            for (auto& cv : chunk->columns) {
                 std::visit([&](auto& vec) { vec.resize(remaining); }, cv.data);
             }
         }
@@ -49,7 +49,7 @@ DataChunk* VecLimitNode::nextChunk() {
 
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 
-    return &out_chunk_;
+    return chunk;
 }
 
 void VecLimitNode::close() {

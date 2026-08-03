@@ -16,5 +16,4 @@ class VecFilterNode : public VecPlanNode{
     private:
     std::unique_ptr<Expr> predicate_;      // declared before child_ so child_ is destroyed first
     std::unique_ptr<VecPlanNode> child_;
-    DataChunk out_chunk_;
 };
