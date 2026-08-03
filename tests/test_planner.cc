@@ -100,35 +100,68 @@ TEST(ValidatorTest, SumOnNumericColumn) {
 
 // ===== planner tests =====
 
-TEST(PlannerTest, BuildsSeqScan) {
-    Catalog catalog("../tests/data/test_catalog.json");
-    Parser p("SELECT team FROM laps");
+#include "planner/binder.h"
+
+// Bind + plan, mirroring the real pipeline (main.cc binds before planning).
+static std::unique_ptr<PlanNode> bindAndPlan(const std::string& sql, const Catalog& catalog) {
+    Parser p(sql);
     auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
 
     std::unordered_map<std::string, std::vector<Row>> table_rows;
     const auto& meta = catalog.getTable(stmt.from_table);
     table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+    if (stmt.join.has_value() && !table_rows.count(stmt.join->join_table)) {
+        const auto& jmeta = catalog.getTable(stmt.join->join_table);
+        table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+    }
+    return Planner::plan(std::move(stmt), catalog, std::move(table_rows));
+}
 
-    auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
-    EXPECT_NE(plan, nullptr);
+// Top-down explain() spine following children()[0].
+static std::vector<std::string> planSpine(const PlanNode* root) {
+    std::vector<std::string> labels;
+    for (const PlanNode* n = root; n; ) {
+        std::string e = n->explain();
+        labels.push_back(e.substr(0, e.find(' ')));
+        auto kids = n->children();
+        n = kids.empty() ? nullptr : kids[0];
+    }
+    return labels;
+}
+
+TEST(PlannerTest, BuildsSeqScan) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlan("SELECT team FROM laps", catalog);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(planSpine(plan.get()), (std::vector<std::string>{"Project", "SeqScan"}));
+    ASSERT_EQ(plan->outputSchema().size(), 1);
+    EXPECT_EQ(plan->outputSchema().column(0).name, "team");
 }
 
 TEST(PlannerTest, BuildsJoinPlan) {
     Catalog catalog("../tests/data/test_catalog.json");
-    Parser p("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id");
-    auto stmt = p.parse();
+    auto plan = bindAndPlan(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", catalog);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(planSpine(plan.get()), (std::vector<std::string>{"Project", "HashJoin", "SeqScan"}));
 
-    std::unordered_map<std::string, std::vector<Row>> table_rows;
-    const auto& meta = catalog.getTable(stmt.from_table);
-    table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
-    if (stmt.join.has_value()) {
-        const auto& jmeta = catalog.getTable(stmt.join->join_table);
-        table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
-    }
+    // join keys routed by binder slot, one per side
+    const PlanNode* join = plan->children()[0];
+    EXPECT_NE(join->explain().find("driver_id = driver_id"), std::string::npos);
+    ASSERT_EQ(join->children().size(), 2u);
 
-    auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows));
-    EXPECT_NE(plan, nullptr);
-    EXPECT_NO_THROW(plan->open());
+    // projected output is just laps.team
+    ASSERT_EQ(plan->outputSchema().size(), 1);
+    EXPECT_EQ(plan->outputSchema().column(0).name, "team");
+    EXPECT_EQ(plan->outputSchema().column(0).relation_slot, 0);
+
+    // the plan actually executes: 5 laps x matching drivers
+    plan->open();
+    int rows = 0;
+    while (plan->next()) ++rows;
+    plan->close();
+    EXPECT_GT(rows, 0);
 }
 // ===== Phase 4 audit fixes: validation gaps =====
 

@@ -6,6 +6,7 @@
 #include "planner/binder.h"
 #include "parser/parser.h"
 #include "parser/ast.h"
+#include "parser/expr_utils.h"
 #include "catalog/catalog.h"
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
@@ -385,4 +386,107 @@ TEST(PredicatePushdown, JoinSidePruningActuallySkipsChunks) {
     ASSERT_NE(drivers_scan, nullptr);
     EXPECT_NE(drivers_scan->explain().find("chunks_skipped=1/2"), std::string::npos)
         << drivers_scan->explain();
+}
+
+// ===== Result correctness under pushdown (audit M8) =====
+
+// Lower WITHOUT the pushdown pass — the baseline plan for result invariance.
+static std::unique_ptr<VecPlanNode> buildUnpushedVec(const std::string& sql, const Catalog& cat) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+}
+
+// Drain a vectorized plan into sorted serialized rows (multiset comparison).
+static std::vector<std::string> drainSorted(VecPlanNode& node) {
+    node.open();
+    std::vector<std::string> out;
+    while (DataChunk* chunk = node.nextChunk()) {
+        int n = chunk->filter_applied ? static_cast<int>(chunk->sel.indices.size())
+                                      : chunk->num_rows;
+        for (int i = 0; i < n; ++i) {
+            int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
+            std::string row;
+            for (const auto& cv : chunk->columns) {
+                std::visit([&](const auto& v) { row += Value(v[r]).toString() + "|"; }, cv.data);
+            }
+            out.push_back(std::move(row));
+        }
+    }
+    node.close();
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Pushdown must be result-preserving, not just shape-preserving: execute the
+// pushed and unpushed plans and compare row multisets. A regression that
+// corrupts or drops a predicate while keeping the plan printable fails here.
+TEST(PredicatePushdown, PushedPlansPreserveResults) {
+    const char* queries[] = {
+        // single-side predicate (pushed to the join side)
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.age > 30",
+        // both-side predicates
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.speed > 300 AND d.age > 25",
+        // mixed conjunct stays residual above the join
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.speed > 300 AND l.season = d.age",
+    };
+    for (const char* sql : queries) {
+        Catalog cat(CATALOG);
+        auto pushed = buildPushedVec(sql, cat);
+        auto rows_pushed = drainSorted(*pushed);
+
+        Catalog cat2(CATALOG);
+        auto unpushed = buildUnpushedVec(sql, cat2);
+        auto rows_unpushed = drainSorted(*unpushed);
+
+        EXPECT_EQ(rows_pushed, rows_unpushed) << sql;
+    }
+}
+
+// ===== Untested classification shapes (audit P2) =====
+
+// An IS NULL conjunct over a join-side column is single-slot: it pushes below
+// the join like any comparison, and executes correctly (CSV data has no NULLs,
+// so zero rows survive).
+TEST(PredicatePushdown, IsNullConjunctPushesBelowJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.name IS NULL", cat);
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+    const auto* filter = static_cast<const LogicalFilter*>(join->children[1].get());
+    EXPECT_NE(dynamic_cast<const IsNullExpr*>(filter->predicate.get()), nullptr);
+
+    Catalog cat2(CATALOG);
+    auto vec = buildPushedVec(
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.name IS NULL", cat2);
+    EXPECT_TRUE(drainSorted(*vec).empty());
+}
+
+// A literal-only conjunct references no relation slot: it must stay above the
+// join as a residual, never be pushed to either scan.
+TEST(PredicatePushdown, LiteralOnlyConjunctStaysAboveJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE 1 = 1 AND d.age > 30", cat);
+
+    // residual filter above the join holds the literal conjunct
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER);
+    const auto* residual = static_cast<const LogicalFilter*>(plan->children[0].get());
+    EXPECT_NE(exprToString(residual->predicate.get()).find("1 = 1"), std::string::npos);
+
+    // and the join-side conjunct still pushed below
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
 }
