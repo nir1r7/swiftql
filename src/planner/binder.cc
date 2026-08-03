@@ -23,13 +23,18 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
             &join_schema
         });
 
-        // A self-join (same table on both sides) is only resolvable if the two
-        // occurrences have distinct names to qualify with — otherwise every
-        // qualified reference is ambiguous. Require aliases, matching SQLite.
+        // Two relations sharing a ref name are unresolvable — every qualified
+        // reference is ambiguous. Distinguish the aliasless self-join (needs
+        // aliases, matching SQLite) from a duplicated alias across tables.
         if (range_table[0].ref_name == range_table[1].ref_name) {
+            if (range_table[0].table_name == range_table[1].table_name) {
+                throw std::runtime_error(
+                    "self-join requires table aliases to disambiguate the two references to '"
+                    + stmt.from_table + "'");
+            }
             throw std::runtime_error(
-                "self-join requires table aliases to disambiguate the two references to '"
-                + stmt.from_table + "'");
+                "duplicate table alias '" + range_table[0].ref_name
+                + "': each side of a join needs a distinct name");
         }
     }
 

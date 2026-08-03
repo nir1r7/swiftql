@@ -445,3 +445,45 @@ TEST(AggregateResolution, OrderByOnlyAggregateExecutes) {
     for (const auto& r : rows) EXPECT_EQ(r.size(), 1u);
     EXPECT_EQ(rows[2][0].asString(), "Mercedes");  // the single-lap team sorts last
 }
+
+// ===== Aggregate type checking across joins (N2) =====
+
+TEST(AggregateTypeCheck, SumOnQualifiedStringColumnInJoinRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT SUM(d.name) FROM laps JOIN drivers d ON laps.driver_id = d.driver_id", cat);
+    EXPECT_NE(err.find("numeric"), std::string::npos) << err;
+}
+
+TEST(AggregateTypeCheck, SumOnUnqualifiedStringColumnInJoinRejected) {
+    Catalog cat(CATALOG);
+    // name exists only in drivers; binder resolves it to the JOIN side
+    std::string err = joinOnValidationError(
+        "SELECT SUM(name) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
+    EXPECT_NE(err.find("numeric"), std::string::npos) << err;
+}
+
+TEST(AggregateTypeCheck, AvgOnStringColumnInHavingRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT season, COUNT(*) FROM laps GROUP BY season HAVING AVG(team) > 5", cat);
+    EXPECT_NE(err.find("numeric"), std::string::npos) << err;
+}
+
+// ===== Duplicate alias diagnostics (N3) =====
+
+TEST(Binder, DuplicateAliasAcrossDifferentTablesNamedCorrectly) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT x.team FROM laps x JOIN drivers x ON x.driver_id = x.driver_id");
+    auto stmt = p.parse();
+    try {
+        Binder::bind(stmt, cat);
+        FAIL() << "expected duplicate-alias error";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        // not a self-join: the message must talk about the duplicate alias,
+        // not claim 'laps' was joined with itself
+        EXPECT_NE(err.find("duplicate table alias"), std::string::npos) << err;
+        EXPECT_NE(err.find("'x'"), std::string::npos) << err;
+    }
+}

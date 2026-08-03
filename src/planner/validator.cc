@@ -17,21 +17,38 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         }
     }
 
-    // aggregate functions must be applied to compatible column types
-    for (const auto& expr : stmt.select_list) {
-        if (auto* agg = dynamic_cast<const AggregateExpr*>(expr.get())) {
-            if (agg->is_star) continue;
-            if (agg->function_name == "SUM" || agg->function_name == "AVG") {
-                if (agg->argument) {
-                    if (auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get())) {
-                        if (col->table_name.empty() && schema.hasColumn(col->column_name)) {
-                            TypeId t = schema.column(schema.indexOf(col->column_name)).type;
-                            if (t == TypeId::STRING){
-                                throw std::runtime_error(agg->function_name + "() requires a numeric column, but '" + col->column_name + "' is of type STRING");
-                            }
-                        }
-                    }
-                }
+    // aggregate functions must be applied to compatible column types, wherever
+    // the aggregate appears (SELECT, HAVING, ORDER BY) and whichever join side
+    // its argument resolves to
+    {
+        std::vector<const AggregateExpr*> aggs;
+        for (const auto& expr : stmt.select_list) collectAggregates(expr.get(), aggs);
+        collectAggregates(stmt.having.get(), aggs);
+        for (const auto& item : stmt.order_by) collectAggregates(item.expr.get(), aggs);
+
+        for (const AggregateExpr* agg : aggs) {
+            if (agg->is_star || !agg->argument) continue;
+            if (agg->function_name != "SUM" && agg->function_name != "AVG") continue;
+            auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get());
+            if (!col) continue;
+
+            // pick the schema the argument resolves against: binder slot when
+            // bound, table-name match for unbound qualified refs, FROM otherwise
+            const Schema* target = nullptr;
+            if (col->relation_slot == 1 && stmt.join.has_value()) {
+                target = &catalog.getTable(stmt.join->join_table).schema;
+            } else if (col->relation_slot == 0 || col->table_name.empty()) {
+                target = &schema;
+            } else if (col->table_name == stmt.from_table) {
+                target = &schema;
+            } else if (stmt.join.has_value() && col->table_name == stmt.join->join_table) {
+                target = &catalog.getTable(stmt.join->join_table).schema;
+            }
+            if (!target || !target->hasColumn(col->column_name)) continue;
+
+            TypeId t = target->column(target->indexOf(col->column_name)).type;
+            if (t == TypeId::STRING){
+                throw std::runtime_error(agg->function_name + "() requires a numeric column, but '" + col->column_name + "' is of type STRING");
             }
         }
     }
