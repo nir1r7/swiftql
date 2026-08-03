@@ -490,3 +490,32 @@ TEST(PredicatePushdown, LiteralOnlyConjunctStaysAboveJoin) {
     ASSERT_NE(join, nullptr);
     EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
 }
+
+// A cross-relation OR must not be split or pushed: OR is indivisible, and its
+// slots span both sides, so the whole disjunction stays above the join as a
+// residual with neither scan filtered.
+TEST(PredicatePushdown, CrossRelationOrStaysAboveJoinIntact) {
+    Catalog cat(CATALOG);
+    const char* sql =
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.season = 2025 OR d.age > 30";
+    auto plan = buildPushed(sql, cat);
+
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER);
+    const auto* residual = static_cast<const LogicalFilter*>(plan->children[0].get());
+    const auto* pred = dynamic_cast<const BinaryExpr*>(residual->predicate.get());
+    ASSERT_NE(pred, nullptr);
+    EXPECT_EQ(pred->op, "OR");  // the disjunction survives unsplit
+
+    const LogicalPlanNode* join = residual->children[0].get();
+    ASSERT_EQ(join->type, LogicalNodeType::JOIN);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN);
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::SCAN);
+
+    // and pushdown is result-preserving for it
+    Catalog cat2(CATALOG);
+    auto pushed = buildPushedVec(sql, cat2);
+    Catalog cat3(CATALOG);
+    auto unpushed = buildUnpushedVec(sql, cat3);
+    EXPECT_EQ(drainSorted(*pushed), drainSorted(*unpushed));
+}

@@ -355,6 +355,12 @@ AUDIT_FIXES_QUERIES = [
     ("fix_c4_c3_m1_combined",
      "SELECT l1.team, AVG(l1.speed), AVG(l2.speed) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
      "GROUP BY l1.team HAVING COUNT(*) > 2 ORDER BY AVG(l2.speed) DESC"),
+
+    # cross-relation OR: indivisible, spans both slots -> stays above the join
+    # as an intact residual (audit follow-up; also pinned by a plan-shape test)
+    ("fix_or_cross_relation_residual",
+     "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.season = 2025 OR d.age > 30"),
 ]
 
 # The join operator each steering comment above claims — asserted from
