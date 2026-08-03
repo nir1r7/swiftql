@@ -337,3 +337,21 @@ TEST(VecSimdLoopJoin, StatsCountProbeRowsInAndJoinedRowsOut) {
     EXPECT_EQ(loop.stats.rows_in, 3);
     EXPECT_EQ(loop.stats.rows_out, 2);
 }
+
+// The build phase runs in open() and must be timed (audit M6): with a zero-row
+// probe, elapsed time can only come from consuming the build side.
+TEST(VecSimdLoopJoin, BuildPhaseIsTimed) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema(std::vector<ColumnDef>{{"pid", TypeId::INT, 0}, {"bid", TypeId::INT, 1}});
+    std::vector<Row> build_rows;
+    build_rows.reserve(5000);
+    for (int i = 0; i < 5000; ++i) build_rows.push_back({Value(int64_t(i))});
+
+    VecSimdLoopJoinNode loop(makeScan(probe_schema, {}), makeScan(build_schema, build_rows),
+                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+    loop.open();
+    while (loop.nextChunk()) {}
+    loop.close();
+    EXPECT_GT(loop.stats.elapsed_us, 0.0);
+}

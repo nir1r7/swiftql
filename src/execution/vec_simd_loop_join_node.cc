@@ -26,6 +26,9 @@ void VecSimdLoopJoinNode::open() {
     int build_key_idx = build_schema.indexOf(build_join_col_); // by name, never positional
 
     while (DataChunk* chunk = build_child_->nextChunk()) {
+        // build work is self-time; the child pull above is excluded, matching
+        // the per-chunk timing pattern of the other pipeline breakers
+        auto t0 = std::chrono::high_resolution_clock::now();
         // sel.indices is authoritative when filter_applied (vec_types.h)
         const std::vector<int>* indices_ptr = nullptr;
         std::vector<int> all_indices;
@@ -52,6 +55,7 @@ void VecSimdLoopJoinNode::open() {
             }
             build_rows_.push_back(std::move(build_row));
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
 
     build_child_->close();
@@ -206,9 +210,12 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
         // if no matches from this probe chunk, loop to pull the next one
     }
 
-    // emit one BATCH_SIZE slice from output_buffer_
+    // emit one BATCH_SIZE slice from output_buffer_; materialization is real
+    // work and counts toward this node's time
     int batch = std::min(BATCH_SIZE, static_cast<int>(output_buffer_.size()) - output_cursor_);
+    auto t_fill = std::chrono::high_resolution_clock::now();
     fillOutChunk(output_cursor_, batch);
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t_fill).count();
 
     stats.rows_out += batch;
     output_cursor_ += batch;

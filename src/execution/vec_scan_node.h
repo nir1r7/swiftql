@@ -24,4 +24,5 @@ class VecScanNode : public VecPlanNode {
         DataChunk current_chunk_;
         const Expr* pruning_where_ = nullptr; // non-owning; caller must ensure the Expr outlives this node
         int skipped_chunks_ = 0;
+        bool executed_ = false;  // gates chunks_skipped in explain(): the counter is only real after open()
 };

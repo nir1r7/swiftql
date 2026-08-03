@@ -586,3 +586,42 @@ TEST(SeqScanNodePruning, AndPredicatePrunesCorrectly) {
     SeqScanNode scan("test", std::move(tbl), schema, and_pred.get());
     EXPECT_EQ(columnarDrainAll(&scan).size(), 0u);
 }
+// ===== Explain must not print a stale runtime counter pre-execution (P3) =====
+
+#include "execution/vec_scan_node.h"
+
+TEST(ScanPruningExplain, PreExecutionShowsHintNotStaleCounter) {
+    Schema schema = singleSeasonSchema();
+    auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
+
+    // never executed: chunks_skipped=0/N would be a runtime value that never ran
+    SeqScanNode scan("test", makeSingleChunkTable(), schema, pred.get());
+    EXPECT_NE(scan.explain().find("pruning=on"), std::string::npos) << scan.explain();
+    EXPECT_EQ(scan.explain().find("chunks_skipped"), std::string::npos) << scan.explain();
+
+    VecScanNode vscan("test", makeSingleChunkTable(), schema, pred.get());
+    EXPECT_NE(vscan.explain().find("pruning=on"), std::string::npos) << vscan.explain();
+    EXPECT_EQ(vscan.explain().find("chunks_skipped"), std::string::npos) << vscan.explain();
+
+    // after execution the counter is real (whole chunk provably skipped)
+    vscan.open();
+    while (vscan.nextChunk()) {}
+    vscan.close();
+    EXPECT_NE(vscan.explain().find("chunks_skipped=1/1"), std::string::npos) << vscan.explain();
+}
+
+// The pruner must keep ignoring slot >= 1 refs: under --no-optimize (and for
+// residual filters) the FROM-side scan's pruning hint still contains join-side
+// conjuncts, and shared column names make them unsafe to act on. Pushed
+// join-side conjuncts are re-stamped to slot 0 before they reach a scan.
+TEST(ChunkPrunerSlots, JoinSlotRefNeverPrunes) {
+    Schema schema = singleSeasonSchema();
+    ColumnarTable tbl = makeSingleChunkTable();  // zone map [2020,2020]
+
+    auto ref = columnarColRef("season");
+    ref->relation_slot = 1;  // join-side ref reaching a FROM-side hint
+    auto pred = makeColumnarBinary("=", std::move(ref), columnarLit(Value(int64_t(2025))));
+
+    // the zone map would prove a skip, but the slot guard must win
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), tbl.zone_maps, 0));
+}

@@ -2468,3 +2468,22 @@ TEST(VecHaving, FilterAggregateGroups) {
     EXPECT_TRUE(saw_B);
     EXPECT_TRUE(saw_C);
 }
+// ===== EXPLAIN ANALYZE timing honesty (audit M6) =====
+
+// The build phase runs in open() and must be timed: with a zero-row probe the
+// probe loop and output materialization never run, so any elapsed time can
+// only come from the (previously untimed) hash-table build.
+TEST(VecHashJoinTiming, BuildPhaseIsTimed) {
+    Schema side = vecSchema({{"k", TypeId::INT}});
+    std::vector<Row> build_rows;
+    build_rows.reserve(5000);
+    for (int i = 0; i < 5000; ++i) build_rows.push_back({Value(int64_t(i))});
+    Schema merged(std::vector<ColumnDef>{{"k", TypeId::INT, 0}, {"k", TypeId::INT, 1}});
+
+    VecHashJoinNode join(makeScan(side, {}), makeScan(side, build_rows),
+                         "k", "k", merged, /*swapped=*/false);
+    join.open();
+    while (join.nextChunk()) {}
+    join.close();
+    EXPECT_GT(join.stats.elapsed_us, 0.0);
+}

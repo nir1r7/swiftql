@@ -40,6 +40,7 @@ class SeqScanNode : public PlanNode {
 
         const Expr* pruning_where_ = nullptr; // non owning
         int skipped_chunks_ = 0;
+        bool executed_ = false;  // gates chunks_skipped in explain(): the counter is only real after open()
 };
 
 

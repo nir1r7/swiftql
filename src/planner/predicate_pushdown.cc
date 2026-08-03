@@ -48,6 +48,22 @@ PushTarget classify(const Expr* conjunct) {
     return PushTarget::RESIDUAL;
 }
 
+// Re-stamp every ColumnRef in a pushed conjunct to the given slot. Same
+// dispatch as collectSlots(). A conjunct pushed below the join lives in a
+// single-table subtree whose scan schema stamps all columns slot 0, so the
+// refs must match — this is also what lets ChunkPruner act on join-side
+// pruning hints (it ignores slot >= 1 refs; see chunk_pruner.h).
+void restampSlots(Expr* expr, int slot) {
+    if (!expr) return;
+    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { cr->relation_slot = slot; return; }
+    if (auto* bin = dynamic_cast<BinaryExpr*>(expr)) {
+        restampSlots(bin->left.get(), slot);
+        restampSlots(bin->right.get(), slot);
+        return;
+    }
+    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) restampSlots(isn->operand.get(), slot);
+}
+
 // Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty.
 std::unique_ptr<Expr> conjoin(std::vector<std::unique_ptr<Expr>> parts) {
     if (parts.empty()) return nullptr;
@@ -122,10 +138,14 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
         }
     }
 
-    // The join scan's standalone schema stamps columns slot 0; a pushed
-    // JOIN-side conjunct's ColumnRefs carry slot 1, so resolveColumnIndex misses
-    // the slot lookup and falls back to bare name — unambiguous on a single
-    // table. No slot re-stamping needed.
+    // Pushed JOIN-side conjuncts were classified as referencing only slot 1;
+    // below the join they execute against the standalone scan, whose schema
+    // stamps every column slot 0. Re-stamp so slot lookups hit directly and
+    // ChunkPruner can act on the hint (it must keep ignoring slot >= 1 refs —
+    // the FROM-side hint path routes residual/un-pushed predicates containing
+    // join-side conjuncts to the FROM scan, where shared column names would
+    // make name-based pruning wrong). Residuals keep their slots.
+    for (auto& c : join_p) restampSlots(c.get(), 0);
     join->children[0] = filterOnto(std::move(join->children[0]), std::move(from_p), catalog);
     join->children[1] = filterOnto(std::move(join->children[1]), std::move(join_p), catalog);
 

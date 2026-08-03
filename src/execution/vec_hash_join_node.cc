@@ -18,6 +18,9 @@ void VecHashJoinNode::open() {
     int build_key_idx = build_schema.indexOf(build_join_col_); // by name, never positional
 
     while (DataChunk* chunk = build_child_->nextChunk()) {
+        // build work is self-time; the child pull above is excluded, matching
+        // the per-chunk timing pattern of the other pipeline breakers
+        auto t0 = std::chrono::high_resolution_clock::now();
         const std::vector<int>* indices_ptr = nullptr;
         std::vector<int> all_indices;
         if (chunk->filter_applied) {
@@ -43,6 +46,7 @@ void VecHashJoinNode::open() {
             }
             hash_table_[key].push_back(std::move(build_row));
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
 
     build_child_->close();
@@ -147,13 +151,14 @@ DataChunk* VecHashJoinNode::nextChunk() {
         // if no matches from this probe chunk, loop to pull the next one
     }
 
-    // emit one BATCH_SIZE slice from output_buffer_
+    // emit one BATCH_SIZE slice from output_buffer_; materialization is real
+    // work and counts toward this node's time
     int batch = std::min(BATCH_SIZE, static_cast<int>(output_buffer_.size()) - output_cursor_);
+    auto t0 = std::chrono::high_resolution_clock::now();
     fillOutChunk(output_cursor_, batch);
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 
     stats.rows_out += batch;
-    stats.elapsed_us += 0;  // fillOutChunk time is minor; folded into probe timing above
-
     output_cursor_ += batch;
     return &out_chunk_;
 }

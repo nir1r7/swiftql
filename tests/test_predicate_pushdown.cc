@@ -272,9 +272,8 @@ TEST(PredicatePushdown, OrdersJoinSideConjunctsMostSelectiveFirst) {
 }
 
 // A join-side WHERE predicate reaches the JOIN-side scan as a zone-map pruning
-// hint (previously the join side always got nullptr). VecScan::explain() prints
-// "chunks_skipped" only when a hint is present — that's the observable contract.
-// The FROM side, with no pushed predicate, must NOT carry a hint.
+// hint. Pre-execution, explain() reports the hint as "pruning=on" (the counter
+// is a runtime value). The FROM side, with no pushed predicate, carries no hint.
 TEST(PredicatePushdown, JoinSidePredicateReachesScanAsPruningHint) {
     Catalog cat(CATALOG);
     auto vec = buildPushedVec(
@@ -286,8 +285,104 @@ TEST(PredicatePushdown, JoinSidePredicateReachesScanAsPruningHint) {
     ASSERT_NE(drivers_scan, nullptr);
     ASSERT_NE(laps_scan, nullptr);
 
-    EXPECT_NE(drivers_scan->explain().find("chunks_skipped"), std::string::npos)
+    EXPECT_NE(drivers_scan->explain().find("pruning=on"), std::string::npos)
         << "join-side scan should receive the pushed predicate as a pruning hint";
-    EXPECT_EQ(laps_scan->explain().find("chunks_skipped"), std::string::npos)
+    EXPECT_EQ(laps_scan->explain().find("pruning=on"), std::string::npos)
         << "FROM-side scan has no pushed predicate and should carry no hint";
+}
+
+// Conjuncts pushed below the join are re-stamped to the standalone scan's
+// slot 0 — that is what lets ChunkPruner (which ignores slot >= 1 refs, a
+// guard the FROM-side hint path depends on) act on them.
+TEST(PredicatePushdown, JoinSideConjunctSlotsRestampedToScanSlot) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.age > 30", cat);
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+    const auto* filter = static_cast<const LogicalFilter*>(join->children[1].get());
+
+    std::vector<const Expr*> stack = {filter->predicate.get()};
+    int refs_seen = 0;
+    while (!stack.empty()) {
+        const Expr* e = stack.back();
+        stack.pop_back();
+        if (auto* col = dynamic_cast<const ColumnRef*>(e)) {
+            ++refs_seen;
+            EXPECT_EQ(col->relation_slot, 0) << col->column_name;
+        } else if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+            stack.push_back(bin->left.get());
+            stack.push_back(bin->right.get());
+        } else if (auto* isn = dynamic_cast<const IsNullExpr*>(e)) {
+            stack.push_back(isn->operand.get());
+        }
+    }
+    EXPECT_GT(refs_seen, 0);
+}
+
+// End-to-end: join-side pruning must actually skip chunks AND preserve results.
+// Synthetic drivers table spans two zone-map chunks sorted by driver_id, so a
+// "driver_id > CHUNK_SIZE" predicate provably excludes chunk 0.
+TEST(PredicatePushdown, JoinSidePruningActuallySkipsChunks) {
+    Catalog cat(CATALOG);
+    const std::string sql =
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.driver_id > " + std::to_string(CHUNK_SIZE);
+
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    // drivers: CHUNK_SIZE + 10 rows, driver_id 1..CHUNK_SIZE+10 in order
+    const Schema& dschema = cat.getTable("drivers").schema;
+    std::vector<Row> drows;
+    drows.reserve(CHUNK_SIZE + 10);
+    for (int i = 1; i <= CHUNK_SIZE + 10; ++i) {
+        drows.push_back({Value(int64_t(i)), Value(std::string("d")),
+                         Value(std::string("n")), Value(std::string("t")),
+                         Value(int64_t(30))});
+    }
+    // laps: two rows land in drivers chunk 1, one in the pruned chunk 0
+    const Schema& lschema = cat.getTable("laps").schema;
+    std::vector<Row> lrows = {
+        {Value(int64_t(1)), Value(int64_t(CHUNK_SIZE + 1)), Value(std::string("t")),
+         Value(300.0), Value(1.0), Value(1.0), Value(1.0), Value(int64_t(2024)), Value(int64_t(1))},
+        {Value(int64_t(2)), Value(int64_t(CHUNK_SIZE + 2)), Value(std::string("t")),
+         Value(300.0), Value(1.0), Value(1.0), Value(1.0), Value(int64_t(2024)), Value(int64_t(1))},
+        {Value(int64_t(3)), Value(int64_t(5)), Value(std::string("t")),
+         Value(300.0), Value(1.0), Value(1.0), Value(1.0), Value(int64_t(2024)), Value(int64_t(1))},
+    };
+    std::unordered_map<std::string, ColumnarTable> tables;
+    tables.emplace("drivers", CSVToColumnar::convert(drows, dschema));
+    tables.emplace("laps", CSVToColumnar::convert(lrows, lschema));
+
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    logical = PredicatePushdown::apply(std::move(logical), cat);
+    auto vec = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+
+    // drain and collect the projected lap_ids
+    vec->open();
+    std::vector<int64_t> lap_ids;
+    while (DataChunk* chunk = vec->nextChunk()) {
+        int n = chunk->filter_applied ? static_cast<int>(chunk->sel.indices.size())
+                                      : chunk->num_rows;
+        for (int i = 0; i < n; ++i) {
+            int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
+            std::visit([&](const auto& v) { lap_ids.push_back(int64_t(Value(v[r]).asInt())); },
+                       chunk->columns[0].data);
+        }
+    }
+    vec->close();
+
+    // results correct: laps 1 and 2 survive, lap 3 (driver_id=5) is filtered out
+    std::sort(lap_ids.begin(), lap_ids.end());
+    EXPECT_EQ(lap_ids, (std::vector<int64_t>{1, 2}));
+
+    // and the join-side scan really skipped drivers chunk 0
+    const VecPlanNode* drivers_scan = findScan(vec.get(), "drivers");
+    ASSERT_NE(drivers_scan, nullptr);
+    EXPECT_NE(drivers_scan->explain().find("chunks_skipped=1/2"), std::string::npos)
+        << drivers_scan->explain();
 }

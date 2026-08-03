@@ -19,11 +19,15 @@ namespace {
         }
 
         // accept ColumnRef operator Literal.
-        // Pruning only ever runs against the FROM-side scan's zone maps, so a
-        // predicate over a JOIN-side column (relation_slot == 1) must be
-        // ignored here — otherwise a shared column name (e.g. both tables have
-        // `team`) would prune the FROM table on the JOIN table's value.
-        // slot < 1 covers FROM (0) and unresolved/single-table (-1).
+        // A conjunct is only prunable when its refs belong to the scanned
+        // table. Pushed conjuncts arrive re-stamped slot 0 (see
+        // predicate_pushdown.cc), matching the standalone scan schema — for
+        // both join sides. A slot >= 1 ref reaching a scan hint can only be a
+        // residual or un-pushed (--no-optimize) predicate routed to the
+        // FROM-side scan, where a shared column name (e.g. both tables have
+        // `team`) would prune the FROM table on the JOIN table's value —
+        // those must stay ignored. slot < 1 covers scan-local (0) and
+        // unresolved/single-table (-1).
         const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
         const auto* lit = dynamic_cast<const Literal*>(bin->right.get());
         if (col && lit && col->relation_slot < 1){

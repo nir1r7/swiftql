@@ -44,6 +44,7 @@ SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, S
 void SeqScanNode::open() {
     cursor_ = 0;
     skipped_chunks_ = 0;
+    executed_ = true;
 }
 
 Row* SeqScanNode::next() {
@@ -93,8 +94,14 @@ const Schema& SeqScanNode::outputSchema() const {
 std::string SeqScanNode::explain() const {
     std::string s = "SeqScan [" + table_name_ + ", " + std::to_string(schema_.columns().size()) + " columns]";
     if (use_columnar_ && pruning_where_){
-        int total = (columnar_table_.num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        s += " chunks_skipped=" + std::to_string(skipped_chunks_) + "/" + std::to_string(total);
+        // the counter is a runtime value; before execution only report that a
+        // pruning hint is attached (plain --explain never runs the plan)
+        if (executed_) {
+            int total = (columnar_table_.num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            s += " chunks_skipped=" + std::to_string(skipped_chunks_) + "/" + std::to_string(total);
+        } else {
+            s += " pruning=on";
+        }
     }
     return s;
 }
