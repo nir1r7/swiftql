@@ -1807,10 +1807,10 @@ TEST(VecSort, SingleColumnDescending) {
 TEST(VecSort, MultiColumnSort) {
     Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(3LL)},
-        {Value(1LL), Value(1LL)},
-        {Value(2LL), Value(2LL)},
-        {Value(2LL), Value(1LL)},
+        {Value(int64_t(1)), Value(int64_t(3))},
+        {Value(int64_t(1)), Value(int64_t(1))},
+        {Value(int64_t(2)), Value(int64_t(2))},
+        {Value(int64_t(2)), Value(int64_t(1))},
     };
     std::vector<OrderByItem> ob;
     ob.push_back(orderAsc(col("a")));
@@ -1864,7 +1864,7 @@ TEST(VecSort, EmptyInput) {
 
 TEST(VecSort, OutputSchemaUnchanged) {
     Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::DOUBLE}});
-    std::vector<Row> rows = {{Value(1LL), Value(2.0)}};
+    std::vector<Row> rows = {{Value(int64_t(1)), Value(2.0)}};
     std::vector<OrderByItem> ob; ob.push_back(orderAsc(col("x")));
     auto sort = std::make_unique<VecSortNode>(makeScan(schema, rows), std::move(ob));
     EXPECT_EQ(sort->outputSchema().size(), 2);
@@ -1931,10 +1931,10 @@ TEST(VecDistinct, MultiColumnKey) {
     // (1,1),(1,2),(1,1),(2,1) → distinct on all cols → (1,1),(1,2),(2,1)
     Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(1LL)},
-        {Value(1LL), Value(2LL)},
-        {Value(1LL), Value(1LL)},
-        {Value(2LL), Value(1LL)},
+        {Value(int64_t(1)), Value(int64_t(1))},
+        {Value(int64_t(1)), Value(int64_t(2))},
+        {Value(int64_t(1)), Value(int64_t(1))},
+        {Value(int64_t(2)), Value(int64_t(1))},
     };
     auto dist = std::make_unique<VecDistinctNode>(makeScan(schema, input));
     auto rows = drainRows(*dist);
@@ -1951,7 +1951,7 @@ TEST(VecDistinct, EmptyInput) {
 
 TEST(VecDistinct, OutputSchemaUnchanged) {
     Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::STRING}});
-    std::vector<Row> rows = {{Value(1LL), Value(std::string("a"))}};
+    std::vector<Row> rows = {{Value(int64_t(1)), Value(std::string("a"))}};
     auto dist = std::make_unique<VecDistinctNode>(makeScan(schema, rows));
     EXPECT_EQ(dist->outputSchema().size(), 2);
     EXPECT_EQ(dist->outputSchema().column(0).name, "x");
@@ -1976,12 +1976,12 @@ TEST(VecHashAggregate, CountStar_NoGroupBy) {
 TEST(VecHashAggregate, CountStar_WithGroupBy) {
     Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(std::string("a")), Value(1LL)},
-        {Value(std::string("a")), Value(2LL)},
-        {Value(std::string("b")), Value(1LL)},
-        {Value(std::string("b")), Value(2LL)},
-        {Value(std::string("b")), Value(3LL)},
-        {Value(std::string("c")), Value(1LL)},
+        {Value(std::string("a")), Value(int64_t(1))},
+        {Value(std::string("a")), Value(int64_t(2))},
+        {Value(std::string("b")), Value(int64_t(1))},
+        {Value(std::string("b")), Value(int64_t(2))},
+        {Value(std::string("b")), Value(int64_t(3))},
+        {Value(std::string("c")), Value(int64_t(1))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
@@ -1997,10 +1997,10 @@ TEST(VecHashAggregate, CountStar_WithGroupBy) {
 TEST(VecHashAggregate, SumGroupBy) {
     Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(10LL)},
-        {Value(1LL), Value(20LL)},
-        {Value(2LL), Value(30LL)},
-        {Value(2LL), Value(40LL)},
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(1)), Value(int64_t(20))},
+        {Value(int64_t(2)), Value(int64_t(30))},
+        {Value(int64_t(2)), Value(int64_t(40))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"total", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
@@ -2017,10 +2017,10 @@ TEST(VecHashAggregate, SumGroupBy) {
 TEST(VecHashAggregate, AvgGroupBy) {
     Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(10LL)},
-        {Value(1LL), Value(20LL)},
-        {Value(2LL), Value(30LL)},
-        {Value(2LL), Value(40LL)},
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(1)), Value(int64_t(20))},
+        {Value(int64_t(2)), Value(int64_t(30))},
+        {Value(int64_t(2)), Value(int64_t(40))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"AVG", "val", false}};
@@ -2035,9 +2035,9 @@ TEST(VecHashAggregate, AvgGroupBy) {
 TEST(VecHashAggregate, MinMax) {
     Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(30LL)},
-        {Value(1LL), Value(10LL)},
-        {Value(1LL), Value(20LL)},
+        {Value(int64_t(1)), Value(int64_t(30))},
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(1)), Value(int64_t(20))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"mn", TypeId::DOUBLE}, {"mx", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"MIN", "val", false}, {"MAX", "val", false}};
@@ -2076,9 +2076,9 @@ TEST(VecHashAggregate, EmptyInput) {
 TEST(VecHashAggregate, InsertionOrderPreserved) {
     Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(std::string("c")), Value(1LL)},
-        {Value(std::string("a")), Value(1LL)},
-        {Value(std::string("b")), Value(1LL)},
+        {Value(std::string("c")), Value(int64_t(1))},
+        {Value(std::string("a")), Value(int64_t(1))},
+        {Value(std::string("b")), Value(int64_t(1))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::STRING}, {"cnt", TypeId::INT}});
     std::vector<AggregateSpec> specs = {{"COUNT", "", true}};
@@ -2095,7 +2095,7 @@ TEST(VecHashAggregate, OutputSchemaCorrect) {
     Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"total", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"SUM", "val", false}};
-    std::vector<Row> rows = {{Value(1LL), Value(10LL)}};
+    std::vector<Row> rows = {{Value(int64_t(1)), Value(int64_t(10))}};
     auto agg = std::make_unique<VecHashAggregateNode>(
         makeScan(schema, rows), std::vector<GroupByColumn>{{"", "grp"}}, specs, out_schema);
     EXPECT_EQ(agg->outputSchema().size(), 2);
@@ -2113,14 +2113,14 @@ TEST(VecHashJoin, BasicInnerJoin) {
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
                                       {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
     std::vector<Row> probe_rows = {
-        {Value(1LL), Value(std::string("p1"))},
-        {Value(2LL), Value(std::string("p2"))},
-        {Value(3LL), Value(std::string("p3"))},
+        {Value(int64_t(1)), Value(std::string("p1"))},
+        {Value(int64_t(2)), Value(std::string("p2"))},
+        {Value(int64_t(3)), Value(std::string("p3"))},
     };
     std::vector<Row> build_rows = {
-        {Value(1LL), Value(std::string("b1"))},
-        {Value(2LL), Value(std::string("b2"))},
-        {Value(3LL), Value(std::string("b3"))},
+        {Value(int64_t(1)), Value(std::string("b1"))},
+        {Value(int64_t(2)), Value(std::string("b2"))},
+        {Value(int64_t(3)), Value(std::string("b3"))},
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
@@ -2137,8 +2137,8 @@ TEST(VecHashJoin, NoMatch) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
-    std::vector<Row> build_rows = {{Value(3LL)}, {Value(4LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+    std::vector<Row> build_rows = {{Value(int64_t(3))}, {Value(int64_t(4))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         "pid", "bid", out_schema);
@@ -2151,11 +2151,11 @@ TEST(VecHashJoin, MultipleMatchesPerKey) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT},
                                       {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
-    std::vector<Row> probe_rows = {{Value(1LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}};
     std::vector<Row> build_rows = {
-        {Value(1LL), Value(std::string("x"))},
-        {Value(1LL), Value(std::string("y"))},
-        {Value(1LL), Value(std::string("z"))},
+        {Value(int64_t(1)), Value(std::string("x"))},
+        {Value(int64_t(1)), Value(std::string("y"))},
+        {Value(int64_t(1)), Value(std::string("z"))},
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
@@ -2169,7 +2169,7 @@ TEST(VecHashJoin, EmptyBuildSide) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     std::vector<Row> build_rows;
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
@@ -2183,7 +2183,7 @@ TEST(VecHashJoin, EmptyProbeSide) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
     std::vector<Row> probe_rows;
-    std::vector<Row> build_rows = {{Value(1LL)}};
+    std::vector<Row> build_rows = {{Value(int64_t(1))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         "pid", "bid", out_schema);
@@ -2197,8 +2197,8 @@ TEST(VecHashJoin, ProbeColsFirst) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bname", TypeId::STRING}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pname", TypeId::STRING},
                                       {"bid", TypeId::INT}, {"bname", TypeId::STRING}});
-    std::vector<Row> probe_rows = {{Value(1LL), Value(std::string("probe"))}};
-    std::vector<Row> build_rows = {{Value(1LL), Value(std::string("build"))}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1)), Value(std::string("probe"))}};
+    std::vector<Row> build_rows = {{Value(int64_t(1)), Value(std::string("build"))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         "pid", "bid", out_schema);
@@ -2220,8 +2220,8 @@ TEST(VecHashJoin, SwappedEmitsFromSideFirst) {
     Schema build_schema = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING}});
     Schema out_schema   = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING},
                                       {"jid", TypeId::INT}, {"jname", TypeId::STRING}});
-    std::vector<Row> probe_rows = {{Value(1LL), Value(std::string("joinrow"))}};
-    std::vector<Row> build_rows = {{Value(1LL), Value(std::string("fromrow"))}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1)), Value(std::string("joinrow"))}};
+    std::vector<Row> build_rows = {{Value(int64_t(1)), Value(std::string("fromrow"))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         "jid", "fid", out_schema, /*swapped=*/true);
@@ -2244,7 +2244,7 @@ TEST(VecHashJoin, MultiChunkProbe) {
     for (int i = 0; i < n; ++i)
         probe_rows.push_back({Value(static_cast<int64_t>(i))});
     std::vector<Row> build_rows = {
-        {Value(1LL)},
+        {Value(int64_t(1))},
         {Value(static_cast<int64_t>(BATCH_SIZE + 2))},
     };
     auto join = std::make_unique<VecHashJoinNode>(
@@ -2267,13 +2267,13 @@ TEST(VecHashJoin, KeyByName) {
     Schema out_schema   = vecSchema({{"pval", TypeId::INT}, {"pid", TypeId::INT},
                                       {"bid", TypeId::INT}, {"bdesc", TypeId::STRING}});
     std::vector<Row> probe_rows = {
-        {Value(99LL),  Value(1LL)},
-        {Value(100LL), Value(2LL)},
-        {Value(101LL), Value(99LL)},  // pid=99 has no build match
+        {Value(int64_t(99)),  Value(int64_t(1))},
+        {Value(int64_t(100)), Value(int64_t(2))},
+        {Value(int64_t(101)), Value(int64_t(99))},  // pid=99 has no build match
     };
     std::vector<Row> build_rows = {
-        {Value(1LL), Value(std::string("one"))},
-        {Value(2LL), Value(std::string("two"))},
+        {Value(int64_t(1)), Value(std::string("one"))},
+        {Value(int64_t(2)), Value(std::string("two"))},
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
@@ -2327,10 +2327,10 @@ TEST(VecHashJoin, FilteredBuildSide) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
 
-    auto build_scan     = makeScan(build_schema, {{Value(1LL)}, {Value(2LL)}, {Value(3LL)}});
+    auto build_scan     = makeScan(build_schema, {{Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(3))}});
     auto build_filtered = std::make_unique<VecFilterNode>(
         std::move(build_scan), binOp("!=", col("bid"), intLit(2)));
-    auto probe_scan     = makeScan(probe_schema, {{Value(1LL)}, {Value(2LL)}, {Value(3LL)}});
+    auto probe_scan     = makeScan(probe_schema, {{Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(3))}});
 
     auto join = std::make_unique<VecHashJoinNode>(
         std::move(probe_scan), std::move(build_filtered),
@@ -2355,11 +2355,11 @@ TEST(VecHashAggregate, FilteredInput) {
     // COUNT(*) GROUP BY grp → exactly one group "b" with count=3.
     Schema schema = vecSchema({{"grp", TypeId::STRING}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(std::string("a")), Value(1LL)},
-        {Value(std::string("a")), Value(2LL)},
-        {Value(std::string("b")), Value(3LL)},
-        {Value(std::string("b")), Value(4LL)},
-        {Value(std::string("b")), Value(5LL)},
+        {Value(std::string("a")), Value(int64_t(1))},
+        {Value(std::string("a")), Value(int64_t(2))},
+        {Value(std::string("b")), Value(int64_t(3))},
+        {Value(std::string("b")), Value(int64_t(4))},
+        {Value(std::string("b")), Value(int64_t(5))},
     };
     auto filter = std::make_unique<VecFilterNode>(
         makeScan(schema, input), binOp(">", col("val"), intLit(2)));
@@ -2394,9 +2394,9 @@ TEST(VecHashJoin, ProbeOutputOverflow) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}};
     std::vector<Row> build_rows;
-    for (int i = 0; i < n; ++i) build_rows.push_back({Value(1LL)});
+    for (int i = 0; i < n; ++i) build_rows.push_back({Value(int64_t(1))});
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         "pid", "bid", out_schema);
@@ -2412,9 +2412,9 @@ TEST(VecHashJoin, ProbeOutputOverflow) {
 TEST(VecHashAggregate, AvgDivisorCorrectness) {
     Schema schema = vecSchema({{"grp", TypeId::INT}, {"val", TypeId::INT}});
     std::vector<Row> input = {
-        {Value(1LL), Value(6LL)},
-        {Value(2LL), Value(1LL)}, {Value(2LL), Value(3LL)},
-        {Value(3LL), Value(2LL)}, {Value(3LL), Value(4LL)}, {Value(3LL), Value(6LL)},
+        {Value(int64_t(1)), Value(int64_t(6))},
+        {Value(int64_t(2)), Value(int64_t(1))}, {Value(int64_t(2)), Value(int64_t(3))},
+        {Value(int64_t(3)), Value(int64_t(2))}, {Value(int64_t(3)), Value(int64_t(4))}, {Value(int64_t(3)), Value(int64_t(6))},
     };
     Schema out_schema = vecSchema({{"grp", TypeId::INT}, {"avg_val", TypeId::DOUBLE}});
     std::vector<AggregateSpec> specs = {{"AVG", "val", false}};

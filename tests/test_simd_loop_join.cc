@@ -136,15 +136,15 @@ TEST(VecSimdLoopJoin, ScalarMatchesHashJoinBasic) {
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
                                       {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
     std::vector<Row> probe_rows = {
-        {Value(1LL), Value(std::string("p1"))},
-        {Value(2LL), Value(std::string("p2"))},
-        {Value(3LL), Value(std::string("p3"))},
-        {Value(9LL), Value(std::string("p9"))},   // no match
+        {Value(int64_t(1)), Value(std::string("p1"))},
+        {Value(int64_t(2)), Value(std::string("p2"))},
+        {Value(int64_t(3)), Value(std::string("p3"))},
+        {Value(int64_t(9)), Value(std::string("p9"))},   // no match
     };
     std::vector<Row> build_rows = {
-        {Value(3LL), Value(std::string("b3"))},
-        {Value(1LL), Value(std::string("b1"))},
-        {Value(2LL), Value(std::string("b2"))},
+        {Value(int64_t(3)), Value(std::string("b3"))},
+        {Value(int64_t(1)), Value(std::string("b1"))},
+        {Value(int64_t(2)), Value(std::string("b2"))},
     };
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
@@ -163,8 +163,8 @@ TEST(VecSimdLoopJoin, SwappedEmitsFromSideFirst) {
     Schema build_schema = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING}});
     Schema out_schema   = vecSchema({{"fid", TypeId::INT}, {"fname", TypeId::STRING},
                                       {"jid", TypeId::INT}, {"jname", TypeId::STRING}});
-    std::vector<Row> probe_rows = {{Value(7LL), Value(std::string("join_side"))}};
-    std::vector<Row> build_rows = {{Value(7LL), Value(std::string("from_side"))}};
+    std::vector<Row> probe_rows = {{Value(int64_t(7)), Value(std::string("join_side"))}};
+    std::vector<Row> build_rows = {{Value(int64_t(7)), Value(std::string("from_side"))}};
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
                              "jid", "fid", out_schema, /*swapped=*/true, /*use_simd=*/false);
@@ -181,11 +181,11 @@ TEST(VecSimdLoopJoin, DuplicateBuildKeys) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT},
                                       {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
-    std::vector<Row> probe_rows = {{Value(1LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}};
     std::vector<Row> build_rows = {
-        {Value(1LL), Value(std::string("x"))},
-        {Value(1LL), Value(std::string("y"))},
-        {Value(1LL), Value(std::string("z"))},
+        {Value(int64_t(1)), Value(std::string("x"))},
+        {Value(int64_t(1)), Value(std::string("y"))},
+        {Value(int64_t(1)), Value(std::string("z"))},
     };
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
                              "pid", "bid", out_schema, false, /*use_simd=*/false);
@@ -200,7 +200,7 @@ TEST(VecSimdLoopJoin, EmptyBuildSide) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, {}),
                              "pid", "bid", out_schema, false, /*use_simd=*/true);
     EXPECT_TRUE(drainRows(loop).empty());
@@ -210,7 +210,7 @@ TEST(VecSimdLoopJoin, EmptyProbeSide) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> build_rows = {{Value(1LL)}};
+    std::vector<Row> build_rows = {{Value(int64_t(1))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, {}), makeScan(build_schema, build_rows),
                              "pid", "bid", out_schema, false, /*use_simd=*/true);
     loop.open();
@@ -228,11 +228,11 @@ TEST(VecSimdLoopJoin, FilteredBuildChildRespected) {
     Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT},
                                       {"bid", TypeId::INT}, {"bval", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     std::vector<Row> build_rows = {
-        {Value(1LL), Value(10LL)},   // bval <= 15: filtered out — must never join
-        {Value(1LL), Value(20LL)},
-        {Value(2LL), Value(30LL)},
+        {Value(int64_t(1)), Value(int64_t(10))},   // bval <= 15: filtered out — must never join
+        {Value(int64_t(1)), Value(int64_t(20))},
+        {Value(int64_t(2)), Value(int64_t(30))},
     };
     auto filtered_build = std::make_unique<VecFilterNode>(
         makeScan(build_schema, build_rows), binOp(">", col("bval"), intLit(15)));
@@ -251,11 +251,11 @@ TEST(VecSimdLoopJoin, FilteredProbeChildRespected) {
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::INT},
                                       {"bid", TypeId::INT}});
     std::vector<Row> probe_rows = {
-        {Value(1LL), Value(10LL)},   // pval <= 15: filtered out — must never probe
-        {Value(1LL), Value(20LL)},
-        {Value(2LL), Value(30LL)},
+        {Value(int64_t(1)), Value(int64_t(10))},   // pval <= 15: filtered out — must never probe
+        {Value(int64_t(1)), Value(int64_t(20))},
+        {Value(int64_t(2)), Value(int64_t(30))},
     };
-    std::vector<Row> build_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> build_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     auto filtered_probe = std::make_unique<VecFilterNode>(
         makeScan(probe_schema, probe_rows), binOp(">", col("pval"), intLit(15)));
 
@@ -329,8 +329,8 @@ TEST(VecSimdLoopJoin, StatsCountProbeRowsInAndJoinedRowsOut) {
     Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
     Schema build_schema = vecSchema({{"bid", TypeId::INT}});
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    std::vector<Row> probe_rows = {{Value(1LL)}, {Value(2LL)}, {Value(9LL)}};
-    std::vector<Row> build_rows = {{Value(1LL)}, {Value(2LL)}};
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(9))}};
+    std::vector<Row> build_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
                              "pid", "bid", out_schema);
     drainRows(loop);

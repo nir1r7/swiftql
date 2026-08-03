@@ -286,10 +286,10 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
         {"k", TypeId::INT, 0}, {"v", TypeId::INT, 0},
         {"k", TypeId::INT, 1}, {"w", TypeId::INT, 1}});
 
-    std::vector<Row> from_rows = {{Value(1LL), Value(10LL)}};
+    std::vector<Row> from_rows = {{Value(int64_t(1)), Value(int64_t(10))}};
     std::vector<Row> join_rows = {
-        {Value(1LL), Value::null()},   // w is NULL
-        {Value(1LL), Value(99LL)},     // w is 99
+        {Value(int64_t(1)), Value::null()},   // w is NULL
+        {Value(int64_t(1)), Value(int64_t(99))},     // w is 99
     };
     auto from_scan = std::make_unique<SeqScanNode>("a", from_rows, from_schema);
     auto join_scan = std::make_unique<SeqScanNode>("b", join_rows, join_schema);
