@@ -26,6 +26,14 @@ struct AggregateSpec {
     std::string output_name;
     // true = referenced only in HAVING/ORDER BY: computed but never projected
     bool hidden = false;
+    // general argument expression (e.g. SUM(speed * (1 - x))). Non-owning:
+    // points into the statement's AST, whose subtrees move into plan nodes of
+    // the same tree — moving a unique_ptr never relocates the Expr (same
+    // aliasing argument as the scan pruning hint in vectorized_plan_builder).
+    // Execution uses `column` when set (plain ColumnRef fast path) and falls
+    // back to evaluating `argument` per row otherwise. Last field so existing
+    // positional brace-inits ({"COUNT", "", true}) stay valid.
+    const Expr* argument = nullptr;
 };
 
 // execution independent plan node

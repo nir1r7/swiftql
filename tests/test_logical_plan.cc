@@ -356,3 +356,39 @@ TEST(LogicalPlan, StringArithmeticRejectedAtPlanTime) {
     EXPECT_THROW(buildLogical("SELECT team FROM laps WHERE team + 1 = 5", cat), std::runtime_error);
     EXPECT_THROW(buildLogical("SELECT team + 1 FROM laps", cat), std::runtime_error);
 }
+
+
+// ===== Week 24: expressions in aggregation =====
+
+TEST(LogicalPlan, AggregateOverExpressionExtracted) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT SUM(speed * 2) FROM laps", cat);
+
+    auto* agg = static_cast<const LogicalAggregate*>(findNode(plan.get(), LogicalNodeType::AGGREGATE));
+    ASSERT_NE(agg, nullptr);
+    ASSERT_EQ(agg->aggregates.size(), 1u);
+    EXPECT_TRUE(agg->aggregates[0].column.empty());     // no plain-column fast path
+    ASSERT_NE(agg->aggregates[0].argument, nullptr);    // expression argument carried
+    EXPECT_EQ(agg->aggregates[0].output_name, "SUM((speed * 2))");
+    EXPECT_EQ(agg->output_schema.column(0).name, "SUM((speed * 2))");
+}
+
+TEST(LogicalPlan, ExpressionOverAggregatePlansAggregate) {
+    // AVG(speed) * 2 is not a top-level AggregateExpr but must still force
+    // an aggregation node (recursive detection)
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT AVG(speed) * 2 FROM laps", cat);
+
+    EXPECT_NE(findNode(plan.get(), LogicalNodeType::AGGREGATE), nullptr);
+    EXPECT_EQ(plan->output_schema.column(0).type, TypeId::DOUBLE);
+}
+
+TEST(LogicalPlan, DuplicateAggregatesShareOneSpec) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT SUM(speed) / COUNT(*), SUM(speed) FROM laps", cat);
+
+    auto* agg = static_cast<const LogicalAggregate*>(findNode(plan.get(), LogicalNodeType::AGGREGATE));
+    ASSERT_NE(agg, nullptr);
+    // SUM(speed) appears twice, COUNT(*) once: 2 deduped specs
+    EXPECT_EQ(agg->aggregates.size(), 2u);
+}

@@ -246,11 +246,17 @@ void HashAggregateNode::open() {
             acc.count++;
 
             if (!spec.is_star) {
-                int agg_idx = spec.relation_slot >= 0
-                    ? child_schema.indexOf(spec.column, spec.relation_slot)
-                    : -1;
-                if (agg_idx < 0) agg_idx = child_schema.indexOf(spec.column);
-                Value val = (*row)[agg_idx];
+                Value val;
+                if (spec.argument && spec.column.empty()) {
+                    // expression argument (e.g. SUM(speed * 2)): evaluate per row
+                    val = evaluate(spec.argument, *row, child_schema);
+                } else {
+                    int agg_idx = spec.relation_slot >= 0
+                        ? child_schema.indexOf(spec.column, spec.relation_slot)
+                        : -1;
+                    if (agg_idx < 0) agg_idx = child_schema.indexOf(spec.column);
+                    val = (*row)[agg_idx];
+                }
                 // skip NULLs (except COUNT(*))
                 if (!val.isNull()) {
                     acc.non_null_count++;
@@ -331,7 +337,11 @@ std::string HashAggregateNode::explain() const {
         s += group_by_cols_[i].column_name;
     }
     for (const auto& agg : aggregates_) {
-        s += ", agg=" + agg.function + "(" + (agg.is_star ? "*" : agg.column) + ")";
+        // expression arguments have no plain column; output_name is the full
+        // FUNC((expr)) string
+        s += ", agg=" + (agg.column.empty() && agg.argument && !agg.is_star
+            ? agg.output_name
+            : agg.function + "(" + (agg.is_star ? "*" : agg.column) + ")");
     }
     return s + "]";
 }

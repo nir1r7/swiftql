@@ -3,6 +3,43 @@
 #include <stdexcept>
 #include "parser/expr_utils.h"
 
+namespace {
+
+// Every ColumnRef reachable outside an aggregate must be a GROUP BY column.
+// AggregateExpr terminates the walk: its argument is evaluated pre-grouping.
+void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_by) {
+    if (!expr) return;
+    if (dynamic_cast<const AggregateExpr*>(expr)) return;
+    if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        for (const auto& g : group_by) {
+            // name match plus slot compatibility: SELECT a.grp with
+            // GROUP BY b.grp is a different column, not a match.
+            // Unbound slots (-1) stay name-only for direct-validate callers.
+            if (g.column_name == col->column_name &&
+                (col->relation_slot < 0 || g.relation_slot < 0 ||
+                 col->relation_slot == g.relation_slot)) {
+                return;
+            }
+        }
+        throw std::runtime_error("SELECT column '" + col->column_name + "' must appear in GROUP BY or be used in an aggregate function");
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        checkGroupedRefs(bin->left.get(), group_by);
+        checkGroupedRefs(bin->right.get(), group_by);
+        return;
+    }
+    if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) {
+        checkGroupedRefs(isn->operand.get(), group_by);
+        return;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        checkGroupedRefs(un->operand.get(), group_by);
+    }
+    // Literal: fine
+}
+
+} // namespace
+
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // FROM table must exist
     if (!catalog.hasTable(stmt.from_table)) {
@@ -106,33 +143,19 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         validateExpr(stmt.having.get(), schema, "HAVING", /*allow_aggregates=*/true);
     }
 
-    // non aggregated SELECT columns must appear in GROUP BY when aggregates are present
+    // non aggregated SELECT column references must appear in GROUP BY.
+    // Detection recurses (AVG(speed) * 2 aggregates without being a top-level
+    // AggregateExpr), and the check now also runs for GROUP BY without
+    // aggregates — previously that shape slipped through and died at runtime.
     bool has_aggregates = false;
-    for (const auto& expr : stmt.select_list) {
-        if (dynamic_cast<const AggregateExpr*>(expr.get())) {
-            has_aggregates = true;
-            break;
-        }
+    {
+        std::vector<const AggregateExpr*> found;
+        for (const auto& expr : stmt.select_list) collectAggregates(expr.get(), found);
+        has_aggregates = !found.empty();
     }
-    if (has_aggregates && !stmt.select_star) {
+    if ((has_aggregates || !stmt.group_by.empty()) && !stmt.select_star) {
         for (const auto& expr : stmt.select_list) {
-            if (auto* col = dynamic_cast<const ColumnRef*>(expr.get())) {
-                bool in_group_by = false;
-                for (const auto& g : stmt.group_by){
-                    // name match plus slot compatibility: SELECT a.grp with
-                    // GROUP BY b.grp is a different column, not a match.
-                    // Unbound slots (-1) stay name-only for direct-validate callers.
-                    if (g.column_name == col->column_name &&
-                        (col->relation_slot < 0 || g.relation_slot < 0 ||
-                         col->relation_slot == g.relation_slot)) {
-                        in_group_by = true;
-                        break;
-                    }
-                }
-                if (!in_group_by){
-                    throw std::runtime_error("SELECT column '" + col->column_name + "' must appear in GROUP BY or be used in an aggregate function");
-                }
-            }
+            checkGroupedRefs(expr.get(), stmt.group_by);
         }
     }
 

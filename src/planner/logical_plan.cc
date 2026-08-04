@@ -142,6 +142,17 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
 Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
                             const std::vector<AggregateSpec>& aggregates,
                             const Schema& table_schema){
+    // plan-time type check of expression arguments (SUM(speed * 2)): both
+    // builders route through here, so ill-typed arguments fail before
+    // execution. Plain-ColumnRef SUM/AVG args are already validator-checked.
+    for (const auto& spec : aggregates) {
+        if (spec.is_star || !spec.argument) continue;
+        TypeId t = inferExprType(spec.argument, table_schema);
+        if ((spec.function == "SUM" || spec.function == "AVG") && t == TypeId::STRING) {
+            throw std::runtime_error(spec.function + "() requires a numeric argument");
+        }
+    }
+
     std::vector<ColumnDef> cols;
 
     // group-by columns in order, resolved slot-first so a qualified GROUP BY
@@ -179,6 +190,7 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
         spec.output_name = aggregateOutputName(agg);
         spec.hidden = hidden;
         if (!agg->is_star && agg->argument) {
+            spec.argument = agg->argument.get();  // non-owning; see AggregateSpec
             if (auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get())) {
                 spec.column = col->column_name;
                 spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
@@ -187,26 +199,30 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
         return spec;
     };
 
-    for (const auto& expr : stmt.select_list) {
-        if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            specs.push_back(makeSpec(agg, /*hidden=*/false));
+    // Dedupe by output_name everywhere — the name is how evaluate() finds the
+    // column, so name-identical references share one output column.
+    auto known = [&specs](const std::string& name) {
+        for (const auto& s : specs) {
+            if (s.output_name == name) return true;
         }
+        return false;
+    };
+
+    // recursive collection: SELECT AVG(speed) * 2 contains an aggregate
+    // without being one at the top level
+    std::vector<const AggregateExpr*> in_select;
+    for (const auto& expr : stmt.select_list) collectAggregates(expr.get(), in_select);
+    for (const AggregateExpr* agg : in_select) {
+        if (!known(aggregateOutputName(agg))) specs.push_back(makeSpec(agg, /*hidden=*/false));
     }
 
     // aggregates referenced only in HAVING or ORDER BY are computed too, as
-    // hidden tail columns the final projection drops. Dedupe by output_name —
-    // the name is how evaluate() finds the column, so name-identical
-    // references share one output column.
+    // hidden tail columns the final projection drops
     std::vector<const AggregateExpr*> referenced;
     collectAggregates(stmt.having.get(), referenced);
     for (const auto& item : stmt.order_by) collectAggregates(item.expr.get(), referenced);
     for (const AggregateExpr* agg : referenced) {
-        std::string name = aggregateOutputName(agg);
-        bool known = false;
-        for (const auto& s : specs) {
-            if (s.output_name == name) { known = true; break; }
-        }
-        if (!known) specs.push_back(makeSpec(agg, /*hidden=*/true));
+        if (!known(aggregateOutputName(agg))) specs.push_back(makeSpec(agg, /*hidden=*/true));
     }
 
     return specs;
@@ -244,7 +260,9 @@ std::string LogicalAggregate::explain() const {
     }
     for (size_t i = 0; i < aggregates.size(); ++i) {
         if (i) s += ", ";
-        s += aggregates[i].function + "(" + (aggregates[i].is_star ? "*" : aggregates[i].column) + ")";
+        s += aggregates[i].column.empty() && aggregates[i].argument && !aggregates[i].is_star
+            ? aggregates[i].output_name
+            : aggregates[i].function + "(" + (aggregates[i].is_star ? "*" : aggregates[i].column) + ")";
     }
     return s + "]";
 }
@@ -331,13 +349,13 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.where));
     }
 
-    // aggregate (GROUP BY + aggregates)
+    // aggregate (GROUP BY + aggregates) — detection must recurse:
+    // AVG(speed) * 2 is not a top-level AggregateExpr but still aggregates
     bool has_aggs = false;
-    for (auto& expr : stmt.select_list) {
-        if (dynamic_cast<AggregateExpr*>(expr.get())) {
-            has_aggs = true;
-            break;
-        }
+    {
+        std::vector<const AggregateExpr*> found;
+        for (auto& expr : stmt.select_list) collectAggregates(expr.get(), found);
+        has_aggs = !found.empty();
     }
 
     if (!stmt.group_by.empty() || has_aggs) {

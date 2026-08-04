@@ -759,3 +759,29 @@ TEST(Evaluate, ArithmeticOnStringThrows) {
         evaluate(makeBinary("+", colRef("team"), lit(Value(int64_t(1)))).get(), row, schema),
         std::runtime_error);
 }
+
+
+// ===== Week 24: aggregate over an expression argument (Volcano) =====
+
+TEST(HashAggregateNode, SumOverExpressionArgument) {
+    Schema schema = makeSchema({{"x", TypeId::INT}, {"y", TypeId::INT}});
+    std::vector<Row> rows = {
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(2)), Value(int64_t(20))},
+    };
+
+    // SUM(x * y) = 1*10 + 2*20 = 50
+    auto arg = makeBinary("*", colRef("x"), colRef("y"));
+    AggregateSpec spec;
+    spec.function = "SUM";
+    spec.is_star = false;
+    spec.argument = arg.get();          // non-owning: `arg` outlives the node
+    spec.output_name = "SUM((x * y))";
+
+    Schema out = makeSchema({{"SUM((x * y))", TypeId::DOUBLE}});
+    HashAggregateNode agg(makeScan(std::move(rows), schema), {}, {spec}, out);
+
+    auto result = drainAll(&agg);
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_DOUBLE_EQ(result[0][0].asDouble(), 50.0);
+}

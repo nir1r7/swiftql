@@ -1,5 +1,6 @@
 #include "planner.h"
 #include "join_condition.h"
+#include "parser/expr_utils.h"
 
 std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
     // validate
@@ -96,13 +97,13 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         node = std::make_unique<FilterNode>(std::move(node), std::move(stmt.where));
     }
 
-    // HashAgrgegate (GROUP BY + aggregates)
+    // HashAgrgegate (GROUP BY + aggregates) — recursive detection, mirroring
+    // LogicalPlanBuilder::build
     bool has_aggregates = false;
-    for (auto& expr : stmt.select_list) {
-        if (dynamic_cast<AggregateExpr*>(expr.get())) {
-            has_aggregates = true;
-            break;
-        }
+    {
+        std::vector<const AggregateExpr*> found;
+        for (auto& expr : stmt.select_list) collectAggregates(expr.get(), found);
+        has_aggregates = !found.empty();
     }
 
     if (!stmt.group_by.empty() || has_aggregates) {

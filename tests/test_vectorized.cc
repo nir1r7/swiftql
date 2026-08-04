@@ -2668,3 +2668,36 @@ TEST(EvalPredicateCascade, OrOfCascadedAndsMergesAscending) {
                                  binOp(">",  col("w"), intLit(0)))));
     EXPECT_EQ(countSurvivors(filter), 200);
 }
+
+
+// ===== Week 24: aggregate over an expression argument (vectorized) =====
+
+TEST(VecHashAggregate, SumOverExpressionArgument) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(2)), Value(int64_t(20))},
+    };
+
+    // SUM(x * y) = 1*10 + 2*20 = 50
+    auto arg = std::make_unique<BinaryExpr>();
+    arg->op = "*";
+    auto lhs = std::make_unique<ColumnRef>(); lhs->column_name = "x";
+    auto rhs = std::make_unique<ColumnRef>(); rhs->column_name = "y";
+    arg->left = std::move(lhs);
+    arg->right = std::move(rhs);
+
+    AggregateSpec spec;
+    spec.function = "SUM";
+    spec.is_star = false;
+    spec.argument = arg.get();          // non-owning: `arg` outlives the node
+    spec.output_name = "SUM((x * y))";
+
+    Schema out_schema = vecSchema({{"SUM((x * y))", TypeId::DOUBLE}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<GroupByColumn>{}, std::vector<AggregateSpec>{spec}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 50.0);
+}

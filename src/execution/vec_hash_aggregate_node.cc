@@ -1,4 +1,5 @@
 #include "execution/vec_hash_aggregate_node.h"
+#include "execution/evaluator.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
@@ -47,15 +48,26 @@ void VecHashAggregateNode::consumeAll() {
         group_idxs.push_back(idx);
     }
 
+    // -1 = COUNT(*) (never read) or expression argument (evaluated per row)
     std::vector<int> agg_idxs;
     for (const auto& spec : specs_){
-        if (spec.is_star) { agg_idxs.push_back(-1); continue; }
+        if (spec.is_star || (spec.argument && spec.column.empty())) {
+            agg_idxs.push_back(-1);
+            continue;
+        }
         // slot-aware: distinguishes join sides sharing a column name (e.g. AVG(l2.speed))
         int idx = spec.relation_slot >= 0
             ? child_schema.indexOf(spec.column, spec.relation_slot)
             : -1;
         if (idx < 0) idx = child_schema.indexOf(spec.column);
         agg_idxs.push_back(idx);
+    }
+
+    // expression arguments call evaluate(), which needs a full Row —
+    // reconstruct lazily, same pattern as VecProjectNode's complex path
+    bool needs_row = false;
+    for (const auto& spec : specs_) {
+        if (!spec.is_star && spec.argument && spec.column.empty()) { needs_row = true; break; }
     }
 
     while (DataChunk* chunk = child_->nextChunk()) {
@@ -76,6 +88,17 @@ void VecHashAggregateNode::consumeAll() {
 
         for (int r : *indices_ptr) {
             stats.rows_in++;
+
+            // full Row only when an expression needs evaluate()
+            Row tmp;
+            if (needs_row) {
+                tmp.reserve(chunk->columns.size());
+                for (const auto& cv : chunk->columns) {
+                    std::visit([&](const auto& vec) {
+                        tmp.push_back(Value(vec[r]));
+                    }, cv.data);
+                }
+            }
 
             // build group key vector from group by columns
             std::vector<Value> key;
@@ -105,7 +128,15 @@ void VecHashAggregateNode::consumeAll() {
 
                 int ci = agg_idxs[i];
                 Value val;
-                std::visit([&](const auto& vec) { val = Value(vec[r]); }, chunk->columns[ci].data);
+                if (ci < 0) {
+                    if (!spec.argument) {
+                        throw std::runtime_error("aggregate input column not found: " + spec.column);
+                    }
+                    // expression argument (e.g. SUM(speed * 2)): evaluate per row
+                    val = evaluate(spec.argument, tmp, child_schema);
+                } else {
+                    std::visit([&](const auto& vec) { val = Value(vec[r]); }, chunk->columns[ci].data);
+                }
 
                 if (val.isNull()) continue;
 
@@ -263,7 +294,9 @@ std::string VecHashAggregateNode::explain() const {
         s += "agg=";
         for (size_t i = 0; i < specs_.size(); ++i) {
             if (i) s += ",";
-            s += specs_[i].function + "(" + (specs_[i].is_star ? "*" : specs_[i].column) + ")";
+            s += specs_[i].column.empty() && specs_[i].argument && !specs_[i].is_star
+                ? specs_[i].output_name
+                : specs_[i].function + "(" + (specs_[i].is_star ? "*" : specs_[i].column) + ")";
         }
     }
     return s + "] (materialize)";

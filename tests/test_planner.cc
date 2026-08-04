@@ -180,3 +180,29 @@ TEST(ValidatorTest, OrderByAggregateWithoutGroupByRejected) {
     auto stmt = p.parse();
     EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
 }
+
+
+// ===== Week 24: grouped-reference validation over expressions =====
+
+TEST(ValidatorTest, NonGroupedColumnInsideExpressionRejected) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT speed + AVG(speed) FROM laps GROUP BY team");
+    auto stmt = p.parse();
+    EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
+
+TEST(ValidatorTest, GroupedColumnInsideExpressionAllowed) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT season + 1, COUNT(*) FROM laps GROUP BY season");
+    auto stmt = p.parse();
+    EXPECT_NO_THROW(Validator::validate(stmt, catalog));
+}
+
+TEST(ValidatorTest, BareColumnWithGroupByButNoAggregatesRejected) {
+    // pre-Week-24 this slipped validation and died at runtime with
+    // "Column not found"; now it is a clean plan-time error
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT lap_id FROM laps GROUP BY team");
+    auto stmt = p.parse();
+    EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
