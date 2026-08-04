@@ -58,6 +58,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
 - `EXPLAIN` — prints the query plan tree without executing; on the vectorized path shows three sections (logical plan, optimized logical plan with estimated rows, physical plan with the join's cost decision)
 - `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, estimated rows (vectorized, optimizer on), exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
 - `--storage row | columnar` — switches the storage backend
@@ -171,21 +172,26 @@ Takes a raw SQL string and produces a structured Abstract Syntax Tree (AST). Han
 select_stmt  → SELECT [DISTINCT] select_list FROM table_ref
                [JOIN IDENT ON expr]
                [WHERE expr]
-               [GROUP BY col_list]
+               [GROUP BY group_list]
                [HAVING expr]
-               [ORDER BY col_list]
+               [ORDER BY order_list]
                [LIMIT INT_LITERAL]
 
 table_ref    → IDENT
-select_list  → expr (COMMA expr)*
-col_list     → IDENT (COMMA IDENT)*
+select_list  → select_item (COMMA select_item)*
+select_item  → expr [AS IDENT]                 ← expression alias (Week 24)
+group_list   → expr (COMMA expr)*              ← expression group keys (Week 24)
+order_list   → expr [ASC|DESC] (COMMA expr [ASC|DESC])*
 
 expr         → or_expr
 or_expr      → and_expr (OR and_expr)*
 and_expr     → compare (AND compare)*
-compare      → primary [(= | != | < | > | <= | >=) primary]
-             | primary IS NULL
-             | primary IS NOT NULL
+compare      → additive [(= | != | < | > | <= | >=) additive]
+             | additive IS NULL
+             | additive IS NOT NULL
+additive     → multiplicative (('+' | '-') multiplicative)*   ← Week 24
+multiplicative → unary (('*' | '/') unary)*                   ← Week 24
+unary        → '-' unary | primary                            ← Week 24
 primary      → IDENT
              | IDENT LPAREN expr RPAREN     ← aggregate call
              | IDENT LPAREN STAR RPAREN     ← COUNT(*)
@@ -198,9 +204,10 @@ primary      → IDENT
 **AST node types:**
 - `ColumnRef` — reference to a column by name (with optional table qualifier)
 - `Literal` — a constant value
-- `BinaryExpr` — left expr, operator, right expr
+- `BinaryExpr` — left expr, operator, right expr (comparisons, AND/OR, and arithmetic `+ - * /`)
+- `UnaryExpr` — prefix operator (unary minus) + operand
 - `IsNullExpr` — expr + is_not_null flag
-- `AggregateExpr` — function name, argument expr, is_star flag
+- `AggregateExpr` — function name, argument expr (any expression as of Week 24), is_star flag
 - `SelectStatement` — select list, from table, optional join, where, group-by, having, order-by, limit, distinct flag
 
 ### Layer 5 — Planner & Validator

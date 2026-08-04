@@ -90,10 +90,18 @@ SELF_JOIN_QUERIES = [
     "SELECT drivers.team, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY drivers.team ORDER BY drivers.team",
 ]
 
+# Week 24 general expressions — the checkpoint shape (TPC-H revenue idiom:
+# expression inside the aggregate + alias + ORDER BY alias) and an
+# expression-over-aggregates projection.
+WEEK24_EXPRESSION_QUERIES = [
+    "SELECT team, SUM(speed * (1 - sector_1 / 100)) AS revenue FROM laps GROUP BY team ORDER BY revenue DESC",
+    "SELECT team, SUM(speed) / COUNT(*) AS manual_avg FROM laps GROUP BY team ORDER BY team",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
-] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES
+] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES + WEEK24_EXPRESSION_QUERIES
 
 # SQLite setup
 def load_sqlite():

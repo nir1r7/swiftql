@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **66 tests, 0 failures.**
+Expected: **420 tests, 0 failures.**
 
 ---
 
@@ -207,13 +207,13 @@ Process Overhead: 148635µs
 
 ### `compare_against_sqlite.py` — correctness harness
 
-Runs the same 22 queries against both SwiftQL and an in-memory SQLite database, then diffs the results.
+Runs the full correctness query suite against both SwiftQL and an in-memory SQLite database, then diffs the results.
 
 ```bash
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **22 passed, 0 failed, 0 errors.**
+Expected: **117 passed, 0 failed, 0 errors** (39 queries × 3 storage/execution modes).
 
 Use this after any engine change to check for regressions.
 
@@ -236,16 +236,18 @@ The `Execution` line from `--explain-analyze` is the number to watch when optimi
 ## Supported SQL
 
 ```sql
-SELECT [DISTINCT] col1, col2, AGG(col), ...
+SELECT [DISTINCT] expr [AS alias], AGG(expr), ...
 FROM table
 [JOIN other_table ON table.col = other_table.col]   -- Phase 2
 [WHERE expr [AND expr ...]]
-[GROUP BY col1, col2, ...]
+[GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
-[ORDER BY col1, col2, ...]
+[ORDER BY expr [ASC|DESC], ...]                      -- expressions + aliases (Week 24)
 [LIMIT N]
 ```
 
-Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`
+Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)` — arguments may be arbitrary numeric expressions, e.g. `SUM(speed * (1 - sector_1 / 100))`
 
 Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`
+
+Arithmetic (Week 24): `+`, `-`, `*`, `/`, unary `-`, with SQL precedence (unary > `* /` > `+ -` > comparisons > `AND` > `OR`). SQLite semantics: `INT / INT` truncates; `x / 0` is `NULL` (on the vectorized path a NULL value degrades to a 0/`"NULL"` sentinel at materialization — `ColumnVector` has no null mask; the sentinel guard lives in both `vec_project_node.cc` and `vec_hash_aggregate_node.cc::fillChunk`, and Volcano remains the NULL-correct baseline). Select-list aliases (`AS`) are referenceable in `GROUP BY` and `ORDER BY`; in `GROUP BY`, input columns take precedence over aliases.

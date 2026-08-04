@@ -363,6 +363,58 @@ AUDIT_FIXES_QUERIES = [
      "WHERE l.season = 2025 OR d.age > 30"),
 ]
 
+# Week 24 general expressions: arithmetic precedence, unary minus, aliases,
+# expressions inside aggregate arguments, expressions over aggregate results,
+# and expression / alias GROUP BY keys. All queries are division-safe (no
+# x/0): a NULL is unrepresentable in a materialized DataChunk column —
+# ColumnVector has no null mask, so the vectorized path degrades NULL to a
+# 0/"NULL" sentinel that legitimately differs from SQLite's NULL. NULL
+# semantics are pinned by Volcano-level and VecProjectNode unit tests
+# instead. SQLite is the semantics oracle (INT/INT truncates).
+WEEK24_QUERIES = [
+    ("w24_arith_projection",
+     "SELECT lap_id, speed * 2 + 1 FROM laps WHERE lap_id < 6 ORDER BY lap_id"),
+
+    ("w24_arith_precedence",
+     "SELECT lap_id, speed + sector_1 * 2, (speed + sector_1) * 2 FROM laps "
+     "WHERE lap_id < 6 ORDER BY lap_id"),
+
+    ("w24_unary_minus",
+     "SELECT lap_id, -speed, 0 - lap_id FROM laps WHERE lap_id < 6 ORDER BY lap_id"),
+
+    ("w24_int_division_truncates",
+     "SELECT season, season / 4 FROM laps WHERE lap_id < 6 ORDER BY lap_id"),
+
+    ("w24_arith_in_where",
+     "SELECT lap_id FROM laps WHERE speed * 2 > 660 AND season - 1 = 2024 ORDER BY lap_id LIMIT 10"),
+
+    # the Week 24 checkpoint shape: TPC-H revenue expression + alias ORDER BY
+    ("w24_sum_over_expression",
+     "SELECT team, SUM(speed * (1 - sector_1 / 100)) AS revenue FROM laps "
+     "GROUP BY team ORDER BY revenue DESC"),
+
+    ("w24_expr_over_aggregates",
+     "SELECT team, SUM(speed) / COUNT(*) AS manual_avg, AVG(speed) FROM laps "
+     "GROUP BY team ORDER BY team"),
+
+    ("w24_alias_order_by",
+     "SELECT team, AVG(speed) AS avg_speed FROM laps GROUP BY team ORDER BY avg_speed DESC LIMIT 3"),
+
+    ("w24_group_by_alias_expression",
+     "SELECT season - 2020 AS era, COUNT(*) FROM laps GROUP BY era ORDER BY era"),
+
+    ("w24_group_by_expr_having",
+     "SELECT season - 2020, AVG(speed) FROM laps GROUP BY season - 2020 "
+     "HAVING season - 2020 >= 3 ORDER BY season - 2020"),
+
+    ("w24_having_expr_aggregate",
+     "SELECT team, COUNT(*) FROM laps GROUP BY team HAVING SUM(speed * 2) > 900000 ORDER BY team"),
+
+    ("w24_join_arith",
+     "SELECT d.name, l.speed - d.age FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.lap_id < 6 ORDER BY d.name, l.speed - d.age"),
+]
+
 # The join operator each steering comment above claims — asserted from
 # --explain's Physical Plan (see run_join_steering), so the steering stays
 # true as data stats or cost constants drift instead of silently all
@@ -411,7 +463,9 @@ def parse_swiftql_output(output: str):
     lines = [l for l in output.strip().split('\n') if l.strip()]
     if len(lines) < 2:
         return []
-    headers = lines[0].split()
+    # split on 2+ spaces like the value rows: Week 24 expression columns print
+    # names containing single spaces, e.g. "((speed * 2) + 1)"
+    headers = re.split(r'  +', lines[0].strip())
     rows = []
     for line in lines[2:]:
         if line.startswith('(') and line.endswith(')'):
@@ -531,11 +585,11 @@ def run_join_steering(queries):
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES
 
-    # existing surface on the default row/Volcano path (audit fixes affected
-    # both engines, so they run here too)
-    r1 = run_suite(conn, QUERIES + AUDIT_FIXES_QUERIES, "Default (row storage, Volcano)")
+    # existing surface on the default row/Volcano path (audit fixes and
+    # Week 24 expressions affected both engines, so they run here too)
+    r1 = run_suite(conn, QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES, "Default (row storage, Volcano)")
     # whole surface + Week 21 shapes on the vectorized path (where the optimizer runs)
     r2 = run_suite(conn, all_queries, "Vectorized (columnar, optimizer ON)", extra_args=VEC)
     # Week 21 result-preserving invariant
@@ -550,7 +604,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
-          f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
+          f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
           f"+ {len(WEEK23_5_QUERIES)} steering)")
 
     if fail_list:
