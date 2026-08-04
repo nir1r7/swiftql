@@ -33,6 +33,9 @@ class Parser {
         std::unique_ptr<Expr> parseOrExpr();
         std::unique_ptr<Expr> parseAndExpr();
         std::unique_ptr<Expr> parseCompare();
+        std::unique_ptr<Expr> parseAdditive();
+        std::unique_ptr<Expr> parseMultiplicative();
+        std::unique_ptr<Expr> parseUnary();
         std::unique_ptr<Expr> parsePrimary();
         std::vector<GroupByColumn> parseColumnList();
 };

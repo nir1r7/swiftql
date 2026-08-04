@@ -32,6 +32,7 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         return;
     }
     if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) { collectSlots(isn->operand.get(), out); return; }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) { collectSlots(un->operand.get(), out); return; }
     // Literal: no slot. AggregateExpr cannot appear in WHERE (Validator forbids it).
 }
 
@@ -61,7 +62,8 @@ void restampSlots(Expr* expr, int slot) {
         restampSlots(bin->right.get(), slot);
         return;
     }
-    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) restampSlots(isn->operand.get(), slot);
+    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { restampSlots(isn->operand.get(), slot); return; }
+    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) restampSlots(un->operand.get(), slot);
 }
 
 // Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty.

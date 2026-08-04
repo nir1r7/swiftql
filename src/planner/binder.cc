@@ -67,6 +67,8 @@ void Binder::bindExpr(Expr* expr, const std::vector<RangeEntry>& range_table) {
         bindExpr(bin->right.get(), range_table);
     } else if (auto* isnull = dynamic_cast<IsNullExpr*>(expr)) {
         bindExpr(isnull->operand.get(), range_table);
+    } else if (auto* un = dynamic_cast<UnaryExpr*>(expr)) {
+        bindExpr(un->operand.get(), range_table);
     } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
         if (!agg->is_star) bindExpr(agg->argument.get(), range_table);
     }

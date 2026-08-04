@@ -26,6 +26,10 @@ static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
         collectCols(isnull->operand.get(), out);
         return;
     }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)){
+        collectCols(un->operand.get(), out);
+        return;
+    }
 }
 
 // build schema using only required columns

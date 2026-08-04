@@ -173,3 +173,126 @@ TEST(ParserTest, AsWithoutAliasIsSyntaxError) {
     Parser p("SELECT team FROM laps AS WHERE season = 2025");
     EXPECT_THROW(p.parse(), ParseError);
 }
+
+
+// ===== Week 24: arithmetic tokens + precedence + unary minus =====
+
+TEST(LexerTest, ArithmeticOperators) {
+    Lexer lexer("+ - / *");
+    EXPECT_EQ(lexer.nextToken().type, TokenType::PLUS);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::MINUS);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::SLASH);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::STAR);
+}
+
+TEST(ParserTest, MultiplicationBindsTighterThanAddition) {
+    Parser parser("SELECT 1 + 2 * 3 FROM laps");
+    SelectStatement stmt = parser.parse();
+    ASSERT_EQ(stmt.select_list.size(), 1u);
+
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "+");
+    auto* rhs = dynamic_cast<BinaryExpr*>(root->right.get());
+    ASSERT_NE(rhs, nullptr);
+    EXPECT_EQ(rhs->op, "*");
+}
+
+TEST(ParserTest, ParensOverridePrecedence) {
+    Parser parser("SELECT (1 + 2) * 3 FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "*");
+    auto* lhs = dynamic_cast<BinaryExpr*>(root->left.get());
+    ASSERT_NE(lhs, nullptr);
+    EXPECT_EQ(lhs->op, "+");
+}
+
+TEST(ParserTest, ArithmeticIsLeftAssociative) {
+    Parser parser("SELECT 10 - 4 - 3 FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    // (10 - 4) - 3, not 10 - (4 - 3)
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "-");
+    auto* lhs = dynamic_cast<BinaryExpr*>(root->left.get());
+    ASSERT_NE(lhs, nullptr);
+    EXPECT_EQ(lhs->op, "-");
+    auto* r = dynamic_cast<Literal*>(root->right.get());
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(r->value.asInt(), 3);
+}
+
+TEST(ParserTest, UnaryMinusBindsTighterThanMultiplication) {
+    Parser parser("SELECT -speed * 2 FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "*");
+    auto* un = dynamic_cast<UnaryExpr*>(root->left.get());
+    ASSERT_NE(un, nullptr);
+    EXPECT_EQ(un->op, "-");
+    EXPECT_NE(dynamic_cast<ColumnRef*>(un->operand.get()), nullptr);
+}
+
+TEST(ParserTest, DoubleUnaryMinus) {
+    Parser parser("SELECT - -5 FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    auto* outer = dynamic_cast<UnaryExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(outer, nullptr);
+    auto* inner = dynamic_cast<UnaryExpr*>(outer->operand.get());
+    ASSERT_NE(inner, nullptr);
+    EXPECT_NE(dynamic_cast<Literal*>(inner->operand.get()), nullptr);
+}
+
+TEST(ParserTest, ComparisonBindsLooserThanArithmetic) {
+    Parser parser("SELECT team FROM laps WHERE speed * 2 > 600 AND season = 2025");
+    SelectStatement stmt = parser.parse();
+
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "AND");
+    auto* cmp = dynamic_cast<BinaryExpr*>(root->left.get());
+    ASSERT_NE(cmp, nullptr);
+    EXPECT_EQ(cmp->op, ">");
+    auto* mul = dynamic_cast<BinaryExpr*>(cmp->left.get());
+    ASSERT_NE(mul, nullptr);
+    EXPECT_EQ(mul->op, "*");
+}
+
+TEST(ParserTest, ArithmeticInsideAggregate) {
+    Parser parser("SELECT SUM(speed * 2) FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    auto* agg = dynamic_cast<AggregateExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(agg, nullptr);
+    EXPECT_FALSE(agg->is_star);
+    auto* arg = dynamic_cast<BinaryExpr*>(agg->argument.get());
+    ASSERT_NE(arg, nullptr);
+    EXPECT_EQ(arg->op, "*");
+}
+
+TEST(ParserTest, OrderByExpression) {
+    Parser parser("SELECT team FROM laps ORDER BY speed * 2 DESC");
+    SelectStatement stmt = parser.parse();
+
+    ASSERT_EQ(stmt.order_by.size(), 1u);
+    EXPECT_TRUE(stmt.order_by[0].desc);
+    auto* mul = dynamic_cast<BinaryExpr*>(stmt.order_by[0].expr.get());
+    ASSERT_NE(mul, nullptr);
+    EXPECT_EQ(mul->op, "*");
+}
+
+TEST(ParserTest, CountStarStillParses) {
+    // STAR keeps its COUNT(*) role: consumed before expression parsing starts
+    Parser parser("SELECT COUNT(*) FROM laps WHERE speed * 2 > 600");
+    SelectStatement stmt = parser.parse();
+    auto* agg = dynamic_cast<AggregateExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(agg, nullptr);
+    EXPECT_TRUE(agg->is_star);
+}

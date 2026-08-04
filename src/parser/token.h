@@ -26,7 +26,10 @@ enum class TokenType {
     GT,          // >
     LTE,         // <=
     GTE,         // >=
-    STAR,        // * (used in COUNT(*) and SELECT *)
+    STAR,        // * (COUNT(*), SELECT *, and multiplication)
+    PLUS,        // +
+    MINUS,       // - (binary and unary)
+    SLASH,       // /
 
     // punctuation
     COMMA,       // ,

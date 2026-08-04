@@ -13,9 +13,16 @@ inline std::string exprToString(const Expr* expr) {
         return lit->value.toString();
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        return exprToString(bin->left.get())
+        // parens are load-bearing: aggregateOutputName() is the byte-for-byte
+        // contract between schema construction and evaluate()'s lookup, and
+        // extractAggregates dedupes specs by this name — without parens,
+        // SUM(a - (b - c)) and SUM((a - b) - c) would collide into one column
+        return "(" + exprToString(bin->left.get())
             + " " + bin->op + " "
-            + exprToString(bin->right.get());
+            + exprToString(bin->right.get()) + ")";
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        return "(" + un->op + exprToString(un->operand.get()) + ")";
     }
     if (auto* n = dynamic_cast<const IsNullExpr*>(expr)) {
         return exprToString(n->operand.get())
@@ -53,5 +60,9 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
     }
     if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
         collectAggregates(isnull->operand.get(), out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        collectAggregates(un->operand.get(), out);
     }
 }

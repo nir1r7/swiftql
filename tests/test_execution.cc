@@ -708,3 +708,54 @@ TEST(Pipeline, HashJoinWithFilterAndAggregate) {
     EXPECT_DOUBLE_EQ((*ferrari)[1].asDouble(), 300.0);
     EXPECT_DOUBLE_EQ((*mclaren)[1].asDouble(), 250.0);
 }
+
+// ===== Week 24: arithmetic evaluation (SQLite is the semantics oracle) =====
+
+TEST(Evaluate, IntegerArithmeticStaysInt) {
+    Schema schema = makeSchema({{"x", TypeId::INT}});
+    Row row = {Value(int64_t(7))};
+
+    Value sum = evaluate(makeBinary("+", colRef("x"), lit(Value(int64_t(3)))).get(), row, schema);
+    EXPECT_EQ(sum.type(), TypeId::INT);
+    EXPECT_EQ(sum.asInt(), 10);
+
+    // SQLite: INT / INT truncates
+    Value quot = evaluate(makeBinary("/", colRef("x"), lit(Value(int64_t(2)))).get(), row, schema);
+    EXPECT_EQ(quot.type(), TypeId::INT);
+    EXPECT_EQ(quot.asInt(), 3);
+}
+
+TEST(Evaluate, MixedArithmeticPromotesToDouble) {
+    Schema schema = makeSchema({{"x", TypeId::INT}, {"y", TypeId::DOUBLE}});
+    Row row = {Value(int64_t(7)), Value(2.0)};
+
+    Value quot = evaluate(makeBinary("/", colRef("x"), colRef("y")).get(), row, schema);
+    EXPECT_EQ(quot.type(), TypeId::DOUBLE);
+    EXPECT_DOUBLE_EQ(quot.asDouble(), 3.5);
+
+    Value prod = evaluate(makeBinary("*", colRef("y"), lit(Value(int64_t(3)))).get(), row, schema);
+    EXPECT_EQ(prod.type(), TypeId::DOUBLE);
+    EXPECT_DOUBLE_EQ(prod.asDouble(), 6.0);
+}
+
+TEST(Evaluate, DivisionByZeroIsNull) {
+    // SQLite: x / 0 is NULL for both INT and DOUBLE
+    Schema schema = makeSchema({{"x", TypeId::INT}, {"y", TypeId::DOUBLE}});
+    Row row = {Value(int64_t(7)), Value(1.5)};
+    EXPECT_TRUE(evaluate(makeBinary("/", colRef("x"), lit(Value(int64_t(0)))).get(), row, schema).isNull());
+    EXPECT_TRUE(evaluate(makeBinary("/", colRef("y"), lit(Value(0.0))).get(), row, schema).isNull());
+}
+
+TEST(Evaluate, ArithmeticNullPropagation) {
+    Schema schema = makeSchema({{"x", TypeId::INT}});
+    Row row = {Value::null()};
+    EXPECT_TRUE(evaluate(makeBinary("+", colRef("x"), lit(Value(int64_t(1)))).get(), row, schema).isNull());
+}
+
+TEST(Evaluate, ArithmeticOnStringThrows) {
+    Schema schema = makeSchema({{"team", TypeId::STRING}});
+    Row row = {Value(std::string("Ferrari"))};
+    EXPECT_THROW(
+        evaluate(makeBinary("+", colRef("team"), lit(Value(int64_t(1)))).get(), row, schema),
+        std::runtime_error);
+}

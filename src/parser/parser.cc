@@ -111,14 +111,14 @@ SelectStatement Parser::parseSelect(){
         expect(TokenType::BY, "BY");
         {
             OrderByItem item;
-            item.expr = parsePrimary();
+            item.expr = parseExpr();
             item.desc = match(TokenType::DESC);
             if (!item.desc) match(TokenType::ASC);
             stmt.order_by.push_back(std::move(item));
         }
         while (match(TokenType::COMMA)) {
             OrderByItem item;
-            item.expr = parsePrimary();
+            item.expr = parseExpr();
             item.desc = match(TokenType::DESC);
             if (!item.desc) match(TokenType::ASC);
             stmt.order_by.push_back(std::move(item));
@@ -170,7 +170,7 @@ std::unique_ptr<Expr> Parser::parseAndExpr(){
 }
 
 std::unique_ptr<Expr> Parser::parseCompare(){
-    auto left = parsePrimary();
+    auto left = parseAdditive();
 
     // IS NULL or IS NOT NULL
     if (check(TokenType::IS)) {
@@ -196,13 +196,57 @@ std::unique_ptr<Expr> Parser::parseCompare(){
 
     // consume operator
     consume();
-    auto right = parsePrimary();
+    auto right = parseAdditive();
 
     auto node = std::make_unique<BinaryExpr>();
     node->op = op;
     node->left = std::move(left);
     node->right = std::move(right);
     return node;
+}
+
+// additive → multiplicative (('+' | '-') multiplicative)*
+std::unique_ptr<Expr> Parser::parseAdditive(){
+    auto left = parseMultiplicative();
+
+    while (check(TokenType::PLUS) || check(TokenType::MINUS)){
+        std::string op = consume().value;
+        auto node = std::make_unique<BinaryExpr>();
+        node->op = op;
+        node->left = std::move(left);
+        node->right = parseMultiplicative();   // tighter level binds first
+        left = std::move(node);                // left-associative fold
+    }
+
+    return left;
+}
+
+// multiplicative → unary (('*' | '/') unary)*
+std::unique_ptr<Expr> Parser::parseMultiplicative(){
+    auto left = parseUnary();
+
+    while (check(TokenType::STAR) || check(TokenType::SLASH)){
+        std::string op = consume().value;
+        auto node = std::make_unique<BinaryExpr>();
+        node->op = op;
+        node->left = std::move(left);
+        node->right = parseUnary();
+        left = std::move(node);
+    }
+
+    return left;
+}
+
+// unary → '-' unary | primary
+std::unique_ptr<Expr> Parser::parseUnary(){
+    if (check(TokenType::MINUS)){
+        consume();
+        auto node = std::make_unique<UnaryExpr>();
+        node->op = "-";
+        node->operand = parseUnary();   // recursion allows "- -x"
+        return node;
+    }
+    return parsePrimary();
 }
 
 std::unique_ptr<Expr> Parser::parsePrimary(){

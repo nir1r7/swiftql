@@ -35,6 +35,9 @@ Token Lexer::nextToken() {
         case '.': return {TokenType::DOT, ".", line_, token_col};
         case ';': return {TokenType::SEMICOLON, ";", line_, token_col};
         case '*': return {TokenType::STAR, "*", line_, token_col};
+        case '+': return {TokenType::PLUS, "+", line_, token_col};
+        case '-': return {TokenType::MINUS, "-", line_, token_col};
+        case '/': return {TokenType::SLASH, "/", line_, token_col};
         case '=': return {TokenType::EQ, "=", line_, token_col};
         case '<':
             if (!isAtEnd() && current() == '=') {

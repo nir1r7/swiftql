@@ -177,6 +177,9 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
     else if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
         validateExpr(isnull->operand.get(), schema, context, allow_aggregates);
     }
+    else if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        validateExpr(un->operand.get(), schema, context, allow_aggregates);
+    }
     else if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         if (!allow_aggregates) {
             throw std::runtime_error(

@@ -30,9 +30,15 @@ struct Literal : Expr {
 // binary express; two expressions joined by an operator
 // expr (operator) expr
 struct BinaryExpr : Expr {
-    std::string op; // "=", "!=", "<", ">", "<=", ">=", "AND", "OR"
+    std::string op; // "=", "!=", "<", ">", "<=", ">=", "AND", "OR", "+", "-", "*", "/"
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
+};
+
+// unary prefix operator; only "-" for now
+struct UnaryExpr : Expr {
+    std::string op;   // "-"
+    std::unique_ptr<Expr> operand;
 };
 
 // IS NULL / IS NOT NULL predicate

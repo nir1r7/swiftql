@@ -44,6 +44,27 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
         if (op == "<=") return Value(static_cast<int64_t>(left <= right));
         if (op == ">=") return Value(static_cast<int64_t>(left >= right));
 
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            // plan-time inferExprType already rejects STRING operands; this
+            // throw only guards hand-built ASTs in tests
+            if (left.type() == TypeId::STRING || right.type() == TypeId::STRING)
+                throw std::runtime_error("'" + op + "' requires numeric operands");
+
+            if (left.type() == TypeId::INT && right.type() == TypeId::INT) {
+                int64_t l = left.asInt(), r = right.asInt();
+                if (op == "+") return Value(l + r);
+                if (op == "-") return Value(l - r);
+                if (op == "*") return Value(l * r);
+                // SQLite semantics: INT/INT truncates, x/0 is NULL
+                return r == 0 ? Value::null() : Value(l / r);
+            }
+            double l = left.toNumeric(), r = right.toNumeric();
+            if (op == "+") return Value(l + r);
+            if (op == "-") return Value(l - r);
+            if (op == "*") return Value(l * r);
+            return r == 0.0 ? Value::null() : Value(l / r);
+        }
+
         if (op == "AND") {
             bool l = left.asInt() != 0;
             bool r = right.asInt() != 0;
@@ -56,6 +77,15 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
         }
 
         throw std::runtime_error("Unknown binary operator: " + op);
+    }
+
+    // unary minus
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        Value v = evaluate(un->operand.get(), row, schema);
+        if (v.isNull()) return Value::null();
+        if (v.type() == TypeId::INT)    return Value(-v.asInt());
+        if (v.type() == TypeId::DOUBLE) return Value(-v.asDouble());
+        throw std::runtime_error("unary '-' requires a numeric operand");
     }
 
     // null expression

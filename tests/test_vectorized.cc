@@ -651,7 +651,8 @@ TEST(VecFilter, ExplainString) {
         makeIntScan("season", {2025}),
         binOp("=", col("season"), intLit(2025)));
 
-    EXPECT_EQ(filter->explain(), "VecFilter [season = 2025]");
+    // Week 24: exprToString parenthesizes BinaryExpr (name-contract injectivity)
+    EXPECT_EQ(filter->explain(), "VecFilter [(season = 2025)]");
 }
 
 TEST(VecFilter, Stats_RowsIn_And_RowsOut) {
