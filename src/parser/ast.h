@@ -69,6 +69,12 @@ struct GroupByColumn {
     std::string table_name;   // as typed; empty if unqualified
     std::string column_name;
     int relation_slot = -1;   // 0 = FROM, 1 = JOIN; -1 = unresolved
+    // non-null for expression grouping (GROUP BY season - 1): the group key
+    // is evaluate(expr) per row instead of a column read. shared_ptr (not
+    // unique_ptr) keeps the struct copyable — planner/test sites copy
+    // group-by vectors, and the expr is read-only after binding, so sharing
+    // is safe. Last field so positional brace-inits ({"", "grp"}) stay valid.
+    std::shared_ptr<Expr> expr;
 };
 
 // the full parsed query

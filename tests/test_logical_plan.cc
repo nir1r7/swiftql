@@ -392,3 +392,36 @@ TEST(LogicalPlan, DuplicateAggregatesShareOneSpec) {
     // SUM(speed) appears twice, COUNT(*) once: 2 deduped specs
     EXPECT_EQ(agg->aggregates.size(), 2u);
 }
+
+
+// ===== Week 24: expression GROUP BY keys =====
+
+TEST(LogicalPlan, ExpressionGroupBySubstitutesProjectRef) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT season - 2000, COUNT(*) FROM laps GROUP BY season - 2000", cat);
+
+    auto* agg = static_cast<const LogicalAggregate*>(findNode(plan.get(), LogicalNodeType::AGGREGATE));
+    ASSERT_NE(agg, nullptr);
+    EXPECT_EQ(agg->output_schema.column(0).name, "(season - 2000)");
+    EXPECT_EQ(agg->output_schema.column(0).type, TypeId::INT);
+
+    // the select item matching the group key was rewritten into a ColumnRef
+    // over the aggregate's group-key output column
+    auto* proj = static_cast<const LogicalProject*>(findNode(plan.get(), LogicalNodeType::PROJECT));
+    ASSERT_NE(proj, nullptr);
+    auto* ref = dynamic_cast<const ColumnRef*>(proj->exprs[0].get());
+    ASSERT_NE(ref, nullptr);
+    EXPECT_EQ(ref->column_name, "(season - 2000)");
+}
+
+TEST(LogicalPlan, ExpressionGroupByScanKeepsInputColumns) {
+    // season is referenced only inside the group expression — the narrowed
+    // scan schema must still carry it (collectCols over g.expr)
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT COUNT(*) FROM laps GROUP BY season - 2000", cat);
+
+    const LogicalPlanNode* scan = findNode(plan.get(), LogicalNodeType::SCAN);
+    ASSERT_NE(scan, nullptr);
+    EXPECT_TRUE(scan->output_schema.hasColumn("season"));
+}

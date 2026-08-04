@@ -1,5 +1,6 @@
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/evaluator.h"
+#include "parser/expr_utils.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
@@ -38,9 +39,11 @@ void VecHashAggregateNode::consumeAll() {
     const Schema& child_schema = child_->outputSchema();
 
     // resolve column indices once outside the chunk loop; slot-first so a
-    // qualified GROUP BY reads the named join side on shared column names
+    // qualified GROUP BY reads the named join side on shared column names.
+    // -1 = expression group key (GROUP BY season - 1): evaluated per row.
     std::vector<int> group_idxs;
     for (const auto& g : group_by_cols_){
+        if (g.expr) { group_idxs.push_back(-1); continue; }
         int idx = g.relation_slot >= 0
             ? child_schema.indexOf(g.column_name, g.relation_slot)
             : -1;
@@ -63,11 +66,16 @@ void VecHashAggregateNode::consumeAll() {
         agg_idxs.push_back(idx);
     }
 
-    // expression arguments call evaluate(), which needs a full Row —
-    // reconstruct lazily, same pattern as VecProjectNode's complex path
+    // expression group keys / arguments call evaluate(), which needs a full
+    // Row — reconstruct lazily, same pattern as VecProjectNode's complex path
     bool needs_row = false;
-    for (const auto& spec : specs_) {
-        if (!spec.is_star && spec.argument && spec.column.empty()) { needs_row = true; break; }
+    for (const auto& g : group_by_cols_) {
+        if (g.expr) { needs_row = true; break; }
+    }
+    if (!needs_row) {
+        for (const auto& spec : specs_) {
+            if (!spec.is_star && spec.argument && spec.column.empty()) { needs_row = true; break; }
+        }
     }
 
     while (DataChunk* chunk = child_->nextChunk()) {
@@ -103,10 +111,14 @@ void VecHashAggregateNode::consumeAll() {
             // build group key vector from group by columns
             std::vector<Value> key;
             key.reserve(group_idxs.size());
-            for (int ci : group_idxs) {
+            for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
+                if (group_idxs[gi] < 0) {
+                    key.push_back(evaluate(group_by_cols_[gi].expr.get(), tmp, child_schema));
+                    continue;
+                }
                 std::visit([&](const auto& vec) {
                     key.push_back(Value(vec[r]));
-                }, chunk->columns[ci].data);
+                }, chunk->columns[group_idxs[gi]].data);
             }
             std::string key_str = serializeKey(key);
 
@@ -285,6 +297,10 @@ std::string VecHashAggregateNode::explain() const {
         s += "group_by=";
         for (size_t i = 0; i < group_by_cols_.size(); ++i) {
             if (i) s += ",";
+            if (group_by_cols_[i].expr) {
+                s += exprToString(group_by_cols_[i].expr.get());
+                continue;
+            }
             if (!group_by_cols_[i].table_name.empty()) s += group_by_cols_[i].table_name + ".";
             s += group_by_cols_[i].column_name;
         }

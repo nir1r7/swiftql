@@ -315,3 +315,27 @@ TEST(ParserTest, AggregateAlias) {
     EXPECT_EQ(stmt.select_list[0]->alias, "total");
     EXPECT_NE(dynamic_cast<AggregateExpr*>(stmt.select_list[0].get()), nullptr);
 }
+
+
+// ===== Week 24: GROUP BY expressions =====
+
+TEST(ParserTest, GroupByExpression) {
+    Parser parser("SELECT COUNT(*) FROM laps GROUP BY season - 2000, team");
+    SelectStatement stmt = parser.parse();
+
+    ASSERT_EQ(stmt.group_by.size(), 2u);
+    ASSERT_NE(stmt.group_by[0].expr, nullptr);        // expression key
+    EXPECT_TRUE(stmt.group_by[0].column_name.empty());
+    EXPECT_EQ(stmt.group_by[1].expr, nullptr);        // plain column keeps fast path
+    EXPECT_EQ(stmt.group_by[1].column_name, "team");
+}
+
+TEST(ParserTest, GroupByQualifiedColumnStillPlain) {
+    Parser parser("SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id GROUP BY l.team");
+    SelectStatement stmt = parser.parse();
+
+    ASSERT_EQ(stmt.group_by.size(), 1u);
+    EXPECT_EQ(stmt.group_by[0].expr, nullptr);
+    EXPECT_EQ(stmt.group_by[0].table_name, "l");
+    EXPECT_EQ(stmt.group_by[0].column_name, "team");
+}

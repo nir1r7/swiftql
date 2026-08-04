@@ -157,6 +157,15 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
 // extract aggregate specifications from the select list
 std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt);
 
+// Rewrite post-aggregate clauses (select list, HAVING, ORDER BY) so any
+// subtree textually matching an expression GROUP BY key becomes a ColumnRef
+// to the aggregate's group-key output column (named by exprToString). Runs
+// AFTER Validator::validate — validation checks the original trees against
+// base-table schemas; the synthesized refs resolve only post-aggregate.
+// No-op unless expression group keys exist. WHERE is never rewritten (it
+// runs pre-aggregate), and AggregateExpr arguments are left intact.
+void substituteGroupKeyRefs(SelectStatement& stmt);
+
 // validates the statement, then builds an execution-independent logical plan tree
 // moves expressions out of stmt (select list, predicates, order by) rather than copying
 // precondition: Binder::bind has run on stmt; relation slots drive join-key routing,

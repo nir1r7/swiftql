@@ -520,3 +520,44 @@ TEST(Binder, OrderByRealColumnNotShadowedWithoutAlias) {
     ASSERT_NE(col, nullptr);
     EXPECT_EQ(col->column_name, "team");
 }
+
+
+// ===== Week 24: GROUP BY alias fallback =====
+
+TEST(Binder, GroupByAliasSubstitutesExpression) {
+    Catalog cat(CATALOG);
+    Parser parser("SELECT season - 2000 AS era, COUNT(*) FROM laps GROUP BY era");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    // 'era' names no input column → falls back to the select alias and
+    // becomes an expression group key
+    ASSERT_EQ(stmt.group_by.size(), 1u);
+    ASSERT_NE(stmt.group_by[0].expr, nullptr);
+    auto* bin = dynamic_cast<BinaryExpr*>(stmt.group_by[0].expr.get());
+    ASSERT_NE(bin, nullptr);
+    EXPECT_EQ(bin->op, "-");
+}
+
+TEST(Binder, GroupByAliasOfPlainColumnKeepsColumnPath) {
+    Catalog cat(CATALOG);
+    Parser parser("SELECT team AS t, COUNT(*) FROM laps GROUP BY t");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    ASSERT_EQ(stmt.group_by.size(), 1u);
+    EXPECT_EQ(stmt.group_by[0].expr, nullptr);
+    EXPECT_EQ(stmt.group_by[0].column_name, "team");
+}
+
+TEST(Binder, GroupByInputColumnBeatsAlias) {
+    Catalog cat(CATALOG);
+    // 'speed' aliases team, but a real input column named speed exists —
+    // input columns take precedence in GROUP BY (SQLite scoping)
+    Parser parser("SELECT team AS speed, COUNT(*) FROM laps GROUP BY speed");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    EXPECT_EQ(stmt.group_by[0].expr, nullptr);
+    EXPECT_EQ(stmt.group_by[0].column_name, "speed");
+}

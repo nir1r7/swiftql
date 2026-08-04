@@ -222,9 +222,14 @@ void HashAggregateNode::open() {
         }
         stats.rows_in++;
         // build group key, resolved slot-first so a qualified GROUP BY reads
-        // the named join side even when both sides share the column name
+        // the named join side even when both sides share the column name;
+        // expression keys (GROUP BY season - 1) are evaluated per row
         std::vector<Value> key;
         for (const auto& g : group_by_cols_) {
+            if (g.expr) {
+                key.push_back(evaluate(g.expr.get(), *row, child_schema));
+                continue;
+            }
             int idx = g.relation_slot >= 0
                 ? child_schema.indexOf(g.column_name, g.relation_slot)
                 : -1;
@@ -333,6 +338,10 @@ std::string HashAggregateNode::explain() const {
     std::string s = "Aggregate [group_by=";
     for (size_t i = 0; i < group_by_cols_.size(); ++i) {
         if (i) s += ", ";
+        if (group_by_cols_[i].expr) {
+            s += exprToString(group_by_cols_[i].expr.get());
+            continue;
+        }
         if (!group_by_cols_[i].table_name.empty()) s += group_by_cols_[i].table_name + ".";
         s += group_by_cols_[i].column_name;
     }

@@ -5,13 +5,20 @@
 
 namespace {
 
-// Every ColumnRef reachable outside an aggregate must be a GROUP BY column.
-// AggregateExpr terminates the walk: its argument is evaluated pre-grouping.
+// Every ColumnRef reachable outside an aggregate must be a GROUP BY column,
+// or sit inside a subtree that textually matches a GROUP BY expression
+// (exprToString on bound ASTs — the same identity the planner's group-key
+// substitution uses). AggregateExpr terminates the walk: its argument is
+// evaluated pre-grouping.
 void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_by) {
     if (!expr) return;
     if (dynamic_cast<const AggregateExpr*>(expr)) return;
+    for (const auto& g : group_by) {
+        if (g.expr && exprToString(g.expr.get()) == exprToString(expr)) return;
+    }
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         for (const auto& g : group_by) {
+            if (g.expr) continue;
             // name match plus slot compatibility: SELECT a.grp with
             // GROUP BY b.grp is a different column, not a match.
             // Unbound slots (-1) stay name-only for direct-validate callers.
@@ -114,6 +121,17 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // already verified; the rest check against the FROM table or, when a join
     // is present, the joined table.
     for (const auto& g : stmt.group_by) {
+        if (g.expr) {
+            // expression group key: no aggregates inside, and every column
+            // it references must exist
+            std::vector<const AggregateExpr*> in_key;
+            collectAggregates(g.expr.get(), in_key);
+            if (!in_key.empty()) {
+                throw std::runtime_error("GROUP BY: aggregate functions are not allowed in GROUP BY");
+            }
+            validateExpr(g.expr.get(), schema, "GROUP BY", /*allow_aggregates=*/true);
+            continue;
+        }
         if (g.relation_slot >= 0 && !g.table_name.empty()) continue; // binder verified
         bool found;
         if (!g.table_name.empty()) {

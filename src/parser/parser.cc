@@ -327,10 +327,13 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
 std::vector<GroupByColumn> Parser::parseColumnList(){
     auto parseOne = [&]() -> GroupByColumn {
         GroupByColumn col;
-        col.column_name = expect(TokenType::IDENTIFIER, "column name").value;
-        if (match(TokenType::DOT)) {
-            col.table_name = col.column_name;
-            col.column_name = expect(TokenType::IDENTIFIER, "column name after '.'").value;
+        auto expr = parseExpr();
+        if (auto* cr = dynamic_cast<ColumnRef*>(expr.get())) {
+            // plain (possibly qualified) column: keep the name-based fast path
+            col.table_name = cr->table_name;
+            col.column_name = cr->column_name;
+        } else {
+            col.expr = std::move(expr);   // expression key (GROUP BY season - 1)
         }
         return col;
     };

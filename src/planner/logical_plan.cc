@@ -93,7 +93,12 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     std::unordered_set<std::string> required;
     for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
     collectCols(stmt.where.get(), required);
-    for (const auto& g : stmt.group_by) required.insert(g.column_name);
+    for (const auto& g : stmt.group_by) {
+        // expression keys reference columns only inside their tree — a miss
+        // here would narrow them out of the scan
+        if (g.expr) { collectCols(g.expr.get(), required); continue; }
+        required.insert(g.column_name);
+    }
     collectCols(stmt.having.get(), required);
     for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
     if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
@@ -156,8 +161,15 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
     std::vector<ColumnDef> cols;
 
     // group-by columns in order, resolved slot-first so a qualified GROUP BY
-    // picks the named join side even when both sides share the column name
+    // picks the named join side even when both sides share the column name.
+    // Expression keys become computed output columns named by exprToString —
+    // the same string substituteGroupKeyRefs rewrites references into.
     for (const auto& g : group_by) {
+        if (g.expr) {
+            cols.push_back({exprToString(g.expr.get()),
+                            inferExprType(g.expr.get(), table_schema)});
+            continue;
+        }
         int idx = g.relation_slot >= 0
             ? table_schema.indexOf(g.column_name, g.relation_slot)
             : -1;
@@ -229,6 +241,52 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
 }
 
 
+// depth-first replacement for substituteGroupKeyRefs; stops at AggregateExpr
+// (arguments evaluate pre-aggregate) and at leaves (a plain ColumnRef can
+// never match — expression keys are non-ColumnRef by construction)
+static void substituteInto(std::unique_ptr<Expr>& expr, const std::vector<std::string>& keys) {
+    if (!expr) return;
+    if (dynamic_cast<AggregateExpr*>(expr.get())) return;
+    if (dynamic_cast<ColumnRef*>(expr.get()) || dynamic_cast<Literal*>(expr.get())) return;
+
+    std::string s = exprToString(expr.get());
+    for (const auto& key : keys) {
+        if (key == s) {
+            auto ref = std::make_unique<ColumnRef>();
+            ref->column_name = key;     // matches buildAggregateSchema's output name
+            ref->alias = expr->alias;   // preserve a select-item alias
+            expr = std::move(ref);
+            return;
+        }
+    }
+
+    if (auto* bin = dynamic_cast<BinaryExpr*>(expr.get())) {
+        substituteInto(bin->left, keys);
+        substituteInto(bin->right, keys);
+        return;
+    }
+    if (auto* un = dynamic_cast<UnaryExpr*>(expr.get())) {
+        substituteInto(un->operand, keys);
+        return;
+    }
+    if (auto* isn = dynamic_cast<IsNullExpr*>(expr.get())) {
+        substituteInto(isn->operand, keys);
+    }
+}
+
+void substituteGroupKeyRefs(SelectStatement& stmt) {
+    std::vector<std::string> keys;
+    for (const auto& g : stmt.group_by) {
+        if (g.expr) keys.push_back(exprToString(g.expr.get()));
+    }
+    if (keys.empty()) return;
+
+    for (auto& e : stmt.select_list) substituteInto(e, keys);
+    substituteInto(stmt.having, keys);
+    for (auto& item : stmt.order_by) substituteInto(item.expr, keys);
+}
+
+
 // LogicalScan
 std::string LogicalScan::explain() const {
     return "LogicalScan [" + table_name + ", " + std::to_string(output_schema.columns().size()) + " columns]";
@@ -253,6 +311,10 @@ std::string LogicalAggregate::explain() const {
     if (!group_by.empty()) {
         for (size_t i = 0; i < group_by.size(); ++i) {
             if (i) s += ", ";
+            if (group_by[i].expr) {
+                s += exprToString(group_by[i].expr.get());
+                continue;
+            }
             if (!group_by[i].table_name.empty()) s += group_by[i].table_name + ".";
             s += group_by[i].column_name;
         }
@@ -306,6 +368,10 @@ std::string LogicalLimit::explain() const {
 // LogicalPlanBuilder
 std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt, const Catalog& catalog) {
     Validator::validate(stmt, catalog);
+
+    // expression GROUP BY keys: rewrite post-aggregate references to the
+    // aggregate's group-key output columns (no-op without expression keys)
+    substituteGroupKeyRefs(stmt);
 
     // FROM scan, narrowed to only the columns the query actually needs
     std::unique_ptr<LogicalPlanNode> node = std::make_unique<LogicalScan>(

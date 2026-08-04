@@ -6,6 +6,10 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // validate
     Validator::validate(stmt, catalog);
 
+    // expression GROUP BY keys: rewrite post-aggregate references, mirroring
+    // LogicalPlanBuilder::build (no-op without expression keys)
+    substituteGroupKeyRefs(stmt);
+
     const TableMetadata& meta = catalog.getTable(stmt.from_table);
 
     // narrowed scan schema via the shared logical-layer helper — this also

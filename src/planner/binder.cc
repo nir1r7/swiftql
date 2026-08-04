@@ -44,8 +44,39 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
     }
     bindExpr(stmt.where.get(), range_table);
     // GROUP BY items resolve through the same machinery as column refs:
-    // qualified names pick their side, ambiguous unqualified names throw
+    // qualified names pick their side, ambiguous unqualified names throw.
+    // A bare name matching no input column falls back to a select-list alias
+    // (input columns take precedence, matching SQLite GROUP BY scoping);
+    // expression items just bind their column references.
     for (auto& g : stmt.group_by) {
+        if (!g.expr && g.table_name.empty() && !g.column_name.empty()) {
+            bool is_column = false;
+            for (const auto& rte : range_table) {
+                if (rte.schema->hasColumn(g.column_name)) { is_column = true; break; }
+            }
+            if (!is_column) {
+                for (const auto& sel : stmt.select_list) {
+                    if (!sel->alias.empty() && sel->alias == g.column_name) {
+                        // GROUP BY <alias>: substitute the (already bound)
+                        // aliased expression; a plain-column alias keeps the
+                        // column fast path
+                        auto clone = cloneExpr(sel.get());
+                        if (auto* cr = dynamic_cast<ColumnRef*>(clone.get())) {
+                            g.table_name = cr->table_name;
+                            g.column_name = cr->column_name;
+                            g.relation_slot = cr->relation_slot;
+                        } else {
+                            g.expr = std::move(clone);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (g.expr) {
+            bindExpr(g.expr.get(), range_table);
+            continue;
+        }
         ColumnRef tmp;
         tmp.table_name = g.table_name;
         tmp.column_name = g.column_name;
