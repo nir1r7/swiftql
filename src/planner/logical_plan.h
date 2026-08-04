@@ -129,6 +129,11 @@ struct LogicalLimit : LogicalPlanNode {
 // Planner (relocated from Planner in Week 18 so the logical layer no longer
 // includes physical operator headers)
 
+// result type of an expression against a schema; throws std::runtime_error on
+// ill-typed trees (arithmetic over STRING). Mirrors evaluate()'s dispatch:
+// same slot-first column resolution, same INT-as-boolean convention.
+TypeId inferExprType(const Expr* expr, const Schema& schema);
+
 // narrowed scan schema for one table: only columns the query references;
 // returns full_schema unchanged for SELECT *
 Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);

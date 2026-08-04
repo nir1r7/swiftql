@@ -91,7 +91,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
     // fliter (WHERE)
     if (stmt.where) {
-        // clone predicate
+        // plan-time type check, mirroring LogicalPlanBuilder::build
+        inferExprType(stmt.where.get(), node->outputSchema());
         node = std::make_unique<FilterNode>(std::move(node), std::move(stmt.where));
     }
 
@@ -112,11 +113,15 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
     // HAVING
     if (stmt.having) {
+        inferExprType(stmt.having.get(), node->outputSchema());
         node = std::make_unique<HavingNode>(std::move(node), std::move(stmt.having));
     }
 
     // sort (ORDER BY) — must evaluate against pre-projection schema
     if (!stmt.order_by.empty()) {
+        for (const auto& item : stmt.order_by) {
+            inferExprType(item.expr.get(), node->outputSchema());
+        }
         node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
     }
 

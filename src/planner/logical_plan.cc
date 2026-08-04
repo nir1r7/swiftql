@@ -44,6 +44,50 @@ static Schema narrowSchema(const Schema& full, const std::unordered_set<std::str
 }
 
 
+TypeId inferExprType(const Expr* expr, const Schema& schema) {
+    if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+        return lit->value.type();
+    }
+    if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        // slot-first with bare-name fallback — same contract as
+        // resolveColumnIndex() in evaluator.cc
+        int idx = col->relation_slot >= 0
+            ? schema.indexOf(col->column_name, col->relation_slot) : -1;
+        if (idx < 0) idx = schema.indexOf(col->column_name);
+        if (idx < 0) throw std::runtime_error(
+            "column not found: '" + col->column_name + "'");
+        return schema.column(idx).type;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        return agg->function_name == "COUNT" ? TypeId::INT : TypeId::DOUBLE;
+    }
+    if (dynamic_cast<const IsNullExpr*>(expr)) {
+        return TypeId::INT;   // boolean-as-INT convention
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        TypeId t = inferExprType(un->operand.get(), schema);
+        if (t == TypeId::STRING)
+            throw std::runtime_error("unary '-' requires a numeric operand");
+        return t;
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        // recurse into both children first so ill-typed subtrees surface even
+        // under comparisons ((team + 1) = 5 must be rejected)
+        TypeId l = inferExprType(bin->left.get(), schema);
+        TypeId r = inferExprType(bin->right.get(), schema);
+        const std::string& op = bin->op;
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            if (l == TypeId::STRING || r == TypeId::STRING)
+                throw std::runtime_error("'" + op + "' requires numeric operands");
+            // INT/INT stays INT (SQLite truncating division); any DOUBLE promotes
+            return (l == TypeId::INT && r == TypeId::INT) ? TypeId::INT : TypeId::DOUBLE;
+        }
+        return TypeId::INT;   // comparison / AND / OR
+    }
+    throw std::runtime_error("inferExprType(): unknown Expr subtype");
+}
+
+
 Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     if (stmt.select_star) return full_schema;
     std::unordered_set<std::string> required;
@@ -78,6 +122,11 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
             // COUNT always produces INT
             TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
             cols.push_back({aggregateOutputName(agg), result_type});
+        } else {
+            // general expression (arithmetic, expr over aggregates): name from
+            // exprToString, type from inference — never STRING-by-default
+            cols.push_back({exprToString(expr.get()),
+                            inferExprType(expr.get(), table_schema)});
         }
     }
 
@@ -273,6 +322,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
 
     // filter (WHERE)
     if (stmt.where) {
+        // plan-time type check: reject STRING arithmetic here instead of
+        // per-row "Type mismatch" throws during execution
+        inferExprType(stmt.where.get(), node->output_schema);
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.where));
     }
 
@@ -293,11 +345,15 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
 
     // HAVING — filter above the aggregate; no dedicated node
     if (stmt.having) {
+        inferExprType(stmt.having.get(), node->output_schema);
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.having));
     }
 
     // sort (ORDER BY) — must evaluate against pre-projection schema
     if (!stmt.order_by.empty()) {
+        for (const auto& item : stmt.order_by) {
+            inferExprType(item.expr.get(), node->output_schema);
+        }
         node = std::make_unique<LogicalSort>(std::move(node), std::move(stmt.order_by));
     }
 

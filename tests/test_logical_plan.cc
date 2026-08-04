@@ -300,3 +300,59 @@ TEST(LogicalPlan, ExplainSmokeTest) {
     ASSERT_NE(filter_node, nullptr);
     EXPECT_NE(filter_node->explain().find("speed"), std::string::npos);
 }
+
+
+// ===== Week 24: expression type inference =====
+
+TEST(InferExprType, ArithmeticTyping) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+
+    auto typeOf = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+
+    EXPECT_EQ(typeOf("season + 1"), TypeId::INT);      // INT op INT stays INT
+    EXPECT_EQ(typeOf("season / 4"), TypeId::INT);      // SQLite truncating division
+    EXPECT_EQ(typeOf("speed * 2"), TypeId::DOUBLE);    // DOUBLE operand promotes
+    EXPECT_EQ(typeOf("season / 2.0"), TypeId::DOUBLE);
+    EXPECT_EQ(typeOf("-speed"), TypeId::DOUBLE);       // unary minus passthrough
+    EXPECT_EQ(typeOf("-season"), TypeId::INT);
+    EXPECT_EQ(typeOf("speed > 300"), TypeId::INT);     // boolean-as-INT convention
+    EXPECT_EQ(typeOf("AVG(speed)"), TypeId::DOUBLE);
+    EXPECT_EQ(typeOf("COUNT(*)"), TypeId::INT);
+    EXPECT_EQ(typeOf("AVG(speed) * 2"), TypeId::DOUBLE);
+}
+
+TEST(InferExprType, StringArithmeticThrows) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+
+    auto infer = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+
+    EXPECT_THROW(infer("team + 1"), std::runtime_error);
+    EXPECT_THROW(infer("-team"), std::runtime_error);
+    EXPECT_THROW(infer("(team + 1) = 5"), std::runtime_error);  // children checked before boolean short-circuit
+}
+
+TEST(LogicalPlan, ProjectSchemaTypesExpressions) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT speed * 2, season + 1 FROM laps", cat);
+
+    const Schema& out = plan->output_schema;
+    ASSERT_EQ(out.size(), 2);
+    EXPECT_EQ(out.column(0).type, TypeId::DOUBLE);   // no STRING fallback
+    EXPECT_EQ(out.column(1).type, TypeId::INT);
+}
+
+TEST(LogicalPlan, StringArithmeticRejectedAtPlanTime) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical("SELECT team FROM laps WHERE team + 1 = 5", cat), std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team + 1 FROM laps", cat), std::runtime_error);
+}
