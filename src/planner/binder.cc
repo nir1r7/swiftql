@@ -1,4 +1,5 @@
 #include "binder.h"
+#include "parser/expr_utils.h"
 #include <stdexcept>
 
 void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
@@ -53,7 +54,23 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         g.relation_slot = tmp.relation_slot;
     }
     bindExpr(stmt.having.get(), range_table);
-    for (auto& item : stmt.order_by) bindExpr(item.expr.get(), range_table);
+    // SQLite scoping: ORDER BY names resolve against select-list aliases
+    // first, then base columns. Substitute a clone of the aliased expression —
+    // Sort evaluates below Project, where the alias name is not a column.
+    // The select list is already bound, so clones carry relation_slot stamps.
+    for (auto& item : stmt.order_by) {
+        if (auto* col = dynamic_cast<ColumnRef*>(item.expr.get())) {
+            if (col->table_name.empty()) {
+                for (const auto& sel : stmt.select_list) {
+                    if (!sel->alias.empty() && sel->alias == col->column_name) {
+                        item.expr = cloneExpr(sel.get());
+                        break;
+                    }
+                }
+            }
+        }
+        bindExpr(item.expr.get(), range_table);   // no-op on already-stamped clones
+    }
     if (stmt.join.has_value()) bindExpr(stmt.join->condition.get(), range_table);
 }
 

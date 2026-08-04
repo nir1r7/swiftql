@@ -1,5 +1,6 @@
 #pragma once
 #include "ast.h"
+#include <stdexcept>
 #include <string>
 
 inline std::string exprToString(const Expr* expr) {
@@ -65,4 +66,42 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
         collectAggregates(un->operand.get(), out);
     }
+}
+
+// Deep copy of an expression tree, preserving binder stamps and alias.
+// DISPATCH SITE: every new Expr subtype must be added here.
+inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
+    if (!expr) return nullptr;
+    std::unique_ptr<Expr> out;
+    if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        out = std::make_unique<ColumnRef>(*col);   // memberwise: keeps relation_slot
+    } else if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+        out = std::make_unique<Literal>(lit->value);
+    } else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        auto b = std::make_unique<BinaryExpr>();
+        b->op = bin->op;
+        b->left = cloneExpr(bin->left.get());
+        b->right = cloneExpr(bin->right.get());
+        out = std::move(b);
+    } else if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        auto u = std::make_unique<UnaryExpr>();
+        u->op = un->op;
+        u->operand = cloneExpr(un->operand.get());
+        out = std::move(u);
+    } else if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) {
+        auto n = std::make_unique<IsNullExpr>();
+        n->operand = cloneExpr(isn->operand.get());
+        n->is_not_null = isn->is_not_null;
+        out = std::move(n);
+    } else if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        auto a = std::make_unique<AggregateExpr>();
+        a->function_name = agg->function_name;
+        a->argument = cloneExpr(agg->argument.get());
+        a->is_star = agg->is_star;
+        out = std::move(a);
+    } else {
+        throw std::runtime_error("cloneExpr(): unknown Expr subtype");
+    }
+    out->alias = expr->alias;
+    return out;
 }

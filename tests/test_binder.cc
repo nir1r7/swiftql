@@ -487,3 +487,36 @@ TEST(Binder, DuplicateAliasAcrossDifferentTablesNamedCorrectly) {
         EXPECT_NE(err.find("'x'"), std::string::npos) << err;
     }
 }
+
+
+// ===== Week 24: ORDER BY alias substitution =====
+
+TEST(Binder, OrderByAliasSubstitutesSelectExpression) {
+    Catalog cat(CATALOG);
+    Parser parser("SELECT speed * 2 AS ds FROM laps ORDER BY ds DESC");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    // the ORDER BY item is no longer the bare ColumnRef 'ds' — it is a clone
+    // of the aliased expression, evaluable against the pre-projection schema
+    ASSERT_EQ(stmt.order_by.size(), 1u);
+    auto* mul = dynamic_cast<BinaryExpr*>(stmt.order_by[0].expr.get());
+    ASSERT_NE(mul, nullptr);
+    EXPECT_EQ(mul->op, "*");
+    auto* col = dynamic_cast<ColumnRef*>(mul->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "speed");
+    EXPECT_EQ(col->relation_slot, 0);   // clone carries binder stamps
+}
+
+TEST(Binder, OrderByRealColumnNotShadowedWithoutAlias) {
+    Catalog cat(CATALOG);
+    Parser parser("SELECT speed AS s, team FROM laps ORDER BY team");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+
+    // 'team' matches no alias — stays a plain bound column ref
+    auto* col = dynamic_cast<ColumnRef*>(stmt.order_by[0].expr.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "team");
+}

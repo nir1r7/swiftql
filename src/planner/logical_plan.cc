@@ -128,6 +128,9 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
             cols.push_back({exprToString(expr.get()),
                             inferExprType(expr.get(), table_schema)});
         }
+        // an alias renames only this projected output column; the aggregate
+        // node's schema underneath keeps canonical aggregateOutputName names
+        if (!expr->alias.empty()) cols.back().name = expr->alias;
     }
 
     return Schema(cols);

@@ -296,3 +296,22 @@ TEST(ParserTest, CountStarStillParses) {
     ASSERT_NE(agg, nullptr);
     EXPECT_TRUE(agg->is_star);
 }
+
+
+// ===== Week 24: expression aliases =====
+
+TEST(ParserTest, SelectExpressionAlias) {
+    Parser parser("SELECT speed * 2 AS double_speed, team FROM laps");
+    SelectStatement stmt = parser.parse();
+
+    ASSERT_EQ(stmt.select_list.size(), 2u);
+    EXPECT_EQ(stmt.select_list[0]->alias, "double_speed");
+    EXPECT_TRUE(stmt.select_list[1]->alias.empty());
+}
+
+TEST(ParserTest, AggregateAlias) {
+    Parser parser("SELECT SUM(speed) AS total FROM laps");
+    SelectStatement stmt = parser.parse();
+    EXPECT_EQ(stmt.select_list[0]->alias, "total");
+    EXPECT_NE(dynamic_cast<AggregateExpr*>(stmt.select_list[0].get()), nullptr);
+}

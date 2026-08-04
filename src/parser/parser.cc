@@ -54,9 +54,18 @@ SelectStatement Parser::parseSelect(){
         consume();
         stmt.select_star = true;
     } else {
-        stmt.select_list.push_back(parseExpr());
+        // select item: expr [AS alias] — the AS keyword is required for an
+        // alias (SQLite's implicit "expr alias" form is a documented non-goal)
+        auto parseSelectItem = [&]() {
+            auto expr = parseExpr();
+            if (match(TokenType::AS)) {
+                expr->alias = expect(TokenType::IDENTIFIER, "alias after AS").value;
+            }
+            return expr;
+        };
+        stmt.select_list.push_back(parseSelectItem());
         while (match(TokenType::COMMA)) {
-            stmt.select_list.push_back(parseExpr());
+            stmt.select_list.push_back(parseSelectItem());
         }
     }
 

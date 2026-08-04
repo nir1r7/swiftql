@@ -8,6 +8,9 @@
 // base expression node
 struct Expr {
     virtual ~Expr() = default;
+    // output-column alias (SELECT expr AS name); meaningful only on
+    // select-list roots, empty elsewhere — DuckDB models it the same way
+    std::string alias;
 };
 
 // reference to a column
