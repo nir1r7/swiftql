@@ -2701,3 +2701,44 @@ TEST(VecHashAggregate, SumOverExpressionArgument) {
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 50.0);
 }
+
+
+// ===== Week 24 audit fix: NULL values at the materialization point =====
+// x/0 evaluates to SQL NULL (SQLite semantics). ColumnVector has no null
+// mask, so VecProjectNode must degrade NULL to the engine-wide sentinel
+// (0 / 0.0 / "NULL" — same contract as VecHashAggregateNode::fillChunk)
+// instead of crashing in the typed asDouble()/asString() accessors.
+
+TEST(VecProject, DivisionByZeroMaterializesSentinelNotCrash) {
+    Schema schema = vecSchema({{"speed", TypeId::DOUBLE}, {"season", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(300.5), Value(int64_t(2025))},
+        {Value(310.0), Value(int64_t(2024))},
+    };
+
+    // SELECT speed / 0, season / 0 — DOUBLE and INT null-producing projections
+    auto div_double = std::make_unique<BinaryExpr>();
+    div_double->op = "/";
+    auto sp = std::make_unique<ColumnRef>(); sp->column_name = "speed";
+    div_double->left = std::move(sp);
+    div_double->right = std::make_unique<Literal>(Value(int64_t(0)));
+
+    auto div_int = std::make_unique<BinaryExpr>();
+    div_int->op = "/";
+    auto se = std::make_unique<ColumnRef>(); se->column_name = "season";
+    div_int->left = std::move(se);
+    div_int->right = std::make_unique<Literal>(Value(int64_t(0)));
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(std::move(div_double));
+    exprs.push_back(std::move(div_int));
+    Schema out_schema = vecSchema({{"(speed / 0)", TypeId::DOUBLE}, {"(season / 0)", TypeId::INT}});
+
+    VecProjectNode project(makeScan(schema, input), std::move(exprs), out_schema);
+
+    std::vector<Row> rows;
+    ASSERT_NO_THROW(rows = drainRows(project));
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 0.0);   // NULL -> 0.0 sentinel
+    EXPECT_EQ(rows[0][1].asInt(), 0);               // NULL -> 0 sentinel
+}

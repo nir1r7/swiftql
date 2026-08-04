@@ -91,6 +91,24 @@ DataChunk* VecProjectNode::nextChunk(){
             } else {
                 v = evaluate(expressions_[c].get(), tmp, child_schema);
             }
+            if (v.isNull()) {
+                // ColumnVector has no null bitmap, so SQL NULL (e.g. x/0 under
+                // SQLite division semantics) cannot be represented in a
+                // materialized column. Degrade to the engine-wide sentinel —
+                // same contract as VecHashAggregateNode::fillChunk. Without
+                // this guard the typed accessors below throw bad_variant_access
+                // (a null Value's variant holds int64_t). Fix requires a
+                // validity vector on ColumnVector.
+                switch (output_schema_.column(c).type) {
+                    case TypeId::INT:
+                        std::get<std::vector<int64_t>>(out_chunk_.columns[c].data).push_back(0); break;
+                    case TypeId::DOUBLE:
+                        std::get<std::vector<double>>(out_chunk_.columns[c].data).push_back(0.0); break;
+                    case TypeId::STRING:
+                        std::get<std::vector<std::string>>(out_chunk_.columns[c].data).push_back("NULL"); break;
+                }
+                continue;
+            }
             switch (output_schema_.column(c).type) {
                 case TypeId::INT:
                     std::get<std::vector<int64_t>>(out_chunk_.columns[c].data).push_back(v.asInt()); break;
