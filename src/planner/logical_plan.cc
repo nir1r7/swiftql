@@ -289,20 +289,34 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
 }
 
 
+// One expression GROUP BY key, in both identities: `canonical` (exprKey, used
+// for matching so a qualifier difference does not defeat it) and `display`
+// (exprToString, used for the output column name users see).
+struct GroupKeyName {
+    std::string canonical;
+    std::string display;
+};
+
 // depth-first replacement for substituteGroupKeyRefs; stops at AggregateExpr
 // (arguments evaluate pre-aggregate) and at leaves (a plain ColumnRef can
 // never match — expression keys are non-ColumnRef by construction)
-static void substituteInto(std::unique_ptr<Expr>& expr, const std::vector<std::string>& keys) {
+static void substituteInto(std::unique_ptr<Expr>& expr,
+                           const std::vector<GroupKeyName>& keys) {
     if (!expr) return;
     if (dynamic_cast<AggregateExpr*>(expr.get())) return;
     if (dynamic_cast<ColumnRef*>(expr.get()) || dynamic_cast<Literal*>(expr.get())) return;
 
-    std::string s = exprToString(expr.get());
+    // Match on the canonical key (slot-based), but name the synthesized ref with
+    // the GROUP BY expression's display name. That is what lets
+    // SELECT laps.season - 1 ... GROUP BY season - 1 resolve: the two render
+    // differently under exprToString but identically under exprKey, and the
+    // output column is named once, from the group key.
+    std::string s = exprKey(expr.get());
     for (const auto& key : keys) {
-        if (key == s) {
+        if (key.canonical == s) {
             auto ref = std::make_unique<ColumnRef>();
-            ref->column_name = key;     // matches buildAggregateSchema's output name
-            ref->alias = expr->alias;   // preserve a select-item alias
+            ref->column_name = key.display;   // matches buildAggregateSchema's output name
+            ref->alias = expr->alias;         // preserve a select-item alias
             expr = std::move(ref);
             return;
         }
@@ -323,9 +337,9 @@ static void substituteInto(std::unique_ptr<Expr>& expr, const std::vector<std::s
 }
 
 void substituteGroupKeyRefs(SelectStatement& stmt) {
-    std::vector<std::string> keys;
+    std::vector<GroupKeyName> keys;
     for (const auto& g : stmt.group_by) {
-        if (g.expr) keys.push_back(exprToString(g.expr.get()));
+        if (g.expr) keys.push_back({exprKey(g.expr.get()), exprToString(g.expr.get())});
     }
     if (keys.empty()) return;
 

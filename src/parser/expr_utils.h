@@ -36,6 +36,53 @@ inline std::string exprToString(const Expr* expr) {
     return "?";
 }
 
+// Canonical identity string for an expression — for MATCHING, never for display.
+//
+// A ColumnRef renders by its binder-assigned relation slot instead of the
+// as-typed qualifier, so `season` and `laps.season` (both slot 0) produce the
+// same key, while a self-join's `l1.speed` and `l2.speed` (slots 0 and 1) stay
+// distinct. That is exactly the identity the plain-column GROUP BY path already
+// uses — (relation_slot, column_name) — so expression group keys now match the
+// same way. Unbound refs (slot -1) fall back to the as-typed qualifier.
+//
+// Display names stay on exprToString: users see `(season - 1)`, not `(0#season - 1)`.
+inline std::string exprKey(const Expr* expr) {
+    if (!expr) return "?";
+    if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        if (col->relation_slot >= 0)
+            return std::to_string(col->relation_slot) + "#" + col->column_name;
+        return col->table_name.empty()
+            ? col->column_name
+            : col->table_name + "." + col->column_name;
+    }
+    if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+        // Tag the type. Value::toString() renders the DOUBLE 1.0 as "1" (%.15g),
+        // so an untagged key made `GROUP BY season - 1` match
+        // `SELECT season - 1.0` and emit the INT column where SQL says REAL.
+        if (lit->value.isNull()) return "NULL";
+        switch (lit->value.type()) {
+            case TypeId::INT:    return "i" + lit->value.toString();
+            case TypeId::DOUBLE: return "d" + lit->value.toString();
+            case TypeId::STRING: return "s'" + lit->value.toString() + "'";
+        }
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        return "(" + exprKey(bin->left.get()) + " " + bin->op + " "
+                   + exprKey(bin->right.get()) + ")";
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        return "(" + un->op + exprKey(un->operand.get()) + ")";
+    }
+    if (auto* n = dynamic_cast<const IsNullExpr*>(expr)) {
+        return exprKey(n->operand.get()) + (n->is_not_null ? " IS NOT NULL" : " IS NULL");
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        std::string arg = agg->is_star ? "*" : exprKey(agg->argument.get());
+        return agg->function_name + "(" + arg + ")";
+    }
+    return "?";
+}
+
 // Output-column name for a computed aggregate.
 // Contract: schema construction (buildAggregateSchema / buildProjectSchema)
 // and evaluate()'s AggregateExpr lookup must agree byte-for-byte — both call

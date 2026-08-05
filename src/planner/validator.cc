@@ -6,15 +6,18 @@
 namespace {
 
 // Every ColumnRef reachable outside an aggregate must be a GROUP BY column,
-// or sit inside a subtree that textually matches a GROUP BY expression
-// (exprToString on bound ASTs — the same identity the planner's group-key
-// substitution uses). AggregateExpr terminates the walk: its argument is
-// evaluated pre-grouping.
+// or sit inside a subtree matching a GROUP BY expression under exprKey — the
+// slot-based canonical identity, so SELECT laps.season - 1 matches
+// GROUP BY season - 1 (both slot 0). Matching on exprToString instead would
+// compare the as-typed qualifier and reject that pair, while the plain-column
+// path below already matches by (relation_slot, column_name). The planner's
+// group-key substitution uses the same identity.
+// AggregateExpr terminates the walk: its argument is evaluated pre-grouping.
 void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_by) {
     if (!expr) return;
     if (dynamic_cast<const AggregateExpr*>(expr)) return;
     for (const auto& g : group_by) {
-        if (g.expr && exprToString(g.expr.get()) == exprToString(expr)) return;
+        if (g.expr && exprKey(g.expr.get()) == exprKey(expr)) return;
     }
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         for (const auto& g : group_by) {
@@ -29,6 +32,21 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
             }
         }
         throw std::runtime_error("SELECT column '" + col->column_name + "' must appear in GROUP BY or be used in an aggregate function");
+    }
+    // A subtree that matches a group key except for a literal's TYPE is the most
+    // confusing near-miss: exprToString renders the DOUBLE 1.0 as "1", so
+    // `SELECT season - 1.0` with `GROUP BY season - 1` reads as identical text but
+    // is a different expression with a different result type. Treating them as one
+    // key made the projection read the INT group column and truncate — `(season -
+    // 1.0) / 2` returned 1010 instead of 1010.5. Say what actually differs.
+    for (const auto& g : group_by) {
+        if (g.expr && exprToString(g.expr.get()) == exprToString(expr)) {
+            throw std::runtime_error(
+                "GROUP BY expression '" + exprToString(g.expr.get())
+                + "' does not match the SELECT expression: they differ in a literal's "
+                  "type (INT vs DOUBLE), which changes the result type. Write the same "
+                  "literal in both clauses.");
+        }
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
         checkGroupedRefs(bin->left.get(), group_by);

@@ -425,3 +425,104 @@ TEST(LogicalPlan, ExpressionGroupByScanKeepsInputColumns) {
     ASSERT_NE(scan, nullptr);
     EXPECT_TRUE(scan->output_schema.hasColumn("season"));
 }
+
+
+// ============================================================
+// Audit fixes: canonical expression-group-key identity, ordinal
+// rejection, nested aggregates, constant folding
+// ============================================================
+
+// Expression group keys are matched by exprKey (slot-based), not exprToString
+// (as-typed qualifier). All four combinations of qualifying/not-qualifying in
+// SELECT, GROUP BY, HAVING, and ORDER BY must therefore agree, as they do in
+// SQLite. Matching on the rendered text rejected every mismatched pair, and
+// qualifying in SELECT but not GROUP BY is routine in TPC-H.
+TEST(GroupKeyIdentity, QualifierMismatchStillMatches) {
+    Catalog cat(CATALOG);
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT laps.season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY laps.season - 1", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1 "
+        "HAVING laps.season - 1 > 2021", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1 "
+        "ORDER BY laps.season - 1", cat));
+}
+
+// The output column is named from the GROUP BY expression regardless of how the
+// SELECT list wrote it, so the aggregate schema and the substituted reference
+// can never disagree.
+TEST(GroupKeyIdentity, OutputColumnNamedFromTheGroupKey) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT laps.season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat);
+    const LogicalPlanNode* agg = findNode(plan.get(), LogicalNodeType::AGGREGATE);
+    ASSERT_NE(agg, nullptr);
+    // named from the GROUP BY expression, which was written unqualified
+    EXPECT_EQ(agg->output_schema.column(0).name, "(season - 1)");
+}
+
+// exprKey renders a ColumnRef by relation slot, so a self-join's two
+// occurrences stay distinct: SELECT l1.season - 1 with GROUP BY l2.season - 1 is
+// a different key and must still be rejected. This is the non-regression that
+// stops the fix from over-matching.
+TEST(GroupKeyIdentity, SelfJoinSidesStayDistinct) {
+    Catalog cat(CATALOG);
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT l1.grp - 1 AS a, COUNT(*) FROM sj l1 JOIN sj l2 ON l1.id = l2.id "
+        "GROUP BY l1.grp - 1", cat));
+    EXPECT_THROW(buildLogical(
+        "SELECT l1.grp - 1 AS a, COUNT(*) FROM sj l1 JOIN sj l2 ON l1.id = l2.id "
+        "GROUP BY l2.grp - 1", cat), std::runtime_error);
+}
+
+
+// exprKey tags a literal with its type. Value::toString() renders the DOUBLE 1.0
+// as "1", so an untagged key made `GROUP BY season - 1` match
+// `SELECT season - 1.0`: the projection then read the INT group-key column and
+// `(season - 1.0) / 2` truncated to 1010 instead of 1010.5. Silently wrong
+// arithmetic, not a display difference — so the mismatch is now an error that
+// names the actual cause.
+TEST(GroupKeyIdentity, LiteralTypeIsPartOfTheKey) {
+    Catalog cat(CATALOG);
+    // matched types on both sides: fine, either way round
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1.0 AS s, COUNT(*) FROM laps GROUP BY season - 1.0", cat));
+
+    // mismatched literal types are a different expression
+    EXPECT_THROW(buildLogical(
+        "SELECT season - 1.0 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat),
+        std::runtime_error);
+    EXPECT_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1.0", cat),
+        std::runtime_error);
+}
+
+// The near-miss message has to name the literal type, not report a missing
+// GROUP BY column — that was the confusing symptom.
+TEST(GroupKeyIdentity, LiteralTypeMismatchExplainsItself) {
+    Catalog cat(CATALOG);
+    try {
+        buildLogical("SELECT season - 1.0 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat);
+        FAIL() << "expected a runtime_error";
+    } catch (const std::runtime_error& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("literal's type"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("(season - 1)"), std::string::npos) << msg;
+    }
+}
+
+// A DOUBLE group key keeps its own type through to the output column, so
+// downstream arithmetic stays DOUBLE.
+TEST(GroupKeyIdentity, DoubleGroupKeyStaysDouble) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT season - 1.0 AS s, COUNT(*) FROM laps GROUP BY season - 1.0", cat);
+    const LogicalPlanNode* agg = findNode(plan.get(), LogicalNodeType::AGGREGATE);
+    ASSERT_NE(agg, nullptr);
+    EXPECT_EQ(agg->output_schema.column(0).type, TypeId::DOUBLE);
+}
