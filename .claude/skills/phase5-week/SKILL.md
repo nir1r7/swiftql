@@ -1,49 +1,71 @@
 ---
 name: phase5-week
-description: Run one full Phase 5 week of SwiftQL development as an orchestrated teach → implement → audit → fix cycle, with orchestrator-run verification gates between every stage, then split the week into conventional commits and push to main. Use when advancing the README's Phase 5 week plan (weeks 26–36), invoked as `/phase5-week <week>`.
+description: Run SwiftQL's Phase 5 week plan as an auto-advancing orchestrated cycle — teach, implement, audit, fix, commit, next week — with every bulk-text step delegated to a subagent that writes to a file and returns a short summary, so one orchestrator can carry weeks 26 through 36 without exhausting context. Use when advancing the README's Phase 5 plan, invoked as `/phase5-week <start-week>`.
 ---
 
 # Phase 5 Week Cycle
 
-You are the **orchestrator**. You do not write engine code. You launch subagents, run the
-verification gates yourself, keep durable state, and own the commit split.
+You are the **orchestrator**. You do not write engine code, do not run builds, do not read
+diffs, and do not read audits. You launch subagents, keep durable state, and decide what
+happens next.
 
-The single rule that makes this work: **a subagent's claim that tests pass is not evidence.**
-You run the gates. If gate output is not in your context, the week is not verified.
+Invoked as `/phase5-week <start-week>` — e.g. `/phase5-week 26`. Phase is always 5. The cycle
+**auto-advances** through Week 36 and then runs the seam audit. Week 37 belongs to the user.
 
-Invoked as `/phase5-week <week>` — e.g. `/phase5-week 26`. Phase is always 5.
+## The two rules that make this work
+
+1. **Nothing verifies its own work.** The agent that writes code never reports whether it
+   passes. A separate verifier with no stake runs the gates and returns exact counts. This is
+   the same reason your auditor is a different agent than your implementer.
+2. **Bulk text goes to a file, never to the orchestrator.** Teaching docs, audits, gate logs,
+   and diffs are written to disk by the subagent that produces them, and the next subagent is
+   pointed at the path. You receive a summary of **≤10 lines** from every subagent. Anything
+   longer means the prompt asked for the wrong thing — tighten it, don't absorb it.
+
+Eleven weeks fit in one orchestrator only if rule 2 holds every single time. Your per-week
+context budget is roughly 80 lines. Guard it.
 
 ---
 
-## Before starting
+## Layout
 
-1. Read `README.md` → the section for this week, and the `37-Week Plan` row. The week's
-   **checkpoint line in the README is the bar**, not TPC-H 22/22 (weeks 26–34 have no TPC-H
-   data — the harness lands in Week 35, so 22/22 is unmeasurable before Week 36).
-2. Read any "Starting notes" / "Carried into Week N" blocks addressed to this week. Weeks 24
-   and 25 left real hazards for later weeks; they are the highest-value input the agent gets.
-3. Confirm the tree is clean (`git status`) and you are on `main`.
-4. Open or create `scratchpad/phase5-state.md` (see **State** below). Your own context will be
-   compacted across a long week — the file is what survives.
-
----
+```
+docs/week-<y>-plan.md                    teaching output (a project artifact, committed)
+scratchpad/phase5-state.md               orchestrator state — authoritative, survives compaction
+scratchpad/gates/week-<y>-round-<n>.log  raw gate output
+scratchpad/audits/week-<y>-round-<n>.md  raw audit
+scratchpad/week-<y>-round-<n>.patch      round snapshot, deleted after the week is pushed
+```
 
 ## State
 
-Keep `scratchpad/phase5-state.md` current. Update it after every gate run and every round.
+`scratchpad/phase5-state.md` is authoritative. Rewrite it after every step. If your context is
+compacted mid-run, re-read it and resume from `Current` — it is the reason a fresh session can
+pick this up.
 
 ```markdown
 # Phase 5 orchestrator state
-Current: week <y>, round <n>
-Gates: build ✅ | unit ✅ (524) | sqlite ✅ | regression ✅   (last run: after round 2 fixes)
-Snapshots: scratchpad/week-<y>-round-1.patch, ...
+Current: week <y>, round <n>, step <step name>
+Weeks done: 26 ✅ 27 ✅ ...
+Last gate: GREEN (week 27 round 3) | RED — <one line>
 Deferred to later weeks: <item> → Week <n> (noted in README)
 Open concerns: <anything unresolved>
 ```
 
+Keep it under 25 lines. It is a resume point, not a log.
+
 ---
 
-## The cycle
+## Per-week cycle
+
+### Before the week
+
+Read only the README section for this week and its `37-Week Plan` row — not the whole README.
+Confirm `git status` is clean and you are on `main`. Note any "Starting notes" or "Carried into
+Week `<y>`" block so you can point Agent A at it by name.
+
+The week's bar is the **README's own checkpoint**. TPC-H 22/22 is unmeasurable before Week 36
+(the data harness lands in Week 35), so it is design context, not this week's deliverable.
 
 ### Step 1 — Agent A teaches
 
@@ -76,140 +98,194 @@ Launch Agent A. Substitute `<y>`; phase is 5.
 > decisions, not as this week's deliverable. Do not build anything this week's checkpoint does
 > not require.
 >
-> Write your full teaching output to `docs/week-<y>-plan.md` as well as returning it.
+> Write your full teaching output to `docs/week-<y>-plan.md`. Do NOT repeat it in your reply.
+> Reply with only: the file path, and a numbered list of the task headings you covered. Ten
+> lines maximum.
 
-**Persist the plan.** It is the most expensive artifact in the cycle. If A degrades later, a
-fresh agent can resume from the file instead of re-reading the README and re-deriving the plan.
+The plan lives on disk. You never read it — Agent A reads its own file in the next step, and
+the human reads it whenever they like.
 
 ### Step 2 — Agent A implements
 
-Same agent, follow-up message:
+Same agent, follow-up:
 
-> Implement the plan that you described above. Implement all changes on the main branch, do not
-> commit anything and do not create any new branches. Provide a brief high level summary of the
-> changes made. Make sure to update the regression tests and regression queries where
-> applicable and run them all as verification.
+> Implement the plan you wrote to `docs/week-<y>-plan.md`. Implement all changes on the main
+> branch, do not commit anything and do not create any new branches. Make sure to update the
+> regression tests and regression queries where applicable.
 >
 > Any new query you add must go into `python_tools/compare_against_sqlite.py` (the external
 > oracle), not only `python_tools/test_new_queries.py`. Never weaken either harness to make
 > something pass.
+>
+> Do not report whether tests pass — a separate verifier owns that. Reply with a high level
+> summary of the changes, ten lines maximum, listing the files touched by layer.
 
-The second paragraph is not optional. `test_new_queries.py` is authored by the same agent whose
-work it validates; `compare_against_sqlite.py` diffs against real SQLite. Only the second is an
-independent oracle, and a wrong expectation baked in this week becomes the baseline every later
-week trusts.
+The SQLite-oracle paragraph is load-bearing. `test_new_queries.py` is authored by the same
+agent whose work it validates; only `compare_against_sqlite.py` diffs against real SQLite. A
+wrong expectation baked in this week becomes the baseline every later week trusts.
 
-### Step 3 — GATE + snapshot
+The last paragraph is also load-bearing — an implementer that self-reports green is the exact
+failure mode this design exists to prevent.
 
-**You run this, not an agent.**
+### Step 3 — Verifier subagent (GATE)
 
-1. Invoke the `verify` skill. Record the pass/fail table in state.
-2. `git diff > scratchpad/week-<y>-round-1.patch` (also `git status` for new files —
-   use `git add -N .` first so untracked files appear in the diff).
+Fresh agent, no shared context with A. It has one job and no authority to fix anything.
 
-If a gate fails, hand the raw failure back to Agent A and re-run the gate. Do not proceed to
-audit on a red tree — auditors waste their pass on symptoms of a known break.
+> Run the `verify` skill on the current working tree. Do not fix, modify, or comment on any
+> code — you are a measurement instrument, not a reviewer.
+>
+> Write the complete raw output of every gate to `scratchpad/gates/week-<y>-round-<n>.log`.
+>
+> Reply with exactly this block and nothing else. Report real numbers taken from the output —
+> never "all tests pass", never a count you did not read:
+>
+> ```
+> GATE week <y> round <n>
+> build:      PASS | FAIL — <first error line>
+> unit:       PASS (<passed>/<total>) | FAIL (<n> failed: <test names>)
+> sqlite:     PASS (<n> queries) | FAIL (<query>, mode <mode>)
+> regression: PASS (<n> queries, all modes) | FAIL (<query>, mode <mode>)
+> VERDICT:    GREEN | RED
+> log:        scratchpad/gates/week-<y>-round-<n>.log
+> ```
 
-### Step 4 — Agent B audits (full)
+Then snapshot, yourself — it is two cheap commands:
 
-Fresh agent, no shared context with A. Single prompt:
+```bash
+git add -N . && git diff > scratchpad/week-<y>-round-<n>.patch
+```
+
+`git add -N` first, or new files are silently absent from the patch and the snapshot is
+worthless exactly when you need it.
+
+**On RED:** send Agent A the verdict block plus the log path — not the log contents — and tell
+it to fix and stop short of re-running gates. Then re-run the verifier at the same round
+number. Never proceed to audit on a red tree; auditors waste their pass on symptoms of a known
+break. If three consecutive gate runs are RED, stop the whole cycle and surface it to the user
+— something is wrong that another fix round will not solve.
+
+### Step 4 — Agent B audits
+
+Fresh agent, no shared context with A.
 
 > - Audit the uncommitted work that the previous agent has made
 > - Use the readme as high level guidance
 > - Manually trace through the code to look for issues
 > - Report all issues with severity markings
+>
+> Write the full audit to `scratchpad/audits/week-<y>-round-<n>.md`. Do NOT repeat it in your
+> reply. Reply with only the file path and a severity tally, e.g.
+> `2 blocker, 3 major, 5 minor — scratchpad/audits/week-<y>-round-1.md`. Two lines maximum.
 
-### Step 5 — Agent A fixes
-
-Paste Agent B's output **verbatim** — do not summarize an audit. In the same prompt:
-
-> - Read the audit and all the issues
-> - Verify all the issues and identify those that require action
-> - Take the steps and actions necessary to implement the changes on main (do not commit)
-> - Provide a summary of the changes made
-> - Make any small notes in the readme plan for future weeks (ONLY IF REQUIRED, the preference
->   is to resolve as much as possible in the current session). A handoff note is a real
->   deliverable, not a concession — the Week 26 "Starting notes" and the "Carried into Week 36"
->   block are why later weeks start with hazards enumerated instead of discovered. Write one
->   when a decision genuinely belongs to a later week; do not write one to avoid work.
-
-### Step 6 — GATE + snapshot
-
-Run `verify` again. Snapshot to `scratchpad/week-<y>-round-2.patch`. Update state.
-
-### Step 7 — Agent B audits (blockers only)
-
-Fresh agent. Same prompt as Step 4, plus:
+On the **second** audit (round 2) and any later one, append:
 
 > Focus only on blockers and real logic issues — correctness, invariant violations, crashes,
 > wrong results, silent dispatch-site omissions. Do not report style, naming, or minor
 > inconveniences.
 
-Then repeat Step 5 (fix) and Step 6 (gate + snapshot as round 3).
+### Step 5 — Agent A fixes
 
-### Step 8 — Third audit, your judgment
+The audit reaches A through the file, not through you. This preserves exactly what
+copy-pasting was for — A sees the audit verbatim, unsummarized — while costing you two lines
+instead of two full audits.
 
-Read Agent A's most recent response. Run one more audit+fix round if any of these hold:
+> Read `scratchpad/audits/week-<y>-round-<n>.md` in full.
+>
+> - Verify all the issues and identify those that require action
+> - Take the steps and actions necessary to implement the changes on main (do not commit)
+> - Make any small notes in the readme plan for future weeks (ONLY IF REQUIRED, the preference
+>   is to resolve as much as possible in the current session). A handoff note is a real
+>   deliverable, not a concession — the Week 26 "Starting notes" and the "Carried into Week 36"
+>   block are why later weeks start with hazards enumerated instead of discovered. Write one
+>   when a decision genuinely belongs to a later week; do not write one to avoid work.
+>
+> Do not report whether tests pass. Reply with ten lines maximum: which issues you actioned,
+> which you rejected and why, and anything you deferred to a later week.
 
-- A's fix round changed planner, execution, or storage code (not just tests/docs)
-- A deferred anything to a later week
-- The audit surfaced a disagreement A resolved by reasoning rather than by running something
-- Gates passed only after more than one fix attempt
+### Step 6 — Repeat
 
-Otherwise proceed. Snapshot after any extra round.
+Gate (Step 3, round 2) → audit (Step 4, blockers-only) → fix (Step 5) → gate (round 3).
 
-### Step 9 — Commit split + push
+### Step 7 — Third round, by checklist
 
-Final `verify` run must be green before anything is committed.
+Run one more audit+fix+gate round if **any** of these hold. Use the checklist, not your
+judgment — judgment degrades over a long session in a way a checklist does not:
 
-Split the week's diff into conventional commits, matching the existing history (`git log`
-shows the pattern from Week 25). Order by pipeline layer so each commit is coherent:
+- The last fix round changed planner, execution, or storage code (not just tests/docs)
+- Agent A deferred anything to a later week
+- Agent A rejected an audit finding by reasoning rather than by running something
+- A gate went RED more than once this week
 
-```
-feat(common):    shared helpers / value / date utils
-feat(parser):    lexer, AST, grammar
-feat(planner):   binder, validator, logical plan, optimizer passes, physical planning
-feat(execution): volcano + vectorized nodes, evaluators
-feat(storage):   columnar layout, encodings, pruning
-test:            unit tests
-test(harness):   python_tools regression + SQLite queries
-docs:            README, development.md, docs/*
-```
+### Step 8 — Commit split subagent
 
-Use `fix(...)` for corrections to existing behaviour, `perf(...)` for measured speedups.
-Skip layers the week did not touch. Then:
+Only on a GREEN gate. Delegate — the week's diff is far too large for you to hold.
+
+> All Phase 5 Week `<y>` work is uncommitted on `main` and has passed verification. Split it
+> into conventional commits matching the existing history (see `git log` for the Week 25
+> pattern). Order by pipeline layer so each commit is coherent and independently sensible:
+>
+> ```
+> feat(common):    shared helpers / value / date utils
+> feat(parser):    lexer, AST, grammar
+> feat(planner):   binder, validator, logical plan, optimizer passes, physical planning
+> feat(execution): volcano + vectorized nodes, evaluators
+> feat(storage):   columnar layout, encodings, pruning
+> test:            unit tests
+> test(harness):   python_tools regression + SQLite queries
+> docs:            README, development.md, docs/*
+> ```
+>
+> Use `fix(...)` for corrections to existing behaviour, `perf(...)` for measured speedups. Skip
+> layers this week did not touch. Include `docs/week-<y>-plan.md` in the `docs:` commit. Do not
+> commit anything under `scratchpad/`. Every change in the working tree must land in exactly
+> one commit — leave nothing uncommitted.
+>
+> Then push: `git push -u origin main`. On network failure retry up to 4 times with exponential
+> backoff (2s, 4s, 8s, 16s).
+>
+> Reply with the output of `git log --oneline` for your commits and `git status --short`.
+> Nothing else.
+
+Confirm yourself with one cheap call — `git status --short` must be empty:
 
 ```bash
-git push -u origin main
+git status --short && git log --oneline -1
 ```
 
-Retry network failures up to 4 times with exponential backoff (2s, 4s, 8s, 16s).
+If the tree is not clean, the split dropped something. Send it back to the same agent.
 
-Delete that week's snapshot patches once pushed. Clear the round state, set `Current` to the
-next week, and carry forward any deferred items.
+### Step 9 — Advance
 
----
+Delete this week's snapshots (`rm -f scratchpad/week-<y>-round-*.patch`). Gate logs and audits
+are small — keep them for the run.
 
-## Advancing weeks
+Update state: mark the week done, carry forward deferred items, set `Current` to the next week.
 
-Re-read the README to pick the next week rather than assuming `+1` — the plan has inserted
-fractional weeks before (Week 23.5). Weeks 26–36 are currently all integers.
+Then **re-read the README** to pick the next week rather than assuming `+1` — the plan has
+inserted fractional weeks before (Week 23.5). Weeks 26–36 are currently all integers.
 
-Stop after **Week 36**. Week 37 is the user's.
-
-**Week 36 is not one iteration.** It is where every deferred gap lands at once — the
-`extract(year from d)` STRING-vs-integer decision, the masked-evaluation `CASE` kernel, the
-`SUM`-in-`double` precision declaration, and whatever weeks 26–35 handed forward. It is also
-the first week TPC-H 22/22 is measurable at all. Budget several cycles, one coherent group of
-queries at a time, and treat the deferral list in state as its work queue.
+Loop to Step 1. After Week 36, go to the seam audit.
 
 ---
 
-## Final phase audit (after Week 36)
+## Week 36 is not one iteration
+
+It is where every deferred gap lands at once — the `extract(year from d)` STRING-vs-integer
+decision, the masked-evaluation `CASE` kernel, the `SUM`-in-`double` precision declaration, and
+whatever weeks 26–35 hand forward. It is also the first week TPC-H 22/22 is measurable at all.
+
+Run the cycle repeatedly on Week 36, one coherent group of queries per iteration, using the
+deferred-items list in state as the work queue. Commit and push each iteration. Move on when
+the gate is GREEN and the deferred list is empty.
+
+---
+
+## Final seam audit (after Week 36)
 
 Do **not** run one auditor per week. Each week already had 2–3 audits; a week-shaped auditor
 re-treads covered ground. What has never been audited is the **seams between weeks**. Launch
-these in parallel, each with the matching project skill:
+these five in parallel, each with the matching project skill, each writing to
+`scratchpad/audits/seam-<name>-pass-<n>.md` and replying with a path plus severity tally:
 
 | Auditor | Scope | Skill |
 |---|---|---|
@@ -219,16 +295,25 @@ these in parallel, each with the matching project skill:
 | Optimizer preservation | optimized ≡ `--no-optimize` ≡ SQLite across the whole Phase 5 query surface; estimate quality on multi-join plans | `optimizer-diff` |
 | Storage | Any Phase 5 change reaching chunks, pruning, or reconstruction | `storage-verify` |
 
-Fix findings using the Step 5 prompt shape. Re-run the full `verify` gate after each fix round.
+Fix findings with the Step 5 prompt shape, one agent per auditor that found blockers, pointed
+at that auditor's file. Gate (Step 3) after each fix round, then commit and push (Step 8).
 Repeat the seam pass up to 5 times, stopping as soon as a pass returns no blockers.
+
+Then stop and report to the user. Week 37 is theirs.
 
 ---
 
 ## Done criteria for a week
 
-- `verify` green on the final tree — build, 524+ unit tests, SQLite oracle, regression harness
-  in all modes including the optimizer invariant
-- The README checkpoint for that week is actually met, not asserted
-- New queries present in `compare_against_sqlite.py`, neither harness weakened
-- Commits split by layer, pushed to `main`
-- State file updated; snapshots deleted; deferred items recorded in both state and README
+- Verifier returned `VERDICT: GREEN` on the final tree, with real counts
+- The README checkpoint for that week is met, not asserted
+- New queries present in `compare_against_sqlite.py`; neither harness weakened
+- Commits split by layer and pushed to `main`; `git status --short` empty
+- State updated, snapshots deleted, deferred items recorded in both state and README
+
+## If you are losing context
+
+The state file plus the on-disk artifacts are a complete resume point. Tell the user which week
+and step you are on and that a fresh session can continue from
+`scratchpad/phase5-state.md` — do not try to push through a compaction mid-week and guess at
+what you already did.

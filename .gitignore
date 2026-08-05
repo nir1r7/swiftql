@@ -52,6 +52,9 @@ data/*.csv
 # macOS filesystem files
 .DS_Store
 
+# Orchestrator working files (phase5-week skill): gate logs, audits, round snapshots
+scratchpad/
+
 # Misc local/accidental folders
 %HOME/
 
