@@ -3001,3 +3001,66 @@ TEST(VecLimit, TruncationKeepsValidityAligned) {
     EXPECT_TRUE(rows[0][0].isNull());
     EXPECT_EQ(rows[1][0].asInt(), 6);
 }
+
+
+// ===== Aggregate result types: MIN/MAX preserve the argument type =====
+// Non-COUNT aggregates were typed DOUBLE unconditionally, so MIN/MAX over a
+// STRING column declared a DOUBLE output column and then threw
+// bad_variant_access in the typed accessor. MIN/MAX are order statistics:
+// they return an element of the input domain.
+
+TEST(VecHashAggregate, MinMaxOverStringColumn) {
+    Schema schema = vecSchema({{"team", TypeId::STRING}});
+    std::vector<Row> input = {
+        {Value(std::string("Mercedes"))},
+        {Value(std::string("AlphaTauri"))},
+        {Value(std::string("Williams"))},
+    };
+
+    AggregateSpec min_spec;
+    min_spec.function = "MIN";
+    min_spec.is_star = false;
+    min_spec.column = "team";
+    min_spec.output_name = "MIN(team)";
+
+    AggregateSpec max_spec;
+    max_spec.function = "MAX";
+    max_spec.is_star = false;
+    max_spec.column = "team";
+    max_spec.output_name = "MAX(team)";
+
+    Schema out_schema = vecSchema({{"MIN(team)", TypeId::STRING}, {"MAX(team)", TypeId::STRING}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<GroupByColumn>{},
+        std::vector<AggregateSpec>{min_spec, max_spec}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asString(), "AlphaTauri");
+    EXPECT_EQ(rows[0][1].asString(), "Williams");
+}
+
+
+TEST(VecHashAggregate, MinMaxOverIntColumnStaysInt) {
+    Schema schema = vecSchema({{"season", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(2024))}, {Value(int64_t(2022))}, {Value(int64_t(2025))},
+    };
+
+    AggregateSpec min_spec;
+    min_spec.function = "MIN";
+    min_spec.is_star = false;
+    min_spec.column = "season";
+    min_spec.output_name = "MIN(season)";
+
+    Schema out_schema = vecSchema({{"MIN(season)", TypeId::INT}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<GroupByColumn>{},
+        std::vector<AggregateSpec>{min_spec}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 2022);
+}
+
+

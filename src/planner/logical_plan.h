@@ -142,6 +142,16 @@ struct LogicalLimit : LogicalPlanNode {
 // same slot-first column resolution, same INT-as-boolean convention.
 TypeId inferExprType(const Expr* expr, const Schema& schema);
 
+// Result type of an aggregate, as a function of the function AND its argument
+// type. COUNT is always INT. MIN/MAX are order statistics — they return an
+// element of the input domain, so they preserve the argument type (including
+// STRING; typing them DOUBLE made MIN(team) throw bad_variant_access at the
+// materialization point). SUM/AVG accumulate in double, a deliberate divergence
+// from SQLite's INT-preserving SUM: the harness compares numerically, and one
+// accumulator type keeps the aggregate nodes simple.
+// `arg_type` is ignored for COUNT and for star aggregates.
+TypeId aggregateResultType(const std::string& function, TypeId arg_type);
+
 // narrowed scan schema for one table: only columns the query references;
 // returns full_schema unchanged for SELECT *
 Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);

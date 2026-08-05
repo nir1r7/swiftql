@@ -44,6 +44,28 @@ static Schema narrowSchema(const Schema& full, const std::unordered_set<std::str
 }
 
 
+TypeId aggregateResultType(const std::string& function, TypeId arg_type) {
+    if (function == "COUNT") return TypeId::INT;
+    if (function == "MIN" || function == "MAX") return arg_type;
+    return TypeId::DOUBLE;   // SUM, AVG — see the header for why SUM is not INT
+}
+
+
+// Argument type of an aggregate spec, for aggregateResultType. Prefers the
+// general argument expression; falls back to the plain-ColumnRef fast path
+// (spec.column), resolved slot-first like everywhere else. COUNT(*) and specs
+// whose argument cannot be resolved report INT, which only COUNT consumes.
+static TypeId specArgType(const AggregateSpec& spec, const Schema& table_schema) {
+    if (spec.is_star) return TypeId::INT;
+    if (spec.argument) return inferExprType(spec.argument, table_schema);
+    if (spec.column.empty()) return TypeId::INT;
+    int idx = spec.relation_slot >= 0
+        ? table_schema.indexOf(spec.column, spec.relation_slot) : -1;
+    if (idx < 0) idx = table_schema.indexOf(spec.column);
+    return idx >= 0 ? table_schema.column(idx).type : TypeId::INT;
+}
+
+
 TypeId inferExprType(const Expr* expr, const Schema& schema) {
     if (auto* lit = dynamic_cast<const Literal*>(expr)) {
         return lit->value.type();
@@ -59,7 +81,18 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
         return schema.column(idx).type;
     }
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
-        return agg->function_name == "COUNT" ? TypeId::INT : TypeId::DOUBLE;
+        // Post-aggregate schemas already carry this aggregate's output column
+        // with its resolved type (buildAggregateSchema is the single source of
+        // truth). Prefer it so inference can never disagree with what the
+        // aggregate node actually produced — this is the path taken by
+        // expressions over aggregates, e.g. SUM(a) / SUM(b) in a projection.
+        int idx = schema.indexOf(aggregateOutputName(agg));
+        if (idx >= 0) return schema.column(idx).type;
+        // pre-aggregate context (hand-built trees in tests): derive from the
+        // argument against the input schema
+        TypeId arg = (agg->is_star || !agg->argument)
+            ? TypeId::INT : inferExprType(agg->argument.get(), schema);
+        return aggregateResultType(agg->function_name, arg);
     }
     if (dynamic_cast<const IsNullExpr*>(expr)) {
         return TypeId::INT;   // boolean-as-INT convention
@@ -123,10 +156,17 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
                 cols.push_back({col->column_name, TypeId::STRING});
             }
         } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr.get())) {
-            // aggregates on numeric columns produce DOUBLE
-            // COUNT always produces INT
-            TypeId result_type = (agg->function_name == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-            cols.push_back({aggregateOutputName(agg), result_type});
+            // the aggregate node below already emitted this column with its
+            // resolved result type; reuse it so project and aggregate can never
+            // disagree. table_schema here is the POST-aggregate schema, so
+            // re-inferring from agg->argument would fail — the argument's base
+            // column no longer exists at this level.
+            std::string agg_name = aggregateOutputName(agg);
+            int agg_idx = table_schema.indexOf(agg_name);
+            TypeId result_type = agg_idx >= 0
+                ? table_schema.column(agg_idx).type
+                : aggregateResultType(agg->function_name, TypeId::DOUBLE);
+            cols.push_back({agg_name, result_type});
         } else {
             // general expression (arithmetic, expr over aggregates): name from
             // exprToString, type from inference — never STRING-by-default
@@ -182,8 +222,8 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
     // one output column per aggregate, in spec order (SELECT-list aggregates
     // first, then hidden HAVING/ORDER-BY-only aggregates at the tail)
     for (const auto& spec : aggregates) {
-        TypeId result_type = (spec.function == "COUNT") ? TypeId::INT : TypeId::DOUBLE;
-        ColumnDef def{spec.output_name, result_type};
+        ColumnDef def{spec.output_name,
+                      aggregateResultType(spec.function, specArgType(spec, table_schema))};
         def.hidden = spec.hidden;
         cols.push_back(def);
     }

@@ -161,20 +161,20 @@ void VecHashAggregateNode::consumeAll() {
 
                 Accumulator::SpecAccum& sa = acc.per_spec[i];
                 sa.non_null_count++;
-                double d = toDouble(val);
 
                 if (spec.function == "SUM" || spec.function == "AVG") {
-                    sa.sum += d;
+                    sa.sum += toDouble(val);
                 }
+                // MIN/MAX are order statistics: they return an element of the
+                // input domain, so they keep the argument's own Value (and type,
+                // per aggregateResultType) instead of coercing to double.
+                // Value's comparison operators coerce INT/DOUBLE and compare
+                // STRING lexicographically, matching SQLite.
                 if (spec.function == "MIN") {
-                    if (sa.min_val.isNull() || d < toDouble(sa.min_val)){
-                        sa.min_val = Value(d);
-                    }
+                    if (sa.min_val.isNull() || val < sa.min_val) sa.min_val = val;
                 }
                 if (spec.function == "MAX") {
-                    if (sa.max_val.isNull() || d > toDouble(sa.max_val)){
-                        sa.max_val = Value(d);
-                    }
+                    if (sa.max_val.isNull() || val > sa.max_val) sa.max_val = val;
                 }
             }
         }

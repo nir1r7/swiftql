@@ -272,15 +272,18 @@ void HashAggregateNode::open() {
                 // skip NULLs (except COUNT(*))
                 if (!val.isNull()) {
                     acc.non_null_count++;
-                    double d = toDouble(val);
                     if (spec.function == "SUM" || spec.function == "AVG") {
-                        acc.sum += d;
+                        acc.sum += toDouble(val);
                     }
+                    // MIN/MAX are order statistics: they return an element of
+                    // the input domain, so they keep the argument's own Value
+                    // (and type, per aggregateResultType) rather than coercing
+                    // to double, which crashed on STRING columns.
                     if (spec.function == "MIN") {
-                        if (acc.min_val.isNull() || d < toDouble(acc.min_val)) acc.min_val = Value(d);
+                        if (acc.min_val.isNull() || val < acc.min_val) acc.min_val = val;
                     }
                     if (spec.function == "MAX") {
-                        if (acc.max_val.isNull() || d > toDouble(acc.max_val)) acc.max_val = Value(d);
+                        if (acc.max_val.isNull() || val > acc.max_val) acc.max_val = val;
                     }
                 }
             }
