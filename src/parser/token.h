@@ -8,8 +8,20 @@ enum class TokenType {
     LIMIT, DISTINCT, JOIN, ON, IS, NOT, AND, OR, AS, ASC, DESC,
     NULL_KW, // NULL_KW because NULL is reserved in C++
 
+    // Week 25 predicates. Interval units (day/month/year) are deliberately NOT
+    // tokens: they are matched as IDENTIFIER text so `year` stays usable as a
+    // column name (TPC-H Q7/Q8/Q9 alias o_year / l_year).
+    BETWEEN, LIKE, IN,
+    CASE, WHEN, THEN, ELSE, END,
+
     // aggregate functions
     COUNT, SUM, AVG, MIN, MAX,
+
+    // Week 25 scalar function + literal syntaxes
+    SUBSTRING,   // SUBSTRING(x FROM a FOR b) / SUBSTRING(x, a, b)
+    FOR,         // only meaningful inside SUBSTRING
+    DATE,        // DATE 'YYYY-MM-DD'
+    INTERVAL,    // INTERVAL 'n' day|month|year
 
     // literals
     INT_LITERAL,     // i.e, 2025

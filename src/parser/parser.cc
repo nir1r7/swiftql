@@ -1,6 +1,46 @@
 
 #include "parser.h"
+#include "expr_utils.h"
+#include "common/date_util.h"
 #include <string.h>
+
+namespace {
+
+// One message for both NOT rejection sites: the leading position in
+// parsePrimary (`WHERE NOT x = 1`, what users write) and the postfix lookahead
+// in parseCompare (`WHERE x NOT 5`). `IS NOT NULL` is listed because it is a
+// supported form worth naming, even though it is consumed by parseCompare's IS
+// branch and never reaches either site.
+const char* const kNotSupportMessage =
+    "NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL";
+
+std::string upperCase(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
+}
+
+// An IN list element must be a constant. Accepts a Literal or a negated
+// numeric Literal (-1), which is what parseUnary produces; everything else is
+// rejected so the executor can hash the set once at compile time.
+bool constantValue(const Expr* expr, Value& out) {
+    if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+        if (lit->value.isNull()) return false;
+        out = lit->value;
+        return true;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        if (un->op != "-") return false;
+        auto* lit = dynamic_cast<const Literal*>(un->operand.get());
+        if (!lit || lit->value.isNull()) return false;
+        if (lit->value.type() == TypeId::INT)    { out = Value(-lit->value.asInt());    return true; }
+        if (lit->value.type() == TypeId::DOUBLE) { out = Value(-lit->value.asDouble()); return true; }
+        return false;
+    }
+    return false;
+}
+
+} // namespace
 
 
 Parser::Parser(const std::string& input): lexer_{input} {
@@ -216,6 +256,90 @@ std::unique_ptr<Expr> Parser::parseCompare(){
         return node;
     }
 
+    // NOT BETWEEN / NOT LIKE / NOT IN. One-token lookahead: current_ is NOT, so
+    // lexer_.peek() is the token after it. A NOT in this position that is not
+    // one of the three is rejected here rather than left to confuse the caller —
+    // general NOT is not part of the grammar (readme.md documents it).
+    bool negated = false;
+    if (check(TokenType::NOT)) {
+        TokenType after = lexer_.peek().type;
+        if (after != TokenType::BETWEEN && after != TokenType::LIKE && after != TokenType::IN) {
+            throw ParseError(kNotSupportMessage, current_);
+        }
+        consume();
+        negated = true;
+    }
+
+    if (check(TokenType::BETWEEN)) {
+        consume();
+        // Bounds parse at the ADDITIVE level, never parseExpr(): BETWEEN binds
+        // tighter than AND, so `a BETWEEN 1 AND 2 AND b > 3` must leave the
+        // second AND for parseAndExpr. parseExpr() here would swallow it.
+        auto lower = parseAdditive();
+        expect(TokenType::AND, "AND in BETWEEN");
+        auto upper = parseAdditive();
+
+        // Desugar rather than add a BetweenExpr node. The desugared shape is
+        // what splitConjuncts, ChunkPruner, scanColumn and selectivity() all
+        // pattern-match on, so both bounds get pushdown, zone-map pruning, the
+        // tight typed loop and range estimation. A node would forfeit all four.
+        // NOT BETWEEN uses De Morgan, which is valid in the Kleene three-valued
+        // logic both evaluators implement.
+        // cloneExpr before binding: the binder then stamps both copies.
+        auto lo = std::make_unique<BinaryExpr>();
+        lo->op = negated ? "<" : ">=";
+        lo->left  = cloneExpr(left.get());
+        lo->right = std::move(lower);
+
+        auto hi = std::make_unique<BinaryExpr>();
+        hi->op = negated ? ">" : "<=";
+        hi->left  = std::move(left);
+        hi->right = std::move(upper);
+
+        auto node = std::make_unique<BinaryExpr>();
+        node->op = negated ? "OR" : "AND";
+        node->left  = std::move(lo);
+        node->right = std::move(hi);
+        return node;
+    }
+
+    if (check(TokenType::LIKE)) {
+        consume();
+        Token pat = expect(TokenType::STRING_LITERAL, "a constant pattern string after LIKE");
+        auto node = std::make_unique<LikeExpr>();
+        node->operand = std::move(left);
+        node->pattern = pat.value;
+        node->negated = negated;
+        return node;
+    }
+
+    if (check(TokenType::IN)) {
+        consume();
+        expect(TokenType::LPAREN, "( after IN");
+
+        auto node = std::make_unique<InExpr>();
+        node->operand = std::move(left);
+        node->negated = negated;
+
+        do {
+            // parseUnary, not parseExpr: an element is a literal or a negated
+            // literal. Anything else (a column, an arithmetic tree, a subquery)
+            // is rejected — see InExpr's contract in ast.h.
+            Token at = current_;
+            auto element = parseUnary();
+            Value v;
+            if (!constantValue(element.get(), v)) {
+                throw ParseError(
+                    "IN accepts a list of constant values only; "
+                    "IN (subquery) is not supported", at);
+            }
+            node->values.push_back(std::move(v));
+        } while (match(TokenType::COMMA));
+
+        expect(TokenType::RPAREN, ") after IN list");
+        return node;
+    }
+
     std::string op;
     if (check(TokenType::EQ)) op = "=";
     else if (check(TokenType::NEQ)) op = "!=";
@@ -281,6 +405,14 @@ std::unique_ptr<Expr> Parser::parseUnary(){
 }
 
 std::unique_ptr<Expr> Parser::parsePrimary(){
+    // A LEADING NOT (`WHERE NOT season = 2021`) is the form users actually
+    // write, and it reaches here — parseCompare's lookahead only sees a NOT that
+    // follows a complete left operand. Without this it failed with the generic
+    // "Expected an expression", which says nothing about what is supported.
+    if (check(TokenType::NOT)) {
+        throw ParseError(kNotSupportMessage, current_);
+    }
+
     // parenthesized expression
     if (match(TokenType::LPAREN)) {
         auto expr = parseExpr();
@@ -309,6 +441,84 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
     if (check(TokenType::STRING_LITERAL)) {
         Token t = consume();
         return std::make_unique<Literal>(Value(t.value));
+    }
+
+    // CASE ... END is self-delimiting, so it lives at the primary level and
+    // composes with arithmetic (SUM(CASE ... END) / SUM(...), TPC-H Q14) with
+    // no precedence work. Conditions and results use parseExpr(): END
+    // terminates unambiguously, so there is no BETWEEN-style trap here.
+    if (check(TokenType::CASE)) {
+        consume();
+        auto node = std::make_unique<CaseExpr>();
+        do {
+            expect(TokenType::WHEN, "WHEN in CASE");
+            CaseExpr::WhenClause clause;
+            clause.condition = parseExpr();
+            expect(TokenType::THEN, "THEN in CASE");
+            clause.result = parseExpr();
+            node->when_clauses.push_back(std::move(clause));
+        } while (check(TokenType::WHEN));
+
+        if (match(TokenType::ELSE)) node->else_expr = parseExpr();
+        expect(TokenType::END, "END to close CASE");
+        return node;
+    }
+
+    // Both the SQL-standard form (TPC-H Q22) and the comma form (SQLite). The
+    // FROM inside cannot confuse parseSelect: it is consumed between the
+    // parentheses, long before the select list is complete.
+    if (check(TokenType::SUBSTRING)) {
+        consume();
+        expect(TokenType::LPAREN, "( after SUBSTRING");
+        auto node = std::make_unique<SubstringExpr>();
+        node->operand = parseExpr();
+
+        if (match(TokenType::FROM)) {
+            node->start = parseExpr();
+            if (match(TokenType::FOR)) node->length = parseExpr();
+        } else {
+            expect(TokenType::COMMA, "FROM or , in SUBSTRING");
+            node->start = parseExpr();
+            if (match(TokenType::COMMA)) node->length = parseExpr();
+        }
+        expect(TokenType::RPAREN, ") after SUBSTRING arguments");
+        return node;
+    }
+
+    // DATE 'YYYY-MM-DD' is literal SYNTAX, not a type: it produces a plain
+    // STRING Literal. ISO-8601 sorts lexicographically, so range comparison,
+    // zone-map pruning and scanColumn<std::string> all work unchanged.
+    if (check(TokenType::DATE)) {
+        consume();
+        Token t = expect(TokenType::STRING_LITERAL, "an ISO-8601 date string after DATE");
+        if (!isIsoDate(t.value)) {
+            throw ParseError("date literal must be a valid ISO-8601 'YYYY-MM-DD'", t);
+        }
+        return std::make_unique<Literal>(Value(t.value));
+    }
+
+    // INTERVAL 'n' <unit>. Units are matched as IDENTIFIER text rather than
+    // reserved keywords, so `year` stays available as a column name.
+    if (check(TokenType::INTERVAL)) {
+        consume();
+        Token n = expect(TokenType::STRING_LITERAL, "a quoted count after INTERVAL");
+        Token u = expect(TokenType::IDENTIFIER, "an interval unit (day, month, year)");
+
+        auto node = std::make_unique<IntervalLiteral>();
+        try {
+            size_t consumed = 0;
+            node->count = std::stoll(n.value, &consumed);
+            if (consumed != n.value.size()) throw std::invalid_argument("trailing");
+        } catch (const std::exception&) {
+            throw ParseError("interval count must be a quoted whole number", n);
+        }
+
+        std::string unit = upperCase(u.value);
+        if      (unit == "DAY"   || unit == "DAYS")   node->unit = IntervalLiteral::Unit::DAY;
+        else if (unit == "MONTH" || unit == "MONTHS") node->unit = IntervalLiteral::Unit::MONTH;
+        else if (unit == "YEAR"  || unit == "YEARS")  node->unit = IntervalLiteral::Unit::YEAR;
+        else throw ParseError("interval unit must be day, month or year", u);
+        return node;
     }
 
     if (check(TokenType::AVG) || check(TokenType::SUM) || check(TokenType::COUNT) || check(TokenType::MIN) || check(TokenType::MAX)) {

@@ -33,6 +33,52 @@ inline std::string exprToString(const Expr* expr) {
         std::string arg = agg->is_star ? "*" : exprToString(agg->argument.get());
         return agg->function_name + "(" + arg + ")";
     }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        std::string s = exprToString(in->operand.get()) + (in->negated ? " NOT IN (" : " IN (");
+        for (size_t i = 0; i < in->values.size(); ++i) {
+            if (i) s += ", ";
+            s += in->values[i].toString();
+        }
+        return s + ")";
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        return exprToString(lk->operand.get())
+            + (lk->negated ? " NOT LIKE '" : " LIKE '") + lk->pattern + "'";
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        std::string s = "CASE";
+        for (const auto& w : c->when_clauses) {
+            s += " WHEN " + exprToString(w.condition.get())
+               + " THEN " + exprToString(w.result.get());
+        }
+        if (c->else_expr) s += " ELSE " + exprToString(c->else_expr.get());
+        return s + " END";
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        std::string s = "SUBSTRING(" + exprToString(sub->operand.get())
+                      + ", " + exprToString(sub->start.get());
+        if (sub->length) s += ", " + exprToString(sub->length.get());
+        return s + ")";
+    }
+    if (auto* iv = dynamic_cast<const IntervalLiteral*>(expr)) {
+        const char* unit = iv->unit == IntervalLiteral::Unit::DAY   ? "DAY"
+                         : iv->unit == IntervalLiteral::Unit::MONTH ? "MONTH" : "YEAR";
+        return "INTERVAL '" + std::to_string(iv->count) + "' " + unit;
+    }
+    return "?";
+}
+
+// Type-tagged identity for a constant. Value::toString() renders the DOUBLE 1.0
+// as "1" (%.15g), so an untagged key made `GROUP BY season - 1` match
+// `SELECT season - 1.0` and emit the INT column where SQL says REAL. Shared by
+// the Literal and InExpr cases of exprKey so the two cannot drift.
+inline std::string literalKey(const Value& v) {
+    if (v.isNull()) return "NULL";
+    switch (v.type()) {
+        case TypeId::INT:    return "i" + v.toString();
+        case TypeId::DOUBLE: return "d" + v.toString();
+        case TypeId::STRING: return "s'" + v.toString() + "'";
+    }
     return "?";
 }
 
@@ -56,15 +102,7 @@ inline std::string exprKey(const Expr* expr) {
             : col->table_name + "." + col->column_name;
     }
     if (auto* lit = dynamic_cast<const Literal*>(expr)) {
-        // Tag the type. Value::toString() renders the DOUBLE 1.0 as "1" (%.15g),
-        // so an untagged key made `GROUP BY season - 1` match
-        // `SELECT season - 1.0` and emit the INT column where SQL says REAL.
-        if (lit->value.isNull()) return "NULL";
-        switch (lit->value.type()) {
-            case TypeId::INT:    return "i" + lit->value.toString();
-            case TypeId::DOUBLE: return "d" + lit->value.toString();
-            case TypeId::STRING: return "s'" + lit->value.toString() + "'";
-        }
+        return literalKey(lit->value);
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
         return "(" + exprKey(bin->left.get()) + " " + bin->op + " "
@@ -79,6 +117,38 @@ inline std::string exprKey(const Expr* expr) {
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         std::string arg = agg->is_star ? "*" : exprKey(agg->argument.get());
         return agg->function_name + "(" + arg + ")";
+    }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        // `negated` and the value TYPES are part of the identity: x IN (1) and
+        // x NOT IN (1) are different expressions, and so are IN (1) and IN (1.0)
+        std::string s = exprKey(in->operand.get()) + (in->negated ? " NOT IN (" : " IN (");
+        for (size_t i = 0; i < in->values.size(); ++i) {
+            if (i) s += ",";
+            s += literalKey(in->values[i]);
+        }
+        return s + ")";
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        return exprKey(lk->operand.get())
+            + (lk->negated ? " NOT LIKE " : " LIKE ") + literalKey(Value(lk->pattern));
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        std::string s = "CASE";
+        for (const auto& w : c->when_clauses) {
+            s += " WHEN " + exprKey(w.condition.get()) + " THEN " + exprKey(w.result.get());
+        }
+        if (c->else_expr) s += " ELSE " + exprKey(c->else_expr.get());
+        return s + " END";
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        std::string s = "SUBSTRING(" + exprKey(sub->operand.get())
+                      + "," + exprKey(sub->start.get());
+        if (sub->length) s += "," + exprKey(sub->length.get());
+        return s + ")";
+    }
+    if (auto* iv = dynamic_cast<const IntervalLiteral*>(expr)) {
+        return "INTERVAL " + std::to_string(iv->count) + " "
+             + std::to_string(static_cast<int>(iv->unit));
     }
     return "?";
 }
@@ -112,7 +182,33 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
         collectAggregates(un->operand.get(), out);
+        return;
     }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        collectAggregates(in->operand.get(), out);   // values are literals
+        return;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        collectAggregates(lk->operand.get(), out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        // every branch: CASE WHEN c THEN SUM(x) ELSE 0 END is legal, and a
+        // missed aggregate here is never computed as a spec
+        for (const auto& w : c->when_clauses) {
+            collectAggregates(w.condition.get(), out);
+            collectAggregates(w.result.get(), out);
+        }
+        collectAggregates(c->else_expr.get(), out);
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        collectAggregates(sub->operand.get(), out);
+        collectAggregates(sub->start.get(), out);
+        collectAggregates(sub->length.get(), out);   // nullptr-safe
+        return;
+    }
+    // IntervalLiteral: a constant, nothing to collect
 }
 
 // Deep copy of an expression tree, preserving binder stamps and alias.
@@ -146,6 +242,36 @@ inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
         a->argument = cloneExpr(agg->argument.get());
         a->is_star = agg->is_star;
         out = std::move(a);
+    } else if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        auto n = std::make_unique<InExpr>();
+        n->operand = cloneExpr(in->operand.get());
+        n->values = in->values;
+        n->negated = in->negated;
+        out = std::move(n);
+    } else if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        auto n = std::make_unique<LikeExpr>();
+        n->operand = cloneExpr(lk->operand.get());
+        n->pattern = lk->pattern;
+        n->negated = lk->negated;
+        out = std::move(n);
+    } else if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        auto n = std::make_unique<CaseExpr>();
+        for (const auto& w : c->when_clauses) {
+            CaseExpr::WhenClause clause;
+            clause.condition = cloneExpr(w.condition.get());
+            clause.result = cloneExpr(w.result.get());
+            n->when_clauses.push_back(std::move(clause));
+        }
+        n->else_expr = cloneExpr(c->else_expr.get());
+        out = std::move(n);
+    } else if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        auto n = std::make_unique<SubstringExpr>();
+        n->operand = cloneExpr(sub->operand.get());
+        n->start = cloneExpr(sub->start.get());
+        n->length = cloneExpr(sub->length.get());   // nullptr-safe
+        out = std::move(n);
+    } else if (auto* iv = dynamic_cast<const IntervalLiteral*>(expr)) {
+        out = std::make_unique<IntervalLiteral>(*iv);   // memberwise: count + unit
     } else {
         throw std::runtime_error("cloneExpr(): unknown Expr subtype");
     }

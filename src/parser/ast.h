@@ -57,6 +57,66 @@ struct AggregateExpr : Expr {
     bool is_star;
 };
 
+// x IN (v1, v2, ...) / x NOT IN (...) over a constant value list.
+//
+// The list is restricted to literals, which is what makes the whole node cheap:
+// the executor hashes the set once at compile time instead of comparing k times
+// per row, and — since the grammar has no NULL literal — the set can never hold
+// a NULL, so SQL's three-valued IN rule collapses to "operand NULL -> NULL".
+// IN (subquery) is Week 32 and lowers to a semi-join; it is a different
+// production, not an extension of this list.
+struct InExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    std::vector<Value> values;   // non-empty, never NULL
+    bool negated = false;        // NOT IN
+};
+
+// x LIKE 'pattern' / x NOT LIKE 'pattern'. '%' matches any sequence, '_' any
+// single character. ASCII case-INSENSITIVE, matching SQLite's default so
+// compare_against_sqlite.py stays the correctness oracle — a documented dialect
+// choice. The pattern must be a string literal: TPC-H never computes one, and a
+// constant pattern is what lets the executor analyse it once per query.
+struct LikeExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    std::string pattern;
+    bool negated = false;
+};
+
+// Searched CASE: CASE WHEN c THEN r [WHEN c THEN r ...] [ELSE e] END.
+// The simple form (CASE x WHEN v ...) is not supported — no TPC-H query needs
+// it. A missing ELSE yields NULL, carried on the validity mask.
+struct CaseExpr : Expr {
+    struct WhenClause {
+        std::unique_ptr<Expr> condition;   // must infer to INT (boolean-as-INT)
+        std::unique_ptr<Expr> result;
+    };
+    std::vector<WhenClause> when_clauses;  // at least one; the parser enforces it
+    std::unique_ptr<Expr> else_expr;       // nullptr when omitted
+};
+
+// SUBSTRING(x FROM start [FOR length]) / SUBSTRING(x, start [, length]).
+// 1-based start, SQLite-compatible. This is the first and only scalar function:
+// if a second one arrives, replace this with a FunctionExpr { name, args } plus
+// a name -> kernel registry rather than adding another one-off node.
+struct SubstringExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    std::unique_ptr<Expr> start;    // 1-based
+    std::unique_ptr<Expr> length;   // nullptr = to the end of the string
+};
+
+// INTERVAL 'n' day|month|year.
+//
+// This node MUST NOT survive planning. foldConstants rewrites `date +/- interval`
+// into a plain date Literal before validation, which is what keeps ChunkPruner,
+// scanColumn and selectivity() on their ColumnRef-op-Literal fast paths. An
+// interval that reaches inferExprType or evaluate() therefore means a malformed
+// query, and both throw — the loud failure is the design.
+struct IntervalLiteral : Expr {
+    enum class Unit { DAY, MONTH, YEAR };
+    int64_t count = 0;
+    Unit unit = Unit::DAY;
+};
+
 // one ORDER BY entry: an expression plus sort direction
 struct OrderByItem {
     std::unique_ptr<Expr> expr;

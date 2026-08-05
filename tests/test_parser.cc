@@ -402,6 +402,198 @@ TEST(ParseErrorPosition, LargestValidIntLiteralStillParses) {
     EXPECT_EQ(lit->value.asInt(), INT64_MAX);
 }
 
+// ===== Week 25: predicates + scalar functions =====
+
+TEST(LexerTest, Week25Keywords) {
+    Lexer lexer("BETWEEN like In case WHEN then ELSE end substring FOR date INTERVAL");
+    EXPECT_EQ(lexer.nextToken().type, TokenType::BETWEEN);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::LIKE);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::IN);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::CASE);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::WHEN);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::THEN);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::ELSE);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::END);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::SUBSTRING);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::FOR);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::DATE);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::INTERVAL);
+}
+
+// Every keyword added is a column name taken away, so the interval units are
+// deliberately NOT reserved — TPC-H Q7/Q8/Q9 alias o_year / l_year.
+TEST(LexerTest, IntervalUnitsAreNotReservedWords) {
+    Lexer lexer("day month year");
+    EXPECT_EQ(lexer.nextToken().type, TokenType::IDENTIFIER);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::IDENTIFIER);
+    EXPECT_EQ(lexer.nextToken().type, TokenType::IDENTIFIER);
+}
+
+TEST(ParserTest, BetweenDesugarsToTwoComparisons) {
+    // No BetweenExpr node: the desugared shape is what splitConjuncts,
+    // ChunkPruner, scanColumn and selectivity() all pattern-match on.
+    Parser p("SELECT team FROM laps WHERE season BETWEEN 2020 AND 2024");
+    auto stmt = p.parse();
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "AND");
+    ASSERT_NE(dynamic_cast<BinaryExpr*>(root->left.get()), nullptr);
+    EXPECT_EQ(dynamic_cast<BinaryExpr*>(root->left.get())->op, ">=");
+    EXPECT_EQ(dynamic_cast<BinaryExpr*>(root->right.get())->op, "<=");
+}
+
+TEST(ParserTest, NotBetweenDesugarsByDeMorgan) {
+    Parser p("SELECT team FROM laps WHERE season NOT BETWEEN 2020 AND 2024");
+    auto stmt = p.parse();
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "OR");
+    EXPECT_EQ(dynamic_cast<BinaryExpr*>(root->left.get())->op, "<");
+    EXPECT_EQ(dynamic_cast<BinaryExpr*>(root->right.get())->op, ">");
+}
+
+// The precedence trap: BETWEEN binds tighter than AND, so the bounds must be
+// parsed at the additive level. parseExpr() there would swallow the second AND.
+TEST(ParserTest, BetweenBindsTighterThanAnd) {
+    Parser p("SELECT team FROM laps WHERE season BETWEEN 2020 AND 2024 AND speed > 300");
+    auto stmt = p.parse();
+    auto* root = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->op, "AND");
+    // right operand is the speed comparison, not part of the range
+    auto* right = dynamic_cast<BinaryExpr*>(root->right.get());
+    ASSERT_NE(right, nullptr);
+    EXPECT_EQ(right->op, ">");
+}
+
+TEST(ParserTest, InListParsesConstants) {
+    Parser p("SELECT team FROM laps WHERE season IN (2020, 2021, -3)");
+    auto stmt = p.parse();
+    auto* in = dynamic_cast<InExpr*>(stmt.where.get());
+    ASSERT_NE(in, nullptr);
+    EXPECT_FALSE(in->negated);
+    ASSERT_EQ(in->values.size(), 3u);
+    EXPECT_EQ(in->values[2].asInt(), -3);   // negated literal is still a constant
+
+    Parser np("SELECT team FROM laps WHERE season NOT IN (2020)");
+    auto nstmt = np.parse();
+    EXPECT_TRUE(dynamic_cast<InExpr*>(nstmt.where.get())->negated);
+}
+
+TEST(ParserTest, InListRejectsNonConstants) {
+    // IN (subquery) is Week 32 and lowers to a semi-join; a column or an
+    // arithmetic tree would defeat the compile-time hashing of the set
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE season IN (speed)").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE season IN (1 + 1)").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE season IN ()").parse(), ParseError);
+}
+
+TEST(ParserTest, LikeRequiresAConstantPattern) {
+    Parser p("SELECT team FROM laps WHERE team LIKE 'Fer%'");
+    auto stmt = p.parse();
+    auto* lk = dynamic_cast<LikeExpr*>(stmt.where.get());
+    ASSERT_NE(lk, nullptr);
+    EXPECT_EQ(lk->pattern, "Fer%");
+    EXPECT_FALSE(lk->negated);
+
+    Parser np("SELECT team FROM laps WHERE team NOT LIKE 'Fer%'");
+    EXPECT_TRUE(dynamic_cast<LikeExpr*>(np.parse().where.get())->negated);
+
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team LIKE team").parse(), ParseError);
+}
+
+TEST(ParserTest, GeneralNotIsRejectedWithATargetedMessage) {
+    // NOT is supported only in the four postfix/IS forms; anything else must
+    // fail cleanly rather than confuse the caller further up the grammar
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE season NOT = 1").parse(), ParseError);
+}
+
+TEST(ParserTest, SearchedCaseParsesBothWithAndWithoutElse) {
+    Parser p("SELECT CASE WHEN season = 2024 THEN 1 WHEN season = 2023 THEN 2 ELSE 0 END AS m FROM laps");
+    auto stmt = p.parse();
+    auto* c = dynamic_cast<CaseExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->when_clauses.size(), 2u);
+    EXPECT_NE(c->else_expr, nullptr);
+    EXPECT_EQ(c->alias, "m");
+
+    Parser p2("SELECT CASE WHEN season = 2024 THEN 1 END AS m FROM laps");
+    EXPECT_EQ(dynamic_cast<CaseExpr*>(p2.parse().select_list[0].get())->else_expr, nullptr);
+}
+
+TEST(ParserTest, CaseRequiresWhenAndEnd) {
+    EXPECT_THROW(Parser("SELECT CASE ELSE 1 END AS m FROM laps").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT CASE WHEN 1 = 1 THEN 2 FROM laps").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT CASE WHEN 1 = 1 THEN 2 ELSE 3 FROM laps").parse(), ParseError);
+}
+
+TEST(ParserTest, SubstringAcceptsBothSyntaxes) {
+    // SQL-standard form (TPC-H Q22). SQLite only accepts the comma form, which
+    // is why the correctness harness uses commas and this form is unit-tested.
+    // the statement must outlive the pointers into it — parse() returns by value
+    Parser standard("SELECT SUBSTRING(team FROM 1 FOR 3) AS t FROM laps");
+    SelectStatement s1 = standard.parse();
+    auto* a = dynamic_cast<SubstringExpr*>(s1.select_list[0].get());
+    ASSERT_NE(a, nullptr);
+    EXPECT_NE(a->length, nullptr);
+
+    Parser commas("SELECT SUBSTRING(team, 1, 3) AS t FROM laps");
+    SelectStatement s2 = commas.parse();
+    auto* b = dynamic_cast<SubstringExpr*>(s2.select_list[0].get());
+    ASSERT_NE(b, nullptr);
+    EXPECT_NE(b->length, nullptr);
+
+    // omitted length: to the end of the string
+    Parser open("SELECT SUBSTRING(team, 2) AS t FROM laps");
+    SelectStatement s3 = open.parse();
+    ASSERT_NE(dynamic_cast<SubstringExpr*>(s3.select_list[0].get()), nullptr);
+    EXPECT_EQ(dynamic_cast<SubstringExpr*>(s3.select_list[0].get())->length, nullptr);
+
+    Parser open2("SELECT SUBSTRING(team FROM 2) AS t FROM laps");
+    SelectStatement s4 = open2.parse();
+    ASSERT_NE(dynamic_cast<SubstringExpr*>(s4.select_list[0].get()), nullptr);
+    EXPECT_EQ(dynamic_cast<SubstringExpr*>(s4.select_list[0].get())->length, nullptr);
+}
+
+TEST(ParserTest, DateLiteralIsAValidatedStringLiteral) {
+    // DATE is literal SYNTAX, not a type: ISO-8601 sorts lexicographically, so
+    // a STRING Literal keeps zone-map pruning and scanColumn<std::string>
+    Parser p("SELECT team FROM laps WHERE team > date '1998-12-01'");
+    SelectStatement stmt = p.parse();
+    auto* bin = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(bin, nullptr);
+    auto* lit = dynamic_cast<Literal*>(bin->right.get());
+    ASSERT_NE(lit, nullptr);
+    EXPECT_EQ(lit->value.type(), TypeId::STRING);
+    EXPECT_EQ(lit->value.asString(), "1998-12-01");
+
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team > date '1998-02-30'").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team > date '12/01/1998'").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team > date 19981201").parse(), ParseError);
+}
+
+TEST(ParserTest, IntervalLiteralParsesUnitsCaseInsensitively) {
+    auto unitOf = [](const char* sql) {
+        Parser p(sql);
+        SelectStatement stmt = p.parse();   // must outlive the pointers below
+        auto* bin = dynamic_cast<BinaryExpr*>(stmt.where.get());
+        EXPECT_NE(bin, nullptr);
+        auto* iv = dynamic_cast<IntervalLiteral*>(bin->right.get());
+        EXPECT_NE(iv, nullptr);
+        return iv->unit;
+    };
+    EXPECT_EQ(unitOf("SELECT team FROM laps WHERE team > interval '90' day"),
+              IntervalLiteral::Unit::DAY);
+    EXPECT_EQ(unitOf("SELECT team FROM laps WHERE team > interval '3' MONTHS"),
+              IntervalLiteral::Unit::MONTH);
+    EXPECT_EQ(unitOf("SELECT team FROM laps WHERE team > interval '1' Year"),
+              IntervalLiteral::Unit::YEAR);
+
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team > interval '1' fortnight").parse(),
+                 ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team > interval 'x' day").parse(),
+                 ParseError);
+}
 
 // The parser must consume the whole input. It used to stop at the last clause
 // it recognised and silently discard the rest, which turns an unsupported

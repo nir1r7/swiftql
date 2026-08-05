@@ -182,6 +182,22 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     {"ASC",      TokenType::ASC},
     {"DESC",     TokenType::DESC},
     {"NULL",     TokenType::NULL_KW},
+    // Week 25. Every keyword added here is a column name taken away — verified
+    // against catalog.json and the TPC-H schema that none of these collide.
+    // Interval units (DAY/MONTH/YEAR) are absent on purpose; parsePrimary
+    // matches them as IDENTIFIER text.
+    {"BETWEEN",   TokenType::BETWEEN},
+    {"LIKE",      TokenType::LIKE},
+    {"IN",        TokenType::IN},
+    {"CASE",      TokenType::CASE},
+    {"WHEN",      TokenType::WHEN},
+    {"THEN",      TokenType::THEN},
+    {"ELSE",      TokenType::ELSE},
+    {"END",       TokenType::END},
+    {"SUBSTRING", TokenType::SUBSTRING},
+    {"FOR",       TokenType::FOR},
+    {"DATE",      TokenType::DATE},
+    {"INTERVAL",  TokenType::INTERVAL},
     {"COUNT",    TokenType::COUNT},
     {"SUM",      TokenType::SUM},
     {"AVG",      TokenType::AVG},
