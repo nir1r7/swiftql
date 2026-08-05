@@ -214,9 +214,17 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
             ? table_schema.indexOf(g.column_name, g.relation_slot)
             : -1;
         if (idx < 0) idx = table_schema.indexOf(g.column_name);
-        if (idx >= 0) {
-            cols.push_back(table_schema.column(idx));
+        if (idx < 0) {
+            // Both executors push one key Value per group-by column, so silently
+            // dropping the column here would leave the schema one column narrower
+            // than every row — silent corruption. Unreachable today (Validator
+            // and buildScanSchema guarantee resolution), so this is the shape of
+            // a planner bug, not a user error.
+            throw std::runtime_error(
+                "internal: GROUP BY column '" + g.column_name
+                + "' not present in the aggregate's input schema");
         }
+        cols.push_back(table_schema.column(idx));
     }
 
     // one output column per aggregate, in spec order (SELECT-list aggregates

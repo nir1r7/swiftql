@@ -267,6 +267,15 @@ void HashAggregateNode::open() {
                         ? child_schema.indexOf(spec.column, spec.relation_slot)
                         : -1;
                     if (agg_idx < 0) agg_idx = child_schema.indexOf(spec.column);
+                    if (agg_idx < 0) {
+                        // (*row)[-1] is out-of-bounds on the Row vector. Unreachable
+                        // today (Validator + buildScanSchema guarantee the column is
+                        // present), so this is the shape of a planner bug — and it
+                        // matches the message the vectorized node raises for the same
+                        // state, instead of reading past the end of a vector.
+                        throw std::runtime_error(
+                            "aggregate input column not found: " + spec.column);
+                    }
                     val = (*row)[agg_idx];
                 }
                 // skip NULLs (except COUNT(*))

@@ -148,7 +148,11 @@ void VecHashAggregateNode::consumeAll() {
                 int ci = agg_idxs[i];
                 Value val;
                 if (ci < 0) {
-                    if (!spec.argument) {
+                    // A plain-column spec reaching here means its column did not
+                    // resolve against the child schema. Say so, with the same message
+                    // the Volcano HashAggregateNode uses, instead of falling through
+                    // to evaluate() against an intentionally-empty Row.
+                    if (!spec.argument || !spec.column.empty()) {
                         throw std::runtime_error("aggregate input column not found: " + spec.column);
                     }
                     // expression argument (e.g. SUM(speed * 2)): evaluate per row
