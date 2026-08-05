@@ -136,7 +136,14 @@ SelectStatement Parser::parseSelect(){
 
     if (match(TokenType::LIMIT)){
         Token t = expect(TokenType::INT_LITERAL, "integer after LIMIT");
-        stmt.limit = std::stoi(t.value);
+        // std::stoi throws std::out_of_range, whose what() is a bare "stoi: out
+        // of range" with no position and no mention of SQL. Route it through
+        // ParseError like every other malformed token.
+        try {
+            stmt.limit = std::stoi(t.value);
+        } catch (const std::out_of_range&) {
+            throw ParseError("LIMIT value is too large for a 32-bit integer", t);
+        }
     }
 
     return stmt;
@@ -267,13 +274,21 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
     }
 
     if (check(TokenType::INT_LITERAL)) {
-    Token t = consume();
-    return std::make_unique<Literal>(Value(static_cast<int64_t>(std::stoll(t.value))));
+        Token t = consume();
+        try {
+            return std::make_unique<Literal>(Value(static_cast<int64_t>(std::stoll(t.value))));
+        } catch (const std::out_of_range&) {
+            throw ParseError("integer literal does not fit in a 64-bit integer", t);
+        }
     }
 
     if (check(TokenType::FLOAT_LITERAL)) {
         Token t = consume();
-        return std::make_unique<Literal>(Value(std::stod(t.value)));
+        try {
+            return std::make_unique<Literal>(Value(std::stod(t.value)));
+        } catch (const std::out_of_range&) {
+            throw ParseError("floating-point literal is outside the range of a double", t);
+        }
     }
 
     if (check(TokenType::STRING_LITERAL)) {

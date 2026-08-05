@@ -339,3 +339,65 @@ TEST(ParserTest, GroupByQualifiedColumnStillPlain) {
     EXPECT_EQ(stmt.group_by[0].table_name, "l");
     EXPECT_EQ(stmt.group_by[0].column_name, "team");
 }
+
+
+// ============================================================
+// Audit fix: parse error positions
+// ============================================================
+// line_/col_ were initialized but never advanced — advance() moved pos_ without
+// touching col_ — so every ParseError reported "line 0, col 0" no matter where
+// the offending token was. Positions are 1-based, as a human reads them.
+
+TEST(ParseErrorPosition, ReportsTheColumnOfTheOffendingToken) {
+    try {
+        Parser("SELECT team, FROM laps").parse();
+        FAIL() << "expected a ParseError";
+    } catch (const ParseError& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("line 1"), std::string::npos) << msg;
+        // "FROM" starts at column 14 of the statement
+        EXPECT_NE(msg.find("col 14"), std::string::npos) << msg;
+        EXPECT_EQ(msg.find("col 0"), std::string::npos) << msg;
+    }
+}
+
+TEST(ParseErrorPosition, CountsLinesAcrossNewlines) {
+    try {
+        Parser("SELECT team\nFROM laps\nWHERE speed >").parse();
+        FAIL() << "expected a ParseError";
+    } catch (const ParseError& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("line 3"), std::string::npos) << msg;
+    }
+}
+
+TEST(ParseErrorPosition, NumericLiteralOverflowIsAParseErrorNotStoll) {
+    // std::stoll's what() is a bare "stoll: out of range" — no position, no SQL
+    try {
+        Parser("SELECT 99999999999999999999 FROM laps").parse();
+        FAIL() << "expected a ParseError";
+    } catch (const ParseError& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("64-bit integer"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("line 1"), std::string::npos) << msg;
+        EXPECT_EQ(msg.find("stoll"), std::string::npos) << msg;
+    }
+
+    try {
+        Parser("SELECT team FROM laps LIMIT 99999999999999999999").parse();
+        FAIL() << "expected a ParseError";
+    } catch (const ParseError& e) {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("LIMIT"), std::string::npos) << msg;
+        EXPECT_EQ(msg.find("stoi"), std::string::npos) << msg;
+    }
+}
+
+TEST(ParseErrorPosition, LargestValidIntLiteralStillParses) {
+    // INT64_MAX itself must not be rejected by the overflow guard
+    auto stmt = Parser("SELECT 9223372036854775807 FROM laps").parse();
+    ASSERT_EQ(stmt.select_list.size(), 1u);
+    auto* lit = dynamic_cast<Literal*>(stmt.select_list[0].get());
+    ASSERT_NE(lit, nullptr);
+    EXPECT_EQ(lit->value.asInt(), INT64_MAX);
+}

@@ -4,7 +4,8 @@
 #include <string>
 #include <unordered_map>
 
-Lexer::Lexer(const std::string& input): input_{input}, pos_{0}, line_{0}, col_{0} {}
+// line_/col_ are 1-based: error messages are read by humans
+Lexer::Lexer(const std::string& input): input_{input}, pos_{0}, line_{1}, col_{1} {}
 
 Token Lexer::nextToken() {
     skipWhitespace();
@@ -78,13 +79,8 @@ Token Lexer::peek() {
 }
 
 void Lexer::skipWhitespace() {
-    while (!isAtEnd() && std::isspace(current())) {
-        if (current() == '\n') {
-            line_++;
-            col_ = 0;
-        }
-        advance();
-    }
+    // newline bookkeeping lives in advance(), the single place that moves pos_
+    while (!isAtEnd() && std::isspace(current())) advance();
 }
 
 Token Lexer::readIdentifierOrKeyword() {
@@ -154,7 +150,12 @@ char Lexer::current() const {
 
 // return current char and move pos_ forward
 char Lexer::advance() {
-    return input_.at(pos_++);
+    char c = input_.at(pos_++);
+    // Every consumed character moves the column. Nothing did this before, so
+    // line_/col_ never left their initial values and every ParseError reported
+    // "line 0, col 0" regardless of where the bad token actually was.
+    if (c == '\n') { line_++; col_ = 1; } else { col_++; }
+    return c;
 }
 
 bool Lexer::isAtEnd() const {
