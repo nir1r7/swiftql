@@ -27,7 +27,8 @@ DataChunk* VecFilterNode::nextChunk(){
     // returns a fresh vector by value, so reading raw->sel as input_sel (rows
     // already rejected upstream) before the assignment below is safe.
     const SelectionVector* input_sel = raw->filter_applied ? &raw->sel : nullptr;
-    SelectionVector out = evalPredicate(predicate_.get(), *raw, child_->outputSchema(), input_sel);
+    SelectionVector out = evalPredicate(predicate_.get(), *raw, child_->outputSchema(),
+                                        input_sel, &exec_cache_);
     raw->sel = std::move(out);
 
     // mark that a filter was applied so VecProjectNode treats empty

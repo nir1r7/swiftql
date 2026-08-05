@@ -1,6 +1,7 @@
 #include "execution/columnar_eval.h"
 #include "execution/evaluator.h"
 #include <functional>
+#include <numeric>
 
 // tight loop scanner
 // T must match the underlying vector element type stored in chunk.columns[col_idx]
@@ -71,12 +72,49 @@ static SelectionVector sv_union(const SelectionVector& a, const SelectionVector&
 
 // fallback
 // handles IS NULL, arithmetic subexpressions, col op col, and any other shape the fast path does not cover
-// reconstructs a temporary Row per row index and delegates to the scalar evaluator.
+//
+// Preferred path: compile the subtree once (cached on the filter node) and
+// evaluate it a chunk at a time. Only when there is no cache, or compile()
+// declines the shape, does this reconstruct a Row per row and call the scalar
+// evaluate() — the 231ms-per-million-rows path this replaces.
+//
 // input_sel: when non-null, only rows in input_sel->indices are evaluated
 static SelectionVector evalFallback(const Expr* pred, const DataChunk& chunk, const Schema& schema,
-                                    const SelectionVector* input_sel) {
+                                    const SelectionVector* input_sel,
+                                    PredicateExecutorCache* cache) {
     SelectionVector sv;
-    auto eval_row = [&](int r) {
+
+    // the row indices under consideration, in order
+    const std::vector<int>* indices_ptr = nullptr;
+    std::vector<int> all_indices;
+    if (input_sel) {
+        indices_ptr = &input_sel->indices;
+    } else {
+        all_indices.resize(chunk.num_rows);
+        std::iota(all_indices.begin(), all_indices.end(), 0);
+        indices_ptr = &all_indices;
+    }
+
+    if (cache) {
+        ExpressionExecutor* exec = cache->get(pred, schema);
+        // A predicate evaluates to the INT-as-boolean convention. Anything else
+        // (e.g. `WHERE speed`, a bare DOUBLE) goes to evaluate(), which raises
+        // from asInt() exactly as it did before.
+        if (exec && exec->type() == TypeId::INT) {
+            const ColumnVector& out = exec->execute(chunk, *indices_ptr);
+            const auto& flags = std::get<std::vector<int64_t>>(out.data);
+            const int n = static_cast<int>(indices_ptr->size());
+            sv.indices.reserve(n);
+            for (int i = 0; i < n; ++i) {
+                // NULL is not true: an unknown predicate rejects the row
+                if (!out.isNull(i) && flags[i] != 0) sv.indices.push_back((*indices_ptr)[i]);
+            }
+            sv.size = static_cast<int>(sv.indices.size());
+            return sv;
+        }
+    }
+
+    for (int r : *indices_ptr) {
         Row tmp;
         tmp.reserve(chunk.columns.size());
         for (const auto& cv : chunk.columns){
@@ -84,11 +122,6 @@ static SelectionVector evalFallback(const Expr* pred, const DataChunk& chunk, co
         }
         Value v = evaluate(pred, tmp, schema);
         if (!v.isNull() && v.asInt() != 0) sv.indices.push_back(r);
-    };
-    if (input_sel) {
-        for (int r : input_sel->indices) eval_row(r);
-    } else {
-        for (int r = 0; r < chunk.num_rows; ++r) eval_row(r);
     }
     sv.size = static_cast<int>(sv.indices.size());
     return sv;
@@ -96,23 +129,24 @@ static SelectionVector evalFallback(const Expr* pred, const DataChunk& chunk, co
 
 // main dispatch
 SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Schema& schema,
-                              const SelectionVector* input_sel) {
+                              const SelectionVector* input_sel,
+                              PredicateExecutorCache* cache) {
     const auto* bin = dynamic_cast<const BinaryExpr*>(pred);
 
     // not a BinaryExpr (IsNullExpr, AggregateExpr, ...), scalar fallback
-    if (!bin) return evalFallback(pred, chunk, schema, input_sel);
+    if (!bin) return evalFallback(pred, chunk, schema, input_sel, cache);
 
     // AND: cascade the selection vector — evaluate the right operand only over
     // rows the left kept. Equivalent to intersect for AND, but the right touches
     // only survivors, so ordering the most-selective conjunct left (Week 21
     // pushdown) pays off. OR must stay a union — it cannot cascade.
     if (bin->op == "AND"){
-        SelectionVector left = evalPredicate(bin->left.get(), chunk, schema, input_sel);
-        return evalPredicate(bin->right.get(), chunk, schema, &left);
+        SelectionVector left = evalPredicate(bin->left.get(), chunk, schema, input_sel, cache);
+        return evalPredicate(bin->right.get(), chunk, schema, &left, cache);
     }
     if (bin->op == "OR"){
-        return sv_union(evalPredicate(bin->left.get(), chunk, schema, input_sel),
-                        evalPredicate(bin->right.get(), chunk, schema, input_sel));
+        return sv_union(evalPredicate(bin->left.get(), chunk, schema, input_sel, cache),
+                        evalPredicate(bin->right.get(), chunk, schema, input_sel, cache));
     }
 
     // comparison, attempt fast path for (ColumnRef) op (Literal)
@@ -120,12 +154,12 @@ SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Sc
     const auto* lit = dynamic_cast<const Literal*>(bin->right.get());
 
     if (!cr || !lit || lit->value.isNull()){
-        return evalFallback(pred, chunk, schema, input_sel);
+        return evalFallback(pred, chunk, schema, input_sel, cache);
     }
 
     int col_idx = resolveColumnIndex(*cr, schema);
     if (col_idx < 0){
-        return evalFallback(pred, chunk, schema, input_sel);
+        return evalFallback(pred, chunk, schema, input_sel, cache);
     }
 
     TypeId col_type = chunk.columns[col_idx].type;
@@ -167,5 +201,5 @@ SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Sc
     }
 
     // type mismatch or unknown operator, scalar fallback
-    return evalFallback(pred, chunk, schema, input_sel);
+    return evalFallback(pred, chunk, schema, input_sel, cache);
 }

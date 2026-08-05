@@ -1,5 +1,6 @@
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/evaluator.h"
+#include "execution/expression_executor.h"
 #include "parser/expr_utils.h"
 #include <algorithm>
 #include <chrono>
@@ -75,17 +76,41 @@ void VecHashAggregateNode::consumeAll() {
         agg_idxs.push_back(idx);
     }
 
-    // expression group keys / arguments call evaluate(), which needs a full
-    // Row — reconstruct lazily, same pattern as VecProjectNode's complex path
-    bool needs_row = false;
-    for (const auto& g : group_by_cols_) {
-        if (g.expr) { needs_row = true; break; }
-    }
-    if (!needs_row) {
-        for (const auto& spec : specs_) {
-            if (!spec.is_star && spec.argument && spec.column.empty()) { needs_row = true; break; }
+    // Compile expression group keys and expression aggregate arguments into
+    // chunk-at-a-time executors, once for the whole scan. This is the hot path
+    // for TPC-H revenue aggregates: SUM(l_extendedprice * (1 - l_discount))
+    // over 6M rows used to pay a dynamic_cast tree walk per row.
+    // A null entry means compile() declined the shape — that expression keeps
+    // the per-row evaluate() path, so an uncovered shape is slow, not wrong.
+    std::vector<std::unique_ptr<ExpressionExecutor>> group_execs(group_by_cols_.size());
+    for (size_t gi = 0; gi < group_by_cols_.size(); ++gi) {
+        if (group_by_cols_[gi].expr) {
+            group_execs[gi] = ExpressionExecutor::compile(group_by_cols_[gi].expr.get(), child_schema);
         }
     }
+    std::vector<std::unique_ptr<ExpressionExecutor>> arg_execs(specs_.size());
+    for (size_t i = 0; i < specs_.size(); ++i) {
+        if (!specs_[i].is_star && specs_[i].argument && specs_[i].column.empty()) {
+            arg_execs[i] = ExpressionExecutor::compile(specs_[i].argument, child_schema);
+        }
+    }
+
+    // A full Row is only needed for expressions that fell back to evaluate();
+    // a compiled expression reads its dense result column by position instead.
+    bool needs_row = false;
+    for (size_t gi = 0; gi < group_by_cols_.size(); ++gi) {
+        if (group_by_cols_[gi].expr && !group_execs[gi]) { needs_row = true; break; }
+    }
+    if (!needs_row) {
+        for (size_t i = 0; i < specs_.size(); ++i) {
+            if (!specs_[i].is_star && specs_[i].argument && specs_[i].column.empty()
+                && !arg_execs[i]) { needs_row = true; break; }
+        }
+    }
+
+    // per-chunk results of the compiled executors; null where none was compiled
+    std::vector<const ColumnVector*> group_vecs(group_by_cols_.size(), nullptr);
+    std::vector<const ColumnVector*> arg_vecs(specs_.size(), nullptr);
 
     while (DataChunk* chunk = child_->nextChunk()) {
         // child time excluded
@@ -103,10 +128,24 @@ void VecHashAggregateNode::consumeAll() {
             indices_ptr = &all_indices;
         }
 
-        for (int r : *indices_ptr) {
+        // Evaluate every compiled expression once for the whole chunk, before
+        // the row loop. This is the dispatch hoist: one typed loop per node per
+        // chunk instead of a dynamic_cast tree walk per node per row.
+        for (size_t gi = 0; gi < group_execs.size(); ++gi) {
+            if (group_execs[gi]) group_vecs[gi] = &group_execs[gi]->execute(*chunk, *indices_ptr);
+        }
+        for (size_t i = 0; i < arg_execs.size(); ++i) {
+            if (arg_execs[i]) arg_vecs[i] = &arg_execs[i]->execute(*chunk, *indices_ptr);
+        }
+
+        // Iterate by position, not by row index: executor results are dense in
+        // selection order, so result index `pos` corresponds to chunk row `r`.
+        const int n_rows = static_cast<int>(indices_ptr->size());
+        for (int pos = 0; pos < n_rows; ++pos) {
+            const int r = (*indices_ptr)[pos];
             stats.rows_in++;
 
-            // full Row only when an expression needs evaluate()
+            // full Row only for expressions that fell back to evaluate()
             Row tmp;
             if (needs_row) {
                 tmp.reserve(chunk->columns.size());
@@ -120,12 +159,17 @@ void VecHashAggregateNode::consumeAll() {
             key.reserve(group_idxs.size());
             for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
                 if (group_idxs[gi] < 0) {
-                    key.push_back(evaluate(group_by_cols_[gi].expr.get(), tmp, child_schema));
+                    if (group_vecs[gi]) {
+                        key.emplace_back();
+                        readColumnValue(*group_vecs[gi], pos, key.back());
+                    } else {
+                        key.push_back(evaluate(group_by_cols_[gi].expr.get(), tmp, child_schema));
+                    }
                     continue;
                 }
-                std::visit([&](const auto& vec) {
-                    key.push_back(Value(vec[r]));
-                }, chunk->columns[group_idxs[gi]].data);
+                // emplace-then-read avoids a temporary Value per key column per row
+                key.emplace_back();
+                readColumnValue(chunk->columns[group_idxs[gi]], r, key.back());
             }
             std::string key_str = serializeKey(key);
 
@@ -149,16 +193,22 @@ void VecHashAggregateNode::consumeAll() {
                 Value val;
                 if (ci < 0) {
                     // A plain-column spec reaching here means its column did not
-                    // resolve against the child schema. Say so, with the same message
-                    // the Volcano HashAggregateNode uses, instead of falling through
-                    // to evaluate() against an intentionally-empty Row.
+                    // resolve against the child schema. Say so, with the same
+                    // message the Volcano HashAggregateNode uses: falling through
+                    // to evaluate() would report a confusing "column not found in
+                    // schema" against an intentionally-empty Row instead.
+                    // Unreachable today — Validator and buildScanSchema guarantee
+                    // resolution — so this is the shape of a planner bug.
                     if (!spec.argument || !spec.column.empty()) {
                         throw std::runtime_error("aggregate input column not found: " + spec.column);
                     }
-                    // expression argument (e.g. SUM(speed * 2)): evaluate per row
-                    val = evaluate(spec.argument, tmp, child_schema);
+                    // expression argument (e.g. SUM(speed * 2)): read the
+                    // pre-evaluated chunk result, or fall back to per-row
+                    // evaluate() when compile() declined the shape
+                    if (arg_vecs[i]) readColumnValue(*arg_vecs[i], pos, val);
+                    else             val = evaluate(spec.argument, tmp, child_schema);
                 } else {
-                    std::visit([&](const auto& vec) { val = Value(vec[r]); }, chunk->columns[ci].data);
+                    readColumnValue(chunk->columns[ci], r, val);
                 }
 
                 if (val.isNull()) continue;

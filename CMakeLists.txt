@@ -41,6 +41,7 @@ add_library(swiftql_lib
     src/planner/planner.cc
     src/planner/plan_nodes.cc
     src/execution/evaluator.cc
+    src/execution/expression_executor.cc
     src/storage/csv_to_columnar.cc
     src/execution/vec_scan_node.cc
     src/execution/vec_filter_node.cc

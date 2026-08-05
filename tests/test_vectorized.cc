@@ -8,6 +8,8 @@
 #include "execution/vec_hash_aggregate_node.h"
 #include "execution/vec_hash_join_node.h"
 #include "execution/vec_types.h"
+#include "execution/expression_executor.h"
+#include "execution/evaluator.h"
 #include "storage/columnar_table.h"
 #include "storage/rle_column.h"
 #include "storage/dictionary_encoder.h"
@@ -3064,3 +3066,611 @@ TEST(VecHashAggregate, MinMaxOverIntColumnStaysInt) {
 }
 
 
+// ===== ExpressionExecutor: chunk-at-a-time expression evaluation =====
+//
+// The executor is a second implementation of evaluate()'s semantics that pays
+// dispatch once per chunk instead of once per row. evaluate() stays the Volcano
+// correctness baseline, so the only test that matters is differential: for every
+// expression shape, the executor must agree with evaluate() row for row,
+// including which rows are NULL.
+
+// Pull the single chunk a small row set produces, then assert executor output
+// equals evaluate() output element by element.
+static void expectExecutorMatchesEvaluate(const Schema& schema,
+                                          const std::vector<Row>& input,
+                                          const Expr* expr,
+                                          const char* label) {
+    auto scan = makeScan(schema, input);
+    scan->open();
+    DataChunk* chunk = scan->nextChunk();
+    ASSERT_NE(chunk, nullptr) << label;
+    ASSERT_EQ(chunk->num_rows, static_cast<int>(input.size())) << label;
+
+    std::vector<int> sel(input.size());
+    std::iota(sel.begin(), sel.end(), 0);
+
+    auto exec = ExpressionExecutor::compile(expr, schema);
+    ASSERT_NE(exec, nullptr) << "compile() refused: " << label;
+
+    const ColumnVector& out = exec->execute(*chunk, sel);
+    ASSERT_EQ(out.size(), static_cast<int>(input.size())) << label;
+    EXPECT_EQ(out.type, exec->type()) << label;
+
+    for (int r = 0; r < static_cast<int>(input.size()); ++r) {
+        Value expected = evaluate(expr, input[r], schema);
+        Value actual   = valueAt(out, r);
+        EXPECT_EQ(expected.isNull(), actual.isNull())
+            << label << " row " << r << ": null mismatch";
+        if (expected.isNull() || actual.isNull()) continue;
+        EXPECT_EQ(expected.type(), actual.type()) << label << " row " << r;
+        if (expected.type() == TypeId::STRING) {
+            EXPECT_EQ(expected.asString(), actual.asString()) << label << " row " << r;
+        } else {
+            EXPECT_DOUBLE_EQ(expected.toNumeric(), actual.toNumeric())
+                << label << " row " << r;
+        }
+    }
+    scan->close();
+}
+
+// i = INT, d = DOUBLE, s = STRING; z carries zeros so every division shape
+// exercises the x/0 -> NULL branch.
+static Schema exprCorpusSchema() {
+    return vecSchema({{"i", TypeId::INT}, {"z", TypeId::INT},
+                      {"d", TypeId::DOUBLE}, {"s", TypeId::STRING}});
+}
+
+static std::vector<Row> exprCorpusRows() {
+    return {
+        {Value(int64_t(7)),  Value(int64_t(2)), Value(1.5),  Value(std::string("b"))},
+        {Value(int64_t(-3)), Value(int64_t(0)), Value(0.0),  Value(std::string("a"))},
+        {Value(int64_t(0)),  Value(int64_t(5)), Value(-2.5), Value(std::string("c"))},
+        {Value(int64_t(10)), Value(int64_t(0)), Value(4.0),  Value(std::string("a"))},
+    };
+}
+
+#define EXPECT_EXEC_MATCHES(expr) \
+    expectExecutorMatchesEvaluate(exprCorpusSchema(), exprCorpusRows(), (expr).get(), #expr)
+
+TEST(ExpressionExecutor, MatchesEvaluateOnColumnsAndLiterals) {
+    EXPECT_EXEC_MATCHES(col("i"));
+    EXPECT_EXEC_MATCHES(col("d"));
+    EXPECT_EXEC_MATCHES(col("s"));
+    EXPECT_EXEC_MATCHES(intLit(42));
+    EXPECT_EXEC_MATCHES(dblLit(2.5));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnIntArithmetic) {
+    EXPECT_EXEC_MATCHES(binOp("+", col("i"), col("z")));
+    EXPECT_EXEC_MATCHES(binOp("-", col("i"), col("z")));
+    EXPECT_EXEC_MATCHES(binOp("*", col("i"), col("z")));
+    // INT/INT truncates, and z is 0 on two rows -> NULL there
+    EXPECT_EXEC_MATCHES(binOp("/", col("i"), col("z")));
+    EXPECT_EXEC_MATCHES(binOp("/", intLit(8), col("z")));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnDoubleAndMixedArithmetic) {
+    EXPECT_EXEC_MATCHES(binOp("+", col("d"), dblLit(1.25)));
+    EXPECT_EXEC_MATCHES(binOp("/", col("d"), col("d")));       // 0.0/0.0 -> NULL
+    EXPECT_EXEC_MATCHES(binOp("*", col("i"), col("d")));       // INT * DOUBLE promotes
+    EXPECT_EXEC_MATCHES(binOp("-", col("d"), col("i")));
+    EXPECT_EXEC_MATCHES(binOp("/", col("i"), col("d")));       // /0.0 -> NULL
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnNestedTpchRevenueShape) {
+    // the TPC-H idiom: d * (1 - i) * (1 + i)
+    EXPECT_EXEC_MATCHES(binOp("*", binOp("*", col("d"), binOp("-", intLit(1), col("i"))),
+                                   binOp("+", intLit(1), col("i"))));
+    // NULL must propagate up through an arithmetic parent
+    EXPECT_EXEC_MATCHES(binOp("+", binOp("/", col("i"), col("z")), col("i")));
+    EXPECT_EXEC_MATCHES(binOp("*", binOp("/", col("d"), intLit(0)), col("d")));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnUnaryMinus) {
+    auto neg = std::make_unique<UnaryExpr>();
+    neg->op = "-";
+    neg->operand = col("i");
+    EXPECT_EXEC_MATCHES(neg);
+
+    auto neg_d = std::make_unique<UnaryExpr>();
+    neg_d->op = "-";
+    neg_d->operand = col("d");
+    EXPECT_EXEC_MATCHES(neg_d);
+
+    // -(i / z): NULL must survive negation
+    auto neg_null = std::make_unique<UnaryExpr>();
+    neg_null->op = "-";
+    neg_null->operand = binOp("/", col("i"), col("z"));
+    EXPECT_EXEC_MATCHES(neg_null);
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnComparisonsAndLogic) {
+    EXPECT_EXEC_MATCHES(binOp(">",  col("i"), intLit(0)));
+    EXPECT_EXEC_MATCHES(binOp("<=", col("d"), dblLit(0.0)));
+    EXPECT_EXEC_MATCHES(binOp("=",  col("s"), strLit("a")));
+    EXPECT_EXEC_MATCHES(binOp("!=", col("s"), strLit("a")));
+    EXPECT_EXEC_MATCHES(binOp("<",  col("i"), col("d")));      // mixed compare promotes
+    EXPECT_EXEC_MATCHES(binOp("AND", binOp(">", col("i"), intLit(0)),
+                                     binOp("<", col("d"), dblLit(3.0))));
+    EXPECT_EXEC_MATCHES(binOp("OR",  binOp("=", col("z"), intLit(0)),
+                                     binOp(">", col("i"), intLit(5))));
+    // comparison against a NULL operand yields NULL, and AND/OR propagate it
+    EXPECT_EXEC_MATCHES(binOp(">", binOp("/", col("i"), col("z")), intLit(0)));
+    EXPECT_EXEC_MATCHES(binOp("AND", binOp(">", binOp("/", col("i"), col("z")), intLit(0)),
+                                     binOp(">", col("i"), intLit(0))));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnIsNull) {
+    auto isn = std::make_unique<IsNullExpr>();
+    isn->operand = binOp("/", col("i"), col("z"));
+    isn->is_not_null = false;
+    EXPECT_EXEC_MATCHES(isn);
+
+    auto isnn = std::make_unique<IsNullExpr>();
+    isnn->operand = binOp("/", col("i"), col("z"));
+    isnn->is_not_null = true;
+    EXPECT_EXEC_MATCHES(isnn);
+}
+
+#undef EXPECT_EXEC_MATCHES
+
+// The executor is dense in selection order: result index i corresponds to
+// sel[i], not to chunk row sel[i]. Callers index it by position.
+TEST(ExpressionExecutor, ResultIsDenseInSelectionOrder) {
+    Schema schema = exprCorpusSchema();
+    std::vector<Row> input = exprCorpusRows();
+    auto scan = makeScan(schema, input);
+    scan->open();
+    DataChunk* chunk = scan->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+
+    auto expr = binOp("*", col("i"), intLit(2));
+    auto exec = ExpressionExecutor::compile(expr.get(), schema);
+    ASSERT_NE(exec, nullptr);
+
+    std::vector<int> sel = {3, 0};                 // rows 10 and 7 -> 20 and 14
+    const ColumnVector& out = exec->execute(*chunk, sel);
+    ASSERT_EQ(out.size(), 2);
+    EXPECT_EQ(valueAt(out, 0).asInt(), 20);
+    EXPECT_EQ(valueAt(out, 1).asInt(), 14);
+    scan->close();
+}
+
+// The scratch buffers are reused across chunks; a stale length or a leftover
+// validity mask from the previous call would corrupt the next one.
+TEST(ExpressionExecutor, ScratchIsResetBetweenCalls) {
+    Schema schema = exprCorpusSchema();
+    std::vector<Row> input = exprCorpusRows();
+    auto scan = makeScan(schema, input);
+    scan->open();
+    DataChunk* chunk = scan->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+
+    auto expr = binOp("/", col("i"), col("z"));    // NULL where z == 0
+    auto exec = ExpressionExecutor::compile(expr.get(), schema);
+    ASSERT_NE(exec, nullptr);
+
+    // first call sees the NULL rows, second sees only valid rows
+    const ColumnVector& first = exec->execute(*chunk, {1, 3});
+    ASSERT_EQ(first.size(), 2);
+    EXPECT_TRUE(valueAt(first, 0).isNull());
+    EXPECT_TRUE(valueAt(first, 1).isNull());
+
+    const ColumnVector& second = exec->execute(*chunk, {0, 2});
+    ASSERT_EQ(second.size(), 2);
+    EXPECT_FALSE(valueAt(second, 0).isNull());     // 7 / 2 = 3
+    EXPECT_EQ(valueAt(second, 0).asInt(), 3);
+    EXPECT_FALSE(valueAt(second, 1).isNull());     // 0 / 5 = 0
+    EXPECT_EQ(valueAt(second, 1).asInt(), 0);
+    scan->close();
+}
+
+// Compilation declines shapes it has no kernel for, so the caller can keep the
+// per-row evaluate() path rather than getting a wrong answer.
+TEST(ExpressionExecutor, CompileDeclinesUnresolvableColumn) {
+    Schema schema = exprCorpusSchema();
+    auto expr = col("nonexistent");
+    EXPECT_EQ(ExpressionExecutor::compile(expr.get(), schema), nullptr);
+}
+
+TEST(ExpressionExecutor, CompileDeclinesRatherThanThrowingOnBadShapes) {
+    Schema schema = exprCorpusSchema();
+
+    // STRING arithmetic: ill-typed, evaluate() raises the error instead
+    auto str_arith = binOp("+", col("s"), intLit(1));
+    EXPECT_NO_THROW(EXPECT_EQ(ExpressionExecutor::compile(str_arith.get(), schema), nullptr));
+
+    // STRING compared to a numeric: Value's operators throw, so decline and let
+    // the fallback raise from the same place it always did
+    auto mixed_cmp = binOp("=", col("s"), intLit(1));
+    EXPECT_NO_THROW(EXPECT_EQ(ExpressionExecutor::compile(mixed_cmp.get(), schema), nullptr));
+
+    // no NULL literal exists in the grammar; a hand-built one is declined, not
+    // broadcast as a typeless constant (Value::type() throws on null)
+    auto null_lit = std::make_unique<Literal>(Value::null());
+    EXPECT_NO_THROW(EXPECT_EQ(ExpressionExecutor::compile(null_lit.get(), schema), nullptr));
+
+    // unknown operator
+    auto bad_op = binOp("%%", col("i"), intLit(2));
+    EXPECT_NO_THROW(EXPECT_EQ(ExpressionExecutor::compile(bad_op.get(), schema), nullptr));
+}
+
+
+// Scratch buffers are reused across chunks and the final chunk is partial, so
+// resetOut() must shrink correctly and no kernel may read a stale element.
+// Row count is deliberately not a multiple of BATCH_SIZE.
+TEST(ExpressionExecutor, MultiChunkWithPartialFinalChunk) {
+    const int n = BATCH_SIZE * 2 + 37;
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input;
+    input.reserve(n);
+    int64_t expected_sum = 0;
+    int expected_nulls = 0;
+    for (int i = 0; i < n; ++i) {
+        // every 5th row has divisor 0 -> NULL, which SUM must skip
+        int64_t z = (i % 5 == 0) ? 0 : (i % 7) + 1;
+        input.push_back({Value(static_cast<int64_t>(i)), Value(z)});
+        if (z == 0) ++expected_nulls;
+        else expected_sum += static_cast<int64_t>(i) / z;   // INT/INT truncates
+    }
+
+    auto arg = binOp("/", col("x"), col("z"));
+    AggregateSpec sum_spec;
+    sum_spec.function = "SUM";
+    sum_spec.is_star = false;
+    sum_spec.argument = arg.get();
+    sum_spec.output_name = "SUM((x / z))";
+
+    AggregateSpec cnt_spec;
+    cnt_spec.function = "COUNT";
+    cnt_spec.is_star = false;
+    cnt_spec.argument = arg.get();
+    cnt_spec.output_name = "COUNT((x / z))";
+
+    Schema out_schema = vecSchema({{"SUM((x / z))", TypeId::DOUBLE},
+                                   {"COUNT((x / z))", TypeId::INT}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<GroupByColumn>{},
+        std::vector<AggregateSpec>{sum_spec, cnt_spec}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), static_cast<double>(expected_sum));
+    // COUNT(expr) counts non-NULL results only
+    EXPECT_EQ(rows[0][1].asInt(), n - expected_nulls);
+}
+
+
+// Expression group keys go through the same executor. A NULL key must form its
+// own group rather than colliding with a real value or with the string "NULL".
+TEST(VecHashAggregate, NullExpressionGroupKeyIsItsOwnGroup) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(6)), Value(int64_t(0))},   // 6/0 -> NULL
+        {Value(int64_t(6)), Value(int64_t(3))},   // -> 2
+        {Value(int64_t(8)), Value(int64_t(0))},   // -> NULL (same group as row 0)
+        {Value(int64_t(4)), Value(int64_t(2))},   // -> 2 (same group as row 1)
+    };
+
+    GroupByColumn g;
+    g.column_name = "(x / z)";
+    g.expr = binOp("/", col("x"), col("z"));
+
+    AggregateSpec cnt;
+    cnt.function = "COUNT";
+    cnt.is_star = true;
+    cnt.output_name = "COUNT(*)";
+
+    Schema out_schema = vecSchema({{"(x / z)", TypeId::INT}, {"COUNT(*)", TypeId::INT}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, input), std::vector<GroupByColumn>{g},
+        std::vector<AggregateSpec>{cnt}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 2u);   // {NULL: 2, 2: 2}
+    for (const Row& r : rows) EXPECT_EQ(r[1].asInt(), 2);
+    int nulls = 0;
+    for (const Row& r : rows) if (r[0].isNull()) ++nulls;
+    EXPECT_EQ(nulls, 1);
+}
+
+
+// A NULL arriving in a source CHUNK column (as opposed to one manufactured by
+// x/0 inside the expression) must be gathered and propagated. Not reachable
+// from SQL today — ColumnarTable cannot express NULL, so an aggregate's input is
+// always all-valid — but it is the shape a left outer join will produce, so the
+// gather path is pinned down here with a hand-built chunk.
+TEST(ExpressionExecutor, NullInSourceColumnPropagates) {
+    DataChunk chunk;
+    ColumnVector a = makeColumnVector(TypeId::INT);
+    ColumnVector b = makeColumnVector(TypeId::DOUBLE);
+    // a = [5, NULL, 7],  b = [2.0, 4.0, NULL]
+    appendColumnValue(a, Value(int64_t(5)));
+    appendColumnValue(a, Value::null());
+    appendColumnValue(a, Value(int64_t(7)));
+    appendColumnValue(b, Value(2.0));
+    appendColumnValue(b, Value(4.0));
+    appendColumnValue(b, Value::null());
+    // validity must be index-aligned with the dense data
+    ASSERT_FALSE(a.all_valid);
+    ASSERT_EQ(a.validity.size(), static_cast<size_t>(a.size()));
+    ASSERT_FALSE(b.all_valid);
+    ASSERT_EQ(b.validity.size(), static_cast<size_t>(b.size()));
+
+    chunk.columns.push_back(std::move(a));
+    chunk.columns.push_back(std::move(b));
+    chunk.num_rows = 3;
+    Schema schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::DOUBLE}});
+
+    // a * b -> [10.0, NULL, NULL]
+    auto expr = binOp("*", col("a"), col("b"));
+    auto exec = ExpressionExecutor::compile(expr.get(), schema);
+    ASSERT_NE(exec, nullptr);
+
+    const ColumnVector& out = exec->execute(chunk, {0, 1, 2});
+    ASSERT_EQ(out.size(), 3);
+    EXPECT_FALSE(out.isNull(0));
+    EXPECT_DOUBLE_EQ(valueAt(out, 0).asDouble(), 10.0);
+    EXPECT_TRUE(out.isNull(1));    // NULL from the left operand
+    EXPECT_TRUE(out.isNull(2));    // NULL from the right operand
+
+    // IS NULL reads the operand mask and is never itself NULL
+    auto isn = std::make_unique<IsNullExpr>();
+    isn->operand = col("a");
+    isn->is_not_null = false;
+    auto isn_exec = ExpressionExecutor::compile(isn.get(), schema);
+    ASSERT_NE(isn_exec, nullptr);
+    const ColumnVector& flags = isn_exec->execute(chunk, {0, 1, 2});
+    EXPECT_TRUE(flags.all_valid);
+    EXPECT_EQ(valueAt(flags, 0).asInt(), 0);
+    EXPECT_EQ(valueAt(flags, 1).asInt(), 1);
+    EXPECT_EQ(valueAt(flags, 2).asInt(), 0);
+
+    // a selection that skips the NULL row must produce an all-valid result,
+    // proving the gather consults the SOURCE index, not the dense position
+    const ColumnVector& subset = exec->execute(chunk, {0});
+    ASSERT_EQ(subset.size(), 1);
+    EXPECT_TRUE(subset.all_valid);
+    EXPECT_DOUBLE_EQ(valueAt(subset, 0).asDouble(), 10.0);
+}
+
+
+// ===== Overflow-checked INT arithmetic =====
+// Signed overflow is UB, not wraparound: the compiler may assume it away at -O2
+// and a UBSan build aborts. SwiftQL used to compute INT64_MAX + 1 as INT64_MIN by
+// accident of the target. Both evaluators now raise instead — and must agree.
+
+static void expectOverflowInBothEvaluators(const Schema& schema,
+                                           const std::vector<Row>& input,
+                                           const Expr* expr,
+                                           const char* label) {
+    // scalar evaluator (the Volcano path and the vectorized fallback)
+    EXPECT_THROW(evaluate(expr, input[0], schema), std::runtime_error) << label;
+
+    // compiled executor must raise on the same input
+    auto scan = makeScan(schema, input);
+    scan->open();
+    DataChunk* chunk = scan->nextChunk();
+    ASSERT_NE(chunk, nullptr) << label;
+    std::vector<int> sel(input.size());
+    std::iota(sel.begin(), sel.end(), 0);
+    auto exec = ExpressionExecutor::compile(expr, schema);
+    ASSERT_NE(exec, nullptr) << label;
+    EXPECT_THROW(exec->execute(*chunk, sel), std::runtime_error) << label;
+    scan->close();
+}
+
+TEST(CheckedArithmetic, OverflowRaisesInBothEvaluators) {
+    Schema schema = vecSchema({{"big", TypeId::INT}, {"neg", TypeId::INT}});
+    std::vector<Row> input = {{Value(INT64_MAX), Value(INT64_MIN)}};
+
+    auto add = binOp("+", col("big"), intLit(1));
+    expectOverflowInBothEvaluators(schema, input, add.get(), "INT64_MAX + 1");
+
+    auto sub = binOp("-", col("neg"), intLit(1));
+    expectOverflowInBothEvaluators(schema, input, sub.get(), "INT64_MIN - 1");
+
+    auto mul = binOp("*", col("big"), intLit(2));
+    expectOverflowInBothEvaluators(schema, input, mul.get(), "INT64_MAX * 2");
+
+    auto div = binOp("/", col("neg"), intLit(-1));
+    expectOverflowInBothEvaluators(schema, input, div.get(), "INT64_MIN / -1");
+
+    auto neg = std::make_unique<UnaryExpr>();
+    neg->op = "-";
+    neg->operand = col("neg");
+    expectOverflowInBothEvaluators(schema, input, neg.get(), "-INT64_MIN");
+}
+
+// DOUBLE arithmetic is IEEE and must NOT be affected by the INT overflow checks.
+TEST(CheckedArithmetic, DoubleArithmeticIsUnaffected) {
+    Schema schema = vecSchema({{"d", TypeId::DOUBLE}});
+    std::vector<Row> input = {{Value(1.0e308)}};
+    auto mul = binOp("*", col("d"), dblLit(10.0));   // overflows to +inf, no throw
+    EXPECT_NO_THROW(evaluate(mul.get(), input[0], schema));
+    expectExecutorMatchesEvaluate(schema, input, mul.get(), "1e308 * 10");
+}
+
+// A row that is already NULL must be SKIPPED, not computed: runColumn gathers the
+// real underlying value for a NULL row, and that value can legitimately be
+// INT64_MIN. Computing on it would raise an overflow for a row whose result is
+// never read — evaluate() short-circuits on NULL before touching either operand,
+// so the kernels must too.
+TEST(CheckedArithmetic, AlreadyNullRowsAreNotComputed) {
+    DataChunk chunk;
+    ColumnVector v = makeColumnVector(TypeId::INT);
+    appendColumnValue(v, Value(int64_t(1)));
+    appendColumnValue(v, Value::null());     // placeholder 0 underneath
+    chunk.columns.push_back(std::move(v));
+
+    // deliberately put INT64_MIN under the NULL so a computed row would overflow
+    std::get<std::vector<int64_t>>(chunk.columns[0].data)[1] = INT64_MIN;
+    chunk.num_rows = 2;
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+
+    // n - 1 : row 0 = 0, row 1 = NULL (must not attempt INT64_MIN - 1)
+    auto sub = binOp("-", col("n"), intLit(1));
+    auto exec = ExpressionExecutor::compile(sub.get(), schema);
+    ASSERT_NE(exec, nullptr);
+    const ColumnVector* out = nullptr;
+    ASSERT_NO_THROW(out = &exec->execute(chunk, {0, 1}));
+    EXPECT_EQ(valueAt(*out, 0).asInt(), 0);
+    EXPECT_TRUE(out->isNull(1));
+
+    // -n : same, for the unary path
+    auto neg = std::make_unique<UnaryExpr>();
+    neg->op = "-";
+    neg->operand = col("n");
+    auto neg_exec = ExpressionExecutor::compile(neg.get(), schema);
+    ASSERT_NE(neg_exec, nullptr);
+    ASSERT_NO_THROW(out = &neg_exec->execute(chunk, {0, 1}));
+    EXPECT_EQ(valueAt(*out, 0).asInt(), -1);
+    EXPECT_TRUE(out->isNull(1));
+}
+
+
+// ===== The executor is wired into the filter and projection positions =====
+// Both used to reconstruct a Row per row and walk the AST with dynamic_cast.
+// Measured on 1M rows, Release: VecFilter 222ms -> 1.7ms, VecProject 162ms ->
+// 1.0ms. These tests pin the CORRECTNESS of the rewritten paths; the win itself
+// is recorded in development.md.
+
+TEST(VecFilterExecutor, ExpressionPredicateMatchesScalarSemantics) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input;
+    for (int i = 0; i < BATCH_SIZE + 7; ++i) {
+        input.push_back({Value(static_cast<int64_t>(i)),
+                         Value(static_cast<int64_t>(i % 4))});   // z == 0 every 4th row
+    }
+
+    // WHERE x * 2 > 100 — arithmetic on the left, so no `col op literal` fast path
+    VecFilterNode filter(makeScan(schema, input),
+                         binOp(">", binOp("*", col("x"), intLit(2)), intLit(100)));
+    int expected = 0;
+    for (const Row& r : input) if (r[0].asInt() * 2 > 100) ++expected;
+    EXPECT_EQ(countSurvivors(filter), expected);
+}
+
+TEST(VecFilterExecutor, NullPredicateResultRejectsTheRow) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(10)), Value(int64_t(2))},   // 10/2 = 5  > 1 -> passes
+        {Value(int64_t(10)), Value(int64_t(0))},   // 10/0 = NULL     -> rejected
+        {Value(int64_t(10)), Value(int64_t(5))},   // 10/5 = 2  > 1 -> passes
+    };
+    // WHERE x / z > 1 : NULL is not true
+    VecFilterNode filter(makeScan(schema, input),
+                         binOp(">", binOp("/", col("x"), col("z")), intLit(1)));
+    EXPECT_EQ(countSurvivors(filter), 2);
+}
+
+TEST(VecFilterExecutor, CascadesUnderAndAcrossCompiledAndFastPaths) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input;
+    for (int i = 0; i < 500; ++i) {
+        input.push_back({Value(static_cast<int64_t>(i)), Value(static_cast<int64_t>(i % 3))});
+    }
+    // (x > 100) AND (x * 2 < 600): a fast-path conjunct cascading into a
+    // compiled one — the compiled side must honour the incoming SelectionVector
+    VecFilterNode filter(makeScan(schema, input),
+        binOp("AND", binOp(">", col("x"), intLit(100)),
+                     binOp("<", binOp("*", col("x"), intLit(2)), intLit(600))));
+    int expected = 0;
+    for (const Row& r : input) {
+        int64_t x = r[0].asInt();
+        if (x > 100 && x * 2 < 600) ++expected;
+    }
+    EXPECT_EQ(countSurvivors(filter), expected);
+}
+
+TEST(VecProjectExecutor, ExpressionColumnsMatchScalarSemantics) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"d", TypeId::DOUBLE}});
+    std::vector<Row> input;
+    for (int i = 0; i < BATCH_SIZE + 13; ++i) {
+        input.push_back({Value(static_cast<int64_t>(i)), Value(i * 0.5)});
+    }
+
+    // a plain column, a compiled INT expression, and a compiled DOUBLE expression
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(col("x"));
+    exprs.push_back(binOp("*", col("x"), intLit(2)));
+    exprs.push_back(binOp("*", col("d"), binOp("-", intLit(1), col("x"))));
+    Schema out_schema = vecSchema({{"x", TypeId::INT},
+                                   {"(x * 2)", TypeId::INT},
+                                   {"(d * (1 - x))", TypeId::DOUBLE}});
+
+    VecProjectNode project(makeScan(schema, input), std::move(exprs), out_schema);
+    std::vector<Row> rows = drainRows(project);
+
+    ASSERT_EQ(rows.size(), input.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        int64_t x = input[i][0].asInt();
+        double d = input[i][1].asDouble();
+        EXPECT_EQ(rows[i][0].asInt(), x) << "row " << i;
+        EXPECT_EQ(rows[i][1].asInt(), x * 2) << "row " << i;
+        EXPECT_DOUBLE_EQ(rows[i][2].asDouble(), d * (1 - static_cast<double>(x))) << "row " << i;
+    }
+}
+
+// The whole-column copy path must carry the executor's validity mask across, and
+// must respect the incoming SelectionVector rather than the physical row order.
+TEST(VecProjectExecutor, CarriesNullsAndHonoursSelectionVector) {
+    Schema schema = vecSchema({{"x", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(10)), Value(int64_t(0))},   // filtered out below
+        {Value(int64_t(20)), Value(int64_t(0))},   // survives; 20/0 -> NULL
+        {Value(int64_t(30)), Value(int64_t(3))},   // survives; 30/3 -> 10
+    };
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", col("x"), col("z")));
+    Schema out_schema = vecSchema({{"(x / z)", TypeId::INT}});
+
+    auto filter = std::make_unique<VecFilterNode>(makeScan(schema, input),
+                                                  binOp(">", col("x"), intLit(15)));
+    VecProjectNode project(std::move(filter), std::move(exprs), out_schema);
+    std::vector<Row> rows = drainRows(project);
+
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_TRUE(rows[0][0].isNull());        // 20 / 0
+    EXPECT_EQ(rows[1][0].asInt(), 10);       // 30 / 3
+}
+
+
+// ===== Three-valued AND/OR =====
+// evaluate() propagated NULL through the connectives, so Volcano answered
+// `WHERE (season/0) > 0 OR 1 = 1` with zero rows while the vectorized path
+// answered with all of them. Both evaluators are now three-valued and agree.
+
+TEST(ThreeValuedLogic, MatchesSqlTruthTables) {
+    Schema schema = vecSchema({{"t", TypeId::INT}, {"f", TypeId::INT}, {"z", TypeId::INT}});
+    std::vector<Row> input = {{Value(int64_t(1)), Value(int64_t(0)), Value(int64_t(0))}};
+    // unknown = 1 / z with z == 0 -> NULL
+    auto unknown = [&]{ return binOp("/", intLit(1), col("z")); };
+    auto isTrue  = [&]{ return binOp(">", col("t"), intLit(0)); };   // 1 > 0  -> true
+    auto isFalse = [&]{ return binOp(">", col("f"), intLit(0)); };   // 0 > 0  -> false
+
+    struct Case { const char* label; std::unique_ptr<Expr> e; int expect; };  // -1 = NULL
+    std::vector<Case> cases;
+    cases.push_back({"true  AND unknown", binOp("AND", isTrue(),  unknown()), -1});
+    cases.push_back({"false AND unknown", binOp("AND", isFalse(), unknown()),  0});
+    cases.push_back({"unknown AND false", binOp("AND", unknown(), isFalse()),  0});
+    cases.push_back({"unknown AND true",  binOp("AND", unknown(), isTrue()),  -1});
+    cases.push_back({"true  OR unknown",  binOp("OR",  isTrue(),  unknown()),  1});
+    cases.push_back({"unknown OR true",   binOp("OR",  unknown(), isTrue()),   1});
+    cases.push_back({"false OR unknown",  binOp("OR",  isFalse(), unknown()), -1});
+    cases.push_back({"unknown OR unknown",binOp("OR",  unknown(), unknown()), -1});
+    cases.push_back({"unknown AND unknown", binOp("AND", unknown(), unknown()), -1});
+
+    for (const Case& c : cases) {
+        Value v = evaluate(c.e.get(), input[0], schema);
+        if (c.expect < 0) {
+            EXPECT_TRUE(v.isNull()) << c.label;
+        } else {
+            ASSERT_FALSE(v.isNull()) << c.label;
+            EXPECT_EQ(v.asInt(), c.expect) << c.label;
+        }
+        // and the compiled executor must agree, row for row
+        expectExecutorMatchesEvaluate(schema, input, c.e.get(), c.label);
+    }
+}

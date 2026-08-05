@@ -7,10 +7,45 @@ VecProjectNode::VecProjectNode(std::unique_ptr<VecPlanNode> child, std::vector<s
 
 void VecProjectNode::open(){
     child_->open();
+    prepare();
 }
 
 void VecProjectNode::close(){
     child_->close();
+}
+
+// Classify each output expression ONCE per query. This used to happen per chunk,
+// and the expression case then walked the AST with dynamic_cast per row on a
+// rebuilt Row — 153ms per million rows for SELECT speed*2 against 8.8ms for the
+// plain column. Compiling here moves that dispatch out of the row loop entirely.
+void VecProjectNode::prepare(){
+    if (prepared_) return;
+    prepared_ = true;
+
+    const Schema& child_schema = child_->outputSchema();
+    src_col_.assign(expressions_.size(), -1);
+    compiled_.clear();
+    compiled_.resize(expressions_.size());
+    needs_row_ = false;
+
+    for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
+        if (auto* cr = dynamic_cast<const ColumnRef*>(expressions_[c].get())){
+            src_col_[c] = resolveColumnIndex(*cr, child_schema);
+            if (src_col_[c] >= 0) continue;
+            // an unresolved ColumnRef is not a plain column read; try to compile
+            // it like any other expression so the error comes from one place
+        }
+        compiled_[c] = ExpressionExecutor::compile(expressions_[c].get(), child_schema);
+        // compile() guarantees type() == inferExprType, and buildProjectSchema
+        // derives the output type from the same function — but only take the
+        // whole-column path when they agree exactly. A mismatch (e.g. a hand-built
+        // schema declaring DOUBLE for an INT expression) falls back to the
+        // per-value append, which widens INT into a DOUBLE column.
+        if (compiled_[c] && compiled_[c]->type() != output_schema_.column(c).type) {
+            compiled_[c].reset();
+        }
+        if (!compiled_[c]) needs_row_ = true;
+    }
 }
 
 DataChunk* VecProjectNode::nextChunk(){
@@ -35,58 +70,53 @@ DataChunk* VecProjectNode::nextChunk(){
 
     // rebuild output columns, must clear between calls since out_chunk_ is reused
     out_chunk_.columns.clear();
+    out_chunk_.columns.resize(output_schema_.size());
     out_chunk_.sel.indices.clear();
     out_chunk_.sel.size = 0;
     out_chunk_.filter_applied = false; // output is fully materialized; no filter pending
 
-    // pre allocate one COlumnVector per output expression
-    for (int c = 0; c < output_schema_.size(); ++c){
-        out_chunk_.columns.push_back(makeColumnVector(output_schema_.column(c).type));
-    }
-
     const Schema& child_schema = child_->outputSchema();
+    const int n_rows = static_cast<int>(indices_ptr->size());
 
-    // preclassify each output expression once before the per row loop
-    // src_col[c] >= 0: pure ColumnRef, read directly from source column array, no Row needed
-    // src_col[c] == -1: complex expression, requires evaluate(), which needs a full Row
-    std::vector<int> src_col(expressions_.size(), -1);
+    // Pass 1 — column at a time, no Row and no per-row dispatch.
     for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
-        if (auto* cr = dynamic_cast<const ColumnRef*>(expressions_[c].get())){
-            src_col[c] = resolveColumnIndex(*cr, child_schema);
+        if (src_col_[c] >= 0) {
+            // plain column: gather the selected rows, carrying validity across
+            const ColumnVector& src = filtered->columns[src_col_[c]];
+            ColumnVector out = makeColumnVector(output_schema_.column(c).type);
+            for (int i = 0; i < n_rows; ++i) {
+                appendColumnValue(out, valueAt(src, (*indices_ptr)[i]));
+            }
+            out_chunk_.columns[c] = std::move(out);
+        } else if (compiled_[c]) {
+            // compiled expression: the executor's dense result IS the output
+            // column, already the right type and carrying its own validity mask,
+            // so copy it whole instead of appending value by value
+            out_chunk_.columns[c] = compiled_[c]->execute(*filtered, *indices_ptr);
+        } else {
+            out_chunk_.columns[c] = makeColumnVector(output_schema_.column(c).type);
         }
     }
-    bool has_complex = false;
-    for (int idx : src_col) if (idx < 0) {
-        has_complex = true;
-        break;
-    }
 
-    for (int r : *indices_ptr) {
-        // build the full Row only when at least one expression needs evaluate().
-        Row tmp;
-        if (has_complex) {
+    // Pass 2 — only for expressions compile() declined: rebuild a Row per row and
+    // call the scalar evaluate(), exactly as before.
+    if (needs_row_) {
+        for (int i = 0; i < n_rows; ++i) {
+            const int r = (*indices_ptr)[i];
+            Row tmp;
             tmp.reserve(filtered->columns.size());
             for (const auto& cv : filtered->columns){
                 tmp.push_back(valueAt(cv, r));
             }
-        }
-
-        for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
-            Value v;
-            if (src_col[c] >= 0) {
-                // direct columnar read, no Row, no evaluate() call
-                v = valueAt(filtered->columns[src_col[c]], r);
-            } else {
-                v = evaluate(expressions_[c].get(), tmp, child_schema);
+            for (int c = 0; c < static_cast<int>(expressions_.size()); ++c) {
+                if (src_col_[c] >= 0 || compiled_[c]) continue;
+                appendColumnValue(out_chunk_.columns[c],
+                                  evaluate(expressions_[c].get(), tmp, child_schema));
             }
-            // a NULL (e.g. x/0 under SQLite division semantics) is carried on the
-            // column's validity mask instead of being flattened to a 0 / "NULL"
-            // sentinel that is indistinguishable from a real value
-            appendColumnValue(out_chunk_.columns[c], v);
         }
     }
 
-    out_chunk_.num_rows = static_cast<int>(indices_ptr->size());
+    out_chunk_.num_rows = n_rows;
 
     stats.rows_in += static_cast<int>(indices_ptr->size());
     stats.rows_out += out_chunk_.num_rows;
