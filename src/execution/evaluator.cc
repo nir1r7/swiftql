@@ -1,4 +1,5 @@
 #include "execution/evaluator.h"
+#include "execution/checked_arith.h"
 #include "parser/expr_utils.h"
 #include <stdexcept>
 
@@ -73,11 +74,12 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
 
             if (left.type() == TypeId::INT && right.type() == TypeId::INT) {
                 int64_t l = left.asInt(), r = right.asInt();
-                if (op == "+") return Value(l + r);
-                if (op == "-") return Value(l - r);
-                if (op == "*") return Value(l * r);
+                // checked: signed overflow is UB, not wraparound (checked_arith.h)
+                if (op == "+") return Value(checkedAdd(l, r));
+                if (op == "-") return Value(checkedSub(l, r));
+                if (op == "*") return Value(checkedMul(l, r));
                 // SQLite semantics: INT/INT truncates, x/0 is NULL
-                return r == 0 ? Value::null() : Value(l / r);
+                return r == 0 ? Value::null() : Value(checkedDiv(l, r));
             }
             double l = left.toNumeric(), r = right.toNumeric();
             if (op == "+") return Value(l + r);
@@ -93,7 +95,7 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
         Value v = evaluate(un->operand.get(), row, schema);
         if (v.isNull()) return Value::null();
-        if (v.type() == TypeId::INT)    return Value(-v.asInt());
+        if (v.type() == TypeId::INT)    return Value(checkedNegate(v.asInt()));
         if (v.type() == TypeId::DOUBLE) return Value(-v.asDouble());
         throw std::runtime_error("unary '-' requires a numeric operand");
     }
