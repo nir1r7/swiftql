@@ -41,12 +41,16 @@ void VecSortNode::consumeAndSort() {
         }
     }
 
+    // compareForSort, not Value::operator< — the SQL operators return false for
+    // every comparison against NULL, which makes NULL equivalent to every value
+    // and the equivalence non-transitive. That is not a strict weak ordering, so
+    // stable_sort's behaviour is undefined: it inverted non-NULL keys and dropped
+    // rows under LIMIT. See the comment on compareForSort in value.h.
     std::stable_sort(flat_buffer_.begin(), flat_buffer_.end(), [&](const Row& a, const Row& b) {
             for (const auto& item : order_by_) {
-                Value va = evaluate(item.expr.get(), a, schema);
-                Value vb = evaluate(item.expr.get(), b, schema);
-                if (va < vb) return !item.desc;
-                if (vb < va) return  item.desc;
+                int c = compareForSort(evaluate(item.expr.get(), a, schema),
+                                       evaluate(item.expr.get(), b, schema));
+                if (c != 0) return item.desc ? c > 0 : c < 0;
             }
             return false;
         });

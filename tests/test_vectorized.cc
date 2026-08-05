@@ -2742,3 +2742,40 @@ TEST(VecProject, DivisionByZeroMaterializesSentinelNotCrash) {
     EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 0.0);   // NULL -> 0.0 sentinel
     EXPECT_EQ(rows[0][1].asInt(), 0);               // NULL -> 0 sentinel
 }
+
+
+// ===== compareForSort is a total order; the SQL operators are not =====
+
+TEST(CompareForSort, NullIsTheMinimumAndNullsAreEqual) {
+    EXPECT_EQ(compareForSort(Value::null(), Value::null()), 0);
+    EXPECT_LT(compareForSort(Value::null(), Value(int64_t(0))), 0);
+    EXPECT_GT(compareForSort(Value(int64_t(0)), Value::null()), 0);
+    EXPECT_LT(compareForSort(Value::null(), Value(-1.5)), 0);
+    EXPECT_LT(compareForSort(Value::null(), Value(std::string(""))), 0);
+}
+
+// The property the old comparator violated: equivalence must be transitive.
+// Under Value::operator<, 1 ≡ NULL and NULL ≡ 2 while 1 < 2 — which is what made
+// stable_sort's behaviour undefined.
+TEST(CompareForSort, EquivalenceIsTransitive) {
+    const Value a(int64_t(1)), n = Value::null(), b(int64_t(2));
+
+    // the broken property, stated directly against the SQL operators
+    EXPECT_FALSE(a < n); EXPECT_FALSE(n < a);   // 1 "equivalent to" NULL
+    EXPECT_FALSE(n < b); EXPECT_FALSE(b < n);   // NULL "equivalent to" 2
+    EXPECT_TRUE(a < b);                         // but 1 < 2 — non-transitive
+
+    // compareForSort gives a strict weak ordering instead
+    EXPECT_LT(compareForSort(n, a), 0);
+    EXPECT_LT(compareForSort(a, b), 0);
+    EXPECT_LT(compareForSort(n, b), 0);         // transitive
+    EXPECT_EQ(compareForSort(a, a), 0);
+    EXPECT_EQ(compareForSort(a, b), -compareForSort(b, a));   // antisymmetric
+    EXPECT_EQ(compareForSort(n, a), -compareForSort(a, n));
+}
+
+TEST(CompareForSort, CoercesIntAgainstDouble) {
+    EXPECT_LT(compareForSort(Value(int64_t(1)), Value(1.5)), 0);
+    EXPECT_GT(compareForSort(Value(2.5), Value(int64_t(2))), 0);
+    EXPECT_EQ(compareForSort(Value(int64_t(2)), Value(2.0)), 0);
+}

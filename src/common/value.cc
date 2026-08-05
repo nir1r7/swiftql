@@ -89,6 +89,20 @@ bool Value::operator>=(const Value& other) const {
 
 #undef NUMERIC_COERCE
 
+int compareForSort(const Value& a, const Value& b) {
+    const bool na = a.isNull(), nb = b.isNull();
+    if (na || nb) {
+        if (na && nb) return 0;      // two NULLs tie; the next sort key decides
+        return na ? -1 : 1;          // NULL is smaller than every value (SQLite)
+    }
+    // both non-NULL: the SQL operators are a correct total order here, and they
+    // coerce INT against DOUBLE. STRING against a number still throws, as it does
+    // everywhere else.
+    if (a < b) return -1;
+    if (b < a) return 1;
+    return 0;
+}
+
 std::string Value::toString() const {
     if (is_null_) return "NULL";
     switch(data_.index()){

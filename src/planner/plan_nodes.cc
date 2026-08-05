@@ -478,12 +478,14 @@ void SortNode::open() {
     // sort — self-work only, no child calls
     auto t0 = std::chrono::high_resolution_clock::now();
     const Schema& schema = child_->outputSchema();
+    // compareForSort, not Value::operator< — see the comment in value.h. Comparing
+    // with the SQL operators is not a strict weak ordering once a sort key can be
+    // NULL, which is undefined behaviour in stable_sort, not just odd placement.
     std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
         for (const auto& item : order_by_) {
-            Value va = evaluate(item.expr.get(), a, schema);
-            Value vb = evaluate(item.expr.get(), b, schema);
-            if (va < vb) return !item.desc;
-            if (vb < va) return  item.desc;
+            int c = compareForSort(evaluate(item.expr.get(), a, schema),
+                                   evaluate(item.expr.get(), b, schema));
+            if (c != 0) return item.desc ? c > 0 : c < 0;
         }
         return false;
     });
