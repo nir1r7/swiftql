@@ -190,13 +190,75 @@ NULL_ORDERING_QUERIES = [
     "SELECT DISTINCT round / (round - 1) AS g FROM laps ORDER BY g",
 ]
 
+# Week 25 predicates. BETWEEN is desugared in the parser into two comparisons,
+# so these also pin down that the rewrite agrees with SQLite — including the
+# precedence case, where a trailing AND must belong to the WHERE and not to the
+# range. LIKE is ASCII case-insensitive to match SQLite's default, which the
+# lowercase-pattern query below is here to prove.
+WEEK25_PREDICATE_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps WHERE season BETWEEN 2021 AND 2023",
+    "SELECT COUNT(*) AS c FROM laps WHERE season NOT BETWEEN 2021 AND 2023",
+    "SELECT COUNT(*) AS c FROM laps WHERE season BETWEEN 2021 AND 2023 AND speed > 340",
+    "SELECT COUNT(*) AS c FROM laps WHERE speed BETWEEN 300 - 10 AND 300 + 10",
+    "SELECT team, COUNT(*) AS c FROM laps WHERE team BETWEEN 'A' AND 'M' GROUP BY team ORDER BY team",
+    "SELECT COUNT(*) AS c FROM laps WHERE season IN (2021, 2023)",
+    "SELECT COUNT(*) AS c FROM laps WHERE season NOT IN (2021, 2023)",
+    "SELECT COUNT(*) AS c FROM laps WHERE team IN ('Ferrari', 'McLaren')",
+    "SELECT COUNT(*) AS c FROM laps WHERE season IN (2021.0, 2023)",
+    "SELECT COUNT(*) AS c FROM laps WHERE (season / 0) IN (1, 2)",
+    "SELECT COUNT(*) AS c FROM laps WHERE team LIKE 'Fer%'",
+    "SELECT COUNT(*) AS c FROM laps WHERE team NOT LIKE 'Fer%'",
+    "SELECT COUNT(*) AS c FROM laps WHERE team LIKE '%rrar%'",
+    "SELECT COUNT(*) AS c FROM laps WHERE team LIKE '_erra_i'",
+    "SELECT COUNT(*) AS c FROM laps WHERE team LIKE 'ferrari'",
+    "SELECT team, COUNT(*) AS c FROM laps WHERE team LIKE '%a%' GROUP BY team ORDER BY team",
+]
+
+# CASE. The conditional-aggregate shape is TPC-H Q8/Q12/Q14's whole structure.
+# A missing ELSE must yield NULL (which SUM skips), not 0, and a NULL condition
+# must fall through rather than count as true.
+WEEK25_CASE_QUERIES = [
+    "SELECT SUM(CASE WHEN season = 2024 THEN speed ELSE 0 END) AS s FROM laps",
+    "SELECT SUM(CASE WHEN season = 2024 THEN speed END) AS s FROM laps",
+    "SELECT team, SUM(CASE WHEN season = 2024 THEN 1 ELSE 0 END) AS n FROM laps GROUP BY team ORDER BY team",
+    "SELECT COUNT(*) AS c FROM laps WHERE CASE WHEN season > 2022 THEN 1 ELSE 0 END = 1",
+    "SELECT COUNT(*) AS c FROM laps WHERE CASE WHEN (season / 0) > 0 THEN 1 ELSE 0 END = 0",
+    "SELECT DISTINCT CASE WHEN season > 2022 THEN 'late' ELSE 'early' END AS era FROM laps ORDER BY era",
+    # mixed INT/DOUBLE branches: inferExprType says DOUBLE while evaluate()
+    # returns an INT from the INT branch, so this pins the widening path
+    "SELECT lap_id, CASE WHEN season = 2024 THEN 1 ELSE 2.5 END AS m FROM laps ORDER BY m, lap_id LIMIT 10",
+]
+
+# SUBSTRING. SQLite accepts only the comma form (the SQL-standard
+# `SUBSTRING(x FROM a FOR b)` is a syntax error there), so the FROM/FOR form is
+# covered by unit tests instead. The IN query is TPC-H Q22's exact shape.
+WEEK25_SUBSTRING_QUERIES = [
+    "SELECT SUBSTRING(team, 1, 3) AS t, COUNT(*) AS c FROM laps GROUP BY SUBSTRING(team, 1, 3) ORDER BY t",
+    "SELECT SUBSTRING(team, 2) AS t FROM laps ORDER BY t LIMIT 10",
+    "SELECT COUNT(*) AS c FROM laps WHERE SUBSTRING(team, 1, 3) IN ('Fer', 'McL')",
+    "SELECT COUNT(*) AS c FROM laps WHERE SUBSTRING(team, 1, 3) LIKE 'Fe%'",
+]
+
+# Week 25 predicates below a join. collectSlots/restampSlots are dispatch sites
+# development.md's checklist omits, and missing them costs pushdown silently —
+# the answers stay right, so only a plan check or a benchmark would notice.
+# These at least lock the answers down across all four modes.
+WEEK25_JOIN_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+    "WHERE laps.team LIKE 'Fer%' AND drivers.nationality IN ('British','German')",
+    "SELECT drivers.team AS dt, COUNT(*) AS c FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+    "WHERE laps.season BETWEEN 2021 AND 2023 GROUP BY drivers.team ORDER BY dt",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
 ] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES \
   + WEEK24_EXPRESSION_QUERIES + NULL_SEMANTICS_QUERIES + MIN_MAX_TYPE_QUERIES \
   + GROUP_KEY_QUALIFIER_QUERIES + CONSTANT_FOLDING_QUERIES + EXPRESSION_POSITION_QUERIES \
-  + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES
+  + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
+  + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
+  + WEEK25_JOIN_QUERIES
 
 # SQLite setup
 def load_sqlite():
