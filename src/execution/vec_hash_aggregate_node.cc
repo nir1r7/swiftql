@@ -10,10 +10,19 @@ namespace {
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
         for (const auto& v : key) {
-            std::string s = v.toString();
-            result += std::to_string(s.size());
-            result += ':';
-            result += s;
+            // NULL gets the marker 'N'; the non-NULL encoding always starts
+            // with a decimal length digit, so the two can never collide.
+            // toString() would render NULL as "NULL", colliding with the
+            // string value "NULL" — reachable since expression group keys
+            // (GROUP BY season / 0) can evaluate to NULL.
+            if (v.isNull()) {
+                result += 'N';
+            } else {
+                std::string s = v.toString();
+                result += std::to_string(s.size());
+                result += ':';
+                result += s;
+            }
             result += '\x01';
         }
         return result;

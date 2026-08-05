@@ -20,10 +20,17 @@ namespace {
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
         for (const auto& v : key) {
-            std::string s = v.toString();
-            result += std::to_string(s.size());
-            result += ':';
-            result += s;
+            // NULL marker 'N' can never collide with the non-NULL encoding,
+            // which always starts with a decimal length digit. Mirrors
+            // serializeKey in vec_hash_aggregate_node.cc.
+            if (v.isNull()) {
+                result += 'N';
+            } else {
+                std::string s = v.toString();
+                result += std::to_string(s.size());
+                result += ':';
+                result += s;
+            }
             result += '\x01';
         }
         return result;
