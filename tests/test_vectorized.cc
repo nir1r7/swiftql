@@ -3114,18 +3114,25 @@ static void expectExecutorMatchesEvaluate(const Schema& schema,
 }
 
 // i = INT, d = DOUBLE, s = STRING; z carries zeros so every division shape
-// exercises the x/0 -> NULL branch.
+// exercises the x/0 -> NULL branch. t (Week 25) holds longer strings so LIKE
+// wildcards and SUBSTRING ranges have something real to chew on, including a
+// string shorter than the substring window and one that is empty.
 static Schema exprCorpusSchema() {
     return vecSchema({{"i", TypeId::INT}, {"z", TypeId::INT},
-                      {"d", TypeId::DOUBLE}, {"s", TypeId::STRING}});
+                      {"d", TypeId::DOUBLE}, {"s", TypeId::STRING},
+                      {"t", TypeId::STRING}});
 }
 
 static std::vector<Row> exprCorpusRows() {
     return {
-        {Value(int64_t(7)),  Value(int64_t(2)), Value(1.5),  Value(std::string("b"))},
-        {Value(int64_t(-3)), Value(int64_t(0)), Value(0.0),  Value(std::string("a"))},
-        {Value(int64_t(0)),  Value(int64_t(5)), Value(-2.5), Value(std::string("c"))},
-        {Value(int64_t(10)), Value(int64_t(0)), Value(4.0),  Value(std::string("a"))},
+        {Value(int64_t(7)),  Value(int64_t(2)), Value(1.5),  Value(std::string("b")),
+         Value(std::string("PROMO BRUSHED STEEL"))},
+        {Value(int64_t(-3)), Value(int64_t(0)), Value(0.0),  Value(std::string("a")),
+         Value(std::string("MEDIUM POLISHED BRASS"))},
+        {Value(int64_t(0)),  Value(int64_t(5)), Value(-2.5), Value(std::string("c")),
+         Value(std::string("ab"))},
+        {Value(int64_t(10)), Value(int64_t(0)), Value(4.0),  Value(std::string("a")),
+         Value(std::string(""))},
     };
 }
 
@@ -3210,6 +3217,97 @@ TEST(ExpressionExecutor, MatchesEvaluateOnIsNull) {
     isnn->operand = binOp("/", col("i"), col("z"));
     isnn->is_not_null = true;
     EXPECT_EXEC_MATCHES(isnn);
+}
+
+
+// ===== Week 25: differential coverage for the new kernels =====
+//
+// development.md is explicit that this corpus — not kernel-only tests — is what
+// holds ExpressionExecutor and evaluate() in agreement. Every Week 25 node with
+// a kernel gets its shapes here.
+
+static std::unique_ptr<Expr> likeOn(std::unique_ptr<Expr> operand,
+                                    const std::string& pattern, bool negated) {
+    auto n = std::make_unique<LikeExpr>();
+    n->operand = std::move(operand);
+    n->pattern = pattern;
+    n->negated = negated;
+    return n;
+}
+
+static std::unique_ptr<Expr> inOn(std::unique_ptr<Expr> operand,
+                                  std::vector<Value> values, bool negated) {
+    auto n = std::make_unique<InExpr>();
+    n->operand = std::move(operand);
+    n->values = std::move(values);
+    n->negated = negated;
+    return n;
+}
+
+static std::unique_ptr<Expr> substringOn(std::unique_ptr<Expr> operand,
+                                         std::unique_ptr<Expr> start,
+                                         std::unique_ptr<Expr> length) {
+    auto n = std::make_unique<SubstringExpr>();
+    n->operand = std::move(operand);
+    n->start = std::move(start);
+    n->length = std::move(length);
+    return n;
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnLike) {
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "PROMO%", false));       // prefix
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "%BRASS", false));       // suffix
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "%POLISHED%", false));   // contains
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "%", false));            // matches empty too
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "", false));             // only the empty string
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "_b", false));           // single-char wildcard
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "promo%", false));       // ASCII case folding
+    EXPECT_EXEC_MATCHES(likeOn(col("t"), "PROMO%", true));        // NOT LIKE
+    EXPECT_EXEC_MATCHES(likeOn(col("s"), "a", false));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnIn) {
+    EXPECT_EXEC_MATCHES(inOn(col("i"), {Value(int64_t(7)), Value(int64_t(0))}, false));
+    EXPECT_EXEC_MATCHES(inOn(col("i"), {Value(int64_t(7))}, true));            // NOT IN
+    EXPECT_EXEC_MATCHES(inOn(col("i"), {Value(int64_t(99))}, false));          // no match
+    EXPECT_EXEC_MATCHES(inOn(col("d"), {Value(1.5), Value(4.0)}, false));
+    EXPECT_EXEC_MATCHES(inOn(col("s"), {Value(std::string("a"))}, false));
+    // INT column against DOUBLE list values: Value::operator== coerces, and the
+    // kernel probes both the exact-INT set and the coerced-DOUBLE set
+    EXPECT_EXEC_MATCHES(inOn(col("i"), {Value(7.0)}, false));
+    EXPECT_EXEC_MATCHES(inOn(col("i"), {Value(7.0), Value(int64_t(0))}, false));
+    // DOUBLE column against INT list values
+    EXPECT_EXEC_MATCHES(inOn(col("d"), {Value(int64_t(4))}, false));
+    // NULL operand -> NULL, under both polarities
+    EXPECT_EXEC_MATCHES(inOn(binOp("/", col("i"), col("z")), {Value(int64_t(0))}, false));
+    EXPECT_EXEC_MATCHES(inOn(binOp("/", col("i"), col("z")), {Value(int64_t(0))}, true));
+}
+
+TEST(ExpressionExecutor, MatchesEvaluateOnSubstring) {
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(1), intLit(5)));
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(1), intLit(0)));   // empty result
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(3), nullptr));     // to end of string
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(50), intLit(2)));  // entirely past the end
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(2), intLit(100))); // length clamps
+    EXPECT_EXEC_MATCHES(substringOn(col("s"), intLit(1), intLit(1)));
+    // a NULL length must null the whole result — the third operand's validity
+    // is folded in separately, since propagateNulls only takes two
+    EXPECT_EXEC_MATCHES(substringOn(col("t"), intLit(1), binOp("/", col("i"), col("z"))));
+}
+
+// CaseExpr is deliberately uncompiled: evaluate() short-circuits and a chunk
+// kernel cannot. compile() must decline so the caller keeps the correct
+// per-row path — an uncovered shape is slow, never wrong.
+TEST(ExpressionExecutor, DeclinesCaseSoTheFallbackStaysCorrect) {
+    Schema schema = exprCorpusSchema();
+    auto c = std::make_unique<CaseExpr>();
+    CaseExpr::WhenClause w;
+    w.condition = binOp(">", col("i"), intLit(0));
+    w.result = intLit(1);
+    c->when_clauses.push_back(std::move(w));
+    c->else_expr = intLit(0);
+
+    EXPECT_EQ(ExpressionExecutor::compile(c.get(), schema), nullptr);
 }
 
 #undef EXPECT_EXEC_MATCHES

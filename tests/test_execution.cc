@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 #include "planner/plan_nodes.h"
+#include "planner/logical_plan.h"
+#include "planner/constant_folding.h"
+#include "parser/parser.h"
+#include "catalog/catalog.h"
 #include "execution/evaluator.h"
 #include "parser/ast.h"
 #include "common/value.h"
@@ -784,4 +788,165 @@ TEST(HashAggregateNode, SumOverExpressionArgument) {
     auto result = drainAll(&agg);
     ASSERT_EQ(result.size(), 1u);
     EXPECT_DOUBLE_EQ(result[0][0].asDouble(), 50.0);
+}
+
+// ===== Week 25: scalar semantics =====
+//
+// evaluate() is the semantic reference every vectorized kernel mirrors, so the
+// SQL rules are pinned here rather than only through the differential corpus.
+
+TEST(LikeMatch, WildcardAndCaseSemantics) {
+    EXPECT_TRUE(likeMatch("PROMO BRUSHED STEEL", "PROMO%"));
+    EXPECT_TRUE(likeMatch("MEDIUM POLISHED BRASS", "%BRASS"));
+    EXPECT_TRUE(likeMatch("MEDIUM POLISHED BRASS", "%POLISHED%"));
+    EXPECT_TRUE(likeMatch("c_comment special requests here", "%special%requests%"));
+    EXPECT_FALSE(likeMatch("PROMO BRUSHED STEEL", "%BRASS"));
+
+    // '_' is exactly one character, never zero
+    EXPECT_TRUE(likeMatch("Ferrari", "_erra_i"));
+    EXPECT_FALSE(likeMatch("errari", "_errari"));
+    EXPECT_TRUE(likeMatch("a", "_"));
+    EXPECT_FALSE(likeMatch("", "_"));
+
+    // '%' matches the empty sequence at both ends
+    EXPECT_TRUE(likeMatch("", "%"));
+    EXPECT_TRUE(likeMatch("abc", "%abc%"));
+    EXPECT_TRUE(likeMatch("abc", "abc%"));
+    EXPECT_TRUE(likeMatch("", ""));
+    EXPECT_FALSE(likeMatch("abc", ""));
+
+    // ASCII case-insensitive, matching SQLite's default so the correctness
+    // harness stays a valid oracle
+    EXPECT_TRUE(likeMatch("Ferrari", "ferrari"));
+    EXPECT_TRUE(likeMatch("Ferrari", "FER%"));
+
+    // backtracking: the greedy '%' has to give characters back
+    EXPECT_TRUE(likeMatch("aaa", "%aa"));
+    EXPECT_TRUE(likeMatch("abcabc", "%abc"));
+    EXPECT_FALSE(likeMatch("abcabd", "%abc"));
+}
+
+// In-domain arguments (start >= 1, length >= 0) agree with SQLite exactly.
+TEST(SubstringOf, AgreesWithSqliteOnInDomainArguments) {
+    EXPECT_EQ(substringOf("abcdef", 2, true, 3), "bcd");
+    EXPECT_EQ(substringOf("abcdef", 1, true, 6), "abcdef");
+    EXPECT_EQ(substringOf("abcdef", 2, false, 0), "bcdef");  // omitted FOR: to the end
+    EXPECT_EQ(substringOf("abcdef", 2, true, 100), "bcdef"); // length clamps
+    EXPECT_EQ(substringOf("abcdef", 1, true, 0), "");        // zero length
+    EXPECT_EQ(substringOf("abcdef", 7, true, 2), "");        // start past the end
+    EXPECT_EQ(substringOf("", 1, true, 2), "");
+}
+
+// Out-of-domain arguments are where SwiftQL DIVERGES from SQLite: SQLite defines
+// all three (substr('Ferrari',0,3) = 'Fe', substr(x,-2) counts from the right,
+// a negative length takes the preceding characters) and SwiftQL rejects them.
+// A documented dialect divergence, listed in readme.md — not an edge case where
+// the two agree, which the old test name claimed.
+//
+// compare_against_sqlite.py structurally cannot cover this: the query errors
+// instead of producing rows to diff, so these assertions are the only guard.
+TEST(SubstringOf, RejectsTheOutOfDomainArgumentsSqliteDefines) {
+    EXPECT_THROW(substringOf("abcdef", 0, true, 2), std::runtime_error);   // SQLite: "a"
+    EXPECT_THROW(substringOf("abcdef", -1, true, 2), std::runtime_error);  // SQLite: "f"
+    EXPECT_THROW(substringOf("abcdef", 1, true, -1), std::runtime_error);  // SQLite: ""
+}
+
+// Constant arguments are rejected at PLAN time, so the common case never
+// reaches the per-row throw above. A computed position still fails at
+// execution — that residue is documented in readme.md.
+TEST(SubstringOf, ConstantOutOfDomainArgumentsFailAtPlanTime) {
+    Catalog cat("../tests/data/test_catalog.json");
+    const Schema& laps = cat.getTable("laps").schema;
+    auto infer = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        // Fold first, exactly as Binder::bind does before anything calls
+        // inferExprType. Without it `-2` is a UnaryExpr over Literal(2), not a
+        // Literal(-2), and the constant check cannot see it — the type checker
+        // must not re-implement folding to compensate.
+        foldConstantsInExpr(stmt.select_list[0]);
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+    EXPECT_THROW(infer("SUBSTRING(team, 0, 3)"), std::runtime_error);
+    EXPECT_THROW(infer("SUBSTRING(team, -2)"), std::runtime_error);
+    EXPECT_THROW(infer("SUBSTRING(team, 1, -1)"), std::runtime_error);
+    EXPECT_NO_THROW(infer("SUBSTRING(team, 1, 3)"));
+}
+
+TEST(EvaluateWeek25, InIsThreeValuedOnANullOperand) {
+    Schema schema = makeSchema({{"i", TypeId::INT}});
+    Row row = {Value::null()};
+
+    auto in = std::make_unique<InExpr>();
+    auto ref = std::make_unique<ColumnRef>();
+    ref->column_name = "i";
+    in->operand = std::move(ref);
+    in->values = {Value(int64_t(1))};
+
+    // NULL IN (...) is NULL, and so is NULL NOT IN (...) — the list cannot
+    // contain a NULL, so this is the only unknown case
+    EXPECT_TRUE(evaluate(in.get(), row, schema).isNull());
+    in->negated = true;
+    EXPECT_TRUE(evaluate(in.get(), row, schema).isNull());
+
+    // a present operand answers definitely under both polarities
+    Row present = {Value(int64_t(1))};
+    EXPECT_EQ(evaluate(in.get(), present, schema).asInt(), 0);   // NOT IN (1) -> false
+    in->negated = false;
+    EXPECT_EQ(evaluate(in.get(), present, schema).asInt(), 1);
+}
+
+TEST(EvaluateWeek25, CaseShortCircuitsAndTreatsNullConditionsAsFalse) {
+    Schema schema = makeSchema({{"i", TypeId::INT}, {"z", TypeId::INT}});
+
+    auto c = std::make_unique<CaseExpr>();
+    CaseExpr::WhenClause w;
+    auto div = std::make_unique<BinaryExpr>();   // i / z -> NULL when z is 0
+    div->op = "/";
+    auto l = std::make_unique<ColumnRef>(); l->column_name = "i";
+    auto r = std::make_unique<ColumnRef>(); r->column_name = "z";
+    div->left = std::move(l);
+    div->right = std::move(r);
+    auto cmp = std::make_unique<BinaryExpr>();
+    cmp->op = ">";
+    cmp->left = std::move(div);
+    cmp->right = std::make_unique<Literal>(Value(int64_t(0)));
+    w.condition = std::move(cmp);
+    w.result = std::make_unique<Literal>(Value(int64_t(1)));
+    c->when_clauses.push_back(std::move(w));
+
+    // NULL condition is not true: falls through to a missing ELSE, i.e. NULL
+    Row null_cond = {Value(int64_t(5)), Value(int64_t(0))};
+    EXPECT_TRUE(evaluate(c.get(), null_cond, schema).isNull());
+
+    // ... and to the ELSE when there is one
+    c->else_expr = std::make_unique<Literal>(Value(int64_t(9)));
+    EXPECT_EQ(evaluate(c.get(), null_cond, schema).asInt(), 9);
+
+    // a true condition wins
+    Row taken = {Value(int64_t(5)), Value(int64_t(1))};
+    EXPECT_EQ(evaluate(c.get(), taken, schema).asInt(), 1);
+}
+
+// The short-circuit is observable, not cosmetic: INT arithmetic is
+// overflow-checked, so an untaken branch that would overflow must not be
+// evaluated. This is exactly why compileNode declines CaseExpr.
+TEST(EvaluateWeek25, CaseNeverEvaluatesTheUntakenBranch) {
+    Schema schema = makeSchema({{"i", TypeId::INT}});
+    Row row = {Value(int64_t(1))};
+
+    auto c = std::make_unique<CaseExpr>();
+    CaseExpr::WhenClause w;
+    w.condition = std::make_unique<Literal>(Value(int64_t(1)));   // always true
+    w.result = std::make_unique<Literal>(Value(int64_t(42)));
+    c->when_clauses.push_back(std::move(w));
+
+    // an ELSE that would throw (checkedMul overflow) if it were evaluated
+    auto boom = std::make_unique<BinaryExpr>();
+    boom->op = "*";
+    boom->left = std::make_unique<Literal>(Value(int64_t(9223372036854775807LL)));
+    boom->right = std::make_unique<Literal>(Value(int64_t(2)));
+    c->else_expr = std::move(boom);
+
+    EXPECT_EQ(evaluate(c.get(), row, schema).asInt(), 42);   // no throw
 }

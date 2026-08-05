@@ -5,6 +5,7 @@
 #include "planner/logical_plan.h"
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_set>
 
 
 // Compiled expression node. Dispatch is resolved at compile() time — kind and
@@ -20,6 +21,9 @@ struct ExpressionExecutor::Node {
         LOGICAL,       // AND OR
         NEGATE,        // unary -
         IS_NULL,       // IS NULL / IS NOT NULL
+        LIKE,          // LIKE / NOT LIKE against a constant pattern
+        IN_SET,        // IN / NOT IN against a constant, pre-hashed value list
+        SUBSTRING,     // SUBSTRING(x, start [, length])
     };
 
     Kind kind;
@@ -28,6 +32,15 @@ struct ExpressionExecutor::Node {
     Value constant;                                // CONSTANT
     std::string op;                                // ARITH / COMPARE / LOGICAL
     bool is_not_null = false;                      // IS_NULL
+    bool negated = false;                          // LIKE / IN_SET
+    std::string pattern;                           // LIKE
+    // IN_SET, hashed once at compile time. Split by storage type to mirror
+    // Value::operator== exactly: INT-vs-INT compares the variants (exact),
+    // while INT-vs-DOUBLE coerces both to double. Collapsing everything into
+    // one double set would make 9007199254740993 IN (9007199254740992) true.
+    std::unordered_set<int64_t> in_ints;
+    std::unordered_set<double> in_doubles;
+    std::unordered_set<std::string> in_strings;
     std::vector<std::unique_ptr<Node>> children;
     ColumnVector out;                              // scratch, reused across chunks
 };
@@ -304,6 +317,92 @@ void runIsNull(Node& n, const ColumnVector& src, int count) {
     }
 }
 
+// LIKE. The matcher itself is evaluator.cc's likeMatch — the same function the
+// scalar path calls, so the two cannot disagree about wildcards or case folding.
+// What is hoisted out of the row loop is the dispatch, not the matching.
+void runLike(Node& n, const ColumnVector& src, int count) {
+    resetOut(n.out, TypeId::INT, count);
+    bool has_nulls = propagateNulls(n.out, src, nullptr, count);
+    const auto& s = std::get<std::vector<std::string>>(src.data);
+    auto& d = std::get<std::vector<int64_t>>(n.out.data);
+    for (int i = 0; i < count; ++i) {
+        // a NULL row's gathered value is a placeholder empty string; matching it
+        // would be wasted work and its result is never read
+        if (has_nulls && n.out.isNull(i)) { d[i] = 0; continue; }
+        bool m = likeMatch(s[i], n.pattern);
+        d[i] = n.negated ? !m : m;
+    }
+}
+
+// IN over the pre-hashed constant set. O(1) per row instead of k comparisons —
+// TPC-H Q22 probes a 7-element list with a SUBSTRING on the left.
+void runInSet(Node& n, const ColumnVector& src, int count) {
+    resetOut(n.out, TypeId::INT, count);
+    bool has_nulls = propagateNulls(n.out, src, nullptr, count);
+    auto& d = std::get<std::vector<int64_t>>(n.out.data);
+
+    auto emit = [&](int i, bool found) { d[i] = n.negated ? !found : found; };
+
+    switch (src.type) {
+        case TypeId::INT: {
+            const auto& s = std::get<std::vector<int64_t>>(src.data);
+            for (int i = 0; i < count; ++i) {
+                if (has_nulls && n.out.isNull(i)) { d[i] = 0; continue; }
+                // both sets: INT values compare exactly, DOUBLE values coerce —
+                // exactly what Value::operator== does for each pair
+                emit(i, n.in_ints.count(s[i]) != 0 ||
+                        n.in_doubles.count(static_cast<double>(s[i])) != 0);
+            }
+            break;
+        }
+        case TypeId::DOUBLE: {
+            const auto& s = std::get<std::vector<double>>(src.data);
+            for (int i = 0; i < count; ++i) {
+                if (has_nulls && n.out.isNull(i)) { d[i] = 0; continue; }
+                emit(i, n.in_doubles.count(s[i]) != 0);
+            }
+            break;
+        }
+        case TypeId::STRING: {
+            const auto& s = std::get<std::vector<std::string>>(src.data);
+            for (int i = 0; i < count; ++i) {
+                if (has_nulls && n.out.isNull(i)) { d[i] = 0; continue; }
+                emit(i, n.in_strings.count(s[i]) != 0);
+            }
+            break;
+        }
+    }
+}
+
+// SUBSTRING. children are [operand, start] or [operand, start, length].
+// Delegates to evaluator.cc's substringOf, so the 1-based indexing and the
+// out-of-domain errors are defined in exactly one place.
+void runSubstring(Node& n, const ColumnVector& str, const ColumnVector& start,
+                  const ColumnVector* len, int count) {
+    resetOut(n.out, TypeId::STRING, count);
+    bool has_nulls = propagateNulls(n.out, str, &start, count);
+    if (len && !len->all_valid) {
+        // third operand: fold its validity in too (propagateNulls takes two)
+        for (int i = 0; i < count; ++i) {
+            if (len->isNull(i)) { markNull(n.out, i, count); has_nulls = true; }
+        }
+    }
+
+    const auto& s  = std::get<std::vector<std::string>>(str.data);
+    const auto& b  = std::get<std::vector<int64_t>>(start.data);
+    const std::vector<int64_t>* l =
+        len ? &std::get<std::vector<int64_t>>(len->data) : nullptr;
+    auto& d = std::get<std::vector<std::string>>(n.out.data);
+
+    for (int i = 0; i < count; ++i) {
+        // skip NULL rows: their gathered start is a placeholder 0, which
+        // substringOf would reject with "start position must be >= 1" for a
+        // row whose result is never read. evaluate() short-circuits the same way.
+        if (has_nulls && n.out.isNull(i)) { d[i].clear(); continue; }
+        d[i] = substringOf(s[i], b[i], l != nullptr, l ? (*l)[i] : 0);
+    }
+}
+
 // Post-order evaluation. One dispatch per node per chunk, not per row.
 const ColumnVector& runNode(Node& n, const DataChunk& chunk, const std::vector<int>& sel) {
     const int count = static_cast<int>(sel.size());
@@ -341,6 +440,22 @@ const ColumnVector& runNode(Node& n, const DataChunk& chunk, const std::vector<i
         case Node::Kind::IS_NULL:
             runIsNull(n, runNode(*n.children[0], chunk, sel), count);
             break;
+        case Node::Kind::LIKE:
+            runLike(n, runNode(*n.children[0], chunk, sel), count);
+            break;
+        case Node::Kind::IN_SET:
+            runInSet(n, runNode(*n.children[0], chunk, sel), count);
+            break;
+        case Node::Kind::SUBSTRING: {
+            const ColumnVector& s = runNode(*n.children[0], chunk, sel);
+            const ColumnVector& b = runNode(*n.children[1], chunk, sel);
+            // runNode returns a reference into each node's own scratch, so the
+            // three results coexist safely — different nodes, different buffers
+            const ColumnVector* l = n.children.size() > 2
+                ? &runNode(*n.children[2], chunk, sel) : nullptr;
+            runSubstring(n, s, b, l, count);
+            break;
+        }
     }
     return n.out;
 }
@@ -483,6 +598,72 @@ std::unique_ptr<Node> compileNode(const Expr* expr, const Schema& schema) {
 
         return nullptr;   // unknown operator
     }
+
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        auto child = compileNode(lk->operand.get(), schema);
+        if (!child || child->type != TypeId::STRING) return nullptr;
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::LIKE;
+        n->type = TypeId::INT;
+        n->pattern = lk->pattern;
+        n->negated = lk->negated;
+        n->children.push_back(std::move(child));
+        return n;
+    }
+
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        auto child = compileNode(in->operand.get(), schema);
+        if (!child) return nullptr;
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::IN_SET;
+        n->type = TypeId::INT;
+        n->negated = in->negated;
+        // Hash the list once. A STRING operand admits only STRING values and a
+        // numeric operand only numeric ones — the mixed shape throws in Value's
+        // comparison operators, so decline it here and let the fallback raise
+        // the same error from the same place.
+        for (const Value& v : in->values) {
+            const bool v_str = (v.type() == TypeId::STRING);
+            if (v_str != (child->type == TypeId::STRING)) return nullptr;
+            if (v_str)                          n->in_strings.insert(v.asString());
+            else if (v.type() == TypeId::INT)   n->in_ints.insert(v.asInt());
+            else                                n->in_doubles.insert(v.asDouble());
+        }
+        // A DOUBLE operand coerces every comparison to double, so fold the INT
+        // values into the double set and probe just one.
+        if (child->type == TypeId::DOUBLE) {
+            for (int64_t i : n->in_ints) n->in_doubles.insert(static_cast<double>(i));
+            n->in_ints.clear();
+        }
+        n->children.push_back(std::move(child));
+        return n;
+    }
+
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        auto str = compileNode(sub->operand.get(), schema);
+        auto beg = compileNode(sub->start.get(), schema);
+        if (!str || !beg) return nullptr;
+        if (str->type != TypeId::STRING || beg->type != TypeId::INT) return nullptr;
+        auto n = std::make_unique<Node>();
+        n->kind = Node::Kind::SUBSTRING;
+        n->type = TypeId::STRING;
+        n->children.push_back(std::move(str));
+        n->children.push_back(std::move(beg));
+        if (sub->length) {
+            auto len = compileNode(sub->length.get(), schema);
+            if (!len || len->type != TypeId::INT) return nullptr;
+            n->children.push_back(std::move(len));
+        }
+        return n;
+    }
+
+    // CaseExpr is deliberately NOT compiled. evaluate() short-circuits — it
+    // never touches an untaken branch — and a chunk kernel cannot, so
+    // `CASE WHEN i < 100 THEN i * 1000000000000 ELSE 0 END` would raise a
+    // checkedMul overflow here for rows whose branch is discarded. Declining
+    // keeps the fallback correct-but-slow, which is the contract; a masked
+    // kernel (evaluate each branch only over its own selection) is the fix when
+    // TPC-H Q8/Q12/Q14 profiling justifies it.
 
     return nullptr;   // unknown Expr subtype — a new node type lands here
 }

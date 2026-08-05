@@ -14,3 +14,9 @@ int resolveColumnIndex(const ColumnRef& col, const Schema& schema);
 
 // recursively evaluates an Expr tree against a singe row
 Value evaluate(const Expr* expr, const Row& row, const Schema& schema);
+
+// Scalar semantics shared with the vectorized kernels in
+// expression_executor.cc. Exposed so the two implementations call the SAME
+// code rather than two copies that must be kept in agreement by review.
+bool likeMatch(const std::string& text, const std::string& pattern);
+std::string substringOf(const std::string& s, int64_t start, bool has_length, int64_t length);

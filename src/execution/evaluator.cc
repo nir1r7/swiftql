@@ -4,6 +4,71 @@
 #include <stdexcept>
 
 
+// LIKE pattern matcher: '%' matches any sequence, '_' any single character.
+// Two-pointer greedy with one backtrack point — O(n*m) worst case, O(n) for the
+// prefix / suffix / contains shapes TPC-H actually uses.
+//
+// ASCII case-INSENSITIVE, matching SQLite's default LIKE. That keeps
+// compare_against_sqlite.py a valid oracle: with case-sensitive matching, any
+// test query whose pattern case differs from the data would diverge from the
+// reference for a reason that has nothing to do with the engine.
+bool likeMatch(const std::string& text, const std::string& pat) {
+    // Strict ASCII A-Z, which is what SQLite's LIKE folds. std::tolower is
+    // locale-dependent — under an ISO-8859-1 locale it maps 0xC9 to 0xE9 — so
+    // using it would make LIKE results depend on the process locale and quietly
+    // break the "ASCII case-insensitive" contract on non-ASCII bytes. The engine
+    // never calls setlocale today, so this is a latent hazard rather than a live
+    // bug; spelling the fold out removes it and costs nothing.
+    auto fold = [](char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+
+    size_t t = 0, p = 0, star_p = std::string::npos, star_t = 0;
+    while (t < text.size()) {
+        if (p < pat.size() && (pat[p] == '_' || fold(pat[p]) == fold(text[t]))) {
+            ++t; ++p;
+        } else if (p < pat.size() && pat[p] == '%') {
+            star_p = p++;     // remember the wildcard...
+            star_t = t;       // ...and where the text stood when we took it
+        } else if (star_p != std::string::npos) {
+            p = star_p + 1;   // backtrack: let that % consume one more character
+            t = ++star_t;
+        } else {
+            return false;
+        }
+    }
+    while (p < pat.size() && pat[p] == '%') ++p;   // trailing %s match the empty tail
+    return p == pat.size();
+}
+
+
+// SUBSTRING with SQL/SQLite 1-based indexing. has_length == false is an omitted
+// FOR clause, meaning "to the end of the string".
+//
+// SQLite DOES define the out-of-domain cases — substr(x,0,3) drops the phantom
+// position 0, a negative start counts from the right, a negative length takes
+// the preceding characters. SwiftQL rejects all three instead. That is a
+// deliberate documented divergence (see the dialect table in readme.md), not an
+// oversight, but it is a real one: unlike column ordinals or unary '+', which
+// are parse-time rejections, this can fire per row. inferExprType decides it at
+// plan time whenever the arguments are constant, which after foldConstants is
+// every realistic query; only a computed position reaches this throw.
+//
+// Shared with the ExpressionExecutor kernel so the two agree by construction
+// rather than by review.
+std::string substringOf(const std::string& s, int64_t start, bool has_length, int64_t length) {
+    if (start < 1)
+        throw std::runtime_error("SUBSTRING: start position must be >= 1");
+    if (has_length && length < 0)
+        throw std::runtime_error("SUBSTRING: length must be >= 0");
+
+    size_t from = static_cast<size_t>(start - 1);
+    if (from >= s.size()) return std::string();   // entirely past the end
+    size_t take = has_length ? static_cast<size_t>(length) : std::string::npos;
+    return s.substr(from, take);                  // substr clamps to what remains
+}
+
+
 int resolveColumnIndex(const ColumnRef& col, const Schema& schema){
     if (col.relation_slot >= 0) {
         int idx = schema.indexOf(col.column_name, col.relation_slot);
@@ -117,6 +182,64 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
             throw std::runtime_error("Column not found in schema: " + col_name);
         return row[idx];
     }
+
+    // IN over a constant list. The list can never contain NULL (the grammar has
+    // no NULL literal and the parser takes literals only), so SQL's three-valued
+    // IN rule collapses to this single unknown case.
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        Value v = evaluate(in->operand.get(), row, schema);
+        if (v.isNull()) return Value::null();
+        bool found = false;
+        for (const Value& c : in->values) {
+            // Value::operator== coerces INT against DOUBLE and throws on
+            // STRING-vs-numeric; inferExprType rejects that shape at plan time
+            if (v == c) { found = true; break; }
+        }
+        return Value(static_cast<int64_t>(in->negated ? !found : found));
+    }
+
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        Value v = evaluate(lk->operand.get(), row, schema);
+        if (v.isNull()) return Value::null();          // NULL LIKE x is NULL
+        if (v.type() != TypeId::STRING)
+            throw std::runtime_error("LIKE requires a STRING operand");
+        bool m = likeMatch(v.asString(), lk->pattern);
+        return Value(static_cast<int64_t>(lk->negated ? !m : m));
+    }
+
+    // CASE short-circuits: an untaken branch is never evaluated. That is why
+    // ExpressionExecutor::compileNode deliberately declines CaseExpr — an eager
+    // chunk kernel would raise checkedMul overflow on rows whose branch is
+    // discarded, and the differential tests would then be right to fail.
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            Value cond = evaluate(w.condition.get(), row, schema);
+            // NULL is not true — an unknown condition falls through, as in WHERE
+            if (cond.isNull() || cond.asInt() == 0) continue;
+            return evaluate(w.result.get(), row, schema);
+        }
+        return c->else_expr ? evaluate(c->else_expr.get(), row, schema) : Value::null();
+    }
+
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        Value s = evaluate(sub->operand.get(), row, schema);
+        Value b = evaluate(sub->start.get(), row, schema);
+        Value n = sub->length ? evaluate(sub->length.get(), row, schema) : Value::null();
+        if (s.isNull() || b.isNull() || (sub->length && n.isNull())) return Value::null();
+        if (s.type() != TypeId::STRING)
+            throw std::runtime_error("SUBSTRING requires a STRING operand");
+        return Value(substringOf(s.asString(), b.asInt(),
+                                 sub->length != nullptr, sub->length ? n.asInt() : 0));
+    }
+
+    // An interval that reaches execution was never folded, which means it was
+    // not part of a constant date expression. Loud by design — see ast.h.
+    if (dynamic_cast<const IntervalLiteral*>(expr)) {
+        throw std::runtime_error(
+            "INTERVAL is only valid in constant date arithmetic, "
+            "e.g. date '1994-01-01' + interval '1' year");
+    }
+
     throw std::runtime_error("evaluate(): unknown Expr subtype");
 }
 
