@@ -98,10 +98,105 @@ WEEK24_EXPRESSION_QUERIES = [
     "SELECT team, SUM(speed) / COUNT(*) AS manual_avg FROM laps GROUP BY team ORDER BY team",
 ]
 
+# NULL on the vectorized path. ColumnVector used to have no validity mask, so
+# every NULL degraded to a 0 / "NULL" sentinel that was indistinguishable from a
+# genuine zero — which blocks left-outer-join semantics (TPC-H Q13). These pin
+# the mask down: NULL through a projection, through the blocking operators
+# (ORDER BY, DISTINCT), and NULL-skipping inside the aggregates.
+# Every computed column is aliased: parse_swiftql_output() splits the header
+# line on whitespace, so an unaliased "(season / 0)" would parse as three
+# columns and the row would be dropped.
+NULL_SEMANTICS_QUERIES = [
+    "SELECT season / 0 AS n FROM laps LIMIT 5",
+    "SELECT DISTINCT round / (round - round) AS n FROM laps",
+    "SELECT speed / 0 AS n FROM laps ORDER BY n LIMIT 5",
+    "SELECT COUNT(*) AS c, COUNT(season / 0) AS cn, SUM(season / 0) AS s, AVG(season / 0) AS a FROM laps",
+    "SELECT team, COUNT(season / 0) AS cn FROM laps GROUP BY team ORDER BY team",
+    "SELECT team, MIN(speed / 0) AS mn, MAX(speed / 0) AS mx FROM laps GROUP BY team ORDER BY team",
+]
+
+# MIN/MAX are order statistics: they return an element of the input domain.
+# Typing every non-COUNT aggregate DOUBLE made MIN(team) throw bad_variant_access.
+MIN_MAX_TYPE_QUERIES = [
+    "SELECT MIN(team), MAX(team) FROM laps",
+    "SELECT MIN(season), MAX(season), MIN(speed), MAX(speed) FROM laps",
+    "SELECT team, MIN(team), MAX(season) FROM laps GROUP BY team ORDER BY team",
+]
+
+# Expression group keys are matched by slot-based identity, not by the as-typed
+# qualifier, so qualifying in one clause but not another agrees with SQLite.
+# All four directions used to error.
+GROUP_KEY_QUALIFIER_QUERIES = [
+    "SELECT laps.season - 1 AS s, COUNT(*) AS c FROM laps GROUP BY season - 1 ORDER BY s",
+    "SELECT season - 1 AS s, COUNT(*) AS c FROM laps GROUP BY laps.season - 1 ORDER BY s",
+    "SELECT season - 1 AS s, COUNT(*) AS c FROM laps GROUP BY season - 1 HAVING laps.season - 1 > 2021 ORDER BY s",
+    "SELECT season - 1 AS s, COUNT(*) AS c FROM laps GROUP BY season - 1 ORDER BY laps.season - 1",
+    "SELECT laps.season - 1 AS s, SUM(laps.speed * (1 - laps.sector_1 / 100)) AS rev FROM laps GROUP BY season - 1 ORDER BY s",
+]
+
+# Constant folding runs before validation, so the folded predicate must produce
+# the same rows as the literal it folds to — in every mode, optimizer on or off.
+# The win is that folding restores zone-map pruning and the comparison fast path.
+CONSTANT_FOLDING_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps WHERE season = 2020 + 4",
+    "SELECT COUNT(*) AS c FROM laps WHERE season = 2024 * 1",
+    "SELECT COUNT(*) AS c FROM laps WHERE season > 2 * (1000 + 10)",
+    "SELECT COUNT(*) AS c FROM laps WHERE season > -(-2023)",
+    "SELECT COUNT(*) AS c FROM laps WHERE season = 2020 + 4 AND speed > 100 * 3",
+]
+
+# Expressions in the WHERE and projection positions now compile to the
+# chunk-at-a-time executor instead of a per-row evaluate(). Same answers required.
+# Three-valued AND/OR. evaluate() propagated NULL through the connectives, so
+# Volcano and the vectorized path returned different answers for the same query —
+# 0 rows vs 10000. TPC-H Q19 is an OR chain over nullable columns.
+THREE_VALUED_LOGIC_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps WHERE (season / 0) > 0 OR 1 = 1",
+    "SELECT COUNT(*) AS c FROM laps WHERE (season / 0) > 0 OR 1 = 0",
+    "SELECT COUNT(*) AS c FROM laps WHERE (season / 0) > 0 AND 1 = 1",
+    "SELECT COUNT(*) AS c FROM laps WHERE (season / 0) > 0 AND 1 = 0",
+    "SELECT COUNT(*) AS c FROM laps WHERE speed > 300 OR (season / 0) > 0",
+    "SELECT COUNT(*) AS c FROM laps WHERE speed > 300 AND (season / 0) > 0",
+    "SELECT COUNT(*) AS c FROM laps WHERE (round / (round - 1)) > 1 OR speed > 340",
+    "SELECT team, COUNT(*) AS c FROM laps WHERE (round / (round - 1)) > 1 OR season = 2024 GROUP BY team ORDER BY team",
+]
+
+EXPRESSION_POSITION_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps WHERE speed * 2 > 600",
+    "SELECT COUNT(*) AS c FROM laps WHERE speed * (1 - sector_1 / 100) > 200",
+    "SELECT COUNT(*) AS c FROM laps WHERE season - 1 = 2023 AND speed * 2 > 600",
+    "SELECT COUNT(*) AS c FROM laps WHERE round + 0 > 10 OR speed * 2 > 690",
+    "SELECT speed * 2 AS d FROM laps ORDER BY d LIMIT 10",
+    "SELECT team, speed * (1 - sector_1 / 100) AS adj FROM laps ORDER BY adj, team LIMIT 10",
+    "SELECT -speed AS n, round * 2 AS r FROM laps ORDER BY n, r LIMIT 10",
+    "SELECT DISTINCT season - 1 AS s FROM laps ORDER BY s",
+]
+
+# ORDER BY over a NULLABLE sort key. Comparing with the SQL operators is not a
+# strict weak ordering once a key can be NULL (every comparison against NULL is
+# false, so NULL is equivalent to every value and equivalence is non-transitive),
+# which is undefined behaviour in std::stable_sort — it inverted the NON-NULL keys
+# and dropped rows under LIMIT, not merely misplaced the NULLs. SQLite orders NULL
+# first ascending, last descending. These only bite because the harness now
+# compares ORDER BY results in emitted order.
+NULL_ORDERING_QUERIES = [
+    "SELECT round / (round - 1) AS g, COUNT(*) AS c FROM laps GROUP BY round / (round - 1) ORDER BY g",
+    "SELECT round / (round - 1) AS g, COUNT(*) AS c FROM laps GROUP BY round / (round - 1) ORDER BY g DESC",
+    "SELECT lap_id, speed / (round - 1) AS n FROM laps ORDER BY n DESC, lap_id LIMIT 12",
+    "SELECT lap_id, speed / (round - 1) AS n FROM laps ORDER BY n, lap_id LIMIT 12",
+    "SELECT lap_id, round / (round - 1) AS g FROM laps ORDER BY g, lap_id LIMIT 20",
+    # NULL as a secondary key, and a NULL-bearing key alongside a non-NULL one
+    "SELECT team, round / (round - 1) AS g FROM laps ORDER BY team, g, round LIMIT 20",
+    "SELECT DISTINCT round / (round - 1) AS g FROM laps ORDER BY g",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
-] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES + WEEK24_EXPRESSION_QUERIES
+] + WEEK6_CHECKPOINT_QUERIES + ZONE_MAP_QUERIES + SELF_JOIN_QUERIES \
+  + WEEK24_EXPRESSION_QUERIES + NULL_SEMANTICS_QUERIES + MIN_MAX_TYPE_QUERIES \
+  + GROUP_KEY_QUALIFIER_QUERIES + CONSTANT_FOLDING_QUERIES + EXPRESSION_POSITION_QUERIES \
+  + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -162,20 +257,37 @@ def parse_swiftql_output(output: str):
     return rows
 
 
-def normalize(rows):
-    """Sort rows and coerce numbers for stable comparison."""
+def normalize(rows, preserve_order=False):
+    """Sort rows and coerce numbers for stable comparison.
+
+    NULL canonicalization: SwiftQL's aligned printer emits the literal "NULL",
+    SQLite's driver returns Python None. Both map to the same token so a NULL
+    compares equal across the two engines. Limitation: a genuine string value
+    "NULL" in the data would also map to it — SwiftQL's text output carries no
+    type information, so the two are indistinguishable here.
+
+    preserve_order: when true, rows are compared in the order the engine emitted
+    them instead of being sorted first. Sorting BOTH sides makes every ORDER BY
+    defect undetectable by construction, which is exactly how a broken sort
+    comparator (NULL keys, see compareForSort in value.h) passed this harness.
+    Callers set it for any query containing ORDER BY; without ORDER BY, SQL does
+    not specify row order and sorting is the only fair comparison.
+    """
+    NULL_TOKEN = "\x00NULL"
+
     def coerce(v):
+        if v is None or v == "NULL": return NULL_TOKEN
         try: return round(float(v), 6)
         except (ValueError, TypeError): return str(v)
 
     normalized = []
     for row in rows:
         normalized.append(tuple(coerce(v) for v in row.values()))
-    return sorted(normalized)
+    return normalized if preserve_order else sorted(normalized)
 
 
 def rows_equal(a, b):
-    """Compare two sorted normalized row lists, using epsilon tolerance for floats."""
+    """Compare two normalized row lists, using epsilon tolerance for floats."""
     if len(a) != len(b):
         return False
     for row_a, row_b in zip(a, b):
@@ -211,13 +323,16 @@ def run_query_suite(conn, queries, label: str, extra_args: list = None):
             cols = [d[0] for d in sqlite_cursor.description]
             sqlite_rows = [dict(zip(cols, r)) for r in sqlite_cursor.fetchall()]
 
-            if rows_equal(normalize(swift_rows), normalize(sqlite_rows)):
+            # ORDER BY makes row order part of the answer, so compare it
+            ordered = "ORDER BY" in query.upper()
+            if rows_equal(normalize(swift_rows, ordered), normalize(sqlite_rows, ordered)):
                 print(f"  PASS  {query[:70]}")
                 passed += 1
             else:
                 print(f"  FAIL  {query[:70]}")
-                print(f"    SwiftQL: {normalize(swift_rows)[:3]}")
-                print(f"    SQLite:  {normalize(sqlite_rows)[:3]}")
+                print(f"    ordered comparison: {ordered}")
+                print(f"    SwiftQL: {normalize(swift_rows, ordered)[:4]}")
+                print(f"    SQLite:  {normalize(sqlite_rows, ordered)[:4]}")
                 failed += 1
         except Exception as e:
             print(f"  ERROR {query[:70]}\n    {e}")
@@ -239,10 +354,17 @@ def main():
         conn, QUERIES, "Vectorized (columnar storage, vec path)",
         extra_args=["--execution", "vectorized", "--storage", "columnar"],
     )
+    # The optimizer-off path shares the binder, the logical planner, and the
+    # physical plan builder with the optimized one, so plan-time typing and the
+    # now-unconditional constant folding run either way — but nothing gated it.
+    p4, f4, e4 = run_query_suite(
+        conn, QUERIES, "Vectorized, optimizer off (--no-optimize)",
+        extra_args=["--execution", "vectorized", "--storage", "columnar", "--no-optimize"],
+    )
 
-    total_passed = p1 + p2 + p3
-    total_failed = f1 + f2 + f3
-    total_errors = e1 + e2 + e3
+    total_passed = p1 + p2 + p3 + p4
+    total_failed = f1 + f2 + f3 + f4
+    total_errors = e1 + e2 + e3 + e4
     print(f"\nTotal: {total_passed} passed, {total_failed} failed, {total_errors} errors")
     if total_failed > 0 or total_errors > 0:
         sys.exit(1)
