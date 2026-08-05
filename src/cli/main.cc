@@ -369,9 +369,7 @@ int main(int argc, char* argv[]) {
                         Row row;
                         row.reserve(chunk->columns.size());
                         for (const auto& cv : chunk->columns) {
-                            std::visit([&](const auto& vec) {
-                                row.push_back(Value(vec[r]));
-                            }, cv.data);
+                            row.push_back(valueAt(cv, r));
                         }
                         rows.push_back(std::move(row));
                     }

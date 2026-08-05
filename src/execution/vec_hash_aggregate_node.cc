@@ -102,9 +102,7 @@ void VecHashAggregateNode::consumeAll() {
             if (needs_row) {
                 tmp.reserve(chunk->columns.size());
                 for (const auto& cv : chunk->columns) {
-                    std::visit([&](const auto& vec) {
-                        tmp.push_back(Value(vec[r]));
-                    }, cv.data);
+                    tmp.push_back(valueAt(cv, r));
                 }
             }
 
@@ -230,39 +228,12 @@ void VecHashAggregateNode::fillChunk(int start, int count) {
     out_chunk_.sel.size = 0;
 
     for (int c = 0; c < output_schema_.size(); ++c) {
-        ColumnVector cv;
-        cv.type = output_schema_.column(c).type;
-        switch (cv.type) {
-            case TypeId::INT: cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE: cv.data = std::vector<double>(); break;
-            case TypeId::STRING: cv.data = std::vector<std::string>(); break;
-        }
+        ColumnVector cv = makeColumnVector(output_schema_.column(c).type);
         for (int i = start; i < start + count; ++i) {
-            const Value& v = result_rows_[i][c];
-            if (v.isNull()) {
-                // TODO: ColumnVector has no null bitmap, so SQL NULL cannot be represented
-                // in a DataChunk column. Null aggregate results (e.g. AVG over an empty group)
-                // are emitted as 0 / 0.0 / "NULL" sentinels — indistinguishable from real
-                // zero values or a string column containing "NULL". Fix requires a validity
-                // vector on ColumnVector (Phase 4).
-                switch (cv.type) {
-                    case TypeId::INT:
-                        std::get<std::vector<int64_t>>(cv.data).push_back(0); break;
-                    case TypeId::DOUBLE:
-                        std::get<std::vector<double>>(cv.data).push_back(0.0); break;
-                    case TypeId::STRING:
-                        std::get<std::vector<std::string>>(cv.data).push_back("NULL"); break;
-                }
-            } else {
-                switch (cv.type) {
-                    case TypeId::INT:
-                        std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
-                    case TypeId::DOUBLE:
-                        std::get<std::vector<double>>(cv.data).push_back(v.asDouble()); break;
-                    case TypeId::STRING:
-                        std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
-                }
-            }
+            // a null aggregate result (SUM/AVG/MIN/MAX over a group with no
+            // non-NULL input) is carried on the validity mask, not flattened
+            // to a 0 / "NULL" sentinel
+            appendColumnValue(cv, result_rows_[i][c]);
         }
         out_chunk_.columns.push_back(std::move(cv));
     }

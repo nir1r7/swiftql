@@ -9,17 +9,34 @@
 template <typename T, typename Cmp>
 static SelectionVector scanColumn(const DataChunk& chunk, int col_idx, const T& threshold, Cmp cmp,
                                   const SelectionVector* input_sel) {
-    const auto& data = std::get<std::vector<T>>(chunk.columns[col_idx].data);
+    const ColumnVector& cv = chunk.columns[col_idx];
+    const auto& data = std::get<std::vector<T>>(cv.data);
     SelectionVector sv;
-    if (input_sel) {
+    // SQL: any comparison against NULL is unknown, so a NULL row never passes.
+    // The all_valid branch keeps the common case (scan output, which can never
+    // hold NULL) on the branch-free loop; the guarded loop only runs above an
+    // operator that actually produced NULLs, e.g. HAVING over a NULL aggregate.
+    if (cv.all_valid) {
+        if (input_sel) {
+            sv.indices.reserve(input_sel->size);
+            for (int r : input_sel->indices) {
+                if (cmp(data[r], threshold)) sv.indices.push_back(r);
+            }
+        } else {
+            sv.indices.reserve(chunk.num_rows);
+            for (int r = 0; r < chunk.num_rows; ++r) {
+                if (cmp(data[r], threshold)) sv.indices.push_back(r);
+            }
+        }
+    } else if (input_sel) {
         sv.indices.reserve(input_sel->size);
         for (int r : input_sel->indices) {
-            if (cmp(data[r], threshold)) sv.indices.push_back(r);
+            if (cv.validity[r] && cmp(data[r], threshold)) sv.indices.push_back(r);
         }
     } else {
         sv.indices.reserve(chunk.num_rows);
         for (int r = 0; r < chunk.num_rows; ++r) {
-            if (cmp(data[r], threshold)) sv.indices.push_back(r);
+            if (cv.validity[r] && cmp(data[r], threshold)) sv.indices.push_back(r);
         }
     }
     sv.size = static_cast<int>(sv.indices.size());
@@ -63,7 +80,7 @@ static SelectionVector evalFallback(const Expr* pred, const DataChunk& chunk, co
         Row tmp;
         tmp.reserve(chunk.columns.size());
         for (const auto& cv : chunk.columns){
-            std::visit([&](const auto& vec){ tmp.push_back(Value(vec[r])); }, cv.data);
+            tmp.push_back(valueAt(cv, r));
         }
         Value v = evaluate(pred, tmp, schema);
         if (!v.isNull() && v.asInt() != 0) sv.indices.push_back(r);

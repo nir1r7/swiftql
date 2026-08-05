@@ -33,9 +33,7 @@ void VecSortNode::consumeAndSort() {
             Row row;
             row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    row.push_back(Value(vec[r]));
-                }, cv.data);
+                row.push_back(valueAt(cv, r));
             }
             flat_buffer_.push_back(std::move(row));
         }
@@ -65,23 +63,9 @@ void VecSortNode::fillChunk(int start, int count) {
     out_chunk_.sel.size = 0;
 
     for (int c = 0; c < schema.size(); ++c) {
-        ColumnVector cv;
-        cv.type = schema.column(c).type;
-        switch (cv.type) {
-            case TypeId::INT: cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE: cv.data = std::vector<double>();  break;
-            case TypeId::STRING: cv.data = std::vector<std::string>(); break;
-        }
+        ColumnVector cv = makeColumnVector(schema.column(c).type);
         for (int i = start; i < start + count; ++i) {
-            const Value& v = flat_buffer_[i][c];
-            switch (cv.type) {
-                case TypeId::INT:
-                    std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
-                case TypeId::DOUBLE:
-                    std::get<std::vector<double>>(cv.data).push_back(v.asDouble()); break;
-                case TypeId::STRING:
-                    std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
-            }
+            appendColumnValue(cv, flat_buffer_[i][c]);
         }
         out_chunk_.columns.push_back(std::move(cv));
     }

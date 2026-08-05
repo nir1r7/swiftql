@@ -40,6 +40,9 @@ DataChunk* VecLimitNode::nextChunk() {
             chunk->num_rows = remaining;
             for (auto& cv : chunk->columns) {
                 std::visit([&](auto& vec) { vec.resize(remaining); }, cv.data);
+                // validity must shrink with the data or isNull() reads past the
+                // truncation point (or out of bounds on the next parent read)
+                if (!cv.all_valid) cv.validity.resize(remaining);
             }
         }
         rows_emitted_ = limit_;

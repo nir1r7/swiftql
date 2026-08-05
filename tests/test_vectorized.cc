@@ -490,9 +490,7 @@ static std::vector<Row> drainRows(VecPlanNode& node) {
             Row row;
             row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    row.push_back(Value(vec[r]));
-                }, cv.data);
+                row.push_back(valueAt(cv, r));   // NULL-aware, mirrors main.cc
             }
             result.push_back(std::move(row));
         }
@@ -2703,13 +2701,13 @@ TEST(VecHashAggregate, SumOverExpressionArgument) {
 }
 
 
-// ===== Week 24 audit fix: NULL values at the materialization point =====
-// x/0 evaluates to SQL NULL (SQLite semantics). ColumnVector has no null
-// mask, so VecProjectNode must degrade NULL to the engine-wide sentinel
-// (0 / 0.0 / "NULL" — same contract as VecHashAggregateNode::fillChunk)
-// instead of crashing in the typed asDouble()/asString() accessors.
+// ===== NULL values at the materialization point =====
+// x/0 evaluates to SQL NULL (SQLite semantics). ColumnVector carries a
+// validity mask, so VecProjectNode materializes a real NULL rather than the
+// old 0 / 0.0 / "NULL" sentinel, which was indistinguishable from a genuine
+// zero and blocked left-outer-join semantics on the vectorized path.
 
-TEST(VecProject, DivisionByZeroMaterializesSentinelNotCrash) {
+TEST(VecProject, DivisionByZeroMaterializesNull) {
     Schema schema = vecSchema({{"speed", TypeId::DOUBLE}, {"season", TypeId::INT}});
     std::vector<Row> input = {
         {Value(300.5), Value(int64_t(2025))},
@@ -2739,8 +2737,183 @@ TEST(VecProject, DivisionByZeroMaterializesSentinelNotCrash) {
     std::vector<Row> rows;
     ASSERT_NO_THROW(rows = drainRows(project));
     ASSERT_EQ(rows.size(), 2u);
-    EXPECT_DOUBLE_EQ(rows[0][0].asDouble(), 0.0);   // NULL -> 0.0 sentinel
-    EXPECT_EQ(rows[0][1].asInt(), 0);               // NULL -> 0 sentinel
+    EXPECT_TRUE(rows[0][0].isNull());   // DOUBLE / 0 -> NULL
+    EXPECT_TRUE(rows[0][1].isNull());   // INT / 0    -> NULL
+    EXPECT_TRUE(rows[1][0].isNull());
+    EXPECT_TRUE(rows[1][1].isNull());
+}
+
+
+// A column whose NULLs start partway through must keep the valid prefix
+// intact — appendColumnValue back-fills the all-valid prefix on the first
+// NULL, and a mis-sized validity mask would corrupt earlier rows.
+TEST(VecProject, NullsMidColumnKeepValidPrefix) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(4))}, {Value(int64_t(2))},
+        {Value(int64_t(0))},                       // divisor 0 -> NULL here
+        {Value(int64_t(1))},
+    };
+
+    // SELECT 8 / n  -> 2, 4, NULL, 8
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(8), col("n")));
+    Schema out_schema = vecSchema({{"(8 / n)", TypeId::INT}});
+
+    VecProjectNode project(makeScan(schema, input), std::move(exprs), out_schema);
+    std::vector<Row> rows = drainRows(project);
+
+    ASSERT_EQ(rows.size(), 4u);
+    EXPECT_EQ(rows[0][0].asInt(), 2);
+    EXPECT_EQ(rows[1][0].asInt(), 4);
+    EXPECT_TRUE(rows[2][0].isNull());
+    EXPECT_EQ(rows[3][0].asInt(), 8);
+}
+
+
+// A null aggregate result (SUM over an all-NULL group; here an empty input)
+// must survive materialization as NULL, not as 0. This is the Q13
+// left-outer-join precondition: COUNT must be able to skip NULLs that came
+// out of an upstream operator.
+TEST(VecHashAggregate, NullScalarAggregateMaterializesNull) {
+    Schema schema = vecSchema({{"x", TypeId::INT}});
+    std::vector<Row> empty;
+
+    AggregateSpec sum_spec;
+    sum_spec.function = "SUM";
+    sum_spec.is_star = false;
+    sum_spec.column = "x";
+    sum_spec.output_name = "SUM(x)";
+
+    AggregateSpec count_spec;
+    count_spec.function = "COUNT";
+    count_spec.is_star = true;
+    count_spec.output_name = "COUNT(*)";
+
+    Schema out_schema = vecSchema({{"SUM(x)", TypeId::DOUBLE}, {"COUNT(*)", TypeId::INT}});
+    auto agg = std::make_unique<VecHashAggregateNode>(
+        makeScan(schema, empty), std::vector<GroupByColumn>{},
+        std::vector<AggregateSpec>{sum_spec, count_spec}, out_schema);
+
+    auto rows = drainRows(*agg);
+    ASSERT_EQ(rows.size(), 1u);          // scalar aggregate always emits one row
+    EXPECT_TRUE(rows[0][0].isNull());    // SUM over no rows -> NULL
+    EXPECT_EQ(rows[0][1].asInt(), 0);    // COUNT(*) over no rows -> 0
+}
+
+
+// NULL must survive the blocking operators, which round-trip rows through a
+// flat Row buffer and re-emit them as chunks.
+TEST(VecSort, NullsSurviveMaterializationRoundTrip) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    std::vector<Row> input = {{Value(int64_t(2))}, {Value(int64_t(0))}, {Value(int64_t(1))}};
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));   // 3, NULL, 6
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    std::vector<OrderByItem> order;
+    order.push_back(orderAsc(col("(6 / n)")));
+    VecSortNode sort(std::move(project), std::move(order));
+
+    std::vector<Row> rows = drainRows(sort);
+    ASSERT_EQ(rows.size(), 3u);
+    // NULL sorts first ascending (SQLite), then 3, then 6. This used to assert
+    // only survival, on the mistaken premise that NULL placement was merely
+    // "arrival position" — in fact comparing with Value::operator< is not a strict
+    // weak ordering once a key can be NULL, so the sort was undefined behaviour
+    // and reordered the non-NULL keys too. See compareForSort in value.h.
+    EXPECT_TRUE(rows[0][0].isNull());
+    EXPECT_EQ(rows[1][0].asInt(), 3);
+    EXPECT_EQ(rows[2][0].asInt(), 6);
+}
+
+
+// The defect this replaces was not NULL placement: with a NULL in the key, the
+// NON-NULL keys came out in the wrong order and rows vanished under LIMIT,
+// because a non-transitive equivalence is undefined behaviour in stable_sort.
+// This is the shape that failed: keys 1 and 2 arrived inverted.
+TEST(VecSort, NullKeyDoesNotDisturbNonNullOrdering) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    // 6/n -> 2, NULL, 6, 1, 3  (arrival order deliberately unsorted)
+    std::vector<Row> input = {{Value(int64_t(3))}, {Value(int64_t(0))},
+                              {Value(int64_t(1))}, {Value(int64_t(6))},
+                              {Value(int64_t(2))}};
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    std::vector<OrderByItem> order;
+    order.push_back(orderAsc(col("(6 / n)")));
+    VecSortNode sort(std::move(project), std::move(order));
+
+    std::vector<Row> rows = drainRows(sort);
+    ASSERT_EQ(rows.size(), 5u);
+    EXPECT_TRUE(rows[0][0].isNull());          // NULL first ascending
+    EXPECT_EQ(rows[1][0].asInt(), 1);
+    EXPECT_EQ(rows[2][0].asInt(), 2);
+    EXPECT_EQ(rows[3][0].asInt(), 3);
+    EXPECT_EQ(rows[4][0].asInt(), 6);
+}
+
+
+TEST(VecSort, NullKeySortsLastDescending) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    std::vector<Row> input = {{Value(int64_t(3))}, {Value(int64_t(0))}, {Value(int64_t(1))}};
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));   // 2, NULL, 6
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    std::vector<OrderByItem> order;
+    order.push_back(orderDesc(col("(6 / n)")));
+    VecSortNode sort(std::move(project), std::move(order));
+
+    std::vector<Row> rows = drainRows(sort);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asInt(), 6);
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_TRUE(rows[2][0].isNull());          // NULL last descending
+}
+
+
+// A NULL in the FIRST key must still let the second key break ties, which only
+// works if two NULLs compare equal rather than each being "equivalent to
+// everything".
+TEST(VecSort, TwoNullsTieAndTheSecondKeyDecides) {
+    Schema schema = vecSchema({{"n", TypeId::INT}, {"t", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(0)), Value(int64_t(9))},   // NULL, 9
+        {Value(int64_t(2)), Value(int64_t(1))},   // 3,    1
+        {Value(int64_t(0)), Value(int64_t(4))},   // NULL, 4
+    };
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));
+    exprs.push_back(col("t"));
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}, {"t", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    std::vector<OrderByItem> order;
+    order.push_back(orderAsc(col("(6 / n)")));
+    order.push_back(orderAsc(col("t")));
+    VecSortNode sort(std::move(project), std::move(order));
+
+    std::vector<Row> rows = drainRows(sort);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_TRUE(rows[0][0].isNull());
+    EXPECT_EQ(rows[0][1].asInt(), 4);           // NULL group, ordered by t
+    EXPECT_TRUE(rows[1][0].isNull());
+    EXPECT_EQ(rows[1][1].asInt(), 9);
+    EXPECT_EQ(rows[2][0].asInt(), 3);
 }
 
 
@@ -2778,4 +2951,53 @@ TEST(CompareForSort, CoercesIntAgainstDouble) {
     EXPECT_LT(compareForSort(Value(int64_t(1)), Value(1.5)), 0);
     EXPECT_GT(compareForSort(Value(2.5), Value(int64_t(2))), 0);
     EXPECT_EQ(compareForSort(Value(int64_t(2)), Value(2.0)), 0);
+}
+
+
+TEST(VecDistinct, NullIsItsOwnDistinctKey) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    // divisors: 0 -> NULL, 0 -> NULL (dup), 1 -> 6, 6 -> 1, 1 -> 6 (dup)
+    std::vector<Row> input = {
+        {Value(int64_t(0))}, {Value(int64_t(0))}, {Value(int64_t(1))},
+        {Value(int64_t(6))}, {Value(int64_t(1))},
+    };
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    VecDistinctNode distinct(std::move(project));
+    std::vector<Row> rows = drainRows(distinct);
+
+    // {NULL, 6, 1} — NULL dedupes against NULL but never against 0
+    ASSERT_EQ(rows.size(), 3u);
+    int nulls = 0;
+    for (const Row& r : rows) if (r[0].isNull()) ++nulls;
+    EXPECT_EQ(nulls, 1);
+}
+
+
+// VecLimitNode truncates a chunk's columns in place; the validity mask has to
+// be truncated with them or it desynchronises from the data.
+TEST(VecLimit, TruncationKeepsValidityAligned) {
+    Schema schema = vecSchema({{"n", TypeId::INT}});
+    std::vector<Row> input = {
+        {Value(int64_t(0))},                       // NULL
+        {Value(int64_t(1))}, {Value(int64_t(2))},
+    };
+
+    std::vector<std::unique_ptr<Expr>> exprs;
+    exprs.push_back(binOp("/", intLit(6), col("n")));
+    Schema proj_schema = vecSchema({{"(6 / n)", TypeId::INT}});
+    auto project = std::make_unique<VecProjectNode>(
+        makeScan(schema, input), std::move(exprs), proj_schema);
+
+    VecLimitNode limit(std::move(project), 2);
+    std::vector<Row> rows = drainRows(limit);
+
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_TRUE(rows[0][0].isNull());
+    EXPECT_EQ(rows[1][0].asInt(), 6);
 }

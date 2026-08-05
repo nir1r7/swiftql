@@ -42,16 +42,19 @@ void VecSimdLoopJoinNode::open() {
 
         // the builder guarantees an INT key column; a non-INT key here is a
         // planning bug, so let std::get's bad_variant_access bubble
-        const auto& keys = std::get<std::vector<int64_t>>(chunk->columns[build_key_idx].data);
+        const ColumnVector& key_col = chunk->columns[build_key_idx];
+        const auto& keys = std::get<std::vector<int64_t>>(key_col.data);
         for (int r : *indices_ptr) {
+            // SQL: NULL never equals anything, so a NULL key can never match.
+            // Keeping it out of build_keys_ also keeps the flat SIMD key buffer
+            // free of the placeholder underneath a NULL.
+            if (key_col.isNull(r)) continue;
             build_keys_.push_back(keys[r]);
 
             Row build_row;
             build_row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    build_row.push_back(Value(vec[r]));
-                }, cv.data);
+                build_row.push_back(valueAt(cv, r));
             }
             build_rows_.push_back(std::move(build_row));
         }
@@ -116,23 +119,9 @@ void VecSimdLoopJoinNode::fillOutChunk(int start, int count) {
     out_chunk_.sel.size = 0;
 
     for (int c = 0; c < output_schema_.size(); ++c) {
-        ColumnVector cv;
-        cv.type = output_schema_.column(c).type;
-        switch (cv.type) {
-            case TypeId::INT: cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE: cv.data = std::vector<double>(); break;
-            case TypeId::STRING: cv.data = std::vector<std::string>(); break;
-        }
+        ColumnVector cv = makeColumnVector(output_schema_.column(c).type);
         for (int i = start; i < start + count; ++i) {
-            const Value& v = output_buffer_[i][c];
-            switch (cv.type) {
-                case TypeId::INT:
-                    std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
-                case TypeId::DOUBLE:
-                    std::get<std::vector<double>>(cv.data).push_back(v.asDouble()); break;
-                case TypeId::STRING:
-                    std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
-            }
+            appendColumnValue(cv, output_buffer_[i][c]);
         }
         out_chunk_.columns.push_back(std::move(cv));
     }
@@ -163,12 +152,14 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
             indices_ptr = &all_indices;
         }
 
-        const auto& probe_keys = std::get<std::vector<int64_t>>(
-            probe_chunk->columns[probe_key_idx].data);
+        const ColumnVector& probe_key_col = probe_chunk->columns[probe_key_idx];
+        const auto& probe_keys = std::get<std::vector<int64_t>>(probe_key_col.data);
 
         std::vector<int> matches;   // build indices matching one probe key
         for (int r : *indices_ptr) {
             stats.rows_in++;
+
+            if (probe_key_col.isNull(r)) continue;   // NULL matches nothing (see open())
 
             // compare pass: the hot loop touches only the flat key buffer —
             // payload columns are read below, only for rows that matched
@@ -185,9 +176,7 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
 
                 auto append_probe = [&]() {
                     for (const auto& cv : probe_chunk->columns) {
-                        std::visit([&](const auto& vec) {
-                            out_row.push_back(Value(vec[r]));
-                        }, cv.data);
+                        out_row.push_back(valueAt(cv, r));
                     }
                 };
                 auto append_build = [&]() {

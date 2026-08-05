@@ -41,17 +41,7 @@ DataChunk* VecProjectNode::nextChunk(){
 
     // pre allocate one COlumnVector per output expression
     for (int c = 0; c < output_schema_.size(); ++c){
-        ColumnVector cv;
-        cv.type = output_schema_.column(c).type;
-        switch (cv.type){
-            case TypeId::INT:
-                cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE:
-                cv.data = std::vector<double>(); break;
-            case TypeId::STRING:
-                cv.data = std::vector<std::string>(); break;
-        }
-        out_chunk_.columns.push_back(std::move(cv));
+        out_chunk_.columns.push_back(makeColumnVector(output_schema_.column(c).type));
     }
 
     const Schema& child_schema = child_->outputSchema();
@@ -77,9 +67,7 @@ DataChunk* VecProjectNode::nextChunk(){
         if (has_complex) {
             tmp.reserve(filtered->columns.size());
             for (const auto& cv : filtered->columns){
-                std::visit([&](const auto& vec){
-                    tmp.push_back(Value(vec[r]));
-                }, cv.data);
+                tmp.push_back(valueAt(cv, r));
             }
         }
 
@@ -87,36 +75,14 @@ DataChunk* VecProjectNode::nextChunk(){
             Value v;
             if (src_col[c] >= 0) {
                 // direct columnar read, no Row, no evaluate() call
-                std::visit([&](const auto& vec){ v = Value(vec[r]); }, filtered->columns[src_col[c]].data);
+                v = valueAt(filtered->columns[src_col[c]], r);
             } else {
                 v = evaluate(expressions_[c].get(), tmp, child_schema);
             }
-            if (v.isNull()) {
-                // ColumnVector has no null bitmap, so SQL NULL (e.g. x/0 under
-                // SQLite division semantics) cannot be represented in a
-                // materialized column. Degrade to the engine-wide sentinel —
-                // same contract as VecHashAggregateNode::fillChunk. Without
-                // this guard the typed accessors below throw bad_variant_access
-                // (a null Value's variant holds int64_t). Fix requires a
-                // validity vector on ColumnVector.
-                switch (output_schema_.column(c).type) {
-                    case TypeId::INT:
-                        std::get<std::vector<int64_t>>(out_chunk_.columns[c].data).push_back(0); break;
-                    case TypeId::DOUBLE:
-                        std::get<std::vector<double>>(out_chunk_.columns[c].data).push_back(0.0); break;
-                    case TypeId::STRING:
-                        std::get<std::vector<std::string>>(out_chunk_.columns[c].data).push_back("NULL"); break;
-                }
-                continue;
-            }
-            switch (output_schema_.column(c).type) {
-                case TypeId::INT:
-                    std::get<std::vector<int64_t>>(out_chunk_.columns[c].data).push_back(v.asInt()); break;
-                case TypeId::DOUBLE:
-                    std::get<std::vector<double>>(out_chunk_.columns[c].data).push_back(v.asDouble()); break;
-                case TypeId::STRING:
-                    std::get<std::vector<std::string>>(out_chunk_.columns[c].data).push_back(v.asString()); break;
-            }
+            // a NULL (e.g. x/0 under SQLite division semantics) is carried on the
+            // column's validity mask instead of being flattened to a 0 / "NULL"
+            // sentinel that is indistinguishable from a real value
+            appendColumnValue(out_chunk_.columns[c], v);
         }
     }
 

@@ -32,17 +32,18 @@ void VecHashJoinNode::open() {
         }
         for (int r : *indices_ptr) {
             // extract join key value, serialize with same '\x01' sentinel as Volcano HashJoinNode
-            Value key_val;
-            std::visit([&](const auto& vec) { key_val = Value(vec[r]); }, chunk->columns[build_key_idx].data);
+            Value key_val = valueAt(chunk->columns[build_key_idx], r);
+            // SQL: NULL never equals anything, so a NULL key can never match a
+            // probe row. Dropping it here keeps it out of the hash table
+            // instead of letting toString() bucket it under "NULL".
+            if (key_val.isNull()) continue;
             std::string key = key_val.toString() + '\x01';
 
             // reconstruct full build-side Row and insert into hash table
             Row build_row;
             build_row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    build_row.push_back(Value(vec[r]));
-                }, cv.data);
+                build_row.push_back(valueAt(cv, r));
             }
             hash_table_[key].push_back(std::move(build_row));
         }
@@ -60,23 +61,9 @@ void VecHashJoinNode::fillOutChunk(int start, int count) {
     out_chunk_.sel.size = 0;
 
     for (int c = 0; c < output_schema_.size(); ++c) {
-        ColumnVector cv;
-        cv.type = output_schema_.column(c).type;
-        switch (cv.type) {
-            case TypeId::INT: cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE: cv.data = std::vector<double>(); break;
-            case TypeId::STRING: cv.data = std::vector<std::string>(); break;
-        }
+        ColumnVector cv = makeColumnVector(output_schema_.column(c).type);
         for (int i = start; i < start + count; ++i) {
-            const Value& v = output_buffer_[i][c];
-            switch (cv.type) {
-                case TypeId::INT:
-                    std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
-                case TypeId::DOUBLE:
-                    std::get<std::vector<double>>(cv.data).push_back(v.asDouble()); break;
-                case TypeId::STRING:
-                    std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
-            }
+            appendColumnValue(cv, output_buffer_[i][c]);
         }
         out_chunk_.columns.push_back(std::move(cv));
     }
@@ -110,8 +97,8 @@ DataChunk* VecHashJoinNode::nextChunk() {
         for (int r : *indices_ptr) {
             stats.rows_in++;
 
-            Value key_val;
-            std::visit([&](const auto& vec) { key_val = Value(vec[r]); }, probe_chunk->columns[probe_key_idx].data);
+            Value key_val = valueAt(probe_chunk->columns[probe_key_idx], r);
+            if (key_val.isNull()) continue;   // NULL matches nothing (see open())
             std::string key = key_val.toString() + '\x01';
 
             auto it = hash_table_.find(key);
@@ -126,9 +113,7 @@ DataChunk* VecHashJoinNode::nextChunk() {
 
                 auto append_probe = [&]() {
                     for (const auto& cv : probe_chunk->columns) {
-                        std::visit([&](const auto& vec) {
-                            out_row.push_back(Value(vec[r]));
-                        }, cv.data);
+                        out_row.push_back(valueAt(cv, r));
                     }
                 };
                 auto append_build = [&]() {

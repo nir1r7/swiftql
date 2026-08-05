@@ -32,24 +32,30 @@ int VecDistinctNode::consumeAndDedup() {
 
         rows_consumed += static_cast<int>(indices_ptr->size());
         for (int r : *indices_ptr) {
+            // Build the dedup key from NULL-aware reads. NULL gets the marker
+            // 'N', which no non-NULL cell can produce because the non-NULL
+            // encoding always starts with a decimal length digit. Reusing
+            // toString() for NULL would collide with the string value "NULL",
+            // and a 0-length encoding would collide with the empty string.
             std::string key;
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    std::string s = Value(vec[r]).toString();
+                Value v = valueAt(cv, r);
+                if (v.isNull()) {
+                    key += 'N';
+                } else {
+                    std::string s = v.toString();
                     key += std::to_string(s.size());
                     key += ':';
                     key += s;
-                    key += '\x01';
-                }, cv.data);
+                }
+                key += '\x01';
             }
 
             if (seen.insert(key).second) {
                 Row row;
                 row.reserve(chunk->columns.size());
                 for (const auto& cv : chunk->columns) {
-                    std::visit([&](const auto& vec) {
-                        row.push_back(Value(vec[r]));
-                    }, cv.data);
+                    row.push_back(valueAt(cv, r));
                 }
                 dedup_buffer_.push_back(std::move(row));
             }
@@ -67,23 +73,9 @@ void VecDistinctNode::fillChunk(int start, int count) {
     out_chunk_.sel.size = 0;
 
     for (int c = 0; c < schema.size(); ++c) {
-        ColumnVector cv;
-        cv.type = schema.column(c).type;
-        switch (cv.type) {
-            case TypeId::INT: cv.data = std::vector<int64_t>(); break;
-            case TypeId::DOUBLE: cv.data = std::vector<double>(); break;
-            case TypeId::STRING: cv.data = std::vector<std::string>(); break;
-        }
+        ColumnVector cv = makeColumnVector(schema.column(c).type);
         for (int i = start; i < start + count; ++i) {
-            const Value& v = dedup_buffer_[i][c];
-            switch (cv.type) {
-                case TypeId::INT:
-                    std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
-                case TypeId::DOUBLE:
-                    std::get<std::vector<double>>(cv.data).push_back(v.asDouble()); break;
-                case TypeId::STRING:
-                    std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
-            }
+            appendColumnValue(cv, dedup_buffer_[i][c]);
         }
         out_chunk_.columns.push_back(std::move(cv));
     }
