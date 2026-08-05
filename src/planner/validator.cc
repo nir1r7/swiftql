@@ -59,8 +59,35 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
         checkGroupedRefs(un->operand.get(), group_by);
+        return;
     }
-    // Literal: fine
+    // Week 25 nodes. This is a SEPARATE dispatch site from validateExpr below,
+    // and it fails silently: a subtype missed here lets an ungrouped column
+    // reference through validation, and the query then dies at execution with
+    // "Column not found in schema" against the post-aggregate schema.
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        checkGroupedRefs(in->operand.get(), group_by);
+        return;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        checkGroupedRefs(lk->operand.get(), group_by);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            checkGroupedRefs(w.condition.get(), group_by);
+            checkGroupedRefs(w.result.get(), group_by);
+        }
+        checkGroupedRefs(c->else_expr.get(), group_by);
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        checkGroupedRefs(sub->operand.get(), group_by);
+        checkGroupedRefs(sub->start.get(), group_by);
+        checkGroupedRefs(sub->length.get(), group_by);   // nullptr-safe
+        return;
+    }
+    // Literal / IntervalLiteral: fine
 }
 
 } // namespace
@@ -284,7 +311,25 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
             validateExpr(agg->argument.get(), schema, context, allow_aggregates);
         }
     }
-    // literal nodes need no validation
+    else if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        validateExpr(in->operand.get(), schema, context, allow_aggregates);
+    }
+    else if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        validateExpr(lk->operand.get(), schema, context, allow_aggregates);
+    }
+    else if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            validateExpr(w.condition.get(), schema, context, allow_aggregates);
+            validateExpr(w.result.get(), schema, context, allow_aggregates);
+        }
+        if (c->else_expr) validateExpr(c->else_expr.get(), schema, context, allow_aggregates);
+    }
+    else if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        validateExpr(sub->operand.get(), schema, context, allow_aggregates);
+        validateExpr(sub->start.get(), schema, context, allow_aggregates);
+        if (sub->length) validateExpr(sub->length.get(), schema, context, allow_aggregates);
+    }
+    // literal / interval nodes need no validation
 }
 
 

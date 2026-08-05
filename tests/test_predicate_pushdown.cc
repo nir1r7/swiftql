@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "planner/predicate_pushdown.h"
+#include "planner/cardinality_estimator.h"
 #include "planner/logical_plan.h"
 #include "planner/vectorized_plan_builder.h"
 #include "planner/vec_plan_node.h"
@@ -518,4 +519,189 @@ TEST(PredicatePushdown, CrossRelationOrStaysAboveJoinIntact) {
     Catalog cat3(CATALOG);
     auto unpushed = buildUnpushedVec(sql, cat3);
     EXPECT_EQ(drainSorted(*pushed), drainSorted(*unpushed));
+}
+
+// ===== Week 25: the new nodes must be pushable =====
+//
+// collectSlots and restampSlots are dispatch sites that development.md's
+// checklist does not list, and both fail SILENTLY: a subtype missed in
+// collectSlots yields an empty slot set, classify() returns RESIDUAL, and the
+// conjunct is evaluated above the join instead of on its own scan. Correct
+// answers, silently lost pushdown — which is where TPC-H Q12/Q14/Q16/Q19 live.
+TEST(PredicatePushdown, PushesLikeAndInBelowJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.team LIKE 'Fer%' AND d.nationality IN ('British', 'German')", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(join->children[0]->children[0]->type, LogicalNodeType::SCAN);
+    EXPECT_EQ(join->children[1]->children[0]->type, LogicalNodeType::SCAN);
+
+    const LogicalPlanNode* n = plan.get();
+    while (n && n->type != LogicalNodeType::JOIN) {
+        EXPECT_NE(n->type, LogicalNodeType::FILTER) << "nothing should remain above the join";
+        n = n->children.empty() ? nullptr : n->children[0].get();
+    }
+}
+
+TEST(PredicatePushdown, PushesSubstringAndCaseBelowJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE SUBSTRING(l.team, 1, 3) = 'Fer' "
+        "AND CASE WHEN d.age > 30 THEN 1 ELSE 0 END = 1", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+}
+
+// restampSlots must stay in lockstep with collectSlots: a conjunct classified
+// as JOIN-side is re-stamped to slot 0 below the join, because the standalone
+// scan schema stamps every column slot 0. Without it the slot lookup misses and
+// ChunkPruner ignores the hint (it deliberately skips slot >= 1 refs).
+TEST(PredicatePushdown, RestampsSlotsInsideWeek25Nodes) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.nationality IN ('British')", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+
+    const auto* filter = static_cast<const LogicalFilter*>(join->children[1].get());
+    const auto* in = dynamic_cast<const InExpr*>(filter->predicate.get());
+    ASSERT_NE(in, nullptr) << "the IN conjunct should be the pushed predicate";
+    const auto* col = dynamic_cast<const ColumnRef*>(in->operand.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->relation_slot, 0) << "pushed join-side refs must be re-stamped to slot 0";
+}
+
+// IN gets a real estimate (k/ndv from statistics); LIKE deliberately does not.
+// Guessing low for LIKE measured 1.4-1.7x slower, because orderByWork ranks on
+// selectivity alone and promoted an expensive predicate ahead of cheap ones —
+// see the comment in cardinality_estimator.cc. This test locks in BOTH halves
+// of that decision, so a future "improvement" to LIKE has to confront it.
+TEST(CardinalityEstimator, EstimatesInSelectivityButNotLike) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // nationality NDV 5, 20 rows
+
+    // both values sit inside nationality's ['Australian', 'Spanish'] range, so
+    // both count toward k
+    Parser parser("SELECT name FROM drivers WHERE nationality IN ('British', 'German')");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
+    CardinalityEstimator::estimate(*plan, cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_NEAR(filter->estimated_rows, 20.0 * (2.0 / 5.0), 1e-9);   // k / ndv
+
+    Parser lp("SELECT name FROM drivers WHERE nationality LIKE 'a%'");
+    auto lstmt = lp.parse();
+    Binder::bind(lstmt, cat);
+    auto lplan = LogicalPlanBuilder::build(std::move(lstmt), cat);
+    CardinalityEstimator::estimate(*lplan, cat);
+
+    const LogicalPlanNode* lfilter = findNode(lplan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(lfilter, nullptr);
+    // LIKE stays on FALLBACK_SELECTIVITY: no histogram, and a low guess reorders
+    // the conjunct cascade against the measured cost
+    EXPECT_NEAR(lfilter->estimated_rows, 20.0 * FALLBACK_SELECTIVITY, 1e-9);
+}
+
+// Only values the column could actually hold count toward k. Without the
+// [min,max] containment check, `NOT IN` inverts catastrophically: k >= ndv
+// clamps selectivity to 1.0, the negated branch returns 0, and the >= 1-row
+// floor turns a filter that keeps EVERY row into a 1-row estimate. Measured
+// consequence before the fix: the join put the 10000-row input on the build
+// side (est=1) and ran 1.54x slower than the equivalent positive form.
+TEST(CardinalityEstimator, InListIgnoresValuesOutsideTheColumnRange) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // age [20, 40], NDV 20, 20 rows
+
+    auto estimateOf = [&](const std::string& sql) {
+        Parser parser(sql);
+        auto stmt = parser.parse();
+        Binder::bind(stmt, cat);
+        auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
+        CardinalityEstimator::estimate(*plan, cat);
+        const LogicalPlanNode* f = findNode(plan.get(), LogicalNodeType::FILTER);
+        return f ? f->estimated_rows : -1.0;
+    };
+
+    // every listed value is outside [20, 40], so none can match
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (1, 2, 3)"), 1.0, 1e-9);
+    // ... and NOT IN of the same list therefore keeps everything. This is the
+    // regression: counting all three gave 3/20 -> negated 0.85 before the range
+    // check existed only in the equality branch, and a longer out-of-range list
+    // (k >= ndv) drove it to a 1-row estimate.
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age NOT IN (1, 2, 3)"), 20.0, 1e-9);
+
+    // a list longer than NDV, entirely out of range: the shape that inverted
+    EXPECT_NEAR(estimateOf(
+        "SELECT name FROM drivers WHERE age NOT IN (1,2,3,4,5,6,7,8,9,10,11,12,"
+        "13,14,15,16,17,18,19,100,101)"), 20.0, 1e-9);
+
+    // in-range values still count normally, in both polarities
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (25, 30)"),
+                20.0 * (2.0 / 20.0), 1e-9);
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age NOT IN (25, 30)"),
+                20.0 * (1.0 - 2.0 / 20.0), 1e-9);
+
+    // mixed: only the in-range half counts
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (25, 30, 1, 999)"),
+                20.0 * (2.0 / 20.0), 1e-9);
+}
+
+// The [min,max] containment check alone did not close the NOT IN inversion.
+// Two paths still drove the negated selectivity to 0 — a 1-row estimate for a
+// filter that keeps nearly every row, which put the 10000-row input on the
+// join's build side.
+TEST(CardinalityEstimator, NegatedInNeverCollapsesToZeroRows) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // age [20,40] NDV 20; nationality NDV 5
+
+    auto estimateOf = [&](const std::string& sql) {
+        Parser parser(sql);
+        auto stmt = parser.parse();
+        Binder::bind(stmt, cat);
+        auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
+        CardinalityEstimator::estimate(*plan, cat);
+        const LogicalPlanNode* f = findNode(plan.get(), LogicalNodeType::FILTER);
+        return f ? f->estimated_rows : -1.0;
+    };
+
+    // (a) duplicates were counted individually, so k could exceed NDV and clamp
+    //     selectivity to 1.0. Five copies of one value is one distinct value.
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (25,25,25,25,25)"),
+                20.0 * (1.0 / 20.0), 1e-9);
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age NOT IN (25,25,25,25,25)"),
+                20.0 * (1.0 - 1.0 / 20.0), 1e-9);
+
+    // (b) a list covering every distinct value must still not estimate 0 rows
+    //     for NOT IN: NDV is an estimate, so the complement is floored at the
+    //     mass of one value rather than allowed to vanish.
+    double all_values = estimateOf(
+        "SELECT name FROM drivers WHERE nationality NOT IN "
+        "('British','German','Dutch','Finnish','Monegasque','Spanish')");
+    EXPECT_GE(all_values, 20.0 * (1.0 / 5.0) - 1e-9);
+
+    // (c) no usable statistics (a computed operand) — the flat 0.1 fallback
+    //     saturates at ten values, which used to make NOT IN estimate 0
+    double no_stats = estimateOf(
+        "SELECT name FROM drivers WHERE SUBSTRING(name,1,2) NOT IN "
+        "('a','b','c','d','e','f','g','h','i','j')");
+    EXPECT_GE(no_stats, 20.0 * FALLBACK_EQ_SELECTIVITY - 1e-9);
+
+    // the positive sense is still allowed to reach 0 — there it is a proof
+    // (every listed value lies outside [min,max]), not a guess
+    EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (1,2,3)"), 1.0, 1e-9);
 }

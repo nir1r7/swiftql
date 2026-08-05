@@ -33,7 +33,28 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     }
     if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) { collectSlots(isn->operand.get(), out); return; }
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) { collectSlots(un->operand.get(), out); return; }
-    // Literal: no slot. AggregateExpr cannot appear in WHERE (Validator forbids it).
+    // Week 25 nodes. Missing one here returns an EMPTY slot set, so classify()
+    // falls through to RESIDUAL and the conjunct is never pushed below the join
+    // — correct answers, silently lost pushdown. TPC-H Q12/Q14/Q16/Q19 all
+    // depend on a LIKE or IN predicate reaching its own scan.
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) { collectSlots(in->operand.get(), out); return; }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) { collectSlots(lk->operand.get(), out); return; }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            collectSlots(w.condition.get(), out);
+            collectSlots(w.result.get(), out);
+        }
+        collectSlots(c->else_expr.get(), out);
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        collectSlots(sub->operand.get(), out);
+        collectSlots(sub->start.get(), out);
+        collectSlots(sub->length.get(), out);   // nullptr-safe
+        return;
+    }
+    // Literal / IntervalLiteral: no slot. AggregateExpr cannot appear in WHERE
+    // (Validator forbids it).
 }
 
 enum class PushTarget { FROM, JOIN, RESIDUAL };
@@ -63,7 +84,25 @@ void restampSlots(Expr* expr, int slot) {
         return;
     }
     if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { restampSlots(isn->operand.get(), slot); return; }
-    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) restampSlots(un->operand.get(), slot);
+    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) { restampSlots(un->operand.get(), slot); return; }
+    // Must stay in lockstep with collectSlots above: a conjunct classified as
+    // pushable there but not re-stamped here keeps slot 1 below the join, where
+    // ChunkPruner ignores it and the zone-map hint is lost.
+    if (auto* in = dynamic_cast<InExpr*>(expr)) { restampSlots(in->operand.get(), slot); return; }
+    if (auto* lk = dynamic_cast<LikeExpr*>(expr)) { restampSlots(lk->operand.get(), slot); return; }
+    if (auto* c = dynamic_cast<CaseExpr*>(expr)) {
+        for (auto& w : c->when_clauses) {
+            restampSlots(w.condition.get(), slot);
+            restampSlots(w.result.get(), slot);
+        }
+        restampSlots(c->else_expr.get(), slot);
+        return;
+    }
+    if (auto* sub = dynamic_cast<SubstringExpr*>(expr)) {
+        restampSlots(sub->operand.get(), slot);
+        restampSlots(sub->start.get(), slot);
+        restampSlots(sub->length.get(), slot);   // nullptr-safe
+    }
 }
 
 // Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty.

@@ -33,6 +33,94 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
         return isnull->is_not_null ? 1.0 - null_frac : null_frac;
     }
 
+    // IN over k constants: the equality case (1/ndv) generalised to a list,
+    // capped at 1. Material for TPC-H Q12/Q16/Q19/Q22, where an IN list is the
+    // most selective conjunct and therefore has to sort first in the cascade.
+    // Safe to promote: a compiled IN_SET probe measures the same as a native
+    // comparison (2.6ms vs 2.4ms per 1M rows), so ranking it by selectivity
+    // alone does not misprice it.
+    if (auto* in = dynamic_cast<const InExpr*>(pred)) {
+        auto* col = dynamic_cast<const ColumnRef*>(in->operand.get());
+        const ColumnStatsEntry* e = col ? ctx.find(col->column_name, col->relation_slot) : nullptr;
+
+        // Distinct values only. `x IN (2022, 2022, 2022)` matches exactly the
+        // rows `x = 2022` does; counting the duplicates inflated k past NDV,
+        // clamped selectivity to 1.0, and drove the negated case to 0. Lists are
+        // a handful of elements, so the quadratic scan is free — and it avoids
+        // needing a hash for Value. inferExprType has already rejected mixed
+        // STRING/numeric lists, so operator== cannot throw here.
+        auto isDuplicate = [&in](size_t i) {
+            for (size_t j = 0; j < i; ++j) {
+                if (in->values[j] == in->values[i]) return true;
+            }
+            return false;
+        };
+
+        double s;
+        if (e && e->stats->distinct_count > 0) {
+            // Count only the values the column could actually hold — the same
+            // [min,max] containment the equality branch below applies, one list
+            // element at a time. Counting all k instead is not merely imprecise,
+            // it inverts the negated case: `season NOT IN (1..10)` against
+            // season [2022,2025] scored k=10 over ndv=4, clamped to selectivity
+            // 1.0, and returned 0 for NOT — a 1-row estimate for a filter that
+            // keeps every row. That flipped the join onto the 10000-row build
+            // side (measured 24.0ms against 15.6ms for the equivalent positive
+            // form). An estimate that is low and wrong is exactly what the LIKE
+            // note below refuses to ship; the same guard belongs here.
+            double k = 0.0;
+            for (size_t i = 0; i < in->values.size(); ++i) {
+                const Value& v = in->values[i];
+                if (isDuplicate(i)) continue;
+                if (comparable(v, e->stats->min_val) &&
+                    (v < e->stats->min_val || v > e->stats->max_val)) {
+                    continue;   // cannot match any row
+                }
+                k += 1.0;
+            }
+            s = std::min(1.0, k / static_cast<double>(e->stats->distinct_count));
+        } else {
+            double k = 0.0;
+            for (size_t i = 0; i < in->values.size(); ++i) {
+                if (!isDuplicate(i)) k += 1.0;
+            }
+            s = std::min(1.0, k * FALLBACK_EQ_SELECTIVITY);
+        }
+        if (!in->negated) return s;
+
+        // NOT IN never estimates that nothing survives. Reaching s == 1.0 means
+        // the list *appears* to cover every distinct value, but that rests on an
+        // NDV estimate (or, with no stats at all, on a flat 0.1 guess that any
+        // list of ten values saturates). A 0 selectivity floors to a 1-row
+        // estimate for a filter that keeps nearly everything, which put the
+        // 10000-row input on the join's build side — measured 18.3ms against
+        // 15.8ms for an equivalent-cardinality control.
+        //
+        // The positive sense is deliberately NOT floored: there, s == 0 comes
+        // from a proof (every listed value lies outside [min,max], so no row can
+        // match), not from a guess. Same asymmetry the equality branch below
+        // relies on when it zeroes `eq` for an out-of-range literal.
+        const double single_value_mass = (e && e->stats->distinct_count > 0)
+            ? 1.0 / static_cast<double>(e->stats->distinct_count)
+            : FALLBACK_EQ_SELECTIVITY;
+        return std::max(1.0 - s, single_value_mass);
+    }
+
+    // LIKE deliberately has NO rule: it falls through to FALLBACK_SELECTIVITY.
+    //
+    // A histogram-free engine cannot estimate pattern matching, and guessing low
+    // actively hurts. Postgres' 0.005 was tried and measured 1.4-1.7x SLOWER on
+    // `WHERE team LIKE 'Fer%' AND lap_id BETWEEN 900000 AND 900100` (1M rows,
+    // Release): orderByWork ranks conjuncts on selectivity alone, so the tiny
+    // estimate promoted the LIKE ahead of two cheap integer comparisons and the
+    // expensive predicate then ran on every surviving row instead of on the ~100
+    // the ranges would have left. The guess was also simply wrong — that pattern
+    // keeps 25% of this table, not 0.5%.
+    //
+    // An accurate LIKE selectivity is only safe once conjunct ordering is
+    // cost-aware, which predicate_pushdown.cc already defers to Week 28. Land
+    // the two together there, not the estimate alone.
+
     auto* bin = dynamic_cast<const BinaryExpr*>(pred);
     if (!bin) return FALLBACK_SELECTIVITY;
 

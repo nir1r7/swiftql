@@ -30,6 +30,29 @@ static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
         collectCols(un->operand.get(), out);
         return;
     }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)){
+        collectCols(in->operand.get(), out);   // values are literals
+        return;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)){
+        collectCols(lk->operand.get(), out);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)){
+        for (const auto& w : c->when_clauses){
+            collectCols(w.condition.get(), out);
+            collectCols(w.result.get(), out);
+        }
+        collectCols(c->else_expr.get(), out);
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)){
+        collectCols(sub->operand.get(), out);
+        collectCols(sub->start.get(), out);
+        collectCols(sub->length.get(), out);   // nullptr-safe
+        return;
+    }
+    // IntervalLiteral: a constant, and folded away before this runs
 }
 
 // build schema using only required columns
@@ -116,6 +139,89 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
             return (l == TypeId::INT && r == TypeId::INT) ? TypeId::INT : TypeId::DOUBLE;
         }
         return TypeId::INT;   // comparison / AND / OR
+    }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        TypeId op_t = inferExprType(in->operand.get(), schema);
+        const bool op_str = (op_t == TypeId::STRING);
+        for (const Value& c : in->values) {
+            // Value's comparison operators throw on STRING vs numeric; reject
+            // that shape here so the failure is a plan-time SQL error rather
+            // than a per-row throw from inside the scan loop
+            if ((c.type() == TypeId::STRING) != op_str)
+                throw std::runtime_error(
+                    "IN: list values must be comparable with the operand "
+                    "(cannot mix STRING and numeric)");
+        }
+        return TypeId::INT;   // boolean-as-INT convention
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        if (inferExprType(lk->operand.get(), schema) != TypeId::STRING)
+            throw std::runtime_error("LIKE requires a STRING operand");
+        return TypeId::INT;
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        // Conditions are predicates. Rejecting a non-INT here is stricter than
+        // WHERE (which lets asInt() raise per row), but this type feeds output
+        // column pre-allocation, so it has to be decided at plan time.
+        for (const auto& w : c->when_clauses) {
+            if (inferExprType(w.condition.get(), schema) != TypeId::INT)
+                throw std::runtime_error("CASE: WHEN condition must be a predicate");
+        }
+        // The parser guarantees at least one WHEN, so an empty list is a
+        // hand-built tree — say so instead of indexing out of bounds.
+        if (c->when_clauses.empty())
+            throw std::runtime_error("internal: CASE with no WHEN clauses");
+        // Unify the result branches with the same promotion rule as arithmetic
+        // above: INT+INT stays INT, any DOUBLE promotes, STRING may not mix.
+        TypeId result = inferExprType(c->when_clauses[0].result.get(), schema);
+        auto unify = [&result](TypeId t) {
+            if (t == result) return;
+            if (t == TypeId::STRING || result == TypeId::STRING)
+                throw std::runtime_error(
+                    "CASE: result branches must be all numeric or all STRING");
+            result = TypeId::DOUBLE;
+        };
+        for (size_t i = 1; i < c->when_clauses.size(); ++i)
+            unify(inferExprType(c->when_clauses[i].result.get(), schema));
+        // A missing ELSE contributes NULL, which is typeless here (Value::type()
+        // throws on null) and so cannot change the unified type.
+        if (c->else_expr) unify(inferExprType(c->else_expr.get(), schema));
+        return result;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        if (inferExprType(sub->operand.get(), schema) != TypeId::STRING)
+            throw std::runtime_error("SUBSTRING requires a STRING operand");
+        if (inferExprType(sub->start.get(), schema) != TypeId::INT)
+            throw std::runtime_error("SUBSTRING: start position must be an integer");
+        if (sub->length && inferExprType(sub->length.get(), schema) != TypeId::INT)
+            throw std::runtime_error("SUBSTRING: length must be an integer");
+        // Constant out-of-domain arguments are decided HERE, not per row. After
+        // foldConstants every realistic SUBSTRING has literal positions, so this
+        // is where the user actually finds out — a plan-time SQL error instead
+        // of a throw from inside the scan loop that aborts a partly-executed
+        // query. A computed position still raises at execution; see
+        // substringOf() in evaluator.cc.
+        if (auto* lit = dynamic_cast<const Literal*>(sub->start.get())) {
+            if (!lit->value.isNull() && lit->value.asInt() < 1)
+                throw std::runtime_error(
+                    "SUBSTRING: start position must be >= 1 (SwiftQL does not "
+                    "support SQLite's 0 and negative start positions)");
+        }
+        if (sub->length) {
+            if (auto* lit = dynamic_cast<const Literal*>(sub->length.get())) {
+                if (!lit->value.isNull() && lit->value.asInt() < 0)
+                    throw std::runtime_error(
+                        "SUBSTRING: length must be >= 0 (SwiftQL does not support "
+                        "SQLite's negative-length form)");
+            }
+        }
+        return TypeId::STRING;
+    }
+    if (dynamic_cast<const IntervalLiteral*>(expr)) {
+        // Unfolded interval: the query is malformed. Loud at plan time, by design.
+        throw std::runtime_error(
+            "INTERVAL is only valid in constant date arithmetic, "
+            "e.g. date '1994-01-01' + interval '1' year");
     }
     throw std::runtime_error("inferExprType(): unknown Expr subtype");
 }
@@ -333,6 +439,28 @@ static void substituteInto(std::unique_ptr<Expr>& expr,
     }
     if (auto* isn = dynamic_cast<IsNullExpr*>(expr.get())) {
         substituteInto(isn->operand, keys);
+        return;
+    }
+    if (auto* in = dynamic_cast<InExpr*>(expr.get())) {
+        substituteInto(in->operand, keys);
+        return;
+    }
+    if (auto* lk = dynamic_cast<LikeExpr*>(expr.get())) {
+        substituteInto(lk->operand, keys);
+        return;
+    }
+    if (auto* c = dynamic_cast<CaseExpr*>(expr.get())) {
+        for (auto& w : c->when_clauses) {
+            substituteInto(w.condition, keys);
+            substituteInto(w.result, keys);
+        }
+        substituteInto(c->else_expr, keys);
+        return;
+    }
+    if (auto* sub = dynamic_cast<SubstringExpr*>(expr.get())) {
+        substituteInto(sub->operand, keys);
+        substituteInto(sub->start, keys);
+        substituteInto(sub->length, keys);   // nullptr-safe
     }
 }
 

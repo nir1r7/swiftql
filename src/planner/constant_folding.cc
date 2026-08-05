@@ -1,7 +1,10 @@
 #include "constant_folding.h"
+#include "common/date_util.h"
+#include "execution/checked_arith.h"
 #include "execution/evaluator.h"
 #include "parser/expr_utils.h"
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -16,6 +19,53 @@ bool isArithOp(const std::string& op) {
     return op == "+" || op == "-" || op == "*" || op == "/";
 }
 
+// `date '1998-12-01' - interval '90' day` -> Literal("1998-09-02").
+//
+// This is the one fold that is not plain arithmetic: the operands are a STRING
+// date Literal and an IntervalLiteral, a pair inferExprType rejects outright.
+// Folding it is the whole reason IntervalLiteral exists — it turns the
+// predicate back into `ColumnRef op Literal`, which is the shape ChunkPruner,
+// scanColumn's tight loop and selectivity() all pattern-match on. Every TPC-H
+// interval expression is constant, so nothing is lost. Returns true when `expr`
+// was replaced by a Literal.
+bool foldDateInterval(std::unique_ptr<Expr>& expr, BinaryExpr* bin) {
+    if (bin->op != "+" && bin->op != "-") return false;
+
+    // SQL allows `interval + date` as well; normalise so one shape is handled.
+    // Subtraction is not commutative, so only '+' may be swapped.
+    Expr* date_side = bin->left.get();
+    Expr* iv_side   = bin->right.get();
+    if (bin->op == "+" && dynamic_cast<IntervalLiteral*>(date_side)) {
+        std::swap(date_side, iv_side);
+    }
+
+    auto* date_lit = dynamic_cast<Literal*>(date_side);
+    auto* iv       = dynamic_cast<IntervalLiteral*>(iv_side);
+    if (!date_lit || !iv) return false;
+    if (date_lit->value.isNull() || date_lit->value.type() != TypeId::STRING) return false;
+    if (!isIsoDate(date_lit->value.asString())) return false;
+
+    // checkedNegate, not `-count`: negating INT64_MIN is undefined behaviour,
+    // and `interval '-9223372036854775808' day` parses fine (stoll accepts it),
+    // so this is reachable from ordinary SQL. Same helper the arithmetic
+    // evaluator uses — date folding had been bypassing checked_arith.h
+    // entirely. The add* functions bound their own count before touching it,
+    // so this is the only unguarded operation left on the path.
+    const int64_t n = (bin->op == "-") ? checkedNegate(iv->count) : iv->count;
+    std::string folded;
+    switch (iv->unit) {
+        case IntervalLiteral::Unit::DAY:   folded = addDays(date_lit->value.asString(), n);   break;
+        case IntervalLiteral::Unit::MONTH: folded = addMonths(date_lit->value.asString(), n); break;
+        case IntervalLiteral::Unit::YEAR:  folded = addYears(date_lit->value.asString(), n);  break;
+    }
+
+    std::string alias = expr->alias;
+    auto lit = std::make_unique<Literal>(Value(folded));
+    lit->alias = alias;
+    expr = std::move(lit);
+    return true;
+}
+
 // Replace `expr` with a Literal when it is a constant arithmetic subtree.
 // Returns true when `expr` is (now) a Literal, so the parent can decide whether
 // it too can fold.
@@ -27,6 +77,11 @@ bool foldNode(std::unique_ptr<Expr>& expr) {
     if (auto* bin = dynamic_cast<BinaryExpr*>(expr.get())) {
         bool l = foldNode(bin->left);
         bool r = foldNode(bin->right);
+        // Runs AFTER the children fold (so a nested date expression is already a
+        // Literal) and BEFORE the arithmetic rule (whose `l && r` guard is false
+        // here: foldNode returns false for an IntervalLiteral, which is not a
+        // Literal). Chains like `date + interval + interval` fold left to right.
+        if (foldDateInterval(expr, bin)) return true;
         if (!isArithOp(bin->op) || !l || !r) return false;
         Value v;
         try {
@@ -76,7 +131,33 @@ bool foldNode(std::unique_ptr<Expr>& expr) {
         return false;   // an aggregate is never a compile-time constant
     }
 
-    return false;   // ColumnRef, or a subtype with no folding rule
+    // Week 25 nodes: fold inside them (SUBSTRING(x, 1 + 0, 2)) but never fold
+    // the node itself. A constant LIKE/IN/CASE/SUBSTRING is not worth a rule,
+    // and declining is always safe — see the "decline and fall back" pattern.
+    if (auto* in = dynamic_cast<InExpr*>(expr.get())) {
+        foldNode(in->operand);
+        return false;   // values are already constants
+    }
+    if (auto* lk = dynamic_cast<LikeExpr*>(expr.get())) {
+        foldNode(lk->operand);
+        return false;
+    }
+    if (auto* c = dynamic_cast<CaseExpr*>(expr.get())) {
+        for (auto& w : c->when_clauses) {
+            foldNode(w.condition);
+            foldNode(w.result);
+        }
+        foldNode(c->else_expr);
+        return false;
+    }
+    if (auto* sub = dynamic_cast<SubstringExpr*>(expr.get())) {
+        foldNode(sub->operand);
+        foldNode(sub->start);
+        foldNode(sub->length);   // nullptr-safe
+        return false;
+    }
+
+    return false;   // ColumnRef, IntervalLiteral, or a subtype with no folding rule
 }
 
 } // namespace

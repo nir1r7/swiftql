@@ -630,3 +630,211 @@ TEST(GroupKeyIdentity, DoubleGroupKeyStaysDouble) {
     ASSERT_NE(agg, nullptr);
     EXPECT_EQ(agg->output_schema.column(0).type, TypeId::DOUBLE);
 }
+
+// ===== Week 25: type inference for the new expression nodes =====
+//
+// inferExprType is a hard contract: the vectorized path pre-allocates output
+// columns from it and ExpressionExecutor::compile asserts its own result type
+// matches. A node whose runtime type can differ produces bad_variant_access,
+// not a SQL error — so every new node is pinned down here.
+
+TEST(InferExprType, Week25NodeTypes) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+
+    auto typeOf = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+
+    EXPECT_EQ(typeOf("season IN (1, 2)"), TypeId::INT);        // boolean-as-INT
+    EXPECT_EQ(typeOf("team IN ('a')"), TypeId::INT);
+    EXPECT_EQ(typeOf("team LIKE 'a%'"), TypeId::INT);
+    EXPECT_EQ(typeOf("SUBSTRING(team, 1, 2)"), TypeId::STRING);
+    EXPECT_EQ(typeOf("SUBSTRING(team, 1)"), TypeId::STRING);
+}
+
+TEST(InferExprType, CaseUnifiesResultBranches) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+
+    auto typeOf = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+    auto infer = typeOf;
+
+    // same promotion rule as arithmetic: INT+INT stays INT, any DOUBLE promotes
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN 1 ELSE 2 END"), TypeId::INT);
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN 1 ELSE 2.5 END"), TypeId::DOUBLE);
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN speed ELSE 0 END"), TypeId::DOUBLE);
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN 'a' ELSE 'b' END"), TypeId::STRING);
+    // a missing ELSE contributes NULL, which is typeless and cannot promote
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN 1 END"), TypeId::INT);
+    // multi-branch unification looks at every THEN
+    EXPECT_EQ(typeOf("CASE WHEN season = 1 THEN 1 WHEN season = 2 THEN 2.5 ELSE 0 END"),
+              TypeId::DOUBLE);
+
+    EXPECT_THROW(infer("CASE WHEN season = 1 THEN 'a' ELSE 2 END"), std::runtime_error);
+    EXPECT_THROW(infer("CASE WHEN season = 1 THEN 1 ELSE team END"), std::runtime_error);
+    EXPECT_THROW(infer("CASE WHEN speed THEN 1 ELSE 2 END"), std::runtime_error);
+}
+
+TEST(InferExprType, Week25IllTypedNodesThrow) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+
+    auto infer = [&](const std::string& sql) {
+        Parser parser("SELECT " + sql + " FROM laps");
+        auto stmt = parser.parse();
+        return inferExprType(stmt.select_list[0].get(), laps);
+    };
+
+    // Value's comparison operators throw on STRING vs numeric; reject at plan
+    // time so the failure is a SQL error, not a per-row throw inside the scan
+    EXPECT_THROW(infer("season IN ('a', 1)"), std::runtime_error);
+    EXPECT_THROW(infer("team IN (1)"), std::runtime_error);
+    EXPECT_THROW(infer("speed LIKE 'a%'"), std::runtime_error);
+    EXPECT_THROW(infer("SUBSTRING(season, 1, 2)"), std::runtime_error);
+    EXPECT_THROW(infer("SUBSTRING(team, 1.5, 2)"), std::runtime_error);
+    EXPECT_THROW(infer("SUBSTRING(team, 1, speed)"), std::runtime_error);
+}
+
+// An interval that survives folding means the query was not constant date
+// arithmetic. Loud at plan time is the design; see ast.h.
+TEST(InferExprType, UnfoldedIntervalThrows) {
+    Catalog cat(CATALOG);
+    const Schema& laps = cat.getTable("laps").schema;
+    Parser parser("SELECT team FROM laps WHERE season < interval '90' day");
+    auto stmt = parser.parse();
+    EXPECT_THROW(inferExprType(stmt.where.get(), laps), std::runtime_error);
+}
+
+// ===== Week 25: interval folding =====
+//
+// `date '1998-12-01' - interval '90' day` must reach the planner as a plain
+// STRING Literal. This is the whole reason IntervalLiteral exists: a runtime
+// date subtraction would leave a computed expression on the right of the
+// comparison, which defeats ChunkPruner, scanColumn's typed loop and
+// selectivity() simultaneously — the same regression `season = 2020 + 4` had.
+TEST(ConstantFolding, DateMinusIntervalFoldsToALiteral) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT COUNT(*) FROM laps WHERE team <= date '1998-12-01' - interval '90' day", cat);
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->explain(), "LogicalFilter [(team <= 1998-09-02)]");
+}
+
+TEST(ConstantFolding, DatePlusIntervalHandlesEveryUnitAndOperandOrder) {
+    Catalog cat(CATALOG);
+    auto folded = [&](const std::string& expr) {
+        auto plan = buildLogical("SELECT COUNT(*) FROM laps WHERE team >= " + expr, cat);
+        const LogicalPlanNode* f = findNode(plan.get(), LogicalNodeType::FILTER);
+        return f ? f->explain() : std::string("<no filter>");
+    };
+
+    EXPECT_EQ(folded("date '1994-01-01' + interval '1' year"),
+              "LogicalFilter [(team >= 1995-01-01)]");
+    EXPECT_EQ(folded("date '1994-01-01' + interval '3' month"),
+              "LogicalFilter [(team >= 1994-04-01)]");
+    EXPECT_EQ(folded("date '1994-01-01' + interval '31' day"),
+              "LogicalFilter [(team >= 1994-02-01)]");
+    // `interval + date` is legal SQL too; only '+' may commute
+    EXPECT_EQ(folded("interval '3' month + date '2024-01-31'"),
+              "LogicalFilter [(team >= 2024-04-30)]");
+    // month arithmetic clamps the day to the target month
+    EXPECT_EQ(folded("date '2024-01-31' + interval '1' month"),
+              "LogicalFilter [(team >= 2024-02-29)]");
+    // and chains fold left to right
+    EXPECT_EQ(folded("date '1994-01-01' + interval '1' year + interval '1' month"),
+              "LogicalFilter [(team >= 1995-02-01)]");
+}
+
+// The fold is what makes BETWEEN on dates a pair of plain literal comparisons,
+// which is the shape TPC-H Q6/Q7/Q8 need for pruning.
+TEST(ConstantFolding, BetweenOnDatesFoldsBothBounds) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT COUNT(*) FROM laps WHERE team BETWEEN date '1994-01-01' "
+        "AND date '1994-01-01' + interval '1' year", cat);
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->explain(),
+              "LogicalFilter [((team >= 1994-01-01) AND (team <= 1995-01-01))]");
+}
+
+// TPC-H Q6 writes its bounds as `[D] - 0.01` / `[D] + 0.01`. Both engines fold
+// with the same IEEE doubles, so SwiftQL and SQLite agree bit for bit.
+TEST(ConstantFolding, BetweenFoldsArithmeticBounds) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT COUNT(*) FROM laps WHERE speed BETWEEN 300 - 10 AND 300 + 10", cat);
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->explain(),
+              "LogicalFilter [((speed >= 290) AND (speed <= 310))]");
+}
+
+// checkGroupedRefs (validator.cc) is a dispatch site SEPARATE from
+// Validator::validateExpr, and development.md's checklist does not list it. It
+// fails silently: an ungrouped column hidden inside a Week 25 node passes
+// validation and then dies at execution with "Column not found in schema"
+// against the post-aggregate schema, far from the cause.
+TEST(Validation, UngroupedColumnInsideWeek25NodesIsRejected) {
+    Catalog cat(CATALOG);
+
+    // Assert on the MESSAGE, not just that something threw. Without the fix
+    // these queries still fail — but with "column not found: 'season'" from
+    // inferExprType against the post-aggregate schema, which is the confusing
+    // far-from-the-cause failure this site exists to prevent. Only the
+    // validator's own message proves checkGroupedRefs recursed.
+    auto expectGroupByError = [&](const std::string& sql) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a GROUP BY error for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("must appear in GROUP BY"), std::string::npos)
+                << "wrong error for: " << sql << "\n  got: " << e.what();
+        }
+    };
+
+    expectGroupByError(
+        "SELECT team, CASE WHEN season > 2020 THEN 1 ELSE 0 END FROM laps GROUP BY team");
+    expectGroupByError(
+        "SELECT team, CASE WHEN 1 = 1 THEN season ELSE 0 END FROM laps GROUP BY team");
+    // group by season so `team` is the ungrouped ref, and keep every earlier
+    // select item grouped so the error can only come from inside the new node
+    expectGroupByError("SELECT season, SUBSTRING(team, 1, 2) FROM laps GROUP BY season");
+    expectGroupByError("SELECT team, season IN (2020) FROM laps GROUP BY team");
+    expectGroupByError("SELECT season, team LIKE 'a%' FROM laps GROUP BY season");
+
+    // the same shapes are fine when the column IS grouped, or is inside an
+    // aggregate (whose argument is evaluated pre-grouping)
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT team, SUBSTRING(team, 1, 2) FROM laps GROUP BY team", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT team, SUM(CASE WHEN season > 2020 THEN 1 ELSE 0 END) FROM laps GROUP BY team", cat));
+}
+
+// The fold must surface an out-of-range date as an error, not as a silently
+// wrapped literal. `+ interval '100000' year` used to plan as the INPUT date.
+TEST(ConstantFolding, OutOfRangeDateArithmeticIsAnError) {
+    Catalog cat(CATALOG);
+    auto plan = [&](const std::string& expr) {
+        return buildLogical("SELECT COUNT(*) FROM laps WHERE team >= " + expr, cat);
+    };
+    EXPECT_THROW(plan("date '1994-01-01' + interval '100000' year"), std::runtime_error);
+    EXPECT_THROW(plan("date '1994-01-01' - interval '2000' year"), std::runtime_error);
+    EXPECT_THROW(plan("date '1994-01-01' + interval '9223372036854775807' day"),
+                 std::runtime_error);
+    // INT64_MIN: `-count` would be UB, so the fold routes through checkedNegate
+    EXPECT_THROW(plan("date '1994-01-01' - interval '-9223372036854775808' day"),
+                 std::runtime_error);
+
+    // in-range arithmetic is untouched
+    EXPECT_NO_THROW(plan("date '1994-01-01' + interval '1' year"));
+    EXPECT_NO_THROW(plan("date '1994-01-01' + interval '8000' year"));
+}

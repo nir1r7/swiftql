@@ -128,8 +128,22 @@ void Binder::bindExpr(Expr* expr, const std::vector<RangeEntry>& range_table) {
         bindExpr(un->operand.get(), range_table);
     } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
         if (!agg->is_star) bindExpr(agg->argument.get(), range_table);
+    } else if (auto* in = dynamic_cast<InExpr*>(expr)) {
+        bindExpr(in->operand.get(), range_table);   // values are literals
+    } else if (auto* lk = dynamic_cast<LikeExpr*>(expr)) {
+        bindExpr(lk->operand.get(), range_table);
+    } else if (auto* c = dynamic_cast<CaseExpr*>(expr)) {
+        for (auto& w : c->when_clauses) {
+            bindExpr(w.condition.get(), range_table);
+            bindExpr(w.result.get(), range_table);
+        }
+        bindExpr(c->else_expr.get(), range_table);
+    } else if (auto* sub = dynamic_cast<SubstringExpr*>(expr)) {
+        bindExpr(sub->operand.get(), range_table);
+        bindExpr(sub->start.get(), range_table);
+        bindExpr(sub->length.get(), range_table);   // nullptr-safe
     }
-    // literal, nothing to bind
+    // literal / interval, nothing to bind
 }
 
 void Binder::resolveColumnRef(ColumnRef* col, const std::vector<RangeEntry>& range_table) {
