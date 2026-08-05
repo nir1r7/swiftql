@@ -17,3 +17,9 @@ add_executable(swiftql_tests
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)
+
+# Register with CTest so `ctest` in build/ actually runs the suite. The tests
+# resolve "../catalog.json" relative to their working directory, which is why
+# WORKING_DIRECTORY is the build root rather than build/tests.
+add_test(NAME unit COMMAND swiftql_tests)
+set_tests_properties(unit PROPERTIES WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")

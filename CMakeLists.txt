@@ -54,7 +54,10 @@ add_library(swiftql_lib
 )
 target_include_directories(swiftql_lib PUBLIC include src)
 
-# Test binary
+# Test binary. enable_testing() must precede add_subdirectory so the tests/
+# CMakeLists' add_test() calls register — without it `ctest` in build/ printed
+# "No tests were found!!!" and exited 0, which reads as a green gate.
+enable_testing()
 add_subdirectory(tests)
 
 target_link_libraries(swiftql_lib 
