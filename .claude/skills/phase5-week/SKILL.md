@@ -173,6 +173,22 @@ Fresh agent, no shared context with A.
 > - Manually trace through the code to look for issues
 > - Report all issues with severity markings
 >
+> This tree has already passed the full gate — build, unit tests, the SQLite oracle, and the
+> regression harness in every mode. Running the tests tells you nothing you do not already
+> know, and a green suite is not evidence of correctness. Your job is to find what the tests
+> do not catch: read the code and trace it by hand. Do not run the test suite as a substitute
+> for reading.
+>
+> Trace the actual execution paths the change introduces. Follow a concrete row or chunk
+> through each new or modified operator. Check both engines — Volcano is the correctness
+> baseline and vectorized must agree with it. Check the dispatch checklist in
+> `development.md` for sites the change should have touched and did not; silent omissions
+> there are the recurring failure mode in this codebase, and they never fail a test.
+>
+> Every issue must cite `file:line` and state the concrete input or state that produces the
+> wrong behaviour. An issue you cannot ground that way is a hunch — mark it as such or leave
+> it out.
+>
 > Write the full audit to `scratchpad/audits/week-<y>-round-<n>.md`. Do NOT repeat it in your
 > reply. Reply with only the file path and a severity tally, e.g.
 > `2 blocker, 3 major, 5 minor — scratchpad/audits/week-<y>-round-1.md`. Two lines maximum.
