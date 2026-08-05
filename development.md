@@ -48,7 +48,17 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **420 tests, 0 failures.**
+Expected: **476 tests, 0 failures.**
+
+`ctest` works too and runs the same binary with the right working directory:
+
+```bash
+cd build && ctest --output-on-failure
+```
+
+> The suite is registered via `enable_testing()` + `add_test()`. Before that,
+> `ctest` printed "No tests were found!!!" and exited 0 — a false green for any
+> ctest-based gate.
 
 ---
 
@@ -213,7 +223,12 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **117 passed, 0 failed, 0 errors** (39 queries × 3 storage/execution modes).
+Expected: **324 passed, 0 failed, 0 errors** (81 queries × 4 modes: row/Volcano, columnar/Volcano, columnar/vectorized, and columnar/vectorized with `--no-optimize`).
+
+Queries containing `ORDER BY` are compared **in emitted order**; the rest are
+sorted first, since SQL does not specify row order without `ORDER BY`. Sorting
+both sides unconditionally is what made a broken sort comparator invisible to this
+harness for an entire phase.
 
 Use this after any engine change to check for regressions.
 
@@ -246,8 +261,170 @@ FROM table
 [LIMIT N]
 ```
 
-Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)` — arguments may be arbitrary numeric expressions, e.g. `SUM(speed * (1 - sector_1 / 100))`
+Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)` — arguments may be arbitrary numeric expressions, e.g. `SUM(speed * (1 - sector_1 / 100))`. `MIN`/`MAX` also accept `STRING` arguments and return a `STRING`
 
 Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`
 
-Arithmetic (Week 24): `+`, `-`, `*`, `/`, unary `-`, with SQL precedence (unary > `* /` > `+ -` > comparisons > `AND` > `OR`). SQLite semantics: `INT / INT` truncates; `x / 0` is `NULL` (on the vectorized path a NULL value degrades to a 0/`"NULL"` sentinel at materialization — `ColumnVector` has no null mask; the sentinel guard lives in both `vec_project_node.cc` and `vec_hash_aggregate_node.cc::fillChunk`, and Volcano remains the NULL-correct baseline). Select-list aliases (`AS`) are referenceable in `GROUP BY` and `ORDER BY`; in `GROUP BY`, input columns take precedence over aliases.
+Not supported, each rejected with a clear error rather than a wrong answer:
+column ordinals (`ORDER BY 1`, `GROUP BY 2` — use an alias), unary `+`,
+scientific-notation floats (`1e5`), scalar functions (`ABS(x)` — Week 25),
+nested aggregates (`SUM(AVG(x))`), and INT arithmetic that overflows 64 bits
+(SQLite promotes to REAL; SwiftQL cannot, because the INT/INT result type is
+fixed at plan time). Full list with rationale in readme.md.
+
+Arithmetic (Week 24): `+`, `-`, `*`, `/`, unary `-`, with SQL precedence (unary > `* /` > `+ -` > comparisons > `AND` > `OR`). SQLite semantics: `INT / INT` truncates; `x / 0` is `NULL`. Select-list aliases (`AS`) are referenceable in `GROUP BY` and `ORDER BY`; in `GROUP BY`, input columns take precedence over aliases.
+
+### NULL on the vectorized path
+
+`ColumnVector` carries a validity mask (`all_valid` + `validity`), so SQL NULL is
+represented natively on the vectorized path — all three modes agree with SQLite.
+The mask is empty whenever `all_valid` is true, which is the common case
+(`ColumnarTable` cannot express NULL, so scan output is always all-valid) and the
+reason operators that never manufacture a NULL need no validity code.
+
+Every operator reads and writes chunk cells through three helpers in
+`src/execution/vec_types.h` — `valueAt` / `readColumnValue` to read, and
+`appendColumnValue` to write. Reading a typed vector directly bypasses the mask
+and silently turns a NULL into the placeholder value stored underneath it.
+
+**Comparing NULL.** `Value`'s comparison operators are SQL three-valued: every one
+returns false when either side is NULL, and callers are expected to test
+`isNull()` first (as `evaluate()` does). They therefore do **not** define an
+ordering over NULL — `!(a<b) && !(b<a)` makes NULL equivalent to every value, and
+equivalence stops being transitive. Sorting needs `compareForSort` (`value.h`)
+instead, which is a real total order with NULL as the minimum: NULLs first
+ascending, last descending, matching SQLite. Handing the SQL operators to
+`std::stable_sort` is undefined behaviour, not just odd NULL placement — it
+reordered the non-NULL keys and dropped rows under `LIMIT`.
+
+**Boolean connectives.** `AND`/`OR` are three-valued in both evaluators:
+`false AND NULL` is false, `true OR NULL` is true, and only a genuinely
+undetermined combination yields NULL. Propagating NULL unconditionally instead
+made the two execution paths disagree on the same query.
+
+### Expression evaluation
+
+Two implementations, kept in agreement by differential tests:
+
+| | Where | Cost model |
+|---|---|---|
+| `evaluate()` (`evaluator.cc`) | Volcano, and the vectorized fallback | tree walk with `dynamic_cast` dispatch, per row |
+| `ExpressionExecutor` (`expression_executor.cc`) | every vectorized expression position | dispatch resolved once at compile time, one typed loop per node per chunk |
+
+All three vectorized expression positions compile:
+
+| Position | Owner of the compiled form |
+|---|---|
+| aggregate arguments, expression group keys | `VecHashAggregateNode::consumeAll` |
+| `WHERE` / `HAVING` fallback subtrees | `PredicateExecutorCache` on `VecFilterNode` |
+| projection expressions | `VecProjectNode::prepare` |
+
+`evalPredicate` keeps its own fast paths — the AND cascade, the OR union, and the
+tight `col op literal` comparison loops — because those beat a compiled
+expression: they touch one column and allocate nothing. The executor serves the
+fallback that used to rebuild a `Row` per row.
+
+`evaluate()` remains the semantic reference. `ExpressionExecutor::compile()`
+returns `nullptr` for any shape it has no kernel for, and the caller keeps the
+per-row `evaluate()` path — so an uncovered expression is slow, never wrong.
+`compile()` also asserts its own result type equals `inferExprType`, which is
+what lets callers pre-allocate output columns before the row loop.
+
+Measured (1M rows, Release, per-node self-time from `--explain-analyze`):
+
+| Node | plain column | with an expression | before compiling |
+|---|---|---|---|
+| `VecHashAggregate` — `SUM(speed)` vs `SUM(speed*(1-sector_1))` | 16 ms | 17 ms | 290 ms |
+| `VecFilter` — `speed > 300` vs `speed*2 > 600` | 0.64 ms | 1.7 ms | 222 ms |
+| `VecProject` — `speed` vs `speed*2` | 8.7 ms | 1.0 ms | 162 ms |
+
+### Constant folding
+
+`foldConstants` (`constant_folding.cc`) runs as the last step of `Binder::bind`,
+rewriting constant arithmetic subtrees to literals before validation. It is
+unconditional — folding cannot change results, so it is canonicalization rather
+than a cost-based decision, and both execution paths and `--no-optimize` get it.
+
+It matters far beyond saving a multiply: three separate fast paths pattern-match
+on the literal shape `ColumnRef op Literal`, and a constant subexpression defeats
+all of them at once — zone-map chunk pruning (`chunk_pruner.h`), the tight typed
+comparison loop (`columnar_eval.cc`), and equality/range selectivity
+(`cardinality_estimator.cc`). `WHERE season = 2020 + 4` went from 203 ms with no
+chunks skipped to 0.35 ms with pruning active.
+
+Scope: arithmetic (`+ - * /`) and unary minus. Comparisons and `AND`/`OR` are
+left alone — folding them buys nothing and would change the predicate shapes
+pushdown and join classification inspect. A fold that evaluates to NULL (`1 / 0`)
+or overflows is skipped, so the existing error still surfaces from its usual place.
+
+### Aggregate result types
+
+`aggregateResultType(function, arg_type)` in `logical_plan.h` is the single
+source of truth, used by `inferExprType`, `buildProjectSchema`, and
+`buildAggregateSchema`:
+
+| Function | Result type |
+|---|---|
+| `COUNT` | `INT` |
+| `SUM`, `AVG` | `DOUBLE` |
+| `MIN`, `MAX` | same as the argument, including `STRING` |
+
+`MIN`/`MAX` are order statistics — they return an element of the input domain,
+so `MIN(team)` is a `STRING`. Typing them `DOUBLE` made that query throw
+`bad_variant_access` at the materialization point.
+
+---
+
+## Extending the expression language
+
+Fourteen functions dispatch on `Expr` subtype. **Six fail silently** when a new
+one is missed — no error, no crash, a wrong answer somewhere far away. Adding a
+node type (Week 25 adds five: `BETWEEN`, `LIKE`, `IN`, `CASE`, `SUBSTRING`) means
+visiting all of them.
+
+Ordered by how hard the failure is to find:
+
+| # | Site | On an unhandled subtype | What breaks |
+|---|---|---|---|
+| 1 | `exprKey` — `expr_utils.h` | returns `"?"` | **Silent.** Two different expressions get the same identity, so unrelated GROUP BY keys collide |
+| 2 | `collectCols` — `logical_plan.cc` | returns | **Silent.** The column is narrowed out of the scan schema, then execution fails with "column not found" far from the cause |
+| 3 | `Binder::bindExpr` — `binder.cc` | returns | **Silent.** Child `ColumnRef`s keep `relation_slot = -1`, so join-side resolution silently falls back to bare-name |
+| 4 | `Validator::validateExpr` — `validator.cc` | falls through | **Silent.** No column-existence or aggregate-placement checks inside the new node |
+| 5 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
+| 6 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
+| 7 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
+| 8 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
+| 9 | `inferExprType` — `logical_plan.cc` | **throws** | Loud, at plan time |
+| 10 | `evaluate` — `evaluator.cc` | **throws** | Loud, at execution |
+| 11 | `foldNode` — `constant_folding.cc` | returns false | Safe: no folding |
+| 12 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
+| 13 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe |
+| 14 | `ChunkPruner::shouldSkip` | no pruning | Safe: correct, just slower |
+
+Sites 11–14 are safe **by design** — they degrade to a correct slower path. That
+is the pattern to copy for anything new: prefer "decline and fall back" over
+"assume and guess."
+
+Recommended order for a new node type:
+
+1. Lexer tokens, then the parser rule at the right precedence level (see the
+   grammar in readme.md — decide the slot before writing code).
+2. Sites 8–10 first (`cloneExpr`, `inferExprType`, `evaluate`). They throw, so they
+   turn every later mistake into a loud failure instead of a quiet one.
+3. Sites 1–7. Write a test per site; the silent ones cannot be caught by eye.
+4. Sites 11–14 last — these are optimizations. Correctness is already complete
+   without them, so land the feature, then add kernels.
+5. Add queries to `compare_against_sqlite.py`. It runs 4 modes and compares
+   `ORDER BY` results in emitted order, so it catches cross-mode divergence and
+   ordering defects that unit tests will not.
+
+Two engine-wide invariants a new node must not break:
+
+- **`inferExprType` is the contract.** The vectorized path pre-allocates output
+  columns from it before the row loop, and `ExpressionExecutor::compile` asserts
+  its own result type matches. A node whose runtime type can differ from its
+  inferred type will produce `bad_variant_access`, not a SQL error.
+- **`evaluate()` is the semantic reference.** Any vectorized kernel is a second
+  implementation of it and must agree row-for-row, NULL-for-NULL. The differential
+  tests in `test_vectorized.cc` (`ExpressionExecutor.MatchesEvaluate*`) are what
+  hold the two together — extend that corpus, don't write kernel-only tests.

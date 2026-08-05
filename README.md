@@ -57,7 +57,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `DISTINCT` — eliminates duplicate rows from output
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — `COUNT` returns `INT`, `SUM`/`AVG` return `DOUBLE`, and `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a `STRING`)
 - General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
 - `EXPLAIN` — prints the query plan tree without executing; on the vectorized path shows three sections (logical plan, optimized logical plan with estimated rows, physical plan with the join's cost decision)
 - `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, estimated rows (vectorized, optimizer on), exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
@@ -74,7 +74,35 @@ The project is structured in five progressive phases, each leaving a working and
 - Transactions / writes (`INSERT`, `UPDATE`, `DELETE`)
 - Indexes
 - Distributed execution
-- Full SQL null semantics (three-valued logic) — null handling scoped to `IS NULL` / `IS NOT NULL` predicates and null display in output
+- Window functions, `OVER`, and recursive CTEs — no TPC-H query needs them
+- Column ordinals, unary `+`, and scientific-notation float literals — see [Syntax Deliberately Not Supported](#syntax-deliberately-not-supported)
+
+> SQL NULL itself is **not** out of scope and is fully modelled: `ColumnVector`
+> carries a validity mask, expressions and aggregates propagate NULL, `AND`/`OR`
+> are three-valued, and `ORDER BY` sorts NULL first ascending / last descending as
+> SQLite does. `CASE` and the scalar functions are Week 25 deliverables, not
+> non-goals.
+
+### Syntax Deliberately Not Supported
+
+Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
+
+| Not supported | Rejected with | Why |
+|---|---|---|
+| Column ordinals — `ORDER BY 1`, `GROUP BY 2` | `column ordinals are not supported; use a column name or a select-list alias` | A bare integer parses as a `Literal`, so ORDER BY 1 would sort every row by the same constant. Select-list aliases cover the need |
+| Unary plus — `SELECT +speed` | parse error at the `+` | The grammar has unary `-` only; `+x` is a no-op |
+| Scientific-notation floats — `1e5`, `1.5e3` | parse error — the exponent lexes as a separate identifier | The lexer's number rule has no exponent part |
+| Scalar functions — `ABS(x)`, `SUBSTRING(...)` | parse error at the `(` | The call form accepts only the five aggregate keywords. Scalar functions are Week 25 |
+| Nested aggregates — `SUM(AVG(x))` | `aggregate functions cannot be nested` | Not meaningful without window functions |
+| Integer overflow promotion — `9223372036854775807 + 1` | `integer overflow in '+'` | SQLite promotes to REAL; SwiftQL cannot, because the INT/INT result type is fixed at plan time and truncating division depends on it. Erroring beats the silent signed-overflow UB this replaced |
+
+> **Batch-evaluation consequence:** the vectorized path evaluates a whole chunk
+> before `LIMIT` truncates it, so an expression that raises on a row the query
+> would have discarded still raises. `SELECT lap_id * 2305843009213693952 FROM laps
+> LIMIT 1` returns a row under `--execution volcano` and errors under
+> `--execution vectorized`. This is inherent to eager batch evaluation; the
+> alternative is evaluating row-at-a-time, which is the thing vectorization exists
+> to avoid.
 
 ---
 
@@ -170,14 +198,14 @@ Takes a raw SQL string and produces a structured Abstract Syntax Tree (AST). Han
 
 ```
 select_stmt  → SELECT [DISTINCT] select_list FROM table_ref
-               [JOIN IDENT ON expr]
+               [JOIN table_ref ON expr]
                [WHERE expr]
                [GROUP BY group_list]
                [HAVING expr]
                [ORDER BY order_list]
                [LIMIT INT_LITERAL]
 
-table_ref    → IDENT
+table_ref    → IDENT [[AS] IDENT]              ← table alias, required for a self-join
 select_list  → select_item (COMMA select_item)*
 select_item  → expr [AS IDENT]                 ← expression alias (Week 24)
 group_list   → expr (COMMA expr)*              ← expression group keys (Week 24)
@@ -192,14 +220,19 @@ compare      → additive [(= | != | < | > | <= | >=) additive]
 additive     → multiplicative (('+' | '-') multiplicative)*   ← Week 24
 multiplicative → unary (('*' | '/') unary)*                   ← Week 24
 unary        → '-' unary | primary                            ← Week 24
-primary      → IDENT
-             | IDENT LPAREN expr RPAREN     ← aggregate call
-             | IDENT LPAREN STAR RPAREN     ← COUNT(*)
+primary      → IDENT [DOT IDENT]               ← optionally qualified column
+             | agg_fn LPAREN expr RPAREN       ← aggregate call
+             | COUNT LPAREN STAR RPAREN        ← COUNT(*)
              | INT_LITERAL
              | FLOAT_LITERAL
              | STRING_LITERAL
              | LPAREN expr RPAREN
+
+agg_fn       → COUNT | SUM | AVG | MIN | MAX   ← keywords, not arbitrary identifiers
 ```
+
+> The function-call form is restricted to the five aggregate keywords: `ABS(speed)`
+> is a parse error, not an unknown-function error. Scalar functions arrive in Week 25.
 
 **AST node types:**
 - `ColumnRef` — reference to a column by name (with optional table qualifier)
@@ -290,6 +323,17 @@ void close();   // release resources
 Instead of one row at a time, operators exchange chunks. Late materialization is a first-class design principle: `VecFilterNode` produces a `SelectionVector` of valid row indices without copying or materializing data — columns are only fully materialized at `VecProjectNode` at the top of the pipeline.
 
 ```cpp
+struct ColumnVector {
+    std::variant<vector<int64_t>, vector<double>, vector<string>> data;
+    TypeId type;
+    // SQL NULL. all_valid == true means `validity` is empty and no row is NULL —
+    // the common case, since ColumnarTable cannot express NULL and scan output is
+    // therefore always all-valid. Reads go through valueAt(), writes through
+    // appendColumnValue(); touching `data` directly bypasses the mask.
+    bool all_valid = true;
+    std::vector<uint8_t> validity;
+};
+
 struct DataChunk {
     std::vector<ColumnVector> columns;
     int num_rows = 0;
@@ -300,6 +344,11 @@ struct SelectionVector {
     int size = 0;
 };
 ```
+
+Expressions are evaluated a chunk at a time by `ExpressionExecutor`, which
+resolves node dispatch once at compile time instead of per row. The scalar
+`evaluate()` remains the semantic reference and the fallback for any expression
+shape the executor declines to compile.
 
 | Operator | Behaviour |
 |---|---|
@@ -629,7 +678,23 @@ being hypothetical.
 - Add arithmetic precedence, unary minus, expression aliases, and expression type checking
 - Support expressions in projection, aggregation, grouping, and ordering
 
-**Checkpoint:** TPC-H revenue expressions parse, bind, and execute.
+**Checkpoint:** TPC-H revenue expressions parse, bind, and execute. ✅
+
+Making the above *correct* pulled in five things the original two bullets did not
+anticipate. They are dialect facts, so Phase 5's correctness report inherits them:
+
+| Shipped | Why it was required |
+|---|---|
+| **NULL is represented natively** — `ColumnVector` carries a validity mask; reads/writes go through `valueAt` / `appendColumnValue` | `x / 0` → NULL is the first way ordinary SQL produces a NULL (CSV cannot express one). The vectorized path previously flattened every NULL to a `0` / `"NULL"` sentinel, which is indistinguishable from a real zero and makes the Week 29 outer join unimplementable |
+| **`ExpressionExecutor`** — compiles an expression once, then one typed loop per node per chunk | The scalar `evaluate()` was being called per row inside the vectorized hot loops. On 1M rows that cost 290 ms for one aggregate expression against 16 ms for a plain column, and it is the whole reason vectorization exists |
+| **Constant folding** (`foldConstants`, run at the end of binding) | Three fast paths pattern-match on `ColumnRef op Literal`; a constant subexpression defeated zone-map pruning, the tight comparison loop, and selectivity estimation simultaneously. `WHERE season = 2020 + 4` went 203 ms → 0.35 ms |
+| **Three-valued `AND`/`OR`** in both evaluators | Propagating NULL made the two engines return *different answers* for the same query (0 rows vs 10000). TPC-H Q19 is an OR chain over nullable columns |
+| **`compareForSort`** — a total order for `ORDER BY`, separate from the SQL comparison operators | The SQL operators return false for every comparison against NULL, making NULL equivalent to every value and equivalence non-transitive. That is not a strict weak ordering, so `std::stable_sort` was undefined behaviour: it reordered the **non-NULL** keys and dropped rows under `LIMIT` |
+
+Also settled here: `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a
+`STRING`), INT arithmetic is overflow-checked rather than wrapping, and column
+ordinals / nested aggregates / unary `+` are rejected rather than mis-answered —
+see [Syntax Deliberately Not Supported](#syntax-deliberately-not-supported).
 
 ### Week 25 — Predicates + Scalar Functions
 
@@ -637,6 +702,27 @@ being hypothetical.
 - Add ISO date literals and constant-folded interval arithmetic
 
 **Checkpoint:** Required non-subquery TPC-H expressions execute correctly.
+
+> **Starting notes, from Week 24's foundations.**
+> - Each of `BETWEEN`, `LIKE`, `IN`, `CASE`, `SUBSTRING` is a **new `Expr` subtype**,
+>   and six of the sites that dispatch on subtype fail *silently* when one is
+>   missed. Work the checklist in
+>   [development.md → Extending the expression language](development.md#extending-the-expression-language)
+>   before writing the operator.
+> - Tokens to add to the lexer: `BETWEEN`, `LIKE`, `IN`, `CASE`, `WHEN`, `THEN`,
+>   `ELSE`, `END`, `SUBSTRING`, `DATE`, `INTERVAL`. `NOT` already exists.
+> - "Constant-folded interval arithmetic" now has a home: `date '1998-12-01' -
+>   interval '90' day` is a constant expression, so it folds to a plain date
+>   literal at plan time via `foldConstants` — extend that pass rather than adding
+>   runtime date arithmetic. Every TPC-H interval expression is constant.
+> - ISO-8601 dates sort lexicographically, and STRING range comparison already
+>   works on both paths (`scanColumn<std::string>` covers `< > <= >=`), so dates can
+>   be `STRING` without a new `TypeId`. That keeps `BETWEEN` on dates on the fast
+>   path. It does *not* extend to date arithmetic — hence folding.
+> - `CASE` inside an aggregate (`SUM(CASE WHEN ... END)`, TPC-H Q8/Q12/Q14) is the
+>   shape to test first: `ExpressionExecutor::compile` returns `nullptr` for any
+>   node it lacks a kernel for and the caller falls back to `evaluate()`, so an
+>   un-compiled `CASE` is slow but never wrong. Ship correct, then add the kernel.
 
 ### Week 26 — Multi-Way Join Language + Binding
 
@@ -759,7 +845,7 @@ being hypothetical.
 | 22 | Cost model + join selection | Filtered build side and join algorithm costed |
 | 23 | Phase 4 explain + benchmarks | Optimizer gains and estimate errors documented |
 | 23.5 | SIMD small-build loop join (extension) | Optimizer picks hash vs SIMD-loop, crossover measured |
-| 24 | General expressions | Arithmetic and aliased expressions execute |
+| 24 | General expressions | Arithmetic and aliased expressions execute; NULL modelled natively, expressions compiled per chunk, constants folded |
 | 25 | Predicates + scalar functions | Required TPC-H expressions supported |
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly |
 | 27 | Multi-way join execution | General vectorized join trees execute |
@@ -901,7 +987,7 @@ Execution: 72.0ms
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
 - Single join only — multi-way joins not supported
 - No subqueries or correlated expressions
-- Null handling scoped to `IS NULL` / `IS NOT NULL` predicates — full three-valued logic not implemented
+- `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
 - Commas inside string values not supported in CSV input
 - No persistence beyond CSV files and catalog JSON
 - Cost-based optimization applies only to columnar/vectorized execution
