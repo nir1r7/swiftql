@@ -39,7 +39,22 @@ bool Parser::match(TokenType type){
 
 
 SelectStatement Parser::parse(){
-    return parseSelect();
+    SelectStatement stmt = parseSelect();
+
+    // Require the whole input to be consumed. Without this the parser silently
+    // ignored everything after the last clause it recognised, which turns an
+    // unsupported clause into a WRONG ANSWER rather than a clean error — the one
+    // outcome this dialect's error handling exists to prevent. `WHERE x LIKE
+    // 'a%b' ESCAPE '\'` ran with the escape dropped, and `... LIMIT 2 GARBAGE`
+    // ran as if the garbage were not there.
+    //
+    // A trailing semicolon is fine: run_queries.py splits on it, but a
+    // hand-written --query may keep it.
+    match(TokenType::SEMICOLON);
+    if (!check(TokenType::END_OF_FILE)) {
+        throw ParseError("unexpected trailing input after the end of the query", current_);
+    }
+    return stmt;
 }
 
 // grammar rule methods

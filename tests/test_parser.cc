@@ -401,3 +401,21 @@ TEST(ParseErrorPosition, LargestValidIntLiteralStillParses) {
     ASSERT_NE(lit, nullptr);
     EXPECT_EQ(lit->value.asInt(), INT64_MAX);
 }
+
+
+// The parser must consume the whole input. It used to stop at the last clause
+// it recognised and silently discard the rest, which turns an unsupported
+// clause into a wrong answer instead of an error: `LIKE 'a%b' ESCAPE '\'` ran
+// with the escape dropped. Pre-existing since Week 4; Week 25's LIKE is what
+// made a silently-ignored trailing clause dangerous rather than merely sloppy.
+TEST(ParserTest, TrailingInputIsRejected) {
+    EXPECT_THROW(Parser("SELECT team FROM laps LIMIT 2 TOTAL GARBAGE").parse(), ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE team LIKE 'a%' ESCAPE '\\'").parse(),
+                 ParseError);
+    EXPECT_THROW(Parser("SELECT team FROM laps WHERE season = 2024 BOGUS").parse(), ParseError);
+
+    // a trailing semicolon is still fine — run_queries.py splits on it, but a
+    // hand-written --query may keep it
+    EXPECT_NO_THROW(Parser("SELECT team FROM laps LIMIT 2;").parse());
+    EXPECT_NO_THROW(Parser("SELECT team FROM laps LIMIT 2").parse());
+}
