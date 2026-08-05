@@ -135,6 +135,31 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         validateExpr(stmt.where.get(), schema, "WHERE", /*allow_aggregates=*/false);
     }
 
+    // Column ordinals (ORDER BY 1 / GROUP BY 2) are not supported. Rejecting is
+    // the point: a bare integer parses as a Literal, so ORDER BY 1 used to sort
+    // every row by the same constant and return them unsorted with no error,
+    // and GROUP BY 1 failed with a message about the SELECT list. SQLite treats
+    // both as references to output column 1.
+    for (const auto& item : stmt.order_by) {
+        if (auto* lit = dynamic_cast<const Literal*>(item.expr.get())) {
+            if (!lit->value.isNull() && lit->value.type() == TypeId::INT) {
+                throw std::runtime_error(
+                    "ORDER BY " + lit->value.toString() + ": column ordinals are not "
+                    "supported; use a column name or a select-list alias");
+            }
+        }
+    }
+    for (const auto& g : stmt.group_by) {
+        if (!g.expr) continue;
+        if (auto* lit = dynamic_cast<const Literal*>(g.expr.get())) {
+            if (!lit->value.isNull() && lit->value.type() == TypeId::INT) {
+                throw std::runtime_error(
+                    "GROUP BY " + lit->value.toString() + ": column ordinals are not "
+                    "supported; use a column name or a select-list alias");
+            }
+        }
+    }
+
     // GROUP BY columns must exist. Binder-resolved entries (slot stamped) were
     // already verified; the rest check against the FROM table or, when a join
     // is present, the joined table.
@@ -245,6 +270,17 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
                 context + ": aggregate functions are not allowed in WHERE clause; use HAVING instead");
         }
         if (!agg->is_star && agg->argument) {
+            // Aggregates cannot nest. expr_utils.h's collectAggregates() stops
+            // walking at an AggregateExpr on that assumption, so a nested one is
+            // never collected as a spec and SUM(AVG(speed)) used to reach
+            // execution and die with "Column not found in schema: AVG(speed)".
+            std::vector<const AggregateExpr*> nested;
+            collectAggregates(agg->argument.get(), nested);
+            if (!nested.empty()) {
+                throw std::runtime_error(
+                    context + ": aggregate functions cannot be nested — '"
+                    + agg->function_name + "(" + nested.front()->function_name + "(...))'");
+            }
             validateExpr(agg->argument.get(), schema, context, allow_aggregates);
         }
     }

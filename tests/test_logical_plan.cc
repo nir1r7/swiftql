@@ -478,6 +478,36 @@ TEST(GroupKeyIdentity, SelfJoinSidesStayDistinct) {
         "GROUP BY l2.grp - 1", cat), std::runtime_error);
 }
 
+// A bare integer in ORDER BY parses as a Literal, so ORDER BY 1 used to sort
+// every row by the same constant and return them unsorted with no error at all.
+// Rejecting is the fix; SQLite would treat it as output column 1.
+TEST(ColumnOrdinals, RejectedInOrderByAndGroupBy) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY 1", cat),
+                 std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team, COUNT(*) FROM laps GROUP BY 1", cat),
+                 std::runtime_error);
+    // a non-ordinal expression that merely contains an integer is unaffected
+    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY speed + 1", cat));
+    EXPECT_NO_THROW(buildLogical(
+        "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat));
+}
+
+// collectAggregates() stops walking at an AggregateExpr, so a nested aggregate
+// was never collected as a spec and SUM(AVG(speed)) reached execution before
+// dying with "Column not found in schema: AVG(speed)".
+TEST(NestedAggregates, RejectedAtValidation) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical("SELECT SUM(AVG(speed)) FROM laps", cat), std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT MAX(COUNT(speed)) FROM laps", cat), std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT SUM(speed + AVG(speed)) FROM laps", cat),
+                 std::runtime_error);
+    // an aggregate over an ordinary expression is still fine
+    EXPECT_NO_THROW(buildLogical("SELECT SUM(speed * (1 - sector_1)) FROM laps", cat));
+    // and an expression OVER aggregates is not nesting
+    EXPECT_NO_THROW(buildLogical("SELECT SUM(speed) / COUNT(*) FROM laps", cat));
+}
+
 
 // exprKey tags a literal with its type. Value::toString() renders the DOUBLE 1.0
 // as "1", so an untagged key made `GROUP BY season - 1` match
