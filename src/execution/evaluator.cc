@@ -32,11 +32,32 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
         Value left = evaluate(bin->left.get(), row, schema);
         Value right = evaluate(bin->right.get(), row, schema);
+        const std::string& op = bin->op;
 
-        // any null operand returns a null result
+        // AND/OR are three-valued and must be handled BEFORE the blanket NULL
+        // propagation below: they can reach a definite answer with a NULL operand
+        // (false AND NULL = false, true OR NULL = true). Propagating NULL instead
+        // made Volcano answer `WHERE (season/0) > 0 OR 1 = 1` with zero rows while
+        // the vectorized path answered with all of them — two engines disagreeing
+        // on the same query, which Phase 5 cannot ship as "a documented dialect".
+        // TPC-H Q19 is an OR chain over nullable columns.
+        if (op == "AND" || op == "OR") {
+            // tri-state: -1 unknown (NULL), 0 false, 1 true
+            const int l = left.isNull()  ? -1 : (left.asInt()  != 0);
+            const int r = right.isNull() ? -1 : (right.asInt() != 0);
+            if (op == "AND") {
+                if (l == 0 || r == 0) return Value(static_cast<int64_t>(0));  // false dominates
+                if (l < 0 || r < 0)   return Value::null();
+                return Value(static_cast<int64_t>(1));
+            }
+            if (l == 1 || r == 1) return Value(static_cast<int64_t>(1));      // true dominates
+            if (l < 0 || r < 0)   return Value::null();
+            return Value(static_cast<int64_t>(0));
+        }
+
+        // every other operator propagates NULL
         if (left.isNull() || right.isNull()) return Value::null();
 
-        const std::string& op = bin->op;
         if (op == "=")  return Value(static_cast<int64_t>(left == right));
         if (op == "!=") return Value(static_cast<int64_t>(left != right));
         if (op == "<") return Value(static_cast<int64_t>(left < right));
@@ -63,17 +84,6 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
             if (op == "-") return Value(l - r);
             if (op == "*") return Value(l * r);
             return r == 0.0 ? Value::null() : Value(l / r);
-        }
-
-        if (op == "AND") {
-            bool l = left.asInt() != 0;
-            bool r = right.asInt() != 0;
-            return Value(static_cast<int64_t>(l && r));
-        }
-        if (op == "OR") {
-            bool l = left.asInt() != 0;
-            bool r = right.asInt() != 0;
-            return Value(static_cast<int64_t>(l || r));
         }
 
         throw std::runtime_error("Unknown binary operator: " + op);
