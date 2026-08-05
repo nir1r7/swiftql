@@ -16,7 +16,10 @@ Run the complete SwiftQL verification loop. Do not declare work done until every
 
 ```bash
 # 1. Build — must be warning-clean for changed files
-cmake --build build -j$(sysctl -n hw.logicalcpu)
+#    nproc on Linux, sysctl on macOS. Without the fallback the substitution is
+#    empty on Linux and `-j` alone means unbounded parallelism, which OOMs a
+#    small container.
+cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
 
 # 2. C++ unit tests — MUST run from build/ (tests resolve ../catalog.json relative to CWD)
 cd build && ./tests/swiftql_tests && cd ..
