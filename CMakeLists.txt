@@ -5,18 +5,25 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# GoogleTest via FetchContent (downloads automatically)
+# GoogleTest via FetchContent (downloads automatically).
+# Fetched over git rather than by archive URL: sandboxed CI/agent environments
+# commonly proxy egress and reject the codeload archive endpoints with a 403
+# while allowing the git protocol. Same pinned versions either way.
 include(FetchContent)
 FetchContent_Declare(
   googletest
-  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.14.0
+  GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(googletest)
 
 # nlohmann/json via FetchContent (downloads automatically)
 FetchContent_Declare(
     nlohmann_json
-    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
