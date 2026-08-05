@@ -31,6 +31,7 @@ add_library(swiftql_lib
     src/parser/parser.cc
     src/planner/validator.cc
     src/planner/binder.cc
+    src/planner/constant_folding.cc
     src/planner/join_condition.cc
     src/planner/logical_plan.cc
     src/planner/cardinality_estimator.cc

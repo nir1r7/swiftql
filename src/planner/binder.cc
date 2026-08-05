@@ -1,4 +1,5 @@
 #include "binder.h"
+#include "constant_folding.h"
 #include "parser/expr_utils.h"
 #include <stdexcept>
 
@@ -103,6 +104,14 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         bindExpr(item.expr.get(), range_table);   // no-op on already-stamped clones
     }
     if (stmt.join.has_value()) bindExpr(stmt.join->condition.get(), range_table);
+
+    // Fold constant arithmetic last, so every downstream pass — Validator, the
+    // logical planner, pushdown, cardinality estimation, the chunk pruner, and
+    // the columnar comparison fast path — sees `season = 2024` rather than
+    // `season = 2020 + 4`. Unconditional: folding cannot change results, so it
+    // is canonicalization rather than a cost-based decision, and both execution
+    // paths and `--no-optimize` get it.
+    foldConstants(stmt);
 }
 
 void Binder::bindExpr(Expr* expr, const std::vector<RangeEntry>& range_table) {
