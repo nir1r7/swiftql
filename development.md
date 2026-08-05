@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **476 tests, 0 failures.**
+Expected: **524 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,7 +223,7 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **324 passed, 0 failed, 0 errors** (81 queries × 4 modes: row/Volcano, columnar/Volcano, columnar/vectorized, and columnar/vectorized with `--no-optimize`).
+Expected: **440 passed, 0 failed, 0 errors** (110 queries × 4 modes: row/Volcano, columnar/Volcano, columnar/vectorized, and columnar/vectorized with `--no-optimize`).
 
 Queries containing `ORDER BY` are compared **in emitted order**; the rest are
 sorted first, since SQL does not specify row order without `ORDER BY`. Sorting
@@ -263,14 +263,88 @@ FROM table
 
 Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, `MAX(expr)` — arguments may be arbitrary numeric expressions, e.g. `SUM(speed * (1 - sector_1 / 100))`. `MIN`/`MAX` also accept `STRING` arguments and return a `STRING`
 
-Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`
+Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`,
+and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
+
+Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
+literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
 
 Not supported, each rejected with a clear error rather than a wrong answer:
 column ordinals (`ORDER BY 1`, `GROUP BY 2` — use an alias), unary `+`,
-scientific-notation floats (`1e5`), scalar functions (`ABS(x)` — Week 25),
-nested aggregates (`SUM(AVG(x))`), and INT arithmetic that overflows 64 bits
-(SQLite promotes to REAL; SwiftQL cannot, because the INT/INT result type is
-fixed at plan time). Full list with rationale in readme.md.
+scientific-notation floats (`1e5`), scalar functions other than `SUBSTRING`
+(`ABS(x)`), general `NOT` (only the four `IS NOT NULL` / `NOT BETWEEN` /
+`NOT LIKE` / `NOT IN` forms), nested aggregates (`SUM(AVG(x))`), and INT
+arithmetic that overflows 64 bits (SQLite promotes to REAL; SwiftQL cannot,
+because the INT/INT result type is fixed at plan time). Full list with rationale
+in readme.md.
+
+### Week 25 dialect notes
+
+| Decision | Why |
+|---|---|
+| `BETWEEN` is **desugared in the parser** into `a >= x AND a <= y` (`NOT BETWEEN` into `a < x OR a > y`, valid De Morgan in Kleene 3VL) | The desugared shape is what `splitConjuncts`, `ChunkPruner`, `scanColumn` and `selectivity()` pattern-match on, so both bounds get pushdown, zone-map pruning, the tight typed loop and range estimation. A `BetweenExpr` node would forfeit all four and cost 17 dispatch sites. Visible consequence: `--explain` prints the two comparisons, not `BETWEEN` |
+| `BETWEEN` bounds parse at the **additive** level | `BETWEEN` binds tighter than `AND`. Parsing them with `parseExpr()` makes `a BETWEEN 1 AND 2 AND b > 3` swallow the second `AND` into the range |
+| `BETWEEN`'s left operand is **cloned**, so a computed one is evaluated twice | The price of desugaring: `SUBSTRING(team,1,3) BETWEEN 'A' AND 'M'` plans as two independent SUBSTRING kernels. Bounded in practice — every TPC-H `BETWEEN` has a bare column on the left, and the AND cascade runs the second copy over survivors only. `HAVING SUM(x) BETWEEN ...` is unaffected: the cloned aggregate dedupes to one spec by `output_name` |
+| `SUBSTRING` rejects SQLite's out-of-domain positions | SQLite defines `substr(x,0,3)`, negative starts and negative lengths; SwiftQL raises instead. Unlike column ordinals or unary `+` this is not purely a parse-time rejection, so `inferExprType` decides it at plan time whenever the arguments are constant — after folding, every realistic query. Only a *computed* position can still abort mid-execution |
+| `LIKE` is **ASCII case-insensitive** and takes a **constant pattern** | Case-insensitivity matches SQLite's default, which keeps `compare_against_sqlite.py` a valid oracle; TPC-H patterns are case-uniform so results are unaffected either way. The fold is spelled out as `A-Z` rather than `std::tolower`, which is locale-dependent (under ISO-8859-1 it maps 0xC9 to 0xE9) and would make LIKE results depend on the process locale. A constant pattern lets the executor analyse it once per query instead of per row. **No `ESCAPE` clause**, so a literal `%` or `_` cannot be matched — listed in readme.md's divergence table |
+| `IN` takes a **literal list only** | Makes the set hashable once at compile time, and — since the grammar has no NULL literal — makes NULL-in-list unreachable, collapsing SQL's three-valued `IN` rule to "operand NULL → NULL". `IN (subquery)` is Week 32 and lowers to a semi-join, a different production |
+| `CASE` has **no vectorized kernel** | `evaluate()` short-circuits; a chunk kernel cannot. `CASE WHEN i < 100 THEN i * 1000000000000 ELSE 0 END` would raise a `checkedMul` overflow for rows whose branch is discarded, and the differential tests would be right to fail. `compileNode` declines, so the fallback is correct-but-slow — see the measured cost below. A masked kernel (evaluate each branch only over its own selection) is the fix when Q8/Q12/Q14 profiling justifies it |
+| Dates are **STRING**, not a new `TypeId` | ISO-8601 sorts lexicographically, and zone maps are built for every column including STRING — so dates get chunk pruning and `scanColumn<std::string>` for free. `DATE 'x'` is validated against a real calendar at parse time |
+| Intervals fold at **plan time**, never at runtime | `IntervalLiteral` exists only for `foldNode` to consume: `date '1998-12-01' - interval '90' day` becomes `Literal("1998-09-02")`, restoring the `ColumnRef op Literal` shape. An interval that survives folding throws from `inferExprType` and `evaluate` — the query was not constant date arithmetic. Every TPC-H interval expression is constant |
+| Dates are bounded to **0000-01-01 .. 9999-12-31**, and interval counts are range-checked *before* any arithmetic | `formatIsoDate` writes exactly four year digits, so an out-of-range year wrapped modulo 10000 instead of failing: `+ interval '100000' year` returned the **input date unchanged**, and a negative year emitted `'0' + (-6)` = `'*'`, producing the non-date string `000*-01-01` that then flowed into comparisons and zone maps as an ordinary STRING. Bounding the count first also removes three signed-overflow UB sites (`addDays`, `addMonths`, and the `-count` in `foldDateInterval`, which now uses `checkedNegate`) — date folding had been bypassing `checked_arith.h` entirely |
+| Reserved words added | `BETWEEN LIKE IN CASE WHEN THEN ELSE END SUBSTRING FOR DATE INTERVAL`. Interval units (`day`/`month`/`year`) are **not** reserved — they are matched as identifier text, so `year` stays usable as a column name (TPC-H aliases `o_year` / `l_year`) |
+
+**Measured** (1M rows, Release, per-node self-time from `--explain-analyze`).
+`LIKE` and `IN` compile to chunk kernels; `CASE` does not, and that is the whole
+cost of the decision above:
+
+| Node | Expression | Self-time |
+|---|---|---|
+| `VecHashAggregate` | `SUM(speed)` — plain column | 62 ms |
+| `VecHashAggregate` | `SUM(speed * (1 - sector_1))` — compiled | 63 ms |
+| `VecHashAggregate` | `SUM(CASE WHEN season = 2024 THEN speed ELSE 0 END)` — **uncompiled fallback** | **406 ms** |
+| `VecFilter` | `speed > 300` — `scanColumn` fast path | 2.4 ms |
+| `VecFilter` | `season IN (2023, 2024)` — compiled `IN_SET` | 2.6 ms |
+| `VecFilter` | `team LIKE '%a%'` — compiled `LIKE` | 32 ms |
+
+`IN` costs the same as a native comparison: the list is hashed once at compile
+time, so the row loop is one probe. `LIKE` is more expensive because wildcard
+matching genuinely is — but it is a chunk loop, not a per-row `evaluate()`. The
+`CASE` fallback is 6.4x the compiled path, because it sets `needs_row` in
+`VecHashAggregateNode::consumeAll` and rebuilds a full `Row` per row.
+
+**A selectivity rule for `LIKE` was written, measured, and removed.** Postgres'
+`DEFAULT_MATCH_SEL` of 0.005 looked like an easy win. It made
+`WHERE team LIKE 'Fer%' AND lap_id BETWEEN 900000 AND 900100` **1.5–1.7x slower**
+(min of 9, interleaved, 1M rows, Release):
+
+| Query | `LIKE` = 0.005 | no `LIKE` rule (0.5) |
+|---|---|---|
+| `team LIKE 'Fer%' AND lap_id BETWEEN 900000 AND 900100` | 500 µs | **325 µs** |
+| `team LIKE '%a%' AND lap_id BETWEEN 900000 AND 900100` | 1821 µs | **1085 µs** |
+
+Two things went wrong at once, and both are worth remembering. The estimate was
+*wrong* — that pattern keeps 25% of the table, not 0.5% — and `orderByWork` ranks
+conjuncts on **selectivity alone**, so being wrong in the low direction promoted
+the most expensive predicate to the front of the cascade, where it ran on every
+surviving row instead of on the ~100 the ranges would have left. An accurate
+`LIKE` estimate is only safe once ordering is cost-aware, which
+`predicate_pushdown.cc` already defers to Week 28; land the pair together there.
+`IN` is not exposed to this: its `k/ndv` comes from real statistics, and its
+kernel costs what a comparison costs.
+
+> **Reproducing these numbers.** They need a 1M-row dataset and an optimized
+> build; the checked-in `data/laps.csv` is 10k rows and the default `cmake ..`
+> configure sets no `CMAKE_BUILD_TYPE`, so `build/` is unoptimized and roughly
+> 20x slower. `data/*.csv` are git-tracked, so restore them afterwards:
+>
+> ```bash
+> cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release && cmake --build build-rel -j
+> python3 python_tools/generate_data.py --rows 1000000
+> ./build-rel/swiftql --catalog catalog.json --storage columnar --execution vectorized \
+>   --explain-analyze --no-cache --query "<one of the queries above>"
+> git checkout -- data/          # the CSVs are tracked; put them back
+> ```
 
 Arithmetic (Week 24): `+`, `-`, `*`, `/`, unary `-`, with SQL precedence (unary > `* /` > `+ -` > comparisons > `AND` > `OR`). SQLite semantics: `INT / INT` truncates; `x / 0` is `NULL`. Select-list aliases (`AS`) are referenceable in `GROUP BY` and `ORDER BY`; in `GROUP BY`, input columns take precedence over aliases.
 
@@ -377,10 +451,9 @@ so `MIN(team)` is a `STRING`. Typing them `DOUBLE` made that query throw
 
 ## Extending the expression language
 
-Fourteen functions dispatch on `Expr` subtype. **Six fail silently** when a new
-one is missed — no error, no crash, a wrong answer somewhere far away. Adding a
-node type (Week 25 adds five: `BETWEEN`, `LIKE`, `IN`, `CASE`, `SUBSTRING`) means
-visiting all of them.
+Eighteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
+one is missed — no error, no crash, a wrong answer or a lost optimization
+somewhere far away. Adding a node type means visiting all of them.
 
 Ordered by how hard the failure is to find:
 
@@ -390,18 +463,26 @@ Ordered by how hard the failure is to find:
 | 2 | `collectCols` — `logical_plan.cc` | returns | **Silent.** The column is narrowed out of the scan schema, then execution fails with "column not found" far from the cause |
 | 3 | `Binder::bindExpr` — `binder.cc` | returns | **Silent.** Child `ColumnRef`s keep `relation_slot = -1`, so join-side resolution silently falls back to bare-name |
 | 4 | `Validator::validateExpr` — `validator.cc` | falls through | **Silent.** No column-existence or aggregate-placement checks inside the new node |
-| 5 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
-| 6 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 7 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
-| 8 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
-| 9 | `inferExprType` — `logical_plan.cc` | **throws** | Loud, at plan time |
-| 10 | `evaluate` — `evaluator.cc` | **throws** | Loud, at execution |
-| 11 | `foldNode` — `constant_folding.cc` | returns false | Safe: no folding |
-| 12 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
-| 13 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe |
-| 14 | `ChunkPruner::shouldSkip` | no pruning | Safe: correct, just slower |
+| 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
+| 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
+| 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance.** `classify()` sees no single relation and returns `RESIDUAL`, so the conjunct is evaluated above the join instead of on its own scan. Right answers, lost pushdown |
+| 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps `relation_slot = 1` below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
+| 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
+| 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
+| 12 | `inferExprType` — `logical_plan.cc` | **throws** | Loud, at plan time |
+| 13 | `evaluate` — `evaluator.cc` | **throws** | Loud, at execution |
+| 14 | `foldNode` — `constant_folding.cc` | returns false | Safe: no folding |
+| 15 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
+| 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
+| 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
+| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Dormant until Week 26.** Dispatches on `ColumnRef`/`BinaryExpr` only, so a new subtype inside an `ON` clause gets no column-existence check. Unreachable today because `classifyJoinCondition` runs first and rejects anything that is not a single `=` between two `ColumnRef`s. Week 26 lifts exactly that restriction (multi-key equi-joins) and Week 27 routes non-equality `ON` conjuncts as residuals — **extend this function in the same commit that relaxes `classifyJoinCondition`**, or `ON a.x = b.x AND a.team LIKE 'F%'` validates nothing |
 
-Sites 11–14 are safe **by design** — they degrade to a correct slower path. That
+`ChunkPruner::shouldSkip` is not on the list: `collectSimplePredicates` returns
+immediately on anything that is not a `BinaryExpr`, so a new node contributes no
+pruning hint while its sibling conjuncts still prune. Correct, just slower.
+
+Sites 14–17 are safe **by design** — they degrade to a correct slower path. That
 is the pattern to copy for anything new: prefer "decline and fall back" over
 "assume and guess."
 
@@ -409,10 +490,14 @@ Recommended order for a new node type:
 
 1. Lexer tokens, then the parser rule at the right precedence level (see the
    grammar in readme.md — decide the slot before writing code).
-2. Sites 8–10 first (`cloneExpr`, `inferExprType`, `evaluate`). They throw, so they
-   turn every later mistake into a loud failure instead of a quiet one.
-3. Sites 1–7. Write a test per site; the silent ones cannot be caught by eye.
-4. Sites 11–14 last — these are optimizations. Correctness is already complete
+2. Sites 11–13 first (`cloneExpr`, `inferExprType`, `evaluate`). They throw, so
+   they turn every later mistake into a loud failure instead of a quiet one.
+3. Sites 1–10. Write a test per site; the silent ones cannot be caught by eye,
+   and a test that only asserts "something threw" does not prove the right site
+   caught it — assert on the message (see
+   `Validation.UngroupedColumnInsideWeek25NodesIsRejected`, which passes for the
+   wrong reason without that check).
+4. Sites 14–17 last — these are optimizations. Correctness is already complete
    without them, so land the feature, then add kernels.
 5. Add queries to `compare_against_sqlite.py`. It runs 4 modes and compares
    `ORDER BY` results in emitted order, so it catches cross-mode divergence and

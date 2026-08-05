@@ -59,6 +59,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — `COUNT` returns `INT`, `SUM`/`AVG` return `DOUBLE`, and `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a `STRING`)
 - General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
+- Predicates and scalar functions (Week 25) — `[NOT] BETWEEN`, `[NOT] LIKE` (ASCII case-insensitive, matching SQLite), `[NOT] IN` over a constant list, searched `CASE`, `SUBSTRING`, ISO-8601 date literals (`date '1998-12-01'`, stored as `STRING`), and constant-folded interval arithmetic (`date '1994-01-01' + interval '1' year`)
 - `EXPLAIN` — prints the query plan tree without executing; on the vectorized path shows three sections (logical plan, optimized logical plan with estimated rows, physical plan with the join's cost decision)
 - `EXPLAIN ANALYZE` — executes the query and annotates each plan node with rows in, rows out, estimated rows (vectorized, optimizer on), exclusive self-time (child time excluded), and % of total execution time; footer shows rows returned and separate parse, plan, and execution times
 - `--storage row | columnar` — switches the storage backend
@@ -80,8 +81,7 @@ The project is structured in five progressive phases, each leaving a working and
 > SQL NULL itself is **not** out of scope and is fully modelled: `ColumnVector`
 > carries a validity mask, expressions and aggregates propagate NULL, `AND`/`OR`
 > are three-valued, and `ORDER BY` sorts NULL first ascending / last descending as
-> SQLite does. `CASE` and the scalar functions are Week 25 deliverables, not
-> non-goals.
+> SQLite does. `CASE` and `SUBSTRING` shipped in Week 25.
 
 ### Syntax Deliberately Not Supported
 
@@ -92,8 +92,15 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 | Column ordinals — `ORDER BY 1`, `GROUP BY 2` | `column ordinals are not supported; use a column name or a select-list alias` | A bare integer parses as a `Literal`, so ORDER BY 1 would sort every row by the same constant. Select-list aliases cover the need |
 | Unary plus — `SELECT +speed` | parse error at the `+` | The grammar has unary `-` only; `+x` is a no-op |
 | Scientific-notation floats — `1e5`, `1.5e3` | parse error — the exponent lexes as a separate identifier | The lexer's number rule has no exponent part |
-| Scalar functions — `ABS(x)`, `SUBSTRING(...)` | parse error at the `(` | The call form accepts only the five aggregate keywords. Scalar functions are Week 25 |
+| Scalar functions other than `SUBSTRING` — `ABS(x)`, `UPPER(x)` | parse error at the `(` | The call form accepts only the five aggregate keywords plus `SUBSTRING`. No TPC-H query in the documented dialect needs another one |
+| General `NOT` — `WHERE NOT (x = 1)` | `NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL` | Those four cover every TPC-H negation. A general prefix `NOT` would need its own node and three-valued kernel for no query's benefit. Both the leading position (`NOT x = 1`, what users write) and the postfix one (`x NOT 5`) give this message |
+| `IN (subquery)` — `x IN (SELECT ...)` | `IN accepts a list of constant values only` | Week 32 lowers set-membership subqueries to semi-/anti-joins; that is a different production, not an extension of the constant list |
+| Computed `LIKE` patterns — `x LIKE y` | parse error — a constant pattern string is required | TPC-H never computes a pattern, and a constant one is analysed once per query rather than per row |
+| `LIKE ... ESCAPE` — matching a literal `%` or `_` | `unexpected trailing input after the end of the query` | There is no escape clause and no default escape character, so a literal wildcard cannot be matched. SQLite supports this; no TPC-H pattern needs it. Until Week 25 the parser silently **discarded** everything after the last clause it recognised, so an `ESCAPE` was dropped and the query returned wildcard results — a wrong answer, not an error. `Parser::parse` now requires end-of-input (a trailing `;` is still fine) |
+| Trailing input — `SELECT team FROM laps LIMIT 2 GARBAGE` | `unexpected trailing input after the end of the query` | Same root cause as the row above. Pre-existing since Week 4 |
+| `SUBSTRING` out-of-domain positions — `SUBSTRING(x, 0, 3)`, `SUBSTRING(x, -2)`, `SUBSTRING(x, 1, -1)` | `start position must be >= 1` / `length must be >= 0` | SQLite **defines** all three (`substr('Ferrari',0,3)` is `'Fe'`, a negative start counts from the right, a negative length takes the preceding characters). SwiftQL rejects them rather than reimplement three sign conventions no TPC-H query uses. Decided at plan time whenever the arguments are constant — which after constant folding is every realistic query; only a *computed* position reaches a per-row throw. Note `compare_against_sqlite.py` cannot police this: the query errors instead of producing rows to diff, so `SubstringOf.RejectsTheOutOfDomainArgumentsSqliteDefines` is the guard |
 | Nested aggregates — `SUM(AVG(x))` | `aggregate functions cannot be nested` | Not meaningful without window functions |
+| Dates outside `0000-01-01 .. 9999-12-31` — `date '1994-01-01' + interval '100000' year` | `date arithmetic result is outside the supported range 0000-01-01 .. 9999-12-31` | The ISO-8601 STRING representation carries exactly four year digits. Before Week 25 closed this, an out-of-range year wrapped modulo 10000 and returned the **input date** with no error, and a negative year rendered a non-digit byte (`000*-01-01`) that then compared as an ordinary STRING. Matches SQLite's `date()` range |
 | Integer overflow promotion — `9223372036854775807 + 1` | `integer overflow in '+'` | SQLite promotes to REAL; SwiftQL cannot, because the INT/INT result type is fixed at plan time and truncating division depends on it. Erroring beats the silent signed-overflow UB this replaced |
 
 > **Batch-evaluation consequence:** the vectorized path evaluates a whole chunk
@@ -215,24 +222,42 @@ expr         → or_expr
 or_expr      → and_expr (OR and_expr)*
 and_expr     → compare (AND compare)*
 compare      → additive [(= | != | < | > | <= | >=) additive]
-             | additive IS NULL
-             | additive IS NOT NULL
+             | additive IS [NOT] NULL
+             | additive [NOT] BETWEEN additive AND additive   ← Week 25, desugared
+             | additive [NOT] LIKE STRING_LITERAL             ← Week 25
+             | additive [NOT] IN LPAREN const_list RPAREN     ← Week 25
 additive     → multiplicative (('+' | '-') multiplicative)*   ← Week 24
 multiplicative → unary (('*' | '/') unary)*                   ← Week 24
 unary        → '-' unary | primary                            ← Week 24
 primary      → IDENT [DOT IDENT]               ← optionally qualified column
              | agg_fn LPAREN expr RPAREN       ← aggregate call
              | COUNT LPAREN STAR RPAREN        ← COUNT(*)
+             | CASE (WHEN expr THEN expr)+ [ELSE expr] END    ← Week 25
+             | SUBSTRING LPAREN expr FROM expr [FOR expr] RPAREN   ← Week 25
+             | SUBSTRING LPAREN expr COMMA expr [COMMA expr] RPAREN
+             | DATE STRING_LITERAL             ← ISO-8601 date, a STRING Literal
+             | INTERVAL STRING_LITERAL unit    ← folded away at plan time
              | INT_LITERAL
              | FLOAT_LITERAL
              | STRING_LITERAL
              | LPAREN expr RPAREN
 
 agg_fn       → COUNT | SUM | AVG | MIN | MAX   ← keywords, not arbitrary identifiers
+const_list   → literal (COMMA literal)*        ← constants only; IN (subquery) is Week 32
+unit         → day[s] | month[s] | year[s]     ← matched as identifier text (case-insensitive), NOT reserved
 ```
 
-> The function-call form is restricted to the five aggregate keywords: `ABS(speed)`
-> is a parse error, not an unknown-function error. Scalar functions arrive in Week 25.
+> The function-call form is restricted to the five aggregate keywords plus
+> `SUBSTRING`: `ABS(speed)` is a parse error, not an unknown-function error.
+> `SUBSTRING` is the only scalar function; if a second one is ever needed, the
+> right move is a generic `FunctionExpr { name, args }` with a name→kernel
+> registry, not a third one-off node.
+>
+> `BETWEEN` is **desugared by the parser** into `a >= x AND a <= y` (`NOT BETWEEN`
+> into `a < x OR a > y`). There is no `BetweenExpr` node, because the desugared
+> shape is what predicate pushdown, zone-map pruning, the tight comparison loop and
+> range selectivity all pattern-match on. Its bounds parse at the *additive* level
+> so that `BETWEEN` binds tighter than `AND`, as SQL requires.
 
 **AST node types:**
 - `ColumnRef` — reference to a column by name (with optional table qualifier)
@@ -701,28 +726,40 @@ see [Syntax Deliberately Not Supported](#syntax-deliberately-not-supported).
 - Add `BETWEEN`, `LIKE`, `IN`, `CASE`, and `SUBSTRING`
 - Add ISO date literals and constant-folded interval arithmetic
 
-**Checkpoint:** Required non-subquery TPC-H expressions execute correctly.
+**Checkpoint:** Required non-subquery TPC-H expressions execute correctly. ✅
 
-> **Starting notes, from Week 24's foundations.**
-> - Each of `BETWEEN`, `LIKE`, `IN`, `CASE`, `SUBSTRING` is a **new `Expr` subtype**,
->   and six of the sites that dispatch on subtype fail *silently* when one is
->   missed. Work the checklist in
->   [development.md → Extending the expression language](development.md#extending-the-expression-language)
->   before writing the operator.
-> - Tokens to add to the lexer: `BETWEEN`, `LIKE`, `IN`, `CASE`, `WHEN`, `THEN`,
->   `ELSE`, `END`, `SUBSTRING`, `DATE`, `INTERVAL`. `NOT` already exists.
-> - "Constant-folded interval arithmetic" now has a home: `date '1998-12-01' -
->   interval '90' day` is a constant expression, so it folds to a plain date
->   literal at plan time via `foldConstants` — extend that pass rather than adding
->   runtime date arithmetic. Every TPC-H interval expression is constant.
-> - ISO-8601 dates sort lexicographically, and STRING range comparison already
->   works on both paths (`scanColumn<std::string>` covers `< > <= >=`), so dates can
->   be `STRING` without a new `TypeId`. That keeps `BETWEEN` on dates on the fast
->   path. It does *not* extend to date arithmetic — hence folding.
-> - `CASE` inside an aggregate (`SUM(CASE WHEN ... END)`, TPC-H Q8/Q12/Q14) is the
->   shape to test first: `ExpressionExecutor::compile` returns `nullptr` for any
->   node it lacks a kernel for and the caller falls back to `evaluate()`, so an
->   un-compiled `CASE` is slow but never wrong. Ship correct, then add the kernel.
+Two decisions shaped the result, and both are dialect facts Phase 5's
+correctness report inherits:
+
+| Shipped | Why it was required |
+|---|---|
+| **`BETWEEN` is desugared, not a node** — the parser emits `a >= x AND a <= y` (`NOT BETWEEN` → `a < x OR a > y`, valid De Morgan in Kleene 3VL) | Five mechanisms pattern-match on `ColumnRef op Literal`: `splitConjuncts`, `ChunkPruner`, `scanColumn`'s tight loop, `selectivity()`, and `orderByWork`. A `BetweenExpr` node would forfeit all five *and* cost 17 dispatch sites. Measured: a desugared `BETWEEN` skips 116/123 chunks on 1M rows — byte-identical to the longhand form. **Cost:** the left operand is cloned, so a *computed* one is evaluated twice — `SUBSTRING(team,1,3) BETWEEN 'A' AND 'M'` runs two SUBSTRING kernels. Every TPC-H `BETWEEN` has a bare column on the left, and the AND cascade evaluates the second copy over survivors only, so the duplication is bounded |
+| **`CASE` has no vectorized kernel, deliberately** | `evaluate()` short-circuits; a chunk kernel cannot. Since INT arithmetic is overflow-checked, an eager kernel raises on rows whose branch is discarded — so the two evaluators would legitimately disagree. `compileNode` declines, and the fallback is correct-but-slow: measured 406 ms vs 63 ms per 1M rows for the same aggregate (Release). `LIKE` and `IN` *do* compile — `IN` costs the same as a native comparison, since the list is hashed once at plan time. The masked-evaluation `CASE` kernel is Week 37 work, gated on Q8/Q12/Q14 profiling |
+
+Three further things the original two bullets did not anticipate:
+
+- **The dispatch checklist was under-counted.** It documented 14 sites; there are
+  **17**. `checkGroupedRefs` (a function separate from `Validator::validateExpr`),
+  `collectSlots` and `restampSlots` all fail silently and all were missing. The
+  first lets an ungrouped column inside a `CASE` reach `inferExprType` and fail
+  with a far-from-the-cause `column not found`; the other two silently stop
+  `LIKE`/`IN` conjuncts from being pushed below a join, which is where TPC-H
+  Q12/Q14/Q16/Q19 spend their time. See
+  [development.md → Extending the expression language](development.md#extending-the-expression-language).
+- **`IN` restricted to a constant list** — which makes the set hashable once at
+  compile time and, because the grammar has no NULL literal, makes NULL-in-list
+  unreachable, collapsing SQL's three-valued `IN` rule to "operand NULL → NULL".
+- **`IntervalLiteral` is a node that must not survive planning.** `foldNode`
+  rewrites `date ± interval` to a date `Literal`; an interval that reaches
+  `inferExprType` or `evaluate()` throws, because the query was not constant date
+  arithmetic. C++17 has no `std::chrono::year_month_day`, so the civil-date
+  conversion is hand-rolled in `src/common/date_util.h`.
+
+> **Carried into Week 36.** `extract(year from d)` has no equivalent; the dialect
+> rewrite is `SUBSTRING(d, 1, 4)`, which yields a **`STRING`** year while the TPC-H
+> reference answers show an integer. Decide there whether the harness normalizes or
+> the dialect grows a numeric conversion. Note `SUM(SUBSTRING(...))` is rejected at
+> plan time, correctly, since the result is a STRING.
 
 ### Week 26 — Multi-Way Join Language + Binding
 
@@ -733,6 +770,39 @@ see [Syntax Deliberately Not Supported](#syntax-deliberately-not-supported).
   multi-key equi-joins (`ON a.x = b.x AND a.y = b.y`) — required for TPC-H Q9
 
 **Checkpoint:** Multi-table queries produce a qualified logical join tree.
+
+> **Starting notes, from Week 25's foundations.**
+> - **Relaxing `classifyJoinCondition` makes `Validator::validateJoinCondition`
+>   a live silent dispatch site — extend both in the same commit.** It recurses
+>   `ColumnRef` and `BinaryExpr` only, so a Week 25 node inside an `ON` clause
+>   gets no column-existence check. It is unreachable today *only* because
+>   `classifyJoinCondition` runs first and rejects anything that is not a single
+>   `=` between two `ColumnRef`s. The moment multi-key `ON` is legal,
+>   `ON a.x = b.x AND a.team LIKE 'F%'` validates nothing. It is site 18 in
+>   [development.md → Extending the expression language](development.md#extending-the-expression-language).
+> - The two-relation model is narrower than it looks — `relation_slot` is
+>   already an `int` assigned positionally by the Binder, not a boolean, so
+>   widening the range table to N entries is the natural generalization. Four
+>   places hardcode the binary assumption: `classify()` in
+>   `predicate_pushdown.cc` (a three-way `FROM`/`JOIN`/`RESIDUAL` enum), the
+>   `relation_slot == 1` branch in `validator.cc`, `ChunkPruner`'s
+>   `relation_slot < 1` scan-local test, and `SelectStatement::join` itself —
+>   a `std::optional<JoinClause>` that 14 sites branch on.
+> - The pushdown hazard is `classify()`, and it is a **wrong answer**, not just
+>   lost pushdown. It collapses "references neither slot 0 nor a mix" into
+>   `PushTarget::JOIN`, and `pushIntoJoin` then attaches those conjuncts to
+>   `join->children[1]`. With two relations that is exactly right; with three or
+>   more in a left-deep tree, `children[1]` is one specific scan, so a conjunct
+>   belonging to a different relation is filtered against the wrong table.
+>   `classify()` has to return a slot, not a side, before the tree grows a third
+>   scan. `ChunkPruner`'s `relation_slot < 1` test is *not* affected — pushed
+>   conjuncts are re-stamped to 0 by `restampSlots` because they sit above a
+>   standalone single-relation scan, which stays true at any relation count.
+> - A second `JOIN` is currently a clean parse error rather than a silently
+>   truncated single-join answer — Week 25 made `Parser::parse` require
+>   end-of-input. That is the correct pre-state to build on; before it, the
+>   trailing `JOIN ... ON ...` was discarded and the query returned a one-join
+>   result with no error.
 
 ### Week 27 — Multi-Way Join Execution
 
@@ -846,7 +916,7 @@ see [Syntax Deliberately Not Supported](#syntax-deliberately-not-supported).
 | 23 | Phase 4 explain + benchmarks | Optimizer gains and estimate errors documented |
 | 23.5 | SIMD small-build loop join (extension) | Optimizer picks hash vs SIMD-loop, crossover measured |
 | 24 | General expressions | Arithmetic and aliased expressions execute; NULL modelled natively, expressions compiled per chunk, constants folded |
-| 25 | Predicates + scalar functions | Required TPC-H expressions supported |
+| 25 | Predicates + scalar functions | `BETWEEN`/`LIKE`/`IN`/`CASE`/`SUBSTRING`, ISO dates, folded intervals; dispatch checklist corrected to 17 sites |
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly |
 | 27 | Multi-way join execution | General vectorized join trees execute |
 | 28 | Join enumeration | DP join ordering with greedy fallback works |
