@@ -313,6 +313,11 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // Decline multi-key rather than invent an encoding — an ineligible
             // algorithm is simply not costed, and the hash join is always
             // correct.
+            // Week 29 adds a fourth eligibility term for the same reason: the
+            // SIMD loop join is an INNER equi-join, and its probe loop has no
+            // unmatched path at all.
+            const bool outer = join->join_type == JoinType::LEFT;
+
             bool int_keys =
                 join->keys.size() == 1 &&
                 from_schema.column(left_idx[0]).type == TypeId::INT &&
@@ -325,9 +330,17 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
 
             double best_hash = std::min(cost_hash_from, cost_hash_join);
             double best_simd = std::min(cost_simd_from, cost_simd_join);
-            bool use_simd = estimate_driven && int_keys && best_simd < best_hash;
-            bool from_builds = use_simd ? cost_simd_from < cost_simd_join
-                                        : cost_hash_from < cost_hash_join;
+            bool use_simd = estimate_driven && int_keys && !outer && best_simd < best_hash;
+            // Week 29: for an outer join the build side stops being a free cost
+            // choice. With the preserved side BUILDING, the operator would need a
+            // matched flag per build row plus an end-of-probe drain; with it
+            // PROBING it needs one branch. Force the side. The cost — when the
+            // null-supplying side is the larger input we hash the larger input —
+            // is stated in README Limitations and belongs to Week 37 measurement,
+            // not to a hunch here.
+            bool from_builds = outer ? false
+                             : (use_simd ? cost_simd_from < cost_simd_join
+                                         : cost_hash_from < cost_hash_join);
 
             // Week 23: hand the costed decision to the node for explain output —
             // but only when cardinality estimates drove it. The raw-table-size
@@ -352,12 +365,18 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                   << "build=" << (isSingleRelation(build_side)
                                       ? leafScanTable(build_side) : "join-subtree")
                   << " cost=" << side_cost << " (alt=" << side_alt << ")";
-                if (int_keys) {
+                if (int_keys && !outer) {
                     d << " algo=" << (use_simd ? "simd" : "hash")
                       << " (" << (use_simd ? "hash=" : "simd=")
                       << (use_simd ? best_hash : best_simd) << ")";
                 }
                 decision = d.str();
+                if (outer) {
+                    // Never print an (alt=) that was not an option: the side was
+                    // forced, not costed against its alternative.
+                    decision = decision.substr(0, decision.find(" (alt="))
+                             + " (outer: the preserved side must probe)";
+                }
             }
 
             // output schema stays in fixed logical order [FROM, JOIN] regardless
@@ -379,6 +398,9 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 join_node->setCostDecision(std::move(decision));
                 return join_node;
             }
+            // Week 29: an outer join always takes the second branch — the
+            // preserved (FROM) side probes — and carries its ON residual into the
+            // operator, where it filters the match test rather than the result.
             std::unique_ptr<VecHashJoinNode> join_node = from_builds
                 // FROM builds: JOIN side probes (swapped)
                 ? std::make_unique<VecHashJoinNode>(
@@ -386,7 +408,8 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                       right_idx, left_idx, join->output_schema, /*swapped=*/true)
                 : std::make_unique<VecHashJoinNode>(
                       std::move(from_child), std::move(join_child),
-                      left_idx, right_idx, join->output_schema, /*swapped=*/false);
+                      left_idx, right_idx, join->output_schema, /*swapped=*/false,
+                      outer, std::move(join->on_residual));
             join_node->setCostDecision(std::move(decision));
             return join_node;
         }

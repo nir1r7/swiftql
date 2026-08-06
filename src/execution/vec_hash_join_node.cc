@@ -1,10 +1,23 @@
 #include "execution/vec_hash_join_node.h"
 #include "execution/key_encoding.h"
+#include "execution/evaluator.h"
+#include "parser/expr_utils.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
+#include <stdexcept>
 
-VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)) {
+    // Loud rather than latent: with swapped_ the build block is the LEFT half of
+    // the output row, so emitNullExtended's trailing-NULL assembly would null the
+    // PRESERVED side's own columns and return rows that look like data.
+    // Unreachable from the builder (Week 29 forces the side), so this is the
+    // shape of a planner bug, and it says so like every other check of its kind.
+    if (left_outer_ && swapped_) {
+        throw std::runtime_error(
+            "internal: a left outer join requires the preserved side on the probe input");
+    }
+}
 
 namespace {
 
@@ -33,6 +46,12 @@ bool serializeKey(const DataChunk& chunk, const std::vector<int>& key_idx, int r
 void VecHashJoinNode::open() {
     probe_child_->open();
     build_child_->open();
+
+    // Width of the NULL block for a left outer join. Read off the schema the
+    // operator was actually given, never derived from a probe chunk's column
+    // count: the builder already checks that lowered inputs match their logical
+    // schemas, and this is the value that must agree with output_schema_.
+    build_width_ = build_child_->outputSchema().size();
 
     hash_table_.clear();
     output_buffer_.clear();
@@ -87,6 +106,23 @@ void VecHashJoinNode::fillOutChunk(int start, int count) {
     }
 }
 
+// One preserved-side row with no surviving match. The build block is the
+// TRAILING columns of output_schema_ (guaranteed by !swapped_, which the
+// constructor enforces), so the assembly is the probe row followed by
+// build_width_ NULLs.
+//
+// appendColumnValue (vec_types.h) back-fills the validity prefix on the first
+// NULL, so fillOutChunk turns these into REAL nulls rather than the placeholder
+// underneath them — the Week 24 validity mask doing the whole job. This operator
+// needs no materialization change at all.
+void VecHashJoinNode::emitNullExtended(const DataChunk& probe_chunk, int r) {
+    Row out_row;
+    out_row.reserve(output_schema_.size());
+    for (const auto& cv : probe_chunk.columns) out_row.push_back(valueAt(cv, r));
+    for (int i = 0; i < build_width_; ++i) out_row.push_back(Value::null());
+    output_buffer_.push_back(std::move(out_row));
+}
+
 DataChunk* VecHashJoinNode::nextChunk() {
     while (output_cursor_ >= static_cast<int>(output_buffer_.size())) {
         // current output buffer exhausted, pull next probe chunk
@@ -109,13 +145,36 @@ DataChunk* VecHashJoinNode::nextChunk() {
             indices_ptr = &all_indices;
         }
 
+        // The ON residual, for a left outer join. Boolean-as-INT with an explicit
+        // null test, the same three-valued rule the filter path uses: UNKNOWN is
+        // not a match. Scalar evaluate() against the assembled row is the
+        // correct-but-slow fallback the project already uses where a chunk kernel
+        // cannot apply — only outer joins that HAVE a residual pay for it.
+        auto passes = [&](const Row& row) {
+            if (!on_residual_) return true;
+            Value v = evaluate(on_residual_.get(), row, output_schema_);
+            return !v.isNull() && v.asInt() != 0;
+        };
+
         for (int r : *indices_ptr) {
             stats.rows_in++;
 
-            if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) continue;   // NULL matches nothing (see open())
+            // An unmatchable key (a NULL member, or a NaN) matches nothing — which
+            // for a LEFT join is precisely the row that must still be emitted.
+            // Week 27's bare `continue` here was a correct comment attached to the
+            // wrong action, and it is the one line in this operator that drops
+            // rows without erroring.
+            if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) {
+                if (left_outer_) emitNullExtended(*probe_chunk, r);
+                continue;
+            }
 
+            bool matched = false;
             auto it = hash_table_.find(key_buf_);
-            if (it == hash_table_.end()) continue;
+            if (it == hash_table_.end()) {
+                if (left_outer_) emitNullExtended(*probe_chunk, r);
+                continue;
+            }
 
             for (const Row& build_row : it->second) {
                 // output row order always matches output_schema_'s fixed
@@ -140,8 +199,15 @@ DataChunk* VecHashJoinNode::nextChunk() {
                     append_probe();
                     append_build();
                 }
+                // A candidate failing the ON residual is NOT a match, so it must
+                // not set `matched`: otherwise the probe row is neither emitted
+                // joined nor null-extended, and it vanishes from the result.
+                if (!passes(out_row)) continue;
+                matched = true;
                 output_buffer_.push_back(std::move(out_row));
             }
+
+            if (left_outer_ && !matched) emitNullExtended(*probe_chunk, r);
         }
 
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -192,13 +258,17 @@ std::string VecHashJoinNode::explain() const {
     const std::vector<int>& from_idx = swapped_ ? build_key_idx_ : probe_key_idx_;
     const std::vector<int>& join_idx = swapped_ ? probe_key_idx_ : build_key_idx_;
 
-    std::string s = "VecHashJoin [";
+    // Week 29: the node NAME carries the join type, so every inner-join plan
+    // string is byte-identical and an outer join is unmissable. It keeps the
+    // substring "Join", which the python harness greps for.
+    std::string s = left_outer_ ? "VecLeftHashJoin [" : "VecHashJoin [";
     for (size_t i = 0; i < from_idx.size(); ++i) {
         if (i) s += " AND ";
         s += qualifyIfAmbiguous(from_side->outputSchema(), from_idx[i]) + " = "
            + qualifyIfAmbiguous(join_side->outputSchema(), join_idx[i]);
     }
     s += "] (materialize)";
+    if (on_residual_) s += " residual=" + exprToString(on_residual_.get());
     if (!cost_decision_.empty()) s += " " + cost_decision_;
     return s;
 }
