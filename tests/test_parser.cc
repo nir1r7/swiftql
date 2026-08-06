@@ -144,8 +144,32 @@ TEST(ParserTest, IsNull) {
 TEST(ParserTest, Join) {
     Parser p("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id");
     auto stmt = p.parse();
-    ASSERT_TRUE(stmt.join.has_value());
-    EXPECT_EQ(stmt.join->join_table, "drivers");
+    ASSERT_EQ(stmt.joins.size(), 1u);
+    EXPECT_EQ(stmt.joins[0].join_table, "drivers");
+}
+
+// Week 26: the join clause is a Kleene star, not an option. Before this a
+// second JOIN hit Parser::parse's end-of-input check ("unexpected trailing
+// input") — a clean error, but not an answer.
+TEST(ParserTest, MultipleJoinClauses) {
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.joins.size(), 2u);
+    EXPECT_EQ(stmt.joins[0].join_table, "sj");
+    EXPECT_EQ(stmt.joins[0].alias, "b");
+    EXPECT_EQ(stmt.joins[1].alias, "c");
+    ASSERT_NE(stmt.joins[1].condition, nullptr);
+}
+
+// Clauses after the last JOIN still parse — the loop must not swallow them.
+TEST(ParserTest, MultipleJoinsFollowedByOtherClauses) {
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id "
+             "WHERE a.val > 100 ORDER BY a.id LIMIT 2");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.joins.size(), 2u);
+    ASSERT_NE(stmt.where, nullptr);
+    ASSERT_EQ(stmt.order_by.size(), 1u);
+    EXPECT_EQ(stmt.limit.value(), 2);
 }
 
 TEST(ParserTest, AndPrecedence) {
@@ -165,8 +189,8 @@ TEST(ParserTest, TableAliasWithAsKeyword) {
     Parser p("SELECT l.team FROM laps AS l JOIN drivers AS d ON l.driver_id = d.driver_id");
     auto stmt = p.parse();
     EXPECT_EQ(stmt.from_alias, "l");
-    ASSERT_TRUE(stmt.join.has_value());
-    EXPECT_EQ(stmt.join->alias, "d");
+    ASSERT_EQ(stmt.joins.size(), 1u);
+    EXPECT_EQ(stmt.joins[0].alias, "d");
 }
 
 TEST(ParserTest, AsWithoutAliasIsSyntaxError) {

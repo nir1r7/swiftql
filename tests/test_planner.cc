@@ -111,9 +111,10 @@ static std::unique_ptr<PlanNode> bindAndPlan(const std::string& sql, const Catal
     std::unordered_map<std::string, std::vector<Row>> table_rows;
     const auto& meta = catalog.getTable(stmt.from_table);
     table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
-    if (stmt.join.has_value() && !table_rows.count(stmt.join->join_table)) {
-        const auto& jmeta = catalog.getTable(stmt.join->join_table);
-        table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+    for (const auto& j : stmt.joins) {
+        if (table_rows.count(j.join_table)) continue;   // self-join: load once
+        const auto& jmeta = catalog.getTable(j.join_table);
+        table_rows[j.join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
     }
     return Planner::plan(std::move(stmt), catalog, std::move(table_rows));
 }
@@ -205,4 +206,32 @@ TEST(ValidatorTest, BareColumnWithGroupByButNoAggregatesRejected) {
     Parser p("SELECT lap_id FROM laps GROUP BY team");
     auto stmt = p.parse();
     EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
+
+
+// ===== Week 26/27 boundary (Volcano path) =====
+
+// HashJoinNode executes exactly one single-key equi-join. Multi-way and
+// multi-key trees bind and plan logically this week but must not execute.
+TEST(PlannerTest, ThreeWayJoinRefusedUntilWeek27) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                    "JOIN sj c ON b.grp = c.id", catalog);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
+    }
+}
+
+TEST(PlannerTest, MultiKeyJoinRefusedUntilWeek27) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", catalog);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-key"), std::string::npos) << err;
+    }
 }

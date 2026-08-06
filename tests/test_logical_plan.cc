@@ -5,6 +5,7 @@
 #include "parser/expr_utils.h"
 #include "catalog/catalog.h"
 #include "common/schema.h"
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -175,8 +176,10 @@ TEST(LogicalPlan, JoinHasTwoChildrenAndStampedMergedSchema) {
     }
 
     const auto* join = static_cast<const LogicalJoin*>(join_node);
-    EXPECT_EQ(join->from_col, "driver_id");
-    EXPECT_EQ(join->join_col, "driver_id");
+    ASSERT_EQ(join->keys.size(), 1u);
+    EXPECT_EQ(join->keys[0].from_col, "driver_id");
+    EXPECT_EQ(join->keys[0].join_col, "driver_id");
+    EXPECT_EQ(join->join_slot, 1);
 }
 
 TEST(LogicalPlan, SelfJoinKeysRouteBySlotNotPosition) {
@@ -189,8 +192,9 @@ TEST(LogicalPlan, SelfJoinKeysRouteBySlotNotPosition) {
     EXPECT_EQ(static_cast<const LogicalScan*>(join1->children[0].get())->table_name, "sj");
     EXPECT_EQ(static_cast<const LogicalScan*>(join1->children[1].get())->table_name, "sj");
     const auto* j1 = static_cast<const LogicalJoin*>(join1);
-    EXPECT_EQ(j1->from_col, "id");
-    EXPECT_EQ(j1->join_col, "grp");
+    ASSERT_EQ(j1->keys.size(), 1u);
+    EXPECT_EQ(j1->keys[0].from_col, "id");
+    EXPECT_EQ(j1->keys[0].join_col, "grp");
 
     // reversed operand order in the ON clause must route identically
     auto plan2 = buildLogical("SELECT l1.id FROM sj l1 JOIN sj l2 ON l2.grp = l1.id", cat);
@@ -200,8 +204,81 @@ TEST(LogicalPlan, SelfJoinKeysRouteBySlotNotPosition) {
     EXPECT_EQ(static_cast<const LogicalScan*>(join2->children[0].get())->table_name, "sj");
     EXPECT_EQ(static_cast<const LogicalScan*>(join2->children[1].get())->table_name, "sj");
     const auto* j2 = static_cast<const LogicalJoin*>(join2);
-    EXPECT_EQ(j2->from_col, "id");
-    EXPECT_EQ(j2->join_col, "grp");
+    ASSERT_EQ(j2->keys.size(), 1u);
+    EXPECT_EQ(j2->keys[0].from_col, "id");
+    EXPECT_EQ(j2->keys[0].join_col, "grp");
+}
+
+// ===== Week 26: multi-way + multi-key logical join trees =====
+
+// The checkpoint: a multi-table query produces a qualified logical join tree.
+// "Qualified" = every relation owns a distinct slot in the merged schema, which
+// is what lets Schema::indexOf(name, slot) tell same-named columns apart.
+TEST(LogicalPlan, ThreeWayJoinIsLeftDeepWithAscendingSlots) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.id, c.val FROM sj a JOIN sj b ON a.grp = b.id "
+        "JOIN sj c ON b.grp = c.id", cat);
+
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    EXPECT_EQ(static_cast<const LogicalJoin*>(top)->join_slot, 2);
+
+    // left-deep: the second join's left input is the first join
+    ASSERT_EQ(top->children[0]->type, LogicalNodeType::JOIN);
+    EXPECT_EQ(top->children[1]->type, LogicalNodeType::SCAN);
+    const auto* inner = static_cast<const LogicalJoin*>(top->children[0].get());
+    EXPECT_EQ(inner->join_slot, 1);
+    EXPECT_EQ(inner->children[0]->type, LogicalNodeType::SCAN);
+    EXPECT_EQ(inner->children[1]->type, LogicalNodeType::SCAN);
+
+    // the merged schema carries all three relations, in relation order
+    std::vector<int> slots;
+    for (const auto& col : top->output_schema.columns()) slots.push_back(col.relation_slot);
+    ASSERT_FALSE(slots.empty());
+    EXPECT_EQ(*std::max_element(slots.begin(), slots.end()), 2);
+    EXPECT_TRUE(std::is_sorted(slots.begin(), slots.end()));
+    for (int s : {0, 1, 2}) {
+        EXPECT_NE(std::find(slots.begin(), slots.end(), s), slots.end())
+            << "relation " << s << " missing from the merged schema";
+    }
+}
+
+TEST(LogicalPlan, MultiKeyJoinKeepsBothKeys) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    const auto* lj = static_cast<const LogicalJoin*>(join);
+    ASSERT_EQ(lj->keys.size(), 2u);
+    EXPECT_EQ(lj->keys[0].from_col, "id");
+    EXPECT_EQ(lj->keys[1].from_col, "grp");
+    EXPECT_EQ(lj->explain(), "LogicalJoin [id = id AND grp = grp]");
+}
+
+// A single-key join must render exactly as it did before Week 26 — existing
+// --explain assertions depend on it.
+TEST(LogicalPlan, SingleKeyJoinExplainUnchanged) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT a.id FROM sj a JOIN sj b ON a.id = b.grp", cat);
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain(), "LogicalJoin [id = grp]");
+}
+
+// A join key must survive scan narrowing even when no other clause names it.
+TEST(LogicalPlan, ThreeWayJoinKeepsEveryJoinKeyInScanSchemas) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.val = c.val", cat);
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    // relation 1's scan needs both `id` (first join) and `val` (second)
+    const LogicalPlanNode* inner_right = top->children[0]->children[1].get();
+    EXPECT_TRUE(inner_right->output_schema.hasColumn("id"));
+    EXPECT_TRUE(inner_right->output_schema.hasColumn("val"));
 }
 
 TEST(LogicalPlan, SelectStarOnSelfJoinPreservesSlots) {

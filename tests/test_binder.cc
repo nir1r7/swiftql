@@ -36,11 +36,11 @@ static std::vector<Row> runVolcano(const std::string& sql, const Catalog& cat) {
     std::unordered_map<std::string, std::vector<Row>> table_rows;
     const auto& fm = cat.getTable(stmt.from_table);
     table_rows[stmt.from_table] = CSVLoader::load(fm.filepath, fm.schema);
-    if (stmt.join.has_value()) {
-        const auto& jm = cat.getTable(stmt.join->join_table);
+    for (const auto& j : stmt.joins) {
         // self-join keys by name; load once is enough (planner copies internally)
-        if (!table_rows.count(stmt.join->join_table))
-            table_rows[stmt.join->join_table] = CSVLoader::load(jm.filepath, jm.schema);
+        if (table_rows.count(j.join_table)) continue;
+        const auto& jm = cat.getTable(j.join_table);
+        table_rows[j.join_table] = CSVLoader::load(jm.filepath, jm.schema);
     }
     auto plan = Planner::plan(std::move(stmt), cat, std::move(table_rows));
     std::vector<Row> out;
@@ -319,12 +319,13 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
 }
 
 // ===== JOIN ON condition validation =====
-// Phase 4 supports exactly one cross-relation equality (ColumnRef = ColumnRef).
-// Anything else must be rejected with a specific error instead of silently
-// executing as an equi-join (or worse). Multi-key / non-equality conditions
-// are deferred to the multi-way join work (Week 26+).
+// Week 26 accepts a cross-relation equality or an AND-chain of them (multi-key
+// equi-joins, TPC-H Q9). Anything else must be rejected with a specific error
+// instead of silently executing as an equi-join (or worse). Non-equality ON
+// conjuncts become post-join residuals in Week 27.
 
 #include "planner/validator.h"
+#include "planner/join_condition.h"
 
 // Bind then validate, returning the error message ("" when accepted).
 static std::string joinOnValidationError(const std::string& sql, const Catalog& cat) {
@@ -359,11 +360,105 @@ TEST(JoinOnValidation, NotEqualOperatorRejected) {
     EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
 }
 
-TEST(JoinOnValidation, CompoundConditionRejected) {
+// Week 26 lifts exactly this restriction: the AND-chain that used to be
+// rejected as "compound" is now a two-key equi-join (required for TPC-H Q9).
+TEST(JoinOnValidation, MultiKeyEquiJoinAccepted) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat), "");
+}
+
+// ...but only when every conjunct is an equality. A mixed compound still
+// throws: routing non-equality ON conjuncts as residuals is Week 27.
+TEST(JoinOnValidation, MixedCompoundWithNonEqualityRejected) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
-    EXPECT_NE(err.find("compound"), std::string::npos) << err;
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat);
+    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, OrConditionRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id OR a.grp = b.grp", cat);
+    EXPECT_NE(err.find("AND-chain"), std::string::npos) << err;
+}
+
+// Only reachable with three relations: `c` is not in the tree when b is joined.
+TEST(JoinOnValidation, ForwardReferenceToLaterRelationRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = c.id JOIN sj c ON b.grp = c.id", cat);
+    EXPECT_NE(err.find("table being joined"), std::string::npos) << err;
+}
+
+// Dispatch site 18. An unqualified name matching no relation is left
+// unresolved by the Binder (it does not throw) and slips past
+// classifyJoinCondition's unbound-positional branch, so validateJoinCondition
+// is what has to catch it. Before Week 26 the AND-chain was rejected as
+// "compound" before that function ever ran.
+TEST(JoinOnValidation, UnknownColumnInsideMultiKeyConditionRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND nope = b.grp", cat);
+    EXPECT_NE(err.find("nope"), std::string::npos) << err;
+    EXPECT_NE(err.find("JOIN ON"), std::string::npos) << err;
+}
+
+// A qualified bad column inside the same AND-chain is caught earlier, by the
+// Binder — pinned so the two paths stay distinguishable.
+TEST(JoinOnValidation, QualifiedUnknownColumnInsideMultiKeyRejectedByBinder) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.nope = b.grp");
+    auto stmt = p.parse();
+    try {
+        Binder::bind(stmt, cat);
+        FAIL() << "expected an unknown-column error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("nope"), std::string::npos) << e.what();
+    }
+}
+
+// Week 25 shapes inside ON are still refused on shape, so site 18's new
+// branches stay dormant until Week 27 routes residual ON conjuncts.
+TEST(JoinOnValidation, Week25NodeInsideOnRejectedOnShape) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.val IN (1, 2)", cat);
+    EXPECT_NE(err.find("AND-chain of equalities"), std::string::npos) << err;
+}
+
+// classifyJoinCondition normalizes operand order: whichever side carries the
+// slot of the relation being joined becomes join_col, the other from_col.
+TEST(JoinOnValidation, KeysNormalizeOperandOrder) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery("SELECT a.id FROM sj a JOIN sj b ON b.grp = a.id", cat);
+    ASSERT_EQ(stmt.joins.size(), 1u);
+    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    ASSERT_EQ(keys.size(), 1u);
+    EXPECT_EQ(keys[0].from_col, "id");
+    EXPECT_EQ(keys[0].join_col, "grp");
+    EXPECT_EQ(keys[0].from_slot, 0);
+}
+
+TEST(JoinOnValidation, MultiKeyConditionYieldsOneKeyPerConjunct) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.grp = a.grp", cat);
+    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    ASSERT_EQ(keys.size(), 2u);
+    EXPECT_EQ(keys[0].from_col, "id");
+    EXPECT_EQ(keys[0].join_col, "id");
+    EXPECT_EQ(keys[1].from_col, "grp");   // normalized from `b.grp = a.grp`
+    EXPECT_EQ(keys[1].join_col, "grp");
+}
+
+TEST(JoinOnValidation, AggregateInsideJoinConditionRejected) {
+    Catalog cat(CATALOG);
+    // shape check fires first; the point is that neither path lets it through
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = SUM(b.grp)", cat);
+    EXPECT_FALSE(err.empty());
 }
 
 TEST(JoinOnValidation, LiteralOperandRejected) {
@@ -486,6 +581,50 @@ TEST(Binder, DuplicateAliasAcrossDifferentTablesNamedCorrectly) {
         EXPECT_NE(err.find("duplicate table alias"), std::string::npos) << err;
         EXPECT_NE(err.find("'x'"), std::string::npos) << err;
     }
+}
+
+
+// ===== Week 26: N-relation range table =====
+
+// The range table is positional: FROM = 0, then each JOIN in written order.
+// Everything downstream (merged schema stamping, join-key routing, pushdown)
+// derives from that, so it is asserted directly.
+TEST(Binder, ThreeRelationsGetAscendingSlots) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT a.id, b.grp, c.val FROM sj a "
+        "JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id", cat);
+    ASSERT_EQ(stmt.select_list.size(), 3u);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[0].get())->relation_slot, 0);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[1].get())->relation_slot, 1);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[2].get())->relation_slot, 2);
+}
+
+// The duplicate-name check must compare against every prior entry: this clash
+// is between range-table entries 0 and 2, which never form the [0]/[1] pair
+// the two-relation check looked at.
+TEST(Binder, DuplicateAliasAcrossNonAdjacentRelationsRejected) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj a ON b.grp = a.id");
+    auto stmt = p.parse();
+    try {
+        Binder::bind(stmt, cat);
+        FAIL() << "expected a duplicate-reference error";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        // same table twice under one name -> the self-join message
+        EXPECT_NE(err.find("self-join requires table aliases"), std::string::npos) << err;
+        EXPECT_NE(err.find("'sj'"), std::string::npos) << err;
+    }
+}
+
+// An unqualified name matching several relations is ambiguous at any relation
+// count — more likely with three, so it is pinned.
+TEST(Binder, UnqualifiedColumnAcrossThreeRelationsIsAmbiguous) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT val FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id");
+    auto stmt = p.parse();
+    EXPECT_THROW(Binder::bind(stmt, cat), std::runtime_error);
 }
 
 

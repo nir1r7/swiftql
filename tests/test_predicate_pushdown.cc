@@ -99,9 +99,10 @@ static std::unordered_map<std::string, ColumnarTable> loadColumnar(
     const auto& fm = cat.getTable(stmt.from_table);
     tables.emplace(stmt.from_table,
                    CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
-    if (stmt.join.has_value() && !tables.count(stmt.join->join_table)) {
-        const auto& jm = cat.getTable(stmt.join->join_table);
-        tables.emplace(stmt.join->join_table,
+    for (const auto& j : stmt.joins) {
+        if (tables.count(j.join_table)) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.join_table);
+        tables.emplace(j.join_table,
                        CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
     }
     return tables;
@@ -704,4 +705,84 @@ TEST(CardinalityEstimator, NegatedInNeverCollapsesToZeroRows) {
     // the positive sense is still allowed to reach 0 — there it is a proof
     // (every listed value lies outside [min,max]), not a guess
     EXPECT_NEAR(estimateOf("SELECT name FROM drivers WHERE age IN (1,2,3)"), 1.0, 1e-9);
+}
+
+
+// ===== Week 26: routing by relation slot, not by join side =====
+
+// The wrong-answer guard. classify() used to collapse "not slot 0" into
+// PushTarget::JOIN and attach those conjuncts to join->children[1]. With two
+// relations that was right; with three, children[1] is one specific scan, so a
+// conjunct belonging to a different relation was filtered against the WRONG
+// table. Each assertion below is paired with its negative form — a test that
+// only counted filters would pass with all three misrouted.
+TEST(PredicatePushdown, ThreeWayJoinPushesEachConjunctToItsOwnRelation) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id "
+        "WHERE a.val > 100 AND b.val > 150 AND c.val > 200", cat);
+
+    // no residual left above the join tree
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::JOIN);
+
+    const LogicalPlanNode* top = plan->children[0].get();
+    ASSERT_EQ(static_cast<const LogicalJoin*>(top)->join_slot, 2);
+
+    auto predicateOf = [](const LogicalPlanNode* n) {
+        return exprToString(static_cast<const LogicalFilter*>(n)->predicate.get());
+    };
+
+    // relation 2 -> the top join's right input
+    ASSERT_EQ(top->children[1]->type, LogicalNodeType::FILTER);
+    std::string rel2 = predicateOf(top->children[1].get());
+    EXPECT_NE(rel2.find("200"), std::string::npos) << rel2;
+    EXPECT_EQ(rel2.find("150"), std::string::npos) << rel2;   // not b's predicate
+    EXPECT_EQ(rel2.find("100"), std::string::npos) << rel2;   // not a's predicate
+
+    // relation 1 -> the inner join's right input
+    const LogicalPlanNode* inner = top->children[0].get();
+    ASSERT_EQ(inner->type, LogicalNodeType::JOIN);
+    ASSERT_EQ(inner->children[1]->type, LogicalNodeType::FILTER);
+    std::string rel1 = predicateOf(inner->children[1].get());
+    EXPECT_NE(rel1.find("150"), std::string::npos) << rel1;
+    EXPECT_EQ(rel1.find("200"), std::string::npos) << rel1;
+
+    // relation 0 -> the bottom of the left spine
+    ASSERT_EQ(inner->children[0]->type, LogicalNodeType::FILTER);
+    std::string rel0 = predicateOf(inner->children[0].get());
+    EXPECT_NE(rel0.find("100"), std::string::npos) << rel0;
+    EXPECT_EQ(rel0.find("150"), std::string::npos) << rel0;
+    EXPECT_EQ(inner->children[0]->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// Conjuncts pushed onto a relation beyond slot 1 must be re-stamped to the
+// standalone scan's slot 0, exactly like the two-relation case.
+TEST(PredicatePushdown, ThirdRelationConjunctRestampedToScanSlot) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id "
+        "WHERE c.val > 200", cat);
+
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    ASSERT_EQ(top->children[1]->type, LogicalNodeType::FILTER);
+    const auto* filter = static_cast<const LogicalFilter*>(top->children[1].get());
+    const auto* bin = dynamic_cast<const BinaryExpr*>(filter->predicate.get());
+    ASSERT_NE(bin, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->relation_slot, 0);
+}
+
+// A conjunct spanning two relations still stays above the whole join tree.
+TEST(PredicatePushdown, ThreeWayCrossRelationConjunctStaysResidual) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id "
+        "WHERE a.val > c.val", cat);
+
+    const LogicalPlanNode* residual = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(residual, nullptr);
+    EXPECT_EQ(residual->children[0]->type, LogicalNodeType::JOIN);
 }

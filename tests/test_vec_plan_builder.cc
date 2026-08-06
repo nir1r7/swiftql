@@ -28,9 +28,10 @@ static std::unordered_map<std::string, ColumnarTable> loadColumnar(
     const auto& fm = cat.getTable(stmt.from_table);
     tables.emplace(stmt.from_table,
                    CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
-    if (stmt.join.has_value() && !tables.count(stmt.join->join_table)) {
-        const auto& jm = cat.getTable(stmt.join->join_table);
-        tables.emplace(stmt.join->join_table,
+    for (const auto& j : stmt.joins) {
+        if (tables.count(j.join_table)) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.join_table);
+        tables.emplace(j.join_table,
                        CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
     }
     return tables;
@@ -80,9 +81,10 @@ static std::vector<Row> runVolcanoRow(const std::string& sql, const Catalog& cat
     std::unordered_map<std::string, std::vector<Row>> table_rows;
     const auto& fm = cat.getTable(stmt.from_table);
     table_rows[stmt.from_table] = CSVLoader::load(fm.filepath, fm.schema);
-    if (stmt.join.has_value() && !table_rows.count(stmt.join->join_table)) {
-        const auto& jm = cat.getTable(stmt.join->join_table);
-        table_rows[stmt.join->join_table] = CSVLoader::load(jm.filepath, jm.schema);
+    for (const auto& j : stmt.joins) {
+        if (table_rows.count(j.join_table)) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.join_table);
+        table_rows[j.join_table] = CSVLoader::load(jm.filepath, jm.schema);
     }
     auto plan = Planner::plan(std::move(stmt), cat, std::move(table_rows));
     std::vector<Row> out;
@@ -704,4 +706,46 @@ TEST(VecPlanBuilder, RowWidthFallsBackPerMissingColumn) {
     ASSERT_NE(join, nullptr);
     EXPECT_NE(buildSideScan(join).find("drivers"), std::string::npos)
         << buildSideScan(join);
+}
+
+
+// ===== Week 26/27 boundary =====
+//
+// The logical layer builds arbitrary join trees this week; lowering them is
+// Week 27. Until then the builder refuses shapes VecHashJoinNode cannot
+// express, rather than lowering something unverified — the Phase 1
+// stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
+
+TEST(VecPlanBuilder, ThreeWayJoinRefusedUntilWeek27) {
+    Catalog cat(CATALOG);
+    try {
+        buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                 "JOIN sj c ON b.grp = c.id", cat);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        // assert on the message: "something threw" would also pass for an
+        // unrelated failure inside lowering
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
+        EXPECT_NE(err.find("not yet executable"), std::string::npos) << err;
+    }
+}
+
+TEST(VecPlanBuilder, MultiKeyJoinRefusedUntilWeek27) {
+    Catalog cat(CATALOG);
+    try {
+        buildVec("SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-key"), std::string::npos) << err;
+    }
+}
+
+// The refusal must not have narrowed what already worked.
+TEST(VecPlanBuilder, SingleKeySingleJoinStillLowers) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
+    ASSERT_NE(plan, nullptr);
 }
