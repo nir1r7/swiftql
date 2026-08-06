@@ -503,7 +503,12 @@ std::string LogicalJoin::explain() const {
         s += (idx >= 0 ? qualifyIfAmbiguous(left, idx) : keys[i].from_col)
            + " = " + keys[i].join_col;
     }
-    return s + "]";
+    s += "]";
+    // Week 28: the join-order decision, on the top join of an enumerated tree
+    // only. Empty everywhere else, so every pre-existing plan string — single
+    // joins, --no-optimize, hand-built test trees — is unchanged.
+    if (!order_decision.empty()) s += " " + order_decision;
+    return s;
 }
 
 

@@ -15,6 +15,7 @@
 #include "planner/logical_plan.h"
 #include "planner/cardinality_estimator.h"
 #include "planner/predicate_pushdown.h"
+#include "planner/join_enumeration.h"
 #include "planner/vec_plan_node.h"
 #include "planner/vectorized_plan_builder.h"
 #include "storage/csv_loader.h"
@@ -320,6 +321,18 @@ int main(int argc, char* argv[]) {
                     // Reshapes the tree first so the estimator below annotates
                     // the final shape. --no-optimize skips this entirely.
                     logical = PredicatePushdown::apply(std::move(logical), catalog);
+
+                    // Week 28: choose the join order. AFTER pushdown, so each
+                    // relation's leaf carries its own filters and costs at its
+                    // FILTERED cardinality; BEFORE estimation, so the stamps
+                    // --explain prints and VectorizedPlanBuilder costs describe
+                    // the tree that will actually run. Deliberately inside this
+                    // block: --no-optimize keeps the written order, which is both
+                    // the benchmark baseline and the differential oracle
+                    // (compare_against_sqlite.py runs the vectorized suite twice,
+                    // and a reordering that only happens with the optimizer on is
+                    // what makes the second run able to catch it).
+                    logical = JoinEnumeration::apply(std::move(logical), catalog);
 
                     // Week 20: annotate the (possibly rewritten) logical plan
                     // with estimated row counts.

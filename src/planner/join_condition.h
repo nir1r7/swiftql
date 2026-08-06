@@ -9,6 +9,17 @@
 // column's binder slot — kept because the left input's merged schema can hold
 // the same column name at several slots (laps.team and drivers.team), so a
 // bare-name lookup there is a coin flip. -1 = unresolved (unbound callers).
+//
+// !! from_slot is the relation slot AS PRESENTED BY THE LEFT CHILD'S OWN SCHEMA:
+// 0 when the left child is a single relation, the binder slot when it is a join
+// subtree. Three consumers resolve from_col against exactly that schema —
+// leftKeyIndices() (physical, THROWS on a miss), LogicalJoin::explain() and
+// joinCardinality()'s left StatsContext — and a standalone scan stamps every
+// column slot 0, because one relation has nothing to disambiguate. Written-order
+// trees hide the distinction: their bottom join's left child IS relation 0. Join
+// enumeration (Week 28) can put any relation at the bottom of the spine, so
+// JoinEnumeration::rebuild sets from_slot = 0 on the FIRST join's keys
+// deliberately. Slot 0 is unambiguous there: exactly one relation is present.
 struct JoinKey {
     std::string from_col;
     std::string join_col;

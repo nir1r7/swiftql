@@ -1,0 +1,51 @@
+#pragma once
+
+#include "catalog/catalog.h"
+#include "planner/logical_plan.h"
+#include <memory>
+
+// Week 28 — left-deep join ordering.
+//
+// Pipeline position is forced at both ends:
+//   AFTER  PredicatePushdown — each relation's local filters must already sit on
+//          its own scan, or every leaf costs at its raw table size and the search
+//          orders on base cardinalities instead of filtered ones;
+//   BEFORE CardinalityEstimator::estimate — which stamps the tree --explain
+//          prints and VectorizedPlanBuilder costs, so it has to see the final
+//          shape.
+//
+// Left-deep only. LogicalJoin::children[1] is always exactly one relation, an
+// invariant rightKeyIndices(), rowWidth()'s isSingleRelation() split and the
+// whole lowering path are written against.
+//
+// Two documented approximations, both deliberate:
+//   1. The search costs the HASH join only, never the SIMD loop join. SIMD
+//      eligibility depends on key count and key type, and an ordering can change
+//      a join's key count. Modelling a per-join decision lowering will re-make
+//      anyway buys accuracy only where the build side is under ~50 rows — where
+//      the absolute cost is negligible and cannot flip an ordering.
+//   2. Independence. joinCardinality divides by the NDV product and filters do
+//      not narrow column statistics, so errors compound multiplicatively along a
+//      spine. Standard System-R; histograms are a README "Possible Extension".
+
+// No-op below three relations: with one join there is no ordering decision.
+// Which side builds is Week 22's decision, made at lowering from the same
+// estimates, and reordering two relations would change merged-schema column
+// order and every Week 22 / 23.5 steering assertion for zero modelled gain.
+constexpr int MIN_ENUMERATED_RELATIONS = 3;
+
+// Search-space cap. Left-deep DP is O(2^N * N): N=10 is ~10k transitions
+// (microseconds), N=20 is ~20M (visible in the plan timer, for a shape no TPC-H
+// query has — Q9 and Q21 top out at 6 relations). Above the cap, greedy. A named
+// constant rather than a CLI flag: nothing needs to vary it per query, and a
+// flag would be a knob with no consumer.
+constexpr int MAX_DP_RELATIONS = 10;
+
+class JoinEnumeration {
+    public:
+        // Reorders the single join tree inside `node`, if any, and returns the
+        // tree. Never called under --no-optimize (see main.cc): the written
+        // order is the benchmark baseline AND the differential oracle.
+        static std::unique_ptr<LogicalPlanNode> apply(std::unique_ptr<LogicalPlanNode> node,
+                                                      const Catalog& catalog);
+};

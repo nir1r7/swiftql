@@ -70,6 +70,13 @@ struct LogicalScan : LogicalPlanNode {
 struct LogicalJoin : LogicalPlanNode {
     std::vector<JoinKey> keys;
     int join_slot;
+    // Week 28: set by JoinEnumeration on the TOP join of an enumerated tree, and
+    // nowhere else. Empty for every single-join plan, every --no-optimize plan
+    // and every hand-built test tree, so all pre-existing explain strings stay
+    // byte-identical. Same discipline as VecHashJoinNode::cost_decision_ — and
+    // the same rule: never print it when estimates did not drive the decision,
+    // or --explain claims an optimizer choice that never happened.
+    std::string order_decision;
 
     LogicalJoin(std::unique_ptr<LogicalPlanNode> from_child, std::unique_ptr<LogicalPlanNode> join_child, std::vector<JoinKey> keys, int join_slot, Schema merged) : LogicalPlanNode(LogicalNodeType::JOIN, std::move(merged)), keys(std::move(keys)), join_slot(join_slot) {
         children.push_back(std::move(from_child));
