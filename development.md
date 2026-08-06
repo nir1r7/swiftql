@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **524 tests, 0 failures.**
+Expected: **590 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,7 +223,16 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **440 passed, 0 failed, 0 errors** (110 queries × 4 modes: row/Volcano, columnar/Volcano, columnar/vectorized, and columnar/vectorized with `--no-optimize`).
+Expected: **532 passed, 0 failed, 0 errors**: 116 queries × 4 modes (row/Volcano,
+columnar/Volcano, columnar/vectorized, and columnar/vectorized with
+`--no-optimize`), plus 12 rejections × the same 4 modes, plus Week 27's
+capability split — 5 multi-way queries × the 2 vectorized modes, diffed against
+SQLite, and the same 5 asserted to be refused × the 2 Volcano modes.
+
+> A query that runs in only some modes has to be listed separately, not dropped
+> from the harness and not run everywhere. Multi-way joins are the first such
+> case: run them in all four and two modes report a refusal as a failure; run
+> them in none and the checkpoint has no oracle at all.
 
 Queries containing `ORDER BY` are compared **in emitted order**; the rest are
 sorted first, since SQL does not specify row order without `ORDER BY`. Sorting
@@ -253,8 +262,11 @@ The `Execution` line from `--explain-analyze` is the number to watch when optimi
 ```sql
 SELECT [DISTINCT] expr [AS alias], AGG(expr), ...
 FROM table
-[JOIN other_table ON key = key [AND key = key ...]]* -- Phase 2; multi-way +
-                                                     -- multi-key: Week 26
+[JOIN other_table ON key = key [AND key = key ...]]* -- Phase 2; multi-key +
+                                                     -- residual ON conjuncts:
+                                                     -- Week 27 (all modes).
+                                                     -- 3+ relations: vectorized
+                                                     -- only (Week 27)
 [WHERE expr [AND expr ...]]
 [GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
@@ -267,12 +279,23 @@ Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(e
 Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`,
 and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 
-> **Week 26 join scope.** Several `JOIN ... ON` clauses and `AND`-chained
-> equi-join keys parse, bind and build a logical join tree; **executing** them is
-> Week 27, so both refuse with `... are planned but not yet executable (Week 27)`
-> rather than returning rows. An `ON` clause is still restricted to equalities
-> between one column of the joined relation and one of a preceding relation —
-> non-equality conjuncts become post-join residuals in Week 27.
+> **Week 27 join scope.** An `ON` clause decomposes into equi-join **keys** —
+> a cross-relation equality or an `AND`-chain of them — plus **residuals**: every
+> other conjunct (`a.x < b.x`, `d.age > 30`, `a.x = a.y`, a Week 25 node),
+> executed as a post-join filter. That is semantics-preserving because the join
+> is inner, and the residuals are folded into the `WHERE` conjunction so
+> predicate pushdown routes them by relation slot like any other conjunct — a
+> single-relation one lands on its own scan. Two things are still errors: an `ON`
+> clause yielding **no key** (`ON a.x < b.x` alone, or an `OR`, which is one
+> indivisible conjunct) — that is a cross product, and there is no operator for
+> it — and a forward reference to a relation joined later.
+>
+> **Three or more relations execute on `--execution vectorized` only.**
+> `Planner::plan` builds exactly one join, so row and columnar Volcano refuse
+> with `multi-way joins are not supported on the Volcano path; use --execution
+> vectorized`. It is the correctness baseline, not the feature-complete path, and
+> deleting the guard would make its single `HashJoinNode` silently drop a
+> relation. Multi-key and residual-`ON` joins execute on **every** path.
 
 Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
 literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
@@ -474,7 +497,7 @@ Ordered by how hard the failure is to find:
 | 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
 | 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
 | 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan. Right answers, lost pushdown |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, two callers, never a private copy |
 | 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps its own relation's slot (any `k >= 1`) below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
 | 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
@@ -484,7 +507,7 @@ Ordered by how hard the failure is to find:
 | 15 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
 | 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
 | 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
-| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. The Week 25 shapes and the `AggregateExpr` branch are still refused on shape by `classifyJoinCondition` first — they are pre-positions for Week 27, which routes non-equality `ON` conjuncts as residuals and makes this function their only column check |
+| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType` |
 
 `ChunkPruner::shouldSkip` is not on the list: `collectSimplePredicates` returns
 immediately on anything that is not a `BinaryExpr`, so a new node contributes no

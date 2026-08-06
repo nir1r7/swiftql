@@ -56,7 +56,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`
 - `DISTINCT` — eliminates duplicate rows from output
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
-- `JOIN ... ON` — hash join execution over columnar storage (Phase 2+). Several `JOIN` clauses and `AND`-chained equi-join keys (`ON a.x = b.x AND a.y = b.y`) parse, bind and plan as of Week 26; executing them is Week 27
+- `JOIN ... ON` — hash join execution over columnar storage (Phase 2+). `AND`-chained equi-join keys (`ON a.x = b.x AND a.y = b.y`) and non-equality `ON` conjuncts (executed as post-join residual filters) work on every path as of Week 27; three or more relations execute on `--execution vectorized` only, since `Planner::plan` builds exactly one join and Volcano is the correctness baseline, not the feature-complete path. An `ON` clause must still yield at least one equi-join key — there is no cross-product operator
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — `COUNT` returns `INT`, `SUM`/`AVG` return `DOUBLE`, and `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a `STRING`)
 - General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
 - Predicates and scalar functions (Week 25) — `[NOT] BETWEEN`, `[NOT] LIKE` (ASCII case-insensitive, matching SQLite), `[NOT] IN` over a constant list, searched `CASE`, `SUBSTRING`, ISO-8601 date literals (`date '1998-12-01'`, stored as `STRING`), and constant-folded interval arithmetic (`date '1994-01-01' + interval '1' year`)
@@ -95,6 +95,7 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 | Scalar functions other than `SUBSTRING` — `ABS(x)`, `UPPER(x)` | parse error at the `(` | The call form accepts only the five aggregate keywords plus `SUBSTRING`. No TPC-H query in the documented dialect needs another one |
 | General `NOT` — `WHERE NOT (x = 1)` | `NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL` | Those four cover every TPC-H negation. A general prefix `NOT` would need its own node and three-valued kernel for no query's benefit. Both the leading position (`NOT x = 1`, what users write) and the postfix one (`x NOT 5`) give this message |
 | `IN (subquery)` — `x IN (SELECT ...)` | `IN accepts a list of constant values only` | Week 32 lowers set-membership subqueries to semi-/anti-joins; that is a different production, not an extension of the constant list |
+| `JOIN ... ON` with no equi-join key — `ON a.x < b.x`, `ON a.x = b.x OR a.y = b.y`, `ON a.x = 5` | `JOIN ON: at least one equality between the joined table and an already-joined table is required` | Such a join is a cross product with a filter on top, and there is no cross-product operator to run it on. Every other `ON` conjunct is legal as of Week 27 and becomes a post-join residual, so what is left to refuse is exactly the missing key. An `OR` is one indivisible conjunct, which is why it contributes no key even though it contains equalities |
 | Computed `LIKE` patterns — `x LIKE y` | parse error — a constant pattern string is required | TPC-H never computes a pattern, and a constant one is analysed once per query rather than per row |
 | `LIKE ... ESCAPE` — matching a literal `%` or `_` | `unexpected trailing input after the end of the query` | There is no escape clause and no default escape character, so a literal wildcard cannot be matched. SQLite supports this; no TPC-H pattern needs it. Until Week 25 the parser silently **discarded** everything after the last clause it recognised, so an `ESCAPE` was dropped and the query returned wildcard results — a wrong answer, not an error. `Parser::parse` now requires end-of-input (a trailing `;` is still fine) |
 | Trailing input — `SELECT team FROM laps LIMIT 2 GARBAGE` | `unexpected trailing input after the end of the query` | Same root cause as the row above. Pre-existing since Week 4 |
@@ -782,6 +783,12 @@ same stance as Phase 1's stubbed hash join, and the reason
 `compare_against_sqlite.py` grew a rejection suite (nothing new this week
 returns rows to diff).
 
+> Both refusals came down in Week 27. Multi-key now executes on every path;
+> multi-way executes on the vectorized path and stays refused on Volcano, with
+> a message that names the capable path rather than a future week. The
+> paragraphs below are kept as the record of why the two refusals sat where
+> they did.
+
 Both refusals are placed so that a genuine query defect outranks a temporary
 engine limitation. The **multi-key** refusal is deferred past `Planner::plan`'s
 plan-time type checks — all of them, including the projection's, which
@@ -850,45 +857,60 @@ Four things the two bullets did not anticipate:
   residual post-join filters during predicate assignment — required for
   TPC-H Q21-style conditions
 
-**Checkpoint:** Three-or-more-table joins execute correctly.
+**Checkpoint:** Three-or-more-table joins execute correctly. ✅
 
-> **Starting notes, from Week 26's foundations.**
-> - **Two guards must come down together with the lowering work**, and they are
->   the only reason a wrong multi-way answer is impossible today:
->   `checkLowerable` in `vectorized_plan_builder.cc` (join count, then key count
->   — that order is load-bearing, so both engines report the same reason) and the
->   `stmt.joins.size() > 1` / `keys.size() != 1` pair in `Planner::plan`. Volcano
->   has no multi-way execution planned: keep its refusal and narrow the message
->   to name the path (`... not supported on the Volcano path; use --execution
->   vectorized`), rather than deleting it and letting `HashJoinNode` produce
->   something. `Planner::plan`'s *multi-key* refusal is deferred to after the
->   plan-time type checks (a flag set in the join block, thrown after the ORDER
->   BY checks and the projection's) — delete that flag with the guard, and keep the multi-way one
->   early, since one join is all that function builds and a deferred check would
->   run against a schema missing a relation.
-> - **De-duplicate join keys before building the hash-key tuple.**
->   `ON a.x = b.x AND a.x = b.x` yields two identical `JoinKey`s today. Harmless
->   while multi-key refuses, and semantically harmless as a predicate, but it
->   makes the probe tuple wider than it needs to be and it already double-counts
->   in `CardinalityEstimator`'s NDV product.
-> - **`Validator::validateJoinCondition` (site 18) is a second opinion, not the
->   authority.** For a bound statement the Binder is what proves a column
->   exists, and site 18 re-checks it by *slot* — never by `table_name`, which
->   for an unqualified ref the Binder rewrites to its relation's table name, so
->   a name match lands on whichever relation is aliased to that name (this
->   rejected a legal query for one round of Week 26). Its Week 25 branches and
->   its `AggregateExpr` branch are pre-positions: `classifyJoinCondition`
->   refuses those shapes first today. When non-equality `ON` conjuncts become
->   legal residuals, bind them like any other expression and keep the slot check
->   slot-based.
-> - **`keys[k].from_col` resolves against `children[0]`, whose merged schema can
->   hold the same column name at several slots.** `JoinKey::from_slot` carries
->   the binder slot for exactly this reason; use `Schema::indexOf(name, slot)`
->   when locating the probe column, not the bare-name overload, or a join on
->   `team` across three relations binds to whichever side comes first.
-> - `--explain` of a multi-way join currently errors instead of printing the
->   logical section, because `main.cc` lowers before it prints the captured
->   sections. Lifting the guard fixes it for free; no reordering needed.
+Nothing in `Lowering::lowerNode`'s JOIN case had to learn about a third
+relation — it already recursed through `children[0]`, so Week 26's logical layer
+made N-way lowering free. The week's work was the machinery the two refusals had
+been standing in front of:
+
+| Shipped | Why it was required |
+|---|---|
+| **Join keys resolve by relation slot, not by name** — the physical operators now take resolved column *indices*, computed once by the planner via `Schema::indexOf(name, from_slot)` | The left input's merged schema can hold one column name at several slots (`laps.team` and `drivers.team`), so a bare-name lookup silently joins the wrong relation's column: `... JOIN laps l2 ON l1.lap_id = l2.driver_id JOIN drivers d ON l2.team = d.team` returns **31440** rows by name and **32193** by slot, with no error either way. The only defect this week that produced rows rather than a message. A slot miss now throws — the bare-name fallback *is* the bug |
+| **Composite hash keys in both engines**, one serialized tuple with the existing `'\x01'` sentinel after **every** field | TPC-H Q9 joins on `(ps_partkey, ps_suppkey)`. Putting the second key in a filter above the join is semantically equal for an inner join but materializes every partial match first. The per-field sentinel is what keeps `("ab","c")` and `("a","bc")` in different buckets; a one-key tuple stays byte-identical to the pre-Week-27 encoding. A NULL member makes the whole tuple unmatchable, which also removed a latent divergence — Volcano used to bucket a NULL key under `"NULL"` and match it against itself while the vectorized path dropped it |
+| **Non-equality `ON` conjuncts execute as residuals**, folded into the `WHERE` conjunction rather than given their own filter node | For an inner join `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)`, so a residual needs no new node — only the predicate assignment that Week 26 already built. Folding it into the *same* filter is load-bearing: `PredicatePushdown` only rewrites a `FILTER` whose **direct** child is a `JOIN`, so a second stacked filter would have left every joined query's `WHERE` unpushed. Three shapes Week 26 rejected are now ordinary SQL: `ON k = k AND a.x < b.x` (Q21), `ON k = k AND d.age > 30` (pushed to its own scan), and `ON k = k AND a.x = a.y` |
+| **Duplicate keys collapse in `classifyJoinCondition`** | `ON a.x = b.x AND a.x = b.x` produced two identical `JoinKey`s: a redundant field in every probe tuple, and `CardinalityEstimator` dividing by the same NDV twice — an underestimate by a factor of NDV, which is a cost-model input Week 28 will trust |
+| **`collectSlots` promoted to a declared, shared walker** | A residual can be any expression shape, so the forward-reference check ("references a relation joined later") had to walk whole conjuncts rather than an equality's two operands. Copying the walker into `join_condition.cc` would have created an **eleventh silent dispatch site**, where a missed subtype makes a forward reference invisible instead of loud |
+| **Cost inputs refuse to guess about a join-shaped input** — `rowWidth` falls back to the uniform proxy, `build=` prints `join-subtree` | `leafScanTable()` returns *relation 0's* name for a whole subtree, so the per-column `avg_width` lookup attributed one table's widths to another table's columns wherever a name is shared. Wrong in a plausible direction, and it feeds the decision Week 28's enumeration is built on |
+
+Two boundaries held deliberately. **Volcano keeps its multi-way refusal**, now
+worded `... not supported on the Volcano path; use --execution vectorized`: it
+builds one join, and deleting the guard would have made it silently drop a
+relation. That is the project's first deliberate per-mode capability difference,
+so `compare_against_sqlite.py` grew both halves — the multi-way rows diffed
+against SQLite in the two vectorized modes, and the refusal asserted in the two
+Volcano ones. And **the SIMD loop join declines multi-key**: a composite key
+cannot occupy its flat `int64` buffer, so the planner costs only the hash join
+there rather than inventing an encoding.
+
+> **Starting notes, from Week 27's foundations.**
+> - **`LogicalJoin::keys` is already the join graph's edge list**, and
+>   `join_slot` is the vertex id. Enumeration needs no new structure to
+>   *represent* the graph — it needs to choose a different fold order than the
+>   written one, and then re-derive each join's keys and merged schema for the
+>   order it picked. The identity `joins[i]` → slot `i+1` is what breaks first:
+>   reordering makes the range-table slot independent of the tree position, so
+>   anything that still infers one from the other (`LogicalPlanBuilder`'s fold,
+>   `distribute()`'s spine walk) must read `join_slot` instead of an index.
+> - **The data-volume cost term Week 22 deferred to Week 28 now has a real
+>   consumer, and a placeholder in its seat.** `rowWidth` returns
+>   `columns * 8.0` for any multi-relation input, which is exactly the case
+>   enumeration compares — differing intermediate widths across orderings are
+>   the whole reason the term discriminates. Land the real per-relation width
+>   sum with the enumeration, not before.
+> - **`--no-optimize` must keep the written join order.** It is the benchmark
+>   baseline and the differential oracle: `compare_against_sqlite.py` runs the
+>   vectorized suite twice, and a reordering that only happens with the
+>   optimizer on is what makes the second run able to catch it.
+> - **Residual `ON` conjuncts are already in the `WHERE` conjunction by the time
+>   pushdown runs**, so enumeration inherits them for free — but the fold is
+>   inner-join-only. Week 29's outer join must split them back apart before it
+>   can be correct, and the comment in `join_condition.h` is the marker.
+> - A residual referencing *two* relations stays above the whole join tree today
+>   (`soleSlot()` returns -1). Once enumeration can choose which pair joins
+>   first, such a conjunct becomes attachable to the lowest join whose output
+>   contains both relations — a real optimization, and out of scope until the
+>   ordering exists.
 
 ### Week 28 — Join Enumeration
 
@@ -994,7 +1016,7 @@ Four things the two bullets did not anticipate:
 | 24 | General expressions | Arithmetic and aliased expressions execute; NULL modelled natively, expressions compiled per chunk, constants folded |
 | 25 | Predicates + scalar functions | `BETWEEN`/`LIKE`/`IN`/`CASE`/`SUBSTRING`, ISO dates, folded intervals; dispatch checklist corrected to 17 sites |
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly; pushdown routes by relation slot ✅ |
-| 27 | Multi-way join execution | General vectorized join trees execute |
+| 27 | Multi-way join execution | General vectorized join trees execute ✅ |
 | 28 | Join enumeration | DP join ordering with greedy fallback works |
 | 29 | Outer join | Left outer hash join correct |
 | 30 | Subquery parsing + binding | Nested scopes and subquery forms bind |
@@ -1131,7 +1153,7 @@ Execution: 72.0ms
 
 - No write path — `INSERT`, `UPDATE`, `DELETE` are not supported
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
-- Multi-way and multi-key joins parse, bind and produce a logical join tree (Week 26); executing them is Week 27, until which they refuse with `... not yet executable`
+- Joins of three or more relations execute on the columnar/vectorized path only; row and columnar Volcano refuse them with `multi-way joins are not supported on the Volcano path; use --execution vectorized`. Multi-key and residual-`ON` joins execute on every path (Week 27)
 - No subqueries or correlated expressions
 - `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
 - Commas inside string values not supported in CSV input
