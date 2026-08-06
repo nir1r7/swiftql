@@ -38,40 +38,6 @@ void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int
     }
 }
 
-// Week 26/27 boundary: the logical layer now builds arbitrary join trees, but
-// this builder still lowers exactly one single-key equi-join. Refuse loudly
-// rather than lower a shape VecHashJoinNode cannot express — the Phase 1
-// stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
-// Counts over the WHOLE tree: after pushdown a join's child is a FILTER over a
-// JOIN, so a type check one level down would miss it.
-// Join count first, key count second — the same order Planner::plan uses. A
-// query that is both multi-way and multi-key must report the same reason in
-// every mode; interleaving the two checks in one preorder walk made the vec
-// path answer "multi-key" where Volcano answered "multi-way".
-void countJoins(const LogicalPlanNode* node, int& joins_seen) {
-    if (node->type == LogicalNodeType::JOIN) ++joins_seen;
-    for (const auto& child : node->children) countJoins(child.get(), joins_seen);
-}
-
-void checkKeyCounts(const LogicalPlanNode* node) {
-    if (node->type == LogicalNodeType::JOIN &&
-        static_cast<const LogicalJoin*>(node)->keys.size() != 1) {
-        throw std::runtime_error(
-            "multi-key equi-joins are planned but not yet executable (Week 27)");
-    }
-    for (const auto& child : node->children) checkKeyCounts(child.get());
-}
-
-void checkLowerable(const LogicalPlanNode* root) {
-    int joins_seen = 0;
-    countJoins(root, joins_seen);
-    if (joins_seen > 1) {
-        throw std::runtime_error(
-            "multi-way joins are planned but not yet executable (Week 27)");
-    }
-    checkKeyCounts(root);
-}
-
 // walk down children[0] to the leaf scan's table name — used to read row
 // counts for the build-side decision before lowering moves the tables
 const std::string& leafScanTable(const LogicalPlanNode* node) {
@@ -81,12 +47,79 @@ const std::string& leafScanTable(const LogicalPlanNode* node) {
     return static_cast<const LogicalScan*>(node)->table_name;
 }
 
+// True when this join input is exactly one relation: a scan, possibly under
+// filters. From three relations on, children[0] can be a whole join subtree
+// whose merged schema spans several tables — and then neither leafScanTable()
+// nor any single TableStats describes it.
+bool isSingleRelation(const LogicalPlanNode* node) {
+    while (node->type != LogicalNodeType::SCAN) {
+        if (node->type == LogicalNodeType::JOIN) return false;
+        node = node->children[0].get();
+    }
+    return true;
+}
+
+// Resolve the LEFT input's key columns to physical column indices.
+//
+// A merged left schema can hold `team` at slot 0 AND slot 1 (laps.team,
+// drivers.team), so a bare-name lookup here is a coin flip that returns
+// plausible rows rather than an error. JoinKey::from_slot carries the binder
+// slot of the left operand for exactly this, and honouring it only when it
+// happens to hit would make the disambiguation advisory — so a miss throws
+// instead of falling back to the bare-name overload, which is the bug this
+// guards against.
+std::vector<int> leftKeyIndices(const Schema& left_schema, const std::vector<JoinKey>& keys) {
+    std::vector<int> idx;
+    idx.reserve(keys.size());
+    for (const JoinKey& k : keys) {
+        // slot -1 = an unbound key from a validator-only caller, which has no
+        // relation identity to be exact about; that path's documented fallback
+        // is bare-name, and it is NOT a fallback for a miss on a bound key.
+        int i = (k.from_slot >= 0) ? left_schema.indexOf(k.from_col, k.from_slot)
+                                   : left_schema.indexOf(k.from_col);
+        if (i < 0) {
+            throw std::runtime_error(
+                "join key '" + k.from_col + "' (relation slot "
+                + std::to_string(k.from_slot) + ") not found on the left join input");
+        }
+        idx.push_back(i);
+    }
+    return idx;
+}
+
+// Resolve the RIGHT input's key columns. children[1] is always exactly one
+// relation (left-deep; Week 28's DP keeps that shape), and a standalone scan's
+// schema stamps every column slot 0 — the join_slot stamp lives only on the
+// MERGED schema — so the bare-name overload is both unambiguous and the only
+// one that resolves here.
+std::vector<int> rightKeyIndices(const Schema& right_schema, const std::vector<JoinKey>& keys) {
+    std::vector<int> idx;
+    idx.reserve(keys.size());
+    for (const JoinKey& k : keys) {
+        int i = right_schema.indexOf(k.join_col);
+        if (i < 0) {
+            throw std::runtime_error(
+                "join key '" + k.join_col + "' not found on the joined relation");
+        }
+        idx.push_back(i);
+    }
+    return idx;
+}
+
 // estimated bytes per row on one join input, for the hash-table memory cost.
 // Sums the real per-column avg_width (Week 19 stats) over the input's output
 // columns; a filter-over-scan child shares its scan's schema, all from one
 // table. Falls back to 8 bytes/column when stats are absent (e.g. unit tests
 // that don't seed them) — the same proxy the pre-Gap-3 code always used.
 double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
+    // Multi-relation input (Week 27): no single TableStats describes it, and
+    // looking its columns up in relation 0's stats would attribute one table's
+    // widths to another table's columns wherever a name is shared (laps.team /
+    // drivers.team) — wrong in a plausible direction, the hardest kind to
+    // notice. Fall back to the documented uniform proxy instead of guessing. A
+    // real per-relation width sum belongs with Week 28's join enumeration, where
+    // differing intermediate widths first change a plan choice.
+    if (!isSingleRelation(child)) return child->output_schema.size() * 8.0;
     const std::string& table = leafScanTable(child);
     if (!catalog.hasStats(table)) return child->output_schema.size() * 8.0;
     const TableStats& ts = catalog.getStats(table);
@@ -123,10 +156,15 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         case LogicalNodeType::JOIN: {
             auto* join = static_cast<LogicalJoin*>(node);
 
-            // Exactly one key, and exactly one join in the tree: build()'s
-            // checkLowerable pre-pass refuses anything else until Week 27.
-            const std::string& from_col = join->keys[0].from_col;
-            const std::string& join_col = join->keys[0].join_col;
+            // Week 27: arbitrary key counts, and children[0] may itself be a
+            // JOIN — the recursion below handles a left-deep tree of any depth
+            // with no extra machinery. Resolve both sides' key columns to
+            // physical indices ONCE, here, where the binder slots are still in
+            // scope; the operators then index without ever resolving a name.
+            const Schema& from_schema = join->children[0]->output_schema;
+            const Schema& jn_schema   = join->children[1]->output_schema;
+            std::vector<int> left_idx  = leftKeyIndices(from_schema, join->keys);
+            std::vector<int> right_idx = rightKeyIndices(jn_schema, join->keys);
 
             // Week 22: choose the build side from filtered cardinality estimates.
             // Post-pushdown, a child may be a LogicalFilter, so its estimated_rows
@@ -169,11 +207,16 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // DOUBLE bitwise equality is a trap) and gated on estimate_driven
             // so --no-optimize keeps the pre-Week-22 hash-only lowering as the
             // unchanged baseline.
-            const Schema& from_schema = join->children[0]->output_schema;
-            const Schema& jn_schema   = join->children[1]->output_schema;
+            //
+            // Week 27 adds a third eligibility term: SIMD holds build keys in
+            // ONE flat int64 buffer, which a composite key cannot occupy.
+            // Decline multi-key rather than invent an encoding — an ineligible
+            // algorithm is simply not costed, and the hash join is always
+            // correct.
             bool int_keys =
-                from_schema.column(from_schema.indexOf(from_col)).type == TypeId::INT &&
-                jn_schema.column(jn_schema.indexOf(join_col)).type == TypeId::INT;
+                join->keys.size() == 1 &&
+                from_schema.column(left_idx[0]).type == TypeId::INT &&
+                jn_schema.column(right_idx[0]).type == TypeId::INT;
 
             double cost_hash_from = hashJoinCost(from_est, from_w, join_est);
             double cost_hash_join = hashJoinCost(join_est, join_w, from_est);
@@ -200,9 +243,14 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                                             : (from_builds ? cost_hash_from : cost_hash_join);
                 double side_alt  = use_simd ? (from_builds ? cost_simd_join : cost_simd_from)
                                             : (from_builds ? cost_hash_join : cost_hash_from);
+                // Naming relation 0 for a whole join subtree would claim a build
+                // side that is not the one chosen, so a multi-relation input
+                // reports what it is instead of a table it only starts with.
+                const LogicalPlanNode* build_side = join->children[from_builds ? 0 : 1].get();
                 std::ostringstream d;
                 d << std::fixed << std::setprecision(0)
-                  << "build=" << leafScanTable(join->children[from_builds ? 0 : 1].get())
+                  << "build=" << (isSingleRelation(build_side)
+                                      ? leafScanTable(build_side) : "join-subtree")
                   << " cost=" << side_cost << " (alt=" << side_alt << ")";
                 if (int_keys) {
                     d << " algo=" << (use_simd ? "simd" : "hash")
@@ -215,15 +263,19 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // output schema stays in fixed logical order [FROM, JOIN] regardless
             // of which side physically builds; swapped tells the join to reorder
             // columns when assembling output.
+            // The key index vectors swap with the children: passing left_idx as
+            // the probe side while passing join_child as the probe child pairs
+            // a.x with b.y — a silent wrong answer, not a crash, since the two
+            // vectors are usually the same length.
             if (use_simd) {
                 std::unique_ptr<VecSimdLoopJoinNode> join_node = from_builds
                     // FROM builds: JOIN side probes (swapped)
                     ? std::make_unique<VecSimdLoopJoinNode>(
                           std::move(join_child), std::move(from_child),
-                          join_col, from_col, join->output_schema, /*swapped=*/true)
+                          right_idx[0], left_idx[0], join->output_schema, /*swapped=*/true)
                     : std::make_unique<VecSimdLoopJoinNode>(
                           std::move(from_child), std::move(join_child),
-                          from_col, join_col, join->output_schema, /*swapped=*/false);
+                          left_idx[0], right_idx[0], join->output_schema, /*swapped=*/false);
                 join_node->setCostDecision(std::move(decision));
                 return join_node;
             }
@@ -231,10 +283,10 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 // FROM builds: JOIN side probes (swapped)
                 ? std::make_unique<VecHashJoinNode>(
                       std::move(join_child), std::move(from_child),
-                      join_col, from_col, join->output_schema, /*swapped=*/true)
+                      right_idx, left_idx, join->output_schema, /*swapped=*/true)
                 : std::make_unique<VecHashJoinNode>(
                       std::move(from_child), std::move(join_child),
-                      from_col, join_col, join->output_schema, /*swapped=*/false);
+                      left_idx, right_idx, join->output_schema, /*swapped=*/false);
             join_node->setCostDecision(std::move(decision));
             return join_node;
         }
@@ -295,8 +347,6 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
         std::unordered_map<std::string, ColumnarTable> columnar_tables,
         const Catalog& catalog) {
-    checkLowerable(logical.get());
-
     Lowering lowering{columnar_tables, {}, catalog};
     countScans(logical.get(), lowering.scan_uses);
     return lowering.lower(logical.get(), nullptr);

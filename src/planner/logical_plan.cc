@@ -576,6 +576,11 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         stmt.from_table,
         buildScanSchema(stmt, catalog.getTable(stmt.from_table).schema));
 
+    // ON conjuncts that are not equi-join keys, cloned out of the statement's
+    // join trees (which die with `stmt` at the end of this function) and folded
+    // into the WHERE conjunction below.
+    std::vector<std::unique_ptr<Expr>> on_residuals;
+
     // joins, folded left-deep in written order: joins[i] attaches relation i+1
     for (size_t i = 0; i < stmt.joins.size(); ++i) {
         const auto& jc = stmt.joins[i];
@@ -587,8 +592,11 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
             buildScanSchema(stmt, join_meta.schema));
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
-        // way to disambiguate a self-join's occurrences of the same table
-        std::vector<JoinKey> keys = classifyJoinCondition(jc.condition.get(), join_slot);
+        // way to disambiguate a self-join's occurrences of the same table —
+        // and hands back every non-key conjunct as a residual (Week 27).
+        JoinCondition on = classifyJoinCondition(jc.condition.get(), join_slot);
+        std::vector<JoinKey> keys = std::move(on.keys);
+        for (const Expr* r : on.residuals) on_residuals.push_back(cloneExpr(r));
 
         // Output schema order is always [relation 0 columns, relation 1, ...] —
         // fixed logical order. The left child already carries slots
@@ -605,6 +613,18 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // no build/probe swap decision here — that's a physical concern
         // (Week 18/22), not part of the logical plan.
         node = std::make_unique<LogicalJoin>(std::move(node), std::move(join_scan), std::move(keys), join_slot, Schema(merged_cols));
+    }
+
+    // Residual ON conjuncts join the WHERE conjunction rather than getting their
+    // own LogicalFilter. For an inner join that is semantics-preserving
+    // (R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)), and it is not merely tidier: PredicatePushdown
+    // only rewrites a FILTER whose DIRECT child is a JOIN, so a second stacked
+    // filter would leave the WHERE unpushed and silently cost every joined query
+    // its pushdown. One filter, one push, every conjunct routed by soleSlot().
+    // The conjunction is type-checked and pushed exactly like a written WHERE.
+    if (!on_residuals.empty()) {
+        if (stmt.where) on_residuals.push_back(std::move(stmt.where));
+        stmt.where = conjoinAll(std::move(on_residuals));
     }
 
     // filter (WHERE)

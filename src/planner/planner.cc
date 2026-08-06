@@ -6,14 +6,21 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // validate
     Validator::validate(stmt, catalog);
 
-    // Week 26/27 boundary: the parser, binder and logical layer now handle
-    // arbitrary join counts and multi-key equi-joins, but HashJoinNode still
-    // executes exactly one single-key equi-join. Refuse loudly rather than run a
-    // shape this operator cannot express — the Phase 1 stubbed-hash-join stance:
-    // a clean "not yet implemented" beats a wrong answer.
+    // Volcano builds exactly ONE join and is not planned to gain more: it is the
+    // correctness baseline, not the feature-complete path. Multi-way execution
+    // is deliberately vectorized-only from Week 27 on, so name the path rather
+    // than describing a temporary limitation. Deleting this and letting the
+    // single HashJoinNode below run would build one join out of N clauses and
+    // silently drop a relation — the wrong answer every refusal here prevents.
+    //
+    // This refusal cannot be deferred past the plan-time type checks the way the
+    // multi-key one was (Week 26): this function builds one join, so with three
+    // relations the merged schema is missing a relation's columns entirely and a
+    // deferred check would report a misleading "column not found".
     if (stmt.joins.size() > 1) {
         throw std::runtime_error(
-            "multi-way joins are planned but not yet executable (Week 27)");
+            "multi-way joins are not supported on the Volcano path; "
+            "use --execution vectorized");
     }
 
     // expression GROUP BY keys: rewrite post-aggregate references, mirroring
@@ -45,7 +52,6 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     }
 
     // build seqScan (bottom of tree) using narrowed schema
-    bool multi_key_join = false;
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
         node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, stmt.where.get());
@@ -82,25 +88,17 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
         // way to disambiguate a self-join's two occurrences of the same table
-        std::vector<JoinKey> keys = classifyJoinCondition(join_clause.condition.get(), 1);
+        JoinCondition on = classifyJoinCondition(join_clause.condition.get(), 1);
 
-        // Multi-key refusal is DEFERRED to after the plan-time type checks
-        // below. The merged schema is built from the two children's schemas and
-        // never reads `keys`, so those checks are valid for a multi-key query —
-        // and running them first reports a genuine query defect ahead of a
-        // temporary engine limitation, which is also what the vectorized path
-        // does (it type-checks the whole logical plan before checkLowerable
-        // refuses). The join node built from keys[0] is never opened, never
-        // returned, and freed when the throw unwinds.
-        //
-        // The multi-way guard at the top of this function cannot be deferred
-        // the same way: this function builds ONE join, so with three relations
-        // the merged schema would be missing a relation's columns entirely and
-        // the type checks would report a misleading "column not found".
-        multi_key_join = keys.size() != 1;
-
-        std::string from_col = keys[0].from_col;
-        std::string join_col = keys[0].join_col;
+        // Both children are single-relation scans here (one join), so their
+        // schemas cannot repeat a column name and the join node resolves keys by
+        // bare name. The vectorized builder cannot: its left input may be a
+        // merged join schema, so it resolves by slot (see leftKeyIndices).
+        std::vector<std::string> from_cols, join_cols;
+        for (const JoinKey& k : on.keys) {
+            from_cols.push_back(k.from_col);
+            join_cols.push_back(k.join_col);
+        }
 
         // put the smaller table on the build side (right_) to minimise hash table memory.
         // Output schema order is always [FROM columns, JOIN columns] — fixed
@@ -116,9 +114,21 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
         bool swap = from_row_count < join_row_count;
         if (swap) {
-            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_col, from_col, merged_schema, /*swapped=*/true);
+            node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_cols, from_cols, merged_schema, /*swapped=*/true);
         } else {
-            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_col, join_col, merged_schema, /*swapped=*/false);
+            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_cols, join_cols, merged_schema, /*swapped=*/false);
+        }
+
+        // Residual ON conjuncts join the WHERE conjunction — inner join, so ON
+        // and WHERE are interchangeable (see logical_plan.cc for the same fold).
+        // conjoinAll MOVES the old predicate, so the raw Expr* handed to the FROM
+        // SeqScanNode above as its zone-map pruning hint still points at the same
+        // live subtree; rebuilding it by cloning would dangle that pointer.
+        if (!on.residuals.empty()) {
+            std::vector<std::unique_ptr<Expr>> parts;
+            for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
+            if (stmt.where) parts.push_back(std::move(stmt.where));
+            stmt.where = conjoinAll(std::move(parts));
         }
     }
 
@@ -188,18 +198,6 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // limit
     if (stmt.limit.has_value()) {
         node = std::make_unique<LimitNode>(std::move(node), stmt.limit.value());
-    }
-
-    // Week 26/27 boundary, deferred from the join block (see the comment there)
-    // so that EVERY plan-time type check runs first — including the projection's,
-    // which buildProjectSchema performs above via inferExprType. Refusing last is
-    // what makes this equivalent to the vectorized path, where checkLowerable
-    // runs after the whole logical plan is built; refusing anywhere earlier means
-    // a fault in whatever clause is checked after it reports the temporary engine
-    // limitation on Volcano and the real defect on the vec path.
-    if (multi_key_join) {
-        throw std::runtime_error(
-            "multi-key equi-joins are planned but not yet executable (Week 27)");
     }
 
     return node;
