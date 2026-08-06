@@ -33,13 +33,21 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         // Two relations sharing a ref name are unresolvable — every qualified
         // reference is ambiguous. Compare against EVERY prior entry, not just
         // the previous one: with three relations the clash can be between
-        // entries 0 and 2, which never form the [0]/[1] pair. Distinguish the
-        // aliasless self-join (needs aliases, matching SQLite) from a
-        // duplicated alias across tables.
+        // entries 0 and 2, which never form the [0]/[1] pair.
+        //
+        // Which diagnostic to give turns on whether aliases were supplied (an
+        // entry is aliased when its ref name differs from its table name), not
+        // on table-name equality: "add aliases" is only right advice when
+        // neither side has one. Choosing on the table name told a user who had
+        // written `FROM sj a JOIN sj b ... JOIN sj a` — every relation aliased,
+        // the fault being that `a` is used twice — to add what they already had.
         const RangeEntry& added = range_table.back();
         for (size_t prior = 0; prior + 1 < range_table.size(); ++prior) {
-            if (range_table[prior].ref_name != added.ref_name) continue;
-            if (range_table[prior].table_name == added.table_name) {
+            const RangeEntry& earlier = range_table[prior];
+            if (earlier.ref_name != added.ref_name) continue;
+            bool neither_aliased = earlier.ref_name == earlier.table_name
+                                && added.ref_name == added.table_name;
+            if (earlier.table_name == added.table_name && neither_aliased) {
                 throw std::runtime_error(
                     "self-join requires table aliases to disambiguate the two references to '"
                     + added.table_name + "'");
@@ -171,7 +179,7 @@ void Binder::resolveColumnRef(ColumnRef* col, const std::vector<RangeEntry>& ran
                 // output names are built from it, and self-join occurrences
                 // are only distinguishable by their aliases. Routing uses the
                 // slot, never the qualifier text.
-                col->relation_slot = slot;        // 0 = FROM, 1 = JOIN
+                col->relation_slot = slot;        // range-table position
                 return;
             }
         }
