@@ -253,7 +253,8 @@ The `Execution` line from `--explain-analyze` is the number to watch when optimi
 ```sql
 SELECT [DISTINCT] expr [AS alias], AGG(expr), ...
 FROM table
-[JOIN other_table ON table.col = other_table.col]   -- Phase 2
+[JOIN other_table ON key = key [AND key = key ...]]* -- Phase 2; multi-way +
+                                                     -- multi-key: Week 26
 [WHERE expr [AND expr ...]]
 [GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
@@ -265,6 +266,13 @@ Aggregate functions: `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, `MIN(e
 
 Predicates: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`,
 and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
+
+> **Week 26 join scope.** Several `JOIN ... ON` clauses and `AND`-chained
+> equi-join keys parse, bind and build a logical join tree; **executing** them is
+> Week 27, so both refuse with `... are planned but not yet executable (Week 27)`
+> rather than returning rows. An `ON` clause is still restricted to equalities
+> between one column of the joined relation and one of a preceding relation —
+> non-equality conjuncts become post-join residuals in Week 27.
 
 Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
 literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
@@ -476,7 +484,7 @@ Ordered by how hard the failure is to find:
 | 15 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
 | 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
 | 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
-| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Dormant until Week 26.** Dispatches on `ColumnRef`/`BinaryExpr` only, so a new subtype inside an `ON` clause gets no column-existence check. Unreachable today because `classifyJoinCondition` runs first and rejects anything that is not a single `=` between two `ColumnRef`s. Week 26 lifts exactly that restriction (multi-key equi-joins) and Week 27 routes non-equality `ON` conjuncts as residuals — **extend this function in the same commit that relaxes `classifyJoinCondition`**, or `ON a.x = b.x AND a.team LIKE 'F%'` validates nothing |
+| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype (aggregates throw; an unqualified name matching no relation is the case that actually reaches it today, since `classifyJoinCondition`'s unbound-positional branch lets it past). The Week 25 shapes are still refused on shape before they get here, so those branches stay dormant until Week 27 routes non-equality `ON` conjuncts as residuals — that is when `ON a.x = b.x AND a.team LIKE 'F%'` becomes legal and this function becomes its only column check |
 
 `ChunkPruner::shouldSkip` is not on the list: `collectSimplePredicates` returns
 immediately on anything that is not a `BinaryExpr`, so a new node contributes no

@@ -703,11 +703,22 @@ statement, not once per conjunct.
 ```cpp
 TEST(JoinOnValidation, UnknownColumnInsideMultiKeyConditionRejected) {
     Catalog cat(CATALOG);
+    // UNqualified: a qualified `a.nope` is caught earlier, by the Binder, so it
+    // proves nothing about site 18. An unqualified name matching no relation is
+    // left unresolved (slot -1), slips past classifyJoinCondition's
+    // unbound-positional branch, and reaches validateJoinCondition — which is
+    // the only thing standing between it and execution.
     std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.nope = b.grp", cat);
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND nope = b.grp", cat);
     EXPECT_NE(err.find("nope"), std::string::npos) << err;   // assert on the message,
 }                                                            // not just that it threw
 ```
+
+Pin the other half too: a *qualified* bad column in the same chain is the
+Binder's error, and the Week 25 shapes are still refused on shape by
+`classifyJoinCondition` — so site 18's new branches are present but dormant
+until Week 27. Say that in the tests rather than implying coverage that is not
+there.
 
 The "assert on the message" rule is not decoration — `development.md` cites
 `Validation.UngroupedColumnInsideWeek25NodesIsRejected` as a test that passes for
@@ -1187,9 +1198,21 @@ in Week 25 was about.
 | `development.md` | Site 18 row: drop "**Dormant until Week 26**", state that Week 26 extended it and Week 27 will exercise it with residual `ON` conjuncts. Update the "Supported SQL" block: `[JOIN other_table ON ...]` → repeatable, with `AND`-chained equality keys |
 | `README.md` | Week 26 checkpoint ✅ plus a short "shipped / why it was required" note in the Week 24–25 house style: `join` → `joins`, `classify()` returning a slot, site 18. Grammar block: `[JOIN table_ref ON expr]` → `(JOIN table_ref ON expr)*`. Limitations: "Single join only — multi-way joins not supported" → multi-way joins parse, bind and plan; execution is Week 27 |
 
-**Do not** add multi-way join queries to `compare_against_sqlite.py` this week —
-they cannot execute, so they would fail the harness. That is Week 27's step 5 in
-the recommended order ("land the feature, then add queries").
+**Do not** add multi-way join queries to the row-diffing suites in
+`compare_against_sqlite.py` this week — they cannot execute, so there is nothing
+to diff. That is Week 27's step 5 in the recommended order ("land the feature,
+then add queries").
+
+What *does* belong in the oracle now is the other half of the contract: a
+`WEEK26_REJECTED_QUERIES` block plus a `run_rejection_suite`, run in the same
+four modes, asserting each unsupported shape fails **with its own message**.
+SQLite is not the oracle there — it accepts all of them; the property under test
+is SwiftQL's own "clean error, never a wrong answer". It is strictly additive:
+no existing comparison is relaxed, and matching the message is what stops an
+unrelated failure from passing. Cover both refusal sites (Volcano and
+vectorized), both shape rejections (`non-equality`, `AND-chain`), the forward
+reference, both duplicate-name diagnostics, and the now-more-likely ambiguous
+unqualified column.
 
 ### Verification — the gate for the whole week
 

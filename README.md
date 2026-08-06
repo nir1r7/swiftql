@@ -56,7 +56,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`
 - `DISTINCT` — eliminates duplicate rows from output
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
-- `JOIN ... ON` — hash join execution over columnar storage (Phase 2+)
+- `JOIN ... ON` — hash join execution over columnar storage (Phase 2+). Several `JOIN` clauses and `AND`-chained equi-join keys (`ON a.x = b.x AND a.y = b.y`) parse, bind and plan as of Week 26; executing them is Week 27
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — `COUNT` returns `INT`, `SUM`/`AVG` return `DOUBLE`, and `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a `STRING`)
 - General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
 - Predicates and scalar functions (Week 25) — `[NOT] BETWEEN`, `[NOT] LIKE` (ASCII case-insensitive, matching SQLite), `[NOT] IN` over a constant list, searched `CASE`, `SUBSTRING`, ISO-8601 date literals (`date '1998-12-01'`, stored as `STRING`), and constant-folded interval arithmetic (`date '1994-01-01' + interval '1' year`)
@@ -205,7 +205,7 @@ Takes a raw SQL string and produces a structured Abstract Syntax Tree (AST). Han
 
 ```
 select_stmt  → SELECT [DISTINCT] select_list FROM table_ref
-               [JOIN table_ref ON expr]
+               (JOIN table_ref ON join_cond)*   ← Week 26: repeatable
                [WHERE expr]
                [GROUP BY group_list]
                [HAVING expr]
@@ -213,6 +213,10 @@ select_stmt  → SELECT [DISTINCT] select_list FROM table_ref
                [LIMIT INT_LITERAL]
 
 table_ref    → IDENT [[AS] IDENT]              ← table alias, required for a self-join
+join_cond    → equality (AND equality)*        ← Week 26: multi-key equi-join;
+                                                 each equality compares a column of
+                                                 the joined relation with one of a
+                                                 preceding relation
 select_list  → select_item (COMMA select_item)*
 select_item  → expr [AS IDENT]                 ← expression alias (Week 24)
 group_list   → expr (COMMA expr)*              ← expression group keys (Week 24)
@@ -769,7 +773,22 @@ Three further things the original two bullets did not anticipate:
   cross-relation equality, enforced by `classifyJoinCondition`): support
   multi-key equi-joins (`ON a.x = b.x AND a.y = b.y`) — required for TPC-H Q9
 
-**Checkpoint:** Multi-table queries produce a qualified logical join tree.
+**Checkpoint:** Multi-table queries produce a qualified logical join tree. ✅
+
+Executing those trees is Week 27: a multi-way or multi-key join binds, validates
+and builds a logical plan, then refuses at physical lowering with
+`... are planned but not yet executable (Week 27)` — the same stance as Phase 1's
+stubbed hash join, and the reason `compare_against_sqlite.py` grew a rejection
+suite (nothing new this week returns rows to diff).
+
+Four things the two bullets did not anticipate:
+
+| Shipped | Why it was required |
+|---|---|
+| **`SelectStatement::join` → `joins`, an ordered vector** | `std::optional` is the type-level encoding of "at most one join", and 14 sites in `src/` branched on it. Making it a vector turns every one into a compile error rather than a place a second relation is silently dropped. The index *is* the arithmetic the rest of the week rests on: `joins[i]` is relation slot `i+1` |
+| **`classify()` returns a slot, not a side** (`predicate_pushdown.cc`) | It collapsed "not slot 0" into `PushTarget::JOIN`, and `pushIntoJoin` attached those conjuncts to `join->children[1]`. Correct with two relations; with three, `children[1]` is one specific scan, so a conjunct was filtered **against the wrong table** — a wrong answer, not lost pushdown. Pushdown now walks the left-deep spine and routes each conjunct to the subtree owning its relation |
+| **Dispatch site 18 extended in the same commit** (`Validator::validateJoinCondition`) | Relaxing `classifyJoinCondition` is what made it reachable: an `AND`-chain used to be rejected before it ran. It now dispatches every `Expr` subtype. The case that actually reaches it is an unqualified name matching no relation, which the Binder leaves unresolved and the classifier's unbound branch lets past |
+| **Slot stamping generalized, in two places that must agree** | The merged join schema stamps the newly added side with the join's relation slot (was a hardcoded `1`), and `CardinalityEstimator`'s JOIN case does the same to its stats context. A standalone scan still stamps slot 0 locally, which is what keeps `restampSlots(…, 0)` and `ChunkPruner`'s `relation_slot < 1` scan-local test correct at any relation count |
 
 > **Starting notes, from Week 25's foundations.**
 > - **Relaxing `classifyJoinCondition` makes `Validator::validateJoinCondition`
@@ -917,7 +936,7 @@ Three further things the original two bullets did not anticipate:
 | 23.5 | SIMD small-build loop join (extension) | Optimizer picks hash vs SIMD-loop, crossover measured |
 | 24 | General expressions | Arithmetic and aliased expressions execute; NULL modelled natively, expressions compiled per chunk, constants folded |
 | 25 | Predicates + scalar functions | `BETWEEN`/`LIKE`/`IN`/`CASE`/`SUBSTRING`, ISO dates, folded intervals; dispatch checklist corrected to 17 sites |
-| 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly |
+| 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly; pushdown routes by relation slot ✅ |
 | 27 | Multi-way join execution | General vectorized join trees execute |
 | 28 | Join enumeration | DP join ordering with greedy fallback works |
 | 29 | Outer join | Left outer hash join correct |
@@ -1055,7 +1074,7 @@ Execution: 72.0ms
 
 - No write path — `INSERT`, `UPDATE`, `DELETE` are not supported
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
-- Single join only — multi-way joins not supported
+- Multi-way and multi-key joins parse, bind and produce a logical join tree (Week 26); executing them is Week 27, until which they refuse with `... not yet executable`
 - No subqueries or correlated expressions
 - `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
 - Commas inside string values not supported in CSV input
