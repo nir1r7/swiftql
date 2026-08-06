@@ -56,6 +56,60 @@ Keep it under 25 lines. It is a resume point, not a log.
 
 ---
 
+## Subagent check-ins
+
+A subagent can burn an hour circling a triviality and you would never know — its only report
+comes at the end, and by then the time is spent. Check in on any agent that has been running
+**longer than 10 minutes**, and every ~10 minutes after that.
+
+**Never read the agent's transcript file to do this.** It is full JSONL and reading it
+overflows exactly the context this skill exists to protect. The check is cheap probes only:
+
+```bash
+git status --short | wc -l                                    # is the diff growing?
+find src tests python_tools docs -type f -newermt '-5 minutes' | wc -l   # still writing?
+git diff --stat | tail -1                                     # net churn
+```
+
+Read those three numbers against how long the agent has been out:
+
+| Signal | Reading | Action |
+|---|---|---|
+| Files still being written, diff growing | Working normally | Leave it alone |
+| No writes in 5+ min, agent still live | Stuck, or thinking hard | Wait one more cycle, then ask |
+| Diff churning but not growing (same files rewritten) | Circling on a decision | `SendMessage`: ask what it is deciding |
+| Diff far wider than the week's scope | Scope creep | `SendMessage`: name the checkpoint, tell it to stop |
+| Verifier out >12 min | A gate is ~5 min; something hung | Ask; `TaskStop` and relaunch if no answer |
+| Auditor out >25 min | Over-reporting minors | `SendMessage`: blockers and real logic issues only |
+
+When you do interrupt, `SendMessage` the agent — do not kill it. It keeps its context, and a
+one-line redirect ("you are 40 minutes in on a checkpoint that needs three-table joins to
+execute; what is unresolved?") recovers a circling agent far more cheaply than restarting.
+Reserve `TaskStop` for an agent that has stopped responding or is provably off-task.
+
+Log nothing about check-ins in state unless one changed what an agent was doing. A quiet
+check-in is not an event.
+
+---
+
+## Pacing
+
+Steps are serial by dependency, so the week's wall-clock is the sum of its steps. Two things
+keep that honest:
+
+- **Run the gate and the audit concurrently** once the previous gate was GREEN. Neither
+  modifies source — the gate writes `build/` and `scratchpad/gates/`, the auditor writes
+  `scratchpad/audits/` — so they observe the same tree. Reword the audit prompt: it can no
+  longer claim the tree already passed, but it must still be told not to run the test suite as
+  a substitute for reading. **After a RED gate, go back to serial** until a gate is green
+  again; a concurrent audit of a broken tree spends its pass on symptoms, and its findings
+  describe pre-fix code.
+- **Do not buy a gate cycle for a lone minor.** If the only findings left are minors, carry
+  them into the next week's "Starting notes" rather than running another fix+gate round. A
+  blocker or major always earns its round.
+
+---
+
 ## Per-week cycle
 
 ### Before the week
