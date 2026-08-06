@@ -775,11 +775,23 @@ Three further things the original two bullets did not anticipate:
 
 **Checkpoint:** Multi-table queries produce a qualified logical join tree. ✅
 
-Executing those trees is Week 27: a multi-way or multi-key join binds, validates
-and builds a logical plan, then refuses at physical lowering with
-`... are planned but not yet executable (Week 27)` — the same stance as Phase 1's
-stubbed hash join, and the reason `compare_against_sqlite.py` grew a rejection
-suite (nothing new this week returns rows to diff).
+Executing those trees is Week 27. A multi-way or multi-key join binds, validates
+and — on the vectorized path — builds a full logical plan, then refuses at
+physical lowering with `... are planned but not yet executable (Week 27)`; the
+same stance as Phase 1's stubbed hash join, and the reason
+`compare_against_sqlite.py` grew a rejection suite (nothing new this week
+returns rows to diff).
+
+The Volcano path refuses *earlier*, right after validation, because it has no
+logical layer: `Planner::plan` builds physical operators directly, and
+`HashJoinNode` holds one key pair and two inputs, so it can neither represent
+the join nor reach the plan-time type checks that come after it. A query with a
+second, independent fault therefore reports the type error on the vectorized
+path and the refusal on Volcano. Both messages are true and neither engine
+accepts what the other rejects; closing the gap would mean giving Volcano
+multi-way planning it is never going to execute, so the divergence is left in
+place and resolves in Week 27 into an ordinary capability difference between the
+two engines.
 
 Four things the two bullets did not anticipate:
 
@@ -839,8 +851,13 @@ Four things the two bullets did not anticipate:
 >   `checkLowerable` in `vectorized_plan_builder.cc` (join count, then key count
 >   — that order is load-bearing, so both engines report the same reason) and the
 >   `stmt.joins.size() > 1` / `keys.size() != 1` pair in `Planner::plan`. Volcano
->   has no multi-way execution planned: keep its refusal and narrow the message,
->   rather than deleting it and letting `HashJoinNode` produce something.
+>   has no multi-way execution planned: keep its refusal and narrow the message
+>   to name the path (`... not supported on the Volcano path; use --execution
+>   vectorized`), rather than deleting it and letting `HashJoinNode` produce
+>   something. That rewording is also what closes the one diagnostic asymmetry
+>   Week 26 leaves behind — a doubly-faulted query reports the type error on the
+>   vec path and the refusal on Volcano, because Volcano refuses before the
+>   plan-time type checks it structurally cannot reach.
 > - **De-duplicate join keys before building the hash-key tuple.**
 >   `ON a.x = b.x AND a.x = b.x` yields two identical `JoinKey`s today. Harmless
 >   while multi-key refuses, and semantically harmless as a predicate, but it

@@ -1305,6 +1305,13 @@ test per conjunct, and write the operand-swapped form of every asymmetric rule.
 `JoinOnValidation.KeysNormalizeOperandOrder` existed *because* operand order is
 not trusted — and the forward-reference test was still written one way only.
 
+Round 2 found two more. One was fixed; one was considered and deliberately left.
+
+| Finding | Outcome |
+|---|---|
+| The join estimator's new slot-keyed left lookup went through `StatsContext::find`, whose bare-name fallback returns *some other relation's* column when the slot misses — and it misses whenever the key's own relation has no `TableStats`, because a stats-less scan contributes no entries | **Fixed.** `from_slot` was introduced this week exactly to disambiguate a merged context that can hold one name at several slots; honouring it only when it happens to hit makes it advisory. The JOIN case now uses a slot-exact `findExact`, so a miss means "no statistic" — which `have_ndv` already models. `find`'s fallback stays for unbound refs and hand-built contexts, which have no relation identity to be exact about |
+| A query that is *both* unlowerable and otherwise malformed reports the type error on the vec path and the Week-27 refusal on Volcano | **Left in place, deliberately.** Volcano has no logical layer: `Planner::plan` builds physical operators directly, and `HashJoinNode` holds one key pair and two inputs, so a multi-way or multi-key query can neither be represented nor reach the plan-time type checks that follow. Aligning the two would mean giving Volcano multi-way planning it will never execute. Both messages are true, neither engine accepts what the other rejects, and Week 27 turns the divergence into an ordinary capability difference. Documented in the README's Week 26 scope paragraph and folded into the Week 27 note about narrowing Volcano's message |
+
 ### Definition of done
 
 - [ ] A three-relation query parses, binds with slots 0/1/2, and builds a
