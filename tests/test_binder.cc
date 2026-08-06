@@ -628,6 +628,25 @@ TEST(JoinOnValidation, DuplicateKeysCollapseToOne) {
     EXPECT_EQ(keys.size(), 1u);
 }
 
+// The forward-reference check walks every ColumnRef in a conjunct via
+// collectSlots, so collectSlots must reach inside every node an ON conjunct can
+// contain — including an AggregateExpr, whose argument is the only place a
+// column can hide from it. Tested against classifyJoinCondition directly:
+// Validator::validateJoinCondition refuses aggregates in ON one line later, so
+// the full pipeline cannot tell a blind walker from a seeing one.
+TEST(JoinOnValidation, ForwardReferenceInsideAnAggregateIsSeenByTheSlotWalker) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND SUM(c.val) > 1 "
+        "JOIN sj c ON b.grp = c.id", cat);
+    try {
+        classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+        FAIL() << "expected the forward reference to c (slot 2) to be rejected";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("joined later"), std::string::npos) << e.what();
+    }
+}
+
 // A forward reference inside a RESIDUAL has to be caught too: those columns are
 // absent from this join's output schema, so it is not merely un-keyable. Only
 // reachable now that a non-equality conjunct gets that far.

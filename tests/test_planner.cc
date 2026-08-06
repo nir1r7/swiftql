@@ -3,6 +3,7 @@
 #include "planner/planner.h"
 #include "parser/parser.h"
 #include "storage/csv_loader.h"
+#include "storage/csv_to_columnar.h"
 
 
 // ===== validator tests =====
@@ -346,4 +347,35 @@ TEST(PlannerTest, ResidualOnConjunctPlansOnVolcano) {
     ASSERT_NE(join, nullptr);
     EXPECT_EQ(join->explain(), "HashJoin [id = id]");
     EXPECT_NE(findNode(plan.get(), "Filter"), nullptr);
+}
+
+// The FROM SeqScanNode is handed `stmt.where` as its zone-map pruning hint, and
+// residual ON conjuncts are folded into that predicate — so the fold has to
+// happen BEFORE the scan is constructed. Folding afterwards left the hint
+// pointing at the pre-fold tree: the vectorized path pruned on a relation-0
+// residual and this one did not, with identical results and nothing to catch the
+// difference. Asserting the skip counter is the only way to see it.
+TEST(PlannerTest, ResidualOnConjunctReachesTheFromScanAsAPruningHint) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT COUNT(*) FROM laps l JOIN drivers d "
+             "ON l.driver_id = d.driver_id AND l.season = 1999");
+    auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
+
+    std::unordered_map<std::string, ColumnarTable> columnar;
+    for (const std::string& t : {std::string("laps"), std::string("drivers")}) {
+        const auto& m = catalog.getTable(t);
+        columnar.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+    }
+    auto plan = Planner::plan(std::move(stmt), catalog, {}, std::move(columnar));
+
+    plan->open();
+    while (plan->next()) {}
+    plan->close();
+
+    // season 1999 is outside the chunk's min/max, so the whole chunk is skipped
+    const PlanNode* scan = findNode(plan.get(), "SeqScan [laps");
+    ASSERT_NE(scan, nullptr) << "expected the FROM scan to be reachable";
+    EXPECT_NE(scan->explain().find("chunks_skipped=1/1"), std::string::npos)
+        << scan->explain();
 }

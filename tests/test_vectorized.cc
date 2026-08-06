@@ -2427,6 +2427,56 @@ TEST(VecHashJoin, MultiKeyStringTupleBoundariesDoNotCollide) {
     EXPECT_TRUE(drainRows(*join).empty());
 }
 
+// Same hazard on the vectorized side: a STRING key can contain the sentinel,
+// because nothing between the CSV cell and the hash key escapes or rejects it.
+TEST(VecHashJoin, MultiKeyTupleIsInjectiveWhenAValueContainsTheSentinel) {
+    Schema probe_schema = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+    std::vector<Row> build_rows = {{Value(std::string("A")), Value(std::string("B\x01" "C"))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{probe_schema.indexOf("p1"), probe_schema.indexOf("p2")},
+        std::vector<int>{build_schema.indexOf("b1"), build_schema.indexOf("b2")},
+        out_schema);
+    EXPECT_TRUE(drainRows(*join).empty());
+}
+
+TEST(VecHashJoin, MultiKeyTupleStillMatchesWhenAValueContainsTheSentinel) {
+    Schema probe_schema = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+    std::vector<Row> build_rows = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{probe_schema.indexOf("p1"), probe_schema.indexOf("p2")},
+        std::vector<int>{build_schema.indexOf("b1"), build_schema.indexOf("b2")},
+        out_schema);
+    EXPECT_EQ(drainRows(*join).size(), 1u);
+}
+
+// Same encoding, same hazard on the vectorized side: two distinct doubles that
+// display alike must not share a bucket, and equal ones (including the two
+// zeros) must still match.
+TEST(VecHashJoin, DoubleKeysCompareExactlyNotByDisplayText) {
+    Schema probe_schema = vecSchema({{"pk", TypeId::DOUBLE}});
+    Schema build_schema = vecSchema({{"bk", TypeId::DOUBLE}});
+    Schema out_schema   = vecSchema({{"pk", TypeId::DOUBLE}, {"bk", TypeId::DOUBLE}});
+
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, {{Value(0.1 + 0.2)}, {Value(-0.0)}}),
+        makeScan(build_schema, {{Value(0.3)}, {Value(0.0)}}),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema);
+
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 1u);          // only the zeros match
+    EXPECT_EQ(rows[0][1].asDouble(), 0.0);
+}
+
 // explain() renders names from the children's schemas; a one-key join must
 // still print exactly the pre-Week-27 string.
 TEST(VecHashJoin, ExplainRendersEveryKeyAndKeepsTheSingleKeyForm) {

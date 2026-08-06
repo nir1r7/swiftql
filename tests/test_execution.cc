@@ -621,6 +621,126 @@ TEST(HashJoinNode, NullKeyMemberMatchesNothing) {
     EXPECT_TRUE(drainAll(&join).empty());
 }
 
+// The sentinel-after-every-field rule is uniquely decodable only if no field can
+// CONTAIN the sentinel — and nothing enforces that: CSVLoader::parseField returns
+// a STRING cell verbatim and Value::toString hands back those bytes. ("A\x01B","C")
+// and ("A","B\x01C") both serialize to `A 01 B 01 C 01` under a bare sentinel, so
+// two rows that differ in both keys join. SQLite returns nothing for that pair.
+TEST(HashJoinNode, MultiKeyTupleIsInjectiveWhenAValueContainsTheSentinel) {
+    Schema left_schema  = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema right_schema = makeSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema merged       = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+    std::vector<Row> right_rows = {{Value(std::string("A")), Value(std::string("B\x01" "C"))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"p1", "p2"}, std::vector<std::string>{"b1", "b2"},
+        merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+// ...and an equal tuple containing the sentinel must still MATCH: an encoding
+// that is injective by mangling the bytes would pass the test above for the
+// wrong reason.
+TEST(HashJoinNode, MultiKeyTupleStillMatchesWhenAValueContainsTheSentinel) {
+    Schema left_schema  = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema right_schema = makeSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema merged       = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+    std::vector<Row> right_rows = {{Value(std::string("A\x01" "B")), Value(std::string("C"))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"p1", "p2"}, std::vector<std::string>{"b1", "b2"},
+        merged);
+
+    EXPECT_EQ(drainAll(&join).size(), 1u);
+}
+
+// A key column that is not on its side's schema is a planner bug, and indexOf
+// returns -1 for it — which serializeRowKey would hand to row[-1], an
+// out-of-bounds read with no diagnostic. The vectorized builder treats the same
+// situation as a named plan-time error; this side must too.
+// A DOUBLE key is compared through its serialized text, so the text has to
+// identify the double. `%.15g` does not: 0.1 + 0.2 and 0.3 are distinct doubles
+// that both render "0.3", so rows SQLite keeps apart used to join.
+TEST(HashJoinNode, DistinctDoublesThatRenderAlikeDoNotJoin) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::DOUBLE}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::DOUBLE}, {"bk", TypeId::DOUBLE}});
+
+    std::vector<Row> left_rows  = {{Value(0.1 + 0.2)}};   // 0.30000000000000004
+    std::vector<Row> right_rows = {{Value(0.3)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+// ...while equal doubles must still join, including the two zeros, which are
+// equal in IEEE and in SQLite but have different bit patterns and different text.
+TEST(HashJoinNode, EqualDoublesJoinIncludingBothZeros) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::DOUBLE}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::DOUBLE}, {"bk", TypeId::DOUBLE}});
+
+    std::vector<Row> left_rows  = {{Value(-0.0)}, {Value(2.5)}};
+    std::vector<Row> right_rows = {{Value(0.0)},  {Value(2.5)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    EXPECT_EQ(drainAll(&join).size(), 2u);
+}
+
+// An INT key and a DOUBLE key holding the same number must keep joining: SQLite
+// applies numeric affinity and considers 1 = 1.0 true, and the key encoding is
+// the only thing standing between the two here.
+TEST(HashJoinNode, IntAndDoubleKeysHoldingTheSameNumberStillJoin) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::INT}, {"bk", TypeId::DOUBLE}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(7))}};
+    std::vector<Row> right_rows = {{Value(7.0)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    EXPECT_EQ(drainAll(&join).size(), 1u);
+}
+
+TEST(HashJoinNode, UnknownKeyColumnThrowsInsteadOfIndexingOutOfBounds) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1))}};
+    std::vector<Row> right_rows = {{Value(int64_t(1))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"nope"}, std::vector<std::string>{"bid"}, merged);
+
+    EXPECT_THROW(join.open(), std::runtime_error);
+}
+
 TEST(HashJoinNode, ExplainRendersEveryKeyAndKeepsTheSingleKeyForm) {
     Schema left_schema  = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
     Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});

@@ -985,3 +985,19 @@ TEST(LogicalPlan, ResidualOnlyColumnSurvivesScanNarrowing) {
     const LogicalPlanNode* join = filter->children[0].get();
     EXPECT_GE(join->children[1]->output_schema.indexOf("val"), 0);
 }
+
+// The logical plan has the same problem and the same fix: a key name that
+// appears at several relation slots on the left input is qualified with the slot
+// the key actually resolved to, so a plan built against the wrong relation no
+// longer renders identically to the right one.
+TEST(LogicalPlan, ExplainQualifiesAJoinKeyThatIsAmbiguousOnTheLeftInput) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id "
+        "JOIN sj c ON b.grp = c.grp", cat);
+
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    // `grp` exists at slot 0 (a) and slot 1 (b) on the merged left schema
+    EXPECT_EQ(top->explain(), "LogicalJoin [grp@1 = grp]");
+}

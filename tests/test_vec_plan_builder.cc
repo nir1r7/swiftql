@@ -794,6 +794,34 @@ TEST(VecPlanBuilder, ThreeWayJoinResolvesAKeyByRelationSlotNotName) {
     EXPECT_EQ(rows.size(), expected);
 }
 
+// The defect Task 1 exists to prevent is invisible in a plan that renders a key
+// as a bare `column = column`: joining laps.team instead of drivers.team prints
+// exactly the same string. --explain is the debugging surface Week 28's
+// enumeration will be read through, so an ambiguous name must carry its slot.
+TEST(VecPlanBuilder, ExplainQualifiesAJoinKeyThatIsAmbiguousOnTheProbeSchema) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecOptimized(
+        "SELECT l2.team FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
+        "JOIN drivers d ON l2.team = d.team", cat);
+
+    // the upper join's probe schema holds `team` at slot 0 (l1) and slot 1 (l2)
+    const VecPlanNode* top = findJoin(plan.get());
+    ASSERT_NE(top, nullptr);
+    EXPECT_NE(top->explain().find("team@1 = team"), std::string::npos) << top->explain();
+}
+
+// ...and a name that is unique on the probe schema stays bare, so every existing
+// single-join --explain string is byte-identical.
+TEST(VecPlanBuilder, ExplainLeavesAnUnambiguousJoinKeyUnqualified) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(join->explain().find("[driver_id = driver_id]"), std::string::npos)
+        << join->explain();
+}
+
 // Residual ON conjuncts reach the same predicate assignment as WHERE conjuncts:
 // a single-relation one lands on its own scan, below the join.
 TEST(VecPlanBuilder, SingleRelationResidualOnConjunctIsPushedToItsScan) {
