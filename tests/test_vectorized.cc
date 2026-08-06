@@ -2477,6 +2477,29 @@ TEST(VecHashJoin, DoubleKeysCompareExactlyNotByDisplayText) {
     EXPECT_EQ(rows[0][1].asDouble(), 0.0);
 }
 
+// The qualification has to follow the ambiguous INPUT, not the probe slot. When
+// the cost model puts a merged join subtree on the BUILD side (swapped=true,
+// which is what happens whenever the already-joined side is the smaller one),
+// the ambiguous schema is the build child and the single-relation scan is the
+// probe — so qualifying the probe alone applies it where it is never needed and
+// withholds it where it is, restoring the byte-identical `[team = team]` the
+// rule exists to eliminate. The operands also read in logical [FROM, JOIN]
+// order, so a swap does not silently reverse them.
+TEST(VecHashJoin, ExplainQualifiesTheAmbiguousSideWhenTheJoinIsSwapped) {
+    // build = a merged two-relation schema holding `team` at slot 0 and slot 1
+    Schema build_schema(std::vector<ColumnDef>{{"team", TypeId::STRING, 0},
+                                               {"team", TypeId::STRING, 1}});
+    Schema probe_schema = vecSchema({{"team", TypeId::STRING}});   // one relation
+    Schema out_schema(std::vector<ColumnDef>{{"team", TypeId::STRING, 0},
+                                             {"team", TypeId::STRING, 1},
+                                             {"team", TypeId::STRING, 2}});
+
+    VecHashJoinNode join(makeScan(probe_schema, {}), makeScan(build_schema, {}),
+                         std::vector<int>{0}, std::vector<int>{1},
+                         out_schema, /*swapped=*/true);
+    EXPECT_EQ(join.explain(), "VecHashJoin [team@1 = team] (materialize)");
+}
+
 // explain() renders names from the children's schemas; a one-key join must
 // still print exactly the pre-Week-27 string.
 TEST(VecHashJoin, ExplainRendersEveryKeyAndKeepsTheSingleKeyForm) {

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cmath>
 #include "planner/plan_nodes.h"
 #include "planner/logical_plan.h"
 #include "planner/constant_folding.h"
@@ -709,6 +710,96 @@ TEST(HashJoinNode, EqualDoublesJoinIncludingBothZeros) {
 // An INT key and a DOUBLE key holding the same number must keep joining: SQLite
 // applies numeric affinity and considers 1 = 1.0 true, and the key encoding is
 // the only thing standing between the two here.
+// Two NaNs serialize identically, so a text-compared key would put them in one
+// bucket — while `Value::operator==` on the same pair is false, so the identical
+// predicate in a WHERE clause rejects it. A join must not match what a filter
+// would not. (SQLite never has the case: it stores NaN as NULL.)
+TEST(HashJoinNode, NaNKeysMatchNothingIncludingEachOther) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::DOUBLE}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::DOUBLE}, {"bk", TypeId::DOUBLE}});
+
+    const double nan_v = std::nan("");
+    std::vector<Row> left_rows  = {{Value(nan_v)}, {Value(4.0)}};
+    std::vector<Row> right_rows = {{Value(nan_v)}, {Value(4.0)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    auto result = drainAll(&join);
+    ASSERT_EQ(result.size(), 1u);          // only the 4.0 pair
+    EXPECT_EQ(result[0][0].asDouble(), 4.0);
+}
+
+// %g switches to scientific notation once the exponent reaches the precision, so
+// a DOUBLE 1e17 printed "1e+17" while the INT printed the digits — and the two
+// stopped joining at that magnitude, though SQLite compares INTEGER against REAL
+// exactly. An integral double goes through the integer path instead, so there is
+// no cliff.
+TEST(HashJoinNode, IntAndDoubleKeysAgreeAtLargeIntegralMagnitudes) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::INT}, {"bk", TypeId::DOUBLE}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(100000000000000000))}};
+    std::vector<Row> right_rows = {{Value(1e17)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    EXPECT_EQ(drainAll(&join).size(), 1u);
+}
+
+// A NULL and the literal string 'NULL' are different values and must not dedup
+// together. Volcano's DistinctNode was the one key serializer with no NULL
+// branch at all, so it returned one row where the vectorized path and SQLite
+// return two — a wrong answer on the correctness baseline.
+TEST(DistinctNode, NullAndTheStringNullAreDifferentRows) {
+    Schema schema = makeSchema({{"x", TypeId::STRING}});
+    std::vector<Row> rows = {{Value(std::string("NULL"))}, {Value()}};
+
+    DistinctNode distinct(makeScan(rows, schema));
+    EXPECT_EQ(drainAll(&distinct).size(), 2u);
+}
+
+// The same for grouping, on the operator that already had the marker — pinned
+// so routing it through the shared encoder cannot quietly drop it.
+TEST(HashAggregateNode, NullAndTheStringNullAreDifferentGroups) {
+    Schema schema = makeSchema({{"x", TypeId::STRING}});
+    Schema out    = makeSchema({{"x", TypeId::STRING}, {"COUNT(*)", TypeId::INT}});
+    std::vector<Row> rows = {{Value(std::string("NULL"))}, {Value()}};
+
+    HashAggregateNode agg(makeScan(rows, schema),
+                          std::vector<GroupByColumn>{{"", "x"}},
+                          std::vector<AggregateSpec>{{"COUNT", "", true}}, out);
+    EXPECT_EQ(drainAll(&agg).size(), 2u);
+}
+
+// Distinct and group keys are compared as text too, so the text has to identify
+// the double: `%.15g` renders 0.1 + 0.2 and 0.3 alike, and 706 such pairs exist
+// in the shipped dataset's sector sums.
+TEST(DistinctNode, DistinctDoublesThatRenderAlikeStayDistinct) {
+    Schema schema = makeSchema({{"x", TypeId::DOUBLE}});
+    std::vector<Row> rows = {{Value(0.1 + 0.2)}, {Value(0.3)}};
+
+    DistinctNode distinct(makeScan(rows, schema));
+    EXPECT_EQ(drainAll(&distinct).size(), 2u);
+}
+
+// ...and the two zeros are ONE value, since IEEE and SQLite both call them
+// equal. The integral-double path collapses them; a %g text would not.
+TEST(DistinctNode, BothZerosAreOneRow) {
+    Schema schema = makeSchema({{"x", TypeId::DOUBLE}});
+    std::vector<Row> rows = {{Value(-0.0)}, {Value(0.0)}};
+
+    DistinctNode distinct(makeScan(rows, schema));
+    EXPECT_EQ(drainAll(&distinct).size(), 1u);
+}
+
 TEST(HashJoinNode, IntAndDoubleKeysHoldingTheSameNumberStillJoin) {
     Schema left_schema  = makeSchema({{"pk", TypeId::INT}});
     Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
