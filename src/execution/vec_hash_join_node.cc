@@ -1,5 +1,5 @@
 #include "execution/vec_hash_join_node.h"
-#include "execution/join_key.h"
+#include "execution/key_encoding.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
@@ -9,7 +9,7 @@ VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::
 namespace {
 
 // Serialize one row's k-key tuple into `out`, reusing its capacity. The encoding
-// itself lives in join_key.h, shared with Volcano's HashJoinNode.
+// itself lives in key_encoding.h, shared with Volcano's HashJoinNode.
 //
 // Returns false when any key column is NULL. SQL's NULL equals nothing, so with
 // k keys the rule composes: one NULL member makes the whole tuple unmatchable,
@@ -22,7 +22,7 @@ bool serializeKey(const DataChunk& chunk, const std::vector<int>& key_idx, int r
         // valueAt, never the typed vector directly: a raw read bypasses the
         // validity mask and turns a NULL into the placeholder underneath it
         Value v = valueAt(chunk.columns[c], r);
-        if (v.isNull()) return false;
+        if (isUnmatchableKey(v)) return false;
         appendJoinKeyField(out, v, prefixed);
     }
     return true;
@@ -175,18 +175,28 @@ std::string VecHashJoinNode::explain() const {
     // rather than the integers this node holds. A one-key join renders exactly
     // the pre-Week-27 string.
     //
-    // The probe schema can be a merged join schema holding one name at several
+    // EITHER side can be a merged join schema holding one name at several
     // relation slots, and that is exactly the case where resolving a key by name
     // instead of by slot silently joins the wrong relation. Printing a bare
     // `team = team` for both the right and the wrong plan makes the defect
     // invisible on the surface used to debug it, so an ambiguous name carries
-    // its slot (`team@1`). Unambiguous names stay bare.
-    const Schema& probe_schema = probe_child_->outputSchema();
+    // its slot (`team@1`) on whichever side it appears. Unambiguous names stay
+    // bare, so every pre-existing plan string is unchanged.
+    //
+    // Rendered in logical [FROM, JOIN] order, which is the build side first when
+    // the join is swapped: the physical probe/build order is a cost decision and
+    // reversing the operands with it leaves the reader unable to tell which
+    // relation is which.
+    const VecPlanNode* from_side  = swapped_ ? build_child_.get() : probe_child_.get();
+    const VecPlanNode* join_side  = swapped_ ? probe_child_.get() : build_child_.get();
+    const std::vector<int>& from_idx = swapped_ ? build_key_idx_ : probe_key_idx_;
+    const std::vector<int>& join_idx = swapped_ ? probe_key_idx_ : build_key_idx_;
+
     std::string s = "VecHashJoin [";
-    for (size_t i = 0; i < probe_key_idx_.size(); ++i) {
+    for (size_t i = 0; i < from_idx.size(); ++i) {
         if (i) s += " AND ";
-        s += qualifyIfAmbiguous(probe_schema, probe_key_idx_[i]) + " = "
-           + build_child_->outputSchema().column(build_key_idx_[i]).name;
+        s += qualifyIfAmbiguous(from_side->outputSchema(), from_idx[i]) + " = "
+           + qualifyIfAmbiguous(join_side->outputSchema(), join_idx[i]);
     }
     s += "] (materialize)";
     if (!cost_decision_.empty()) s += " " + cost_decision_;

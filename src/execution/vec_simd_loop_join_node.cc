@@ -219,11 +219,16 @@ const Schema& VecSimdLoopJoinNode::outputSchema() const {
 
 std::string VecSimdLoopJoinNode::explain() const {
     // Names come from the children's schemas, so --explain prints columns rather
-    // than the indices this node holds; an ambiguous probe-side name carries its
-    // relation slot, for the reason VecHashJoinNode::explain spells out.
+    // than the indices this node holds; an ambiguous name on EITHER side carries
+    // its relation slot, and the operands read in logical [FROM, JOIN] order
+    // whichever side physically builds — see VecHashJoinNode::explain.
+    const VecPlanNode* from_side = swapped_ ? build_child_.get() : probe_child_.get();
+    const VecPlanNode* join_side = swapped_ ? probe_child_.get() : build_child_.get();
+    const int from_idx = swapped_ ? build_key_idx_ : probe_key_idx_;
+    const int join_idx = swapped_ ? probe_key_idx_ : build_key_idx_;
     std::string s = "VecSimdLoopJoin ["
-        + qualifyIfAmbiguous(probe_child_->outputSchema(), probe_key_idx_) + " = "
-        + build_child_->outputSchema().column(build_key_idx_).name + "] (materialize)";
+        + qualifyIfAmbiguous(from_side->outputSchema(), from_idx) + " = "
+        + qualifyIfAmbiguous(join_side->outputSchema(), join_idx) + "] (materialize)";
     if (!cost_decision_.empty()) s += " " + cost_decision_;
     return s;
 }

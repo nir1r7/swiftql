@@ -1,4 +1,5 @@
 #include "execution/vec_distinct_node.h"
+#include "execution/key_encoding.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
@@ -32,23 +33,12 @@ int VecDistinctNode::consumeAndDedup() {
 
         rows_consumed += static_cast<int>(indices_ptr->size());
         for (int r : *indices_ptr) {
-            // Build the dedup key from NULL-aware reads. NULL gets the marker
-            // 'N', which no non-NULL cell can produce because the non-NULL
-            // encoding always starts with a decimal length digit. Reusing
-            // toString() for NULL would collide with the string value "NULL",
-            // and a 0-length encoding would collide with the empty string.
+            // Build the dedup key from NULL-aware reads — valueAt, never the
+            // typed vector, or a NULL reads back as the placeholder under it —
+            // through the shared encoding (key_encoding.h).
             std::string key;
             for (const auto& cv : chunk->columns) {
-                Value v = valueAt(cv, r);
-                if (v.isNull()) {
-                    key += 'N';
-                } else {
-                    std::string s = v.toString();
-                    key += std::to_string(s.size());
-                    key += ':';
-                    key += s;
-                }
-                key += '\x01';
+                appendGroupKeyField(key, valueAt(cv, r));
             }
 
             if (seen.insert(key).second) {

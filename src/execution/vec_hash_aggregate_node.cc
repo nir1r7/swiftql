@@ -2,30 +2,19 @@
 #include "execution/evaluator.h"
 #include "execution/expression_executor.h"
 #include "parser/expr_utils.h"
+#include "execution/key_encoding.h"
 #include <algorithm>
 #include <chrono>
 #include <numeric>
 
 namespace {
-    // mirrors the anonymous namespace helpers in plan_nodes.cc
+    // The encoding is shared with every other key serializer (key_encoding.h):
+    // length-prefixed so it is injective for any bytes, 'N' for NULL so a NULL
+    // group cannot collide with the string value "NULL", and exact rather than
+    // display text for DOUBLE — `%.15g` gave two distinct doubles one group.
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
-        for (const auto& v : key) {
-            // NULL gets the marker 'N'; the non-NULL encoding always starts
-            // with a decimal length digit, so the two can never collide.
-            // toString() would render NULL as "NULL", colliding with the
-            // string value "NULL" — reachable since expression group keys
-            // (GROUP BY season / 0) can evaluate to NULL.
-            if (v.isNull()) {
-                result += 'N';
-            } else {
-                std::string s = v.toString();
-                result += std::to_string(s.size());
-                result += ':';
-                result += s;
-            }
-            result += '\x01';
-        }
+        for (const auto& v : key) appendGroupKeyField(result, v);
         return result;
     }
 

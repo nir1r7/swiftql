@@ -1,5 +1,5 @@
 #include "plan_nodes.h"
-#include "execution/join_key.h"
+#include "execution/key_encoding.h"
 #include "execution/evaluator.h"
 #include "parser/expr_utils.h"
 #include "storage/chunk_pruner.h"
@@ -18,22 +18,11 @@ namespace {
         Value max_val;
     };
 
+    // Shared with every other key serializer — see key_encoding.h for the two
+    // properties they all depend on (injective framing, identifying text).
     std::string serializeKey(const std::vector<Value>& key) {
         std::string result;
-        for (const auto& v : key) {
-            // NULL marker 'N' can never collide with the non-NULL encoding,
-            // which always starts with a decimal length digit. Mirrors
-            // serializeKey in vec_hash_aggregate_node.cc.
-            if (v.isNull()) {
-                result += 'N';
-            } else {
-                std::string s = v.toString();
-                result += std::to_string(s.size());
-                result += ':';
-                result += s;
-            }
-            result += '\x01';
-        }
+        for (const auto& v : key) appendGroupKeyField(result, v);
         return result;
     }
 
@@ -440,14 +429,13 @@ Row* DistinctNode::next() {
             return nullptr;
         }
         stats.rows_in++;
+        // Through the shared encoding, which is what gives this operator the
+        // NULL marker its three siblings already had: without it a NULL cell
+        // and the literal string 'NULL' both encoded as `4:NULL` and deduped
+        // together, so Volcano returned one row where the vectorized path and
+        // SQLite return two.
         std::string key;
-        for (const auto& val : *row) {
-            std::string s = val.toString();
-            key += std::to_string(s.size());
-            key += ':';
-            key += s;
-            key += '\x01';
-        }
+        for (const auto& val : *row) appendGroupKeyField(key, val);
         if (seen_.insert(key).second) {
             // insert returns {iterator, bool}
             stats.rows_out++;
@@ -596,7 +584,7 @@ HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanN
 namespace {
 
 // Serialize one row's k-key tuple, through the encoder VecHashJoinNode shares
-// (join_key.h) so the two engines cannot drift apart on it.
+// (key_encoding.h) so the two engines cannot drift apart on it.
 //
 // Returns false when any key member is NULL — SQL's NULL equals nothing, so the
 // row can neither be inserted nor matched. Volcano used to bucket a NULL key
@@ -608,7 +596,7 @@ bool serializeRowKey(const Row& row, const std::vector<int>& key_idx, std::strin
     out.clear();
     for (int c : key_idx) {
         const Value& v = row[c];
-        if (v.isNull()) return false;
+        if (isUnmatchableKey(v)) return false;
         appendJoinKeyField(out, v, prefixed);
     }
     return true;
