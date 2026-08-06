@@ -751,9 +751,21 @@ def run_join_order_steering(queries):
                               .split("=== Physical Plan ===")[0]
         match = re.search(r"order=(\S+)", section)
         chosen = match.group(1) if match else "no order= decision"
-        if result.returncode == 0 and chosen == expected:
+        # The written order is always legal and always inside the search space, so
+        # a chosen cost above it means the search installed a plan its own model
+        # scores worse -- which no result test can see, since reordering never
+        # changes rows. Asserted on every steering query rather than on one, since
+        # the trigger (a sub-1-row intermediate) is not a property of the shape.
+        cw = re.search(r"cost=([\d.]+) \(written=([\d.]+)\)", section)
+        cost_ok = cw is not None and float(cw.group(1)) <= float(cw.group(2))
+        if result.returncode == 0 and chosen == expected and cost_ok:
             print(f"  PASS  [{label}]  order {chosen}")
             passed += 1
+        elif result.returncode == 0 and chosen == expected:
+            got = f"cost={cw.group(1)} > written={cw.group(2)}" if cw else "no cost= pair"
+            print(f"  FAIL  [{label}]  order {chosen} but {got}")
+            failed += 1
+            fail_list.append((f"order:{label}", query, got, "cost <= written"))
         else:
             print(f"  FAIL  [{label}]  expected {expected}, chose {chosen}")
             failed += 1
@@ -823,6 +835,35 @@ def run_join_order_work(pairs, queries):
 
 
 
+# A ten-way self-join is inside MAX_DP_RELATIONS, so this is a configuration the
+# join enumerator advertises rather than an exotic one. Its estimates exceed
+# int64_t, and std::llround outside that range is undefined -- it printed
+# `est=-9223372036854775808` on the checkpoint surface. Estimates are doubles
+# everywhere decisions are made, so this was display only, but a negative row
+# count is exactly what --explain exists to prevent.
+WIDE_SELF_JOIN = "SELECT COUNT(*) FROM laps a0 " + " ".join(
+    f"JOIN laps a{i} ON a0.driver_id = a{i}.driver_id" for i in range(1, 10))
+
+
+def run_explain_estimate_format():
+    """Week 28: no --explain estimate may render as a negative number."""
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    print(f"\n--- Week 28 estimate rendering (--explain) ---")
+    args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache",
+            *VEC, "--explain", "--query", WIDE_SELF_JOIN]
+    result = subprocess.run(args, capture_output=True, text=True)
+    bad = re.findall(r"est=-\d+", result.stdout)
+    if result.returncode == 0 and not bad:
+        print(f"  PASS  [w28_wide_self_join_estimate]  no negative est=")
+        print(f"  1 passed, 0 failed, 0 errors")
+        return 1, 0, 0, []
+    print(f"  FAIL  [w28_wide_self_join_estimate]  {bad[:2] or result.stderr.strip()[:80]}")
+    print(f"  0 passed, 1 failed, 0 errors")
+    return 0, 1, 0, [("estimate-format:w28_wide_self_join_estimate",
+                      WIDE_SELF_JOIN, str(bad[:2]), "no negative est=")]
+
+
+
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
@@ -842,17 +883,19 @@ def main():
     # Week 28 join-order work: the same graph written two ways must execute
     # identically, measured from --explain-analyze rather than assumed
     r6 = run_join_order_work(WEEK28_ORDER_EQUIVALENT_PAIRS, WEEK28_QUERIES)
+    # Week 28 estimate rendering: a wide self-join overflows int64_t
+    r7 = run_explain_estimate_format()
 
-    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0]
-    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1]
-    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2]
-    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
           f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
           f"+ {len(WEEK23_5_QUERIES)} algorithm steering + {len(WEEK28_QUERIES)} order steering "
-          f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work)")
+          f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work + 1 estimate rendering)")
 
     if fail_list:
         print(f"\n{'='*70}")

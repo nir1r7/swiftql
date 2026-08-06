@@ -586,6 +586,16 @@ def normalize(rows, preserve_order=False):
         try: return round(float(v), 6)
         except (ValueError, TypeError): return str(v)
 
+    # !! Rows arrive as dicts keyed by column NAME, so duplicate names collapse.
+    # A merged join schema legally carries several columns of the same name
+    # (invariant 3: two `driver_id`, two `team`, two `name` on a self-join or a
+    # laps/drivers join), and BOTH engines' rows collapse identically — so this
+    # file cannot see a column-identity or column-order regression in a
+    # `SELECT *` multi-way join. Pre-existing since Week 18; the Week 27 and 28
+    # query blocks deliberately project named columns instead. The gap is covered
+    # on the C++ side by JoinEnumeration.ReorderedPlansReturnTheWrittenOrdersRows,
+    # which diffs raw chunk values and therefore does see column order. Read this
+    # file's silence on `SELECT *` joins as absence of coverage, not as coverage.
     normalized = []
     for row in rows:
         normalized.append(tuple(coerce(v) for v in row.values()))
