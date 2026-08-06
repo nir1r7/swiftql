@@ -59,8 +59,28 @@ Keep it under 25 lines. It is a resume point, not a log.
 ## Subagent check-ins
 
 A subagent can burn an hour circling a triviality and you would never know — its only report
-comes at the end, and by then the time is spent. Check in on any agent that has been running
-**longer than 10 minutes**, and every ~10 minutes after that.
+comes at the end, and by then the time is spent. Worse, an agent can die without ever
+notifying you, and "still running" is indistinguishable from "dead" unless you check.
+
+**You have no internal clock. Stamp every launch, or this whole section is unenforceable.**
+Run `date` when you launch an agent, record that time in state next to the agent, and run
+`date` again at each check-in. Without that, "has it been 10 minutes?" is unanswerable and you
+will sit on a dead agent indefinitely — this happened once for 15 hours, and every status
+report given in the meantime was wrong.
+
+Check in on any agent running **longer than 10 minutes**, and every ~10 minutes after that.
+
+The cheapest liveness probe is the artifact the agent was told to write:
+
+```bash
+date                                          # now
+ls -la --time-style=+%H:%M scratchpad/audits/ scratchpad/gates/   # did its file land?
+```
+
+An agent past its expected duration with no artifact and no recent file writes is dead or
+hung, not thinking. Relaunch it — do not keep waiting. Give the replacement an explicit time
+budget and tell it to write its findings file even if it has to stop early: a partial audit
+that exists beats a complete one that never lands.
 
 **Never read the agent's transcript file to do this.** It is full JSONL and reading it
 overflows exactly the context this skill exists to protect. The check is cheap probes only:
