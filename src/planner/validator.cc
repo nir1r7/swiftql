@@ -174,8 +174,44 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
             // then column existence — a shape error is the more useful message
             // when both are wrong. The returned keys/residuals are rebuilt by
             // the planners; only the throw matters here.
-            classifyJoinCondition(stmt.joins[i].condition.get(), static_cast<int>(i) + 1);
+            JoinCondition on = classifyJoinCondition(stmt.joins[i].condition.get(),
+                                                     static_cast<int>(i) + 1);
             validateJoinCondition(stmt.joins[i].condition.get(), relations);
+
+            // Week 29 (deferred from the Week 27 audit). A join key is compared as
+            // TEXT, which carries no type tag: a STRING "7" matches an INT 7 while
+            // "007" does not, while the identical predicate in a WHERE clause
+            // throws Type mismatch — half a match, with no error either way, and
+            // both halves reachable on the shipped catalog (drivers.team vs
+            // laps.lap_id). Under an outer join the unmatched half comes back as
+            // null-extended rows rather than as missing ones, which is why it is
+            // closed here. Also makes the int_keys SIMD gate's assumption explicit.
+            //
+            // Coarse on purpose — both STRING or both numeric — matching
+            // Value::operator==, which coerces INT/DOUBLE and throws only across
+            // the STRING boundary, and keyFieldText's numeric affinity (7.0 and 7
+            // must keep joining, as they do in SQLite).
+            //
+            // `relations` is in range-table order, so relations[slot] is the schema
+            // a JoinKey slot addresses. Both engines route through this function,
+            // so one check covers all four modes with one message.
+            for (const JoinKey& k : on.keys) {
+                if (k.from_slot < 0) continue;   // unbound: positional routing, no
+                                                 // relation identity to be exact about
+                if (k.from_slot >= static_cast<int>(relations.size())) continue;
+                const Schema* left_schema  = relations[k.from_slot].second;
+                const Schema* right_schema = relations[i + 1].second;
+                int li = left_schema->indexOf(k.from_col);
+                int ri = right_schema->indexOf(k.join_col);
+                if (li < 0 || ri < 0) continue;  // existence is validateJoinCondition's
+                const bool l_str = left_schema->column(li).type  == TypeId::STRING;
+                const bool r_str = right_schema->column(ri).type == TypeId::STRING;
+                if (l_str != r_str) {
+                    throw std::runtime_error(
+                        "JOIN ON: cannot join a STRING column with a numeric one ('"
+                        + k.from_col + "' and '" + k.join_col + "')");
+                }
+            }
         }
     }
 
