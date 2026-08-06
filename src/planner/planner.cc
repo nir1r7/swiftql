@@ -6,6 +6,16 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // validate
     Validator::validate(stmt, catalog);
 
+    // Week 26/27 boundary: the parser, binder and logical layer now handle
+    // arbitrary join counts and multi-key equi-joins, but HashJoinNode still
+    // executes exactly one single-key equi-join. Refuse loudly rather than run a
+    // shape this operator cannot express — the Phase 1 stubbed-hash-join stance:
+    // a clean "not yet implemented" beats a wrong answer.
+    if (stmt.joins.size() > 1) {
+        throw std::runtime_error(
+            "multi-way joins are planned but not yet executable (Week 27)");
+    }
+
     // expression GROUP BY keys: rewrite post-aggregate references, mirroring
     // LogicalPlanBuilder::build (no-op without expression keys)
     substituteGroupKeyRefs(stmt);
@@ -24,7 +34,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // map. The FROM scan below moves that data out, so preserve a copy for the
     // JOIN scan. (A copy — not shared ownership — keeps this a minimal change;
     // it costs one extra table copy, acceptable at this project's scale.)
-    bool self_join = stmt.join.has_value() && stmt.join->join_table == stmt.from_table;
+    bool self_join = !stmt.joins.empty() && stmt.joins[0].join_table == stmt.from_table;
     std::optional<ColumnarTable> self_join_columnar;
     std::optional<std::vector<Row>> self_join_rows;
     if (self_join) {
@@ -42,37 +52,42 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(table_rows.at(stmt.from_table)), meta.schema);
     }
 
-    // hash join
-    if (stmt.join.has_value()){
-        const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
+    // hash join (exactly one, guarded above)
+    if (!stmt.joins.empty()){
+        const auto& join_clause = stmt.joins[0];
+        const TableMetadata& join_meta = catalog.getTable(join_clause.join_table);
 
         Schema right_scan_schema = buildScanSchema(stmt, join_meta.schema);
 
         // capture before std::move transfers ownership into SeqScanNode
         int join_row_count = self_join
             ? from_row_count
-            : (columnar_tables.count(stmt.join->join_table) > 0
-                ? columnar_tables.at(stmt.join->join_table).num_rows
-                : (int)table_rows.at(stmt.join->join_table).size());
+            : (columnar_tables.count(join_clause.join_table) > 0
+                ? columnar_tables.at(join_clause.join_table).num_rows
+                : (int)table_rows.at(join_clause.join_table).size());
 
         std::unique_ptr<PlanNode> right;
         if (self_join) {
             // read from the copy preserved before the FROM scan moved the data
             if (self_join_columnar.has_value())
-                right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(*self_join_columnar), right_scan_schema, nullptr);
+                right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(*self_join_columnar), right_scan_schema, nullptr);
             else
-                right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(*self_join_rows), join_meta.schema);
-        } else if (columnar_tables.count(stmt.join->join_table) > 0) {
-            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(columnar_tables.at(stmt.join->join_table)), right_scan_schema, nullptr);
+                right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(*self_join_rows), join_meta.schema);
+        } else if (columnar_tables.count(join_clause.join_table) > 0) {
+            right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(columnar_tables.at(join_clause.join_table)), right_scan_schema, nullptr);
         } else {
-            right = std::make_unique<SeqScanNode>(stmt.join->join_table, std::move(table_rows.at(stmt.join->join_table)), join_meta.schema);
+            right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(table_rows.at(join_clause.join_table)), join_meta.schema);
         }
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
         // way to disambiguate a self-join's two occurrences of the same table
-        JoinConditionKeys keys = classifyJoinCondition(stmt.join->condition.get());
-        std::string from_col = keys.from_col;
-        std::string join_col = keys.join_col;
+        std::vector<JoinKey> keys = classifyJoinCondition(join_clause.condition.get(), 1);
+        if (keys.size() != 1) {
+            throw std::runtime_error(
+                "multi-key equi-joins are planned but not yet executable (Week 27)");
+        }
+        std::string from_col = keys[0].from_col;
+        std::string join_col = keys[0].join_col;
 
         // put the smaller table on the build side (right_) to minimise hash table memory.
         // Output schema order is always [FROM columns, JOIN columns] — fixed

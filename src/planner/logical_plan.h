@@ -4,6 +4,7 @@
 #include "common/schema.h"
 #include "parser/ast.h"
 #include "catalog/catalog.h"
+#include "planner/join_condition.h"   // JoinKey
 #include <memory>
 #include <string>
 #include <vector>
@@ -60,13 +61,17 @@ struct LogicalScan : LogicalPlanNode {
     std::string explain() const override;
 };
 
-// inner equi-join
-// from_col to children[0], join_col to children[1]
+// inner equi-join. keys[k].from_col resolves against children[0]'s schema,
+// keys[k].join_col against children[1]'s. Multi-key since Week 26 (TPC-H Q9).
+// join_slot is the binder relation slot of children[1] — it stamps the merged
+// schema and is what predicate pushdown routes conjuncts by. Left-deep only:
+// children[1] is always a single relation (join enumeration, Week 28, keeps
+// that shape).
 struct LogicalJoin : LogicalPlanNode {
-    std::string from_col;
-    std::string join_col;
+    std::vector<JoinKey> keys;
+    int join_slot;
 
-    LogicalJoin(std::unique_ptr<LogicalPlanNode> from_child, std::unique_ptr<LogicalPlanNode> join_child, std::string from_c, std::string join_c, Schema merged) : LogicalPlanNode(LogicalNodeType::JOIN, std::move(merged)), from_col(std::move(from_c)), join_col(std::move(join_c)) {
+    LogicalJoin(std::unique_ptr<LogicalPlanNode> from_child, std::unique_ptr<LogicalPlanNode> join_child, std::vector<JoinKey> keys, int join_slot, Schema merged) : LogicalPlanNode(LogicalNodeType::JOIN, std::move(merged)), keys(std::move(keys)), join_slot(join_slot) {
         children.push_back(std::move(from_child));
         children.push_back(std::move(join_child));
     }

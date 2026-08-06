@@ -265,11 +265,14 @@ int main(int argc, char* argv[]) {
             if (!catalog.hasStats(stmt.from_table)) {
                 catalog.setStats(stmt.from_table, TableStats::compute(table_rows[stmt.from_table], meta.schema));
             }
-            if (stmt.join.has_value()) {
-                const TableMetadata& jmeta = catalog.getTable(stmt.join->join_table);
-                table_rows[stmt.join->join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
-                if (!catalog.hasStats(stmt.join->join_table)) {
-                    catalog.setStats(stmt.join->join_table, TableStats::compute(table_rows[stmt.join->join_table], jmeta.schema));
+            // one load per joined table; a self-join names the same table twice,
+            // and table_rows is keyed by table name, so the guard matters
+            for (const auto& j : stmt.joins) {
+                if (table_rows.count(j.join_table)) continue;
+                const TableMetadata& jmeta = catalog.getTable(j.join_table);
+                table_rows[j.join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+                if (!catalog.hasStats(j.join_table)) {
+                    catalog.setStats(j.join_table, TableStats::compute(table_rows[j.join_table], jmeta.schema));
                 }
             }
 

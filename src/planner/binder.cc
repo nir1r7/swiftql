@@ -7,7 +7,9 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
     // table existence is Validator's error to raise (preserves its message)
     // without a valid range table there is nothing safe to resolve here
     if (!catalog.hasTable(stmt.from_table)) return;
-    if (stmt.join.has_value() && !catalog.hasTable(stmt.join->join_table)) return;
+    for (const auto& j : stmt.joins) {
+        if (!catalog.hasTable(j.join_table)) return;
+    }
 
     std::vector<RangeEntry> range_table;
     const Schema& from_schema = catalog.getTable(stmt.from_table).schema;
@@ -17,25 +19,33 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         &from_schema
     });
 
-    if (stmt.join.has_value()) {
-        const Schema& join_schema = catalog.getTable(stmt.join->join_table).schema;
+    // One range-table entry per JOIN, in written order: joins[i] lands at slot
+    // i+1. resolveColumnRef already loops over the range table by index, so
+    // widening it here is the whole of the N-relation generalization.
+    for (const auto& j : stmt.joins) {
+        const Schema& join_schema = catalog.getTable(j.join_table).schema;
         range_table.push_back({
-            stmt.join->alias.empty() ? stmt.join->join_table : stmt.join->alias,
-            stmt.join->join_table,
+            j.alias.empty() ? j.join_table : j.alias,
+            j.join_table,
             &join_schema
         });
 
         // Two relations sharing a ref name are unresolvable — every qualified
-        // reference is ambiguous. Distinguish the aliasless self-join (needs
-        // aliases, matching SQLite) from a duplicated alias across tables.
-        if (range_table[0].ref_name == range_table[1].ref_name) {
-            if (range_table[0].table_name == range_table[1].table_name) {
+        // reference is ambiguous. Compare against EVERY prior entry, not just
+        // the previous one: with three relations the clash can be between
+        // entries 0 and 2, which never form the [0]/[1] pair. Distinguish the
+        // aliasless self-join (needs aliases, matching SQLite) from a
+        // duplicated alias across tables.
+        const RangeEntry& added = range_table.back();
+        for (size_t prior = 0; prior + 1 < range_table.size(); ++prior) {
+            if (range_table[prior].ref_name != added.ref_name) continue;
+            if (range_table[prior].table_name == added.table_name) {
                 throw std::runtime_error(
                     "self-join requires table aliases to disambiguate the two references to '"
-                    + stmt.from_table + "'");
+                    + added.table_name + "'");
             }
             throw std::runtime_error(
-                "duplicate table alias '" + range_table[0].ref_name
+                "duplicate table alias '" + added.ref_name
                 + "': each side of a join needs a distinct name");
         }
     }
@@ -103,7 +113,7 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
         }
         bindExpr(item.expr.get(), range_table);   // no-op on already-stamped clones
     }
-    if (stmt.join.has_value()) bindExpr(stmt.join->condition.get(), range_table);
+    for (auto& j : stmt.joins) bindExpr(j.condition.get(), range_table);
 
     // Fold constant arithmetic last, so every downstream pass — Validator, the
     // logical planner, pushdown, cardinality estimation, the chunk pruner, and

@@ -242,27 +242,35 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             double l = node.children[0]->estimated_rows;
             double r = node.children[1]->estimated_rows;
 
-            // children[0]=FROM, children[1]=JOIN (fixed logical order, Week 16);
-            // from_col/join_col were routed to their sides by extractJoinKeys
-            const ColumnStatsEntry* lk = left.find(join.from_col, -1);
-            const ColumnStatsEntry* rk = right.find(join.join_col, -1);
-            int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
-                                   rk ? rk->stats->distinct_count : int64_t(0));
+            // children[0]=left input, children[1]=the relation this join adds
+            // (fixed logical order, Week 16); keys were routed to their sides by
+            // classifyJoinCondition. One NDV per key, divided out together —
+            // the independent-key generalization of the single-key formula
+            // (Week 26 multi-key equi-joins). The left lookup goes by slot: the
+            // merged left schema can hold the same column name at several slots.
+            double divisor = 1.0;
+            for (const JoinKey& k : join.keys) {
+                const ColumnStatsEntry* lk = left.find(k.from_col, k.from_slot);
+                const ColumnStatsEntry* rk = right.find(k.join_col, -1);
+                int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
+                                       rk ? rk->stats->distinct_count : int64_t(0));
+                if (ndv > 0) divisor *= static_cast<double>(ndv);
+            }
 
             // no usable key NDV: assume the FK-like case (max) rather than a
             // cross product, which would explode and mislead Week 22 costing
-            node.estimated_rows = (ndv > 0) ? (l * r) / ndv : std::max(l, r);
+            node.estimated_rows = (divisor > 1.0) ? (l * r) / divisor : std::max(l, r);
             // ≥1-row floor, matching the FILTER case
             if (l >= 1.0 && r >= 1.0) {
                 node.estimated_rows = std::max(node.estimated_rows, 1.0);
             }
 
-            // merge contexts [FROM ++ JOIN], restamping join-side entries to
-            // slot 1 — mirrors the merged-schema construction in
-            // LogicalPlanBuilder::build
+            // merge contexts [left ++ added relation], restamping the added
+            // side's entries to the join's relation slot — must stay in lockstep
+            // with the merged-schema construction in LogicalPlanBuilder::build
             StatsContext out = std::move(left);
             for (ColumnStatsEntry e : right.entries) {
-                e.relation_slot = 1;
+                e.relation_slot = join.join_slot;
                 out.entries.push_back(std::move(e));
             }
             return out;

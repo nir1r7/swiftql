@@ -240,7 +240,9 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     }
     collectCols(stmt.having.get(), required);
     for (const auto& item : stmt.order_by) collectCols(item.expr.get(), required);
-    if (stmt.join.has_value()) collectCols(stmt.join->condition.get(), required);
+    // every ON condition: a key narrowed out of a scan schema dies later with
+    // "column not found", far from the cause
+    for (const auto& j : stmt.joins) collectCols(j.condition.get(), required);
     return narrowSchema(full_schema, required);
 }
 
@@ -483,9 +485,15 @@ std::string LogicalScan::explain() const {
 }
 
 
-// LogicalJoin
+// LogicalJoin — single-key output is byte-identical to the pre-Week-26 form,
+// so existing --explain assertions keep passing
 std::string LogicalJoin::explain() const {
-    return "LogicalJoin [" + from_col + " = " + join_col + "]";
+    std::string s = "LogicalJoin [";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i) s += " AND ";
+        s += keys[i].from_col + " = " + keys[i].join_col;
+    }
+    return s + "]";
 }
 
 
@@ -568,33 +576,35 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         stmt.from_table,
         buildScanSchema(stmt, catalog.getTable(stmt.from_table).schema));
 
-    // join
-    if (stmt.join.has_value()) {
-        const TableMetadata& join_meta = catalog.getTable(stmt.join->join_table);
+    // joins, folded left-deep in written order: joins[i] attaches relation i+1
+    for (size_t i = 0; i < stmt.joins.size(); ++i) {
+        const auto& jc = stmt.joins[i];
+        const int join_slot = static_cast<int>(i) + 1;   // range-table position
+
+        const TableMetadata& join_meta = catalog.getTable(jc.join_table);
         auto join_scan = std::make_unique<LogicalScan>(
-            stmt.join->join_table,
+            jc.join_table,
             buildScanSchema(stmt, join_meta.schema));
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
-        // way to disambiguate a self-join's two occurrences of the same table
-        JoinConditionKeys keys = classifyJoinCondition(stmt.join->condition.get());
-        std::string from_col = keys.from_col;
-        std::string join_col = keys.join_col;
+        // way to disambiguate a self-join's occurrences of the same table
+        std::vector<JoinKey> keys = classifyJoinCondition(jc.condition.get(), join_slot);
 
-        // Output schema order is always [FROM columns, JOIN columns] — fixed
-        // logical order. JOIN-side columns are stamped slot 1 so qualified
-        // references resolve to the correct side even when both sides share
-        // a column name. By-value loop var: a reference would mutate the
-        // join scan's own schema.
+        // Output schema order is always [relation 0 columns, relation 1, ...] —
+        // fixed logical order. The left child already carries slots
+        // 0..join_slot-1 from the joins beneath it; only the newly added side is
+        // stamped, so qualified references resolve to the correct relation even
+        // when several share a column name. By-value loop var: a reference would
+        // mutate the join scan's own schema.
         std::vector<ColumnDef> merged_cols = node->output_schema.columns();
         for (ColumnDef col : join_scan->output_schema.columns()) {
-            col.relation_slot = 1;
+            col.relation_slot = join_slot;
             merged_cols.push_back(col);
         }
 
         // no build/probe swap decision here — that's a physical concern
         // (Week 18/22), not part of the logical plan.
-        node = std::make_unique<LogicalJoin>(std::move(node), std::move(join_scan), from_col, join_col, Schema(merged_cols));
+        node = std::make_unique<LogicalJoin>(std::move(node), std::move(join_scan), std::move(keys), join_slot, Schema(merged_cols));
     }
 
     // filter (WHERE)

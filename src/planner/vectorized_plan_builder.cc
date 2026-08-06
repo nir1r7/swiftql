@@ -38,6 +38,27 @@ void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int
     }
 }
 
+// Week 26/27 boundary: the logical layer now builds arbitrary join trees, but
+// this builder still lowers exactly one single-key equi-join. Refuse loudly
+// rather than lower a shape VecHashJoinNode cannot express — the Phase 1
+// stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
+// Counts over the WHOLE tree: after pushdown a join's child is a FILTER over a
+// JOIN, so a type check one level down would miss it.
+void checkLowerable(const LogicalPlanNode* node, int& joins_seen) {
+    if (node->type == LogicalNodeType::JOIN) {
+        const auto* join = static_cast<const LogicalJoin*>(node);
+        if (join->keys.size() != 1) {
+            throw std::runtime_error(
+                "multi-key equi-joins are planned but not yet executable (Week 27)");
+        }
+        if (++joins_seen > 1) {
+            throw std::runtime_error(
+                "multi-way joins are planned but not yet executable (Week 27)");
+        }
+    }
+    for (const auto& child : node->children) checkLowerable(child.get(), joins_seen);
+}
+
 // walk down children[0] to the leaf scan's table name — used to read row
 // counts for the build-side decision before lowering moves the tables
 const std::string& leafScanTable(const LogicalPlanNode* node) {
@@ -89,6 +110,11 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         case LogicalNodeType::JOIN: {
             auto* join = static_cast<LogicalJoin*>(node);
 
+            // Exactly one key, and exactly one join in the tree: build()'s
+            // checkLowerable pre-pass refuses anything else until Week 27.
+            const std::string& from_col = join->keys[0].from_col;
+            const std::string& join_col = join->keys[0].join_col;
+
             // Week 22: choose the build side from filtered cardinality estimates.
             // Post-pushdown, a child may be a LogicalFilter, so its estimated_rows
             // is the count *after* the WHERE — which can invert the raw table-size
@@ -133,8 +159,8 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             const Schema& from_schema = join->children[0]->output_schema;
             const Schema& jn_schema   = join->children[1]->output_schema;
             bool int_keys =
-                from_schema.column(from_schema.indexOf(join->from_col)).type == TypeId::INT &&
-                jn_schema.column(jn_schema.indexOf(join->join_col)).type == TypeId::INT;
+                from_schema.column(from_schema.indexOf(from_col)).type == TypeId::INT &&
+                jn_schema.column(jn_schema.indexOf(join_col)).type == TypeId::INT;
 
             double cost_hash_from = hashJoinCost(from_est, from_w, join_est);
             double cost_hash_join = hashJoinCost(join_est, join_w, from_est);
@@ -181,10 +207,10 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                     // FROM builds: JOIN side probes (swapped)
                     ? std::make_unique<VecSimdLoopJoinNode>(
                           std::move(join_child), std::move(from_child),
-                          join->join_col, join->from_col, join->output_schema, /*swapped=*/true)
+                          join_col, from_col, join->output_schema, /*swapped=*/true)
                     : std::make_unique<VecSimdLoopJoinNode>(
                           std::move(from_child), std::move(join_child),
-                          join->from_col, join->join_col, join->output_schema, /*swapped=*/false);
+                          from_col, join_col, join->output_schema, /*swapped=*/false);
                 join_node->setCostDecision(std::move(decision));
                 return join_node;
             }
@@ -192,10 +218,10 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 // FROM builds: JOIN side probes (swapped)
                 ? std::make_unique<VecHashJoinNode>(
                       std::move(join_child), std::move(from_child),
-                      join->join_col, join->from_col, join->output_schema, /*swapped=*/true)
+                      join_col, from_col, join->output_schema, /*swapped=*/true)
                 : std::make_unique<VecHashJoinNode>(
                       std::move(from_child), std::move(join_child),
-                      join->from_col, join->join_col, join->output_schema, /*swapped=*/false);
+                      from_col, join_col, join->output_schema, /*swapped=*/false);
             join_node->setCostDecision(std::move(decision));
             return join_node;
         }
@@ -256,6 +282,9 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
         std::unordered_map<std::string, ColumnarTable> columnar_tables,
         const Catalog& catalog) {
+    int joins_seen = 0;
+    checkLowerable(logical.get(), joins_seen);
+
     Lowering lowering{columnar_tables, {}, catalog};
     countScans(logical.get(), lowering.scan_uses);
     return lowering.lower(logical.get(), nullptr);

@@ -2,35 +2,71 @@
 
 #include <stdexcept>
 
-JoinConditionKeys classifyJoinCondition(const Expr* condition) {
-    auto* bin = dynamic_cast<const BinaryExpr*>(condition);
-    if (!bin) {
-        throw std::runtime_error(
-            "JOIN ON: condition must be a single equality between one column from each table");
+namespace {
+
+// Flatten an AND-chain without taking ownership — the ON tree still belongs to
+// the statement. Same recursion shape as splitConjuncts() in
+// predicate_pushdown.cc, which flattens the WHERE clause.
+void flattenAnd(const Expr* pred, std::vector<const Expr*>& out) {
+    auto* bin = dynamic_cast<const BinaryExpr*>(pred);
+    if (bin && bin->op == "AND") {
+        flattenAnd(bin->left.get(), out);
+        flattenAnd(bin->right.get(), out);
+        return;
     }
-    if (bin->op == "AND" || bin->op == "OR") {
-        throw std::runtime_error(
-            "JOIN ON: compound join conditions are not supported; "
-            "use a single equality between one column from each table");
-    }
-    if (bin->op != "=") {
-        throw std::runtime_error(
-            "JOIN ON: non-equality join conditions are not supported (got '" + bin->op + "')");
-    }
-    auto* lc = dynamic_cast<const ColumnRef*>(bin->left.get());
-    auto* rc = dynamic_cast<const ColumnRef*>(bin->right.get());
-    if (!lc || !rc) {
-        throw std::runtime_error(
-            "JOIN ON: both sides of the join equality must be column references");
-    }
-    if (lc->relation_slot >= 0 && rc->relation_slot >= 0) {
+    out.push_back(pred);
+}
+
+} // namespace
+
+std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot) {
+    std::vector<const Expr*> conjuncts;
+    flattenAnd(condition, conjuncts);
+
+    std::vector<JoinKey> keys;
+    for (const Expr* c : conjuncts) {
+        auto* bin = dynamic_cast<const BinaryExpr*>(c);
+        if (!bin || bin->op == "OR") {
+            throw std::runtime_error(
+                "JOIN ON: condition must be an equality, or an AND-chain of equalities, "
+                "between one column from each joined table");
+        }
+        if (bin->op != "=") {
+            // Week 27 routes these as residual post-join filters; until then a
+            // clean refusal beats executing '<' as '='.
+            throw std::runtime_error(
+                "JOIN ON: non-equality join conditions are not supported (got '" + bin->op + "')");
+        }
+        auto* lc = dynamic_cast<const ColumnRef*>(bin->left.get());
+        auto* rc = dynamic_cast<const ColumnRef*>(bin->right.get());
+        if (!lc || !rc) {
+            throw std::runtime_error(
+                "JOIN ON: both sides of the join equality must be column references");
+        }
+
+        if (lc->relation_slot < 0 || rc->relation_slot < 0) {
+            // unbound: positional routing, as documented in the header
+            keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
+            continue;
+        }
         if (lc->relation_slot == rc->relation_slot) {
             throw std::runtime_error(
                 "JOIN ON: condition must compare a column from each joined table; "
                 "both sides reference '" + lc->table_name + "'");
         }
-        if (lc->relation_slot == 0) return {lc->column_name, rc->column_name};
-        return {rc->column_name, lc->column_name};
+        if (rc->relation_slot == right_slot) {
+            keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
+        } else if (lc->relation_slot == right_slot) {
+            keys.push_back({rc->column_name, lc->column_name, rc->relation_slot});
+        } else {
+            // Neither side is the relation being joined in: with two relations
+            // this was unreachable, with three it is a forward reference
+            // (ON a.x = c.x before c is joined) or a stale join.
+            throw std::runtime_error(
+                "JOIN ON: each condition must reference the table being joined; '"
+                + lc->table_name + "." + lc->column_name + " = "
+                + rc->table_name + "." + rc->column_name + "' does not");
+        }
     }
-    return {lc->column_name, rc->column_name};
+    return keys;
 }

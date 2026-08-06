@@ -125,14 +125,21 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
             // pick the schema the argument resolves against: binder slot when
             // bound, table-name match for unbound qualified refs, FROM otherwise
             const Schema* target = nullptr;
-            if (col->relation_slot == 1 && stmt.join.has_value()) {
-                target = &catalog.getTable(stmt.join->join_table).schema;
+            if (col->relation_slot > 0
+                && col->relation_slot <= static_cast<int>(stmt.joins.size())) {
+                // slot k > 0 is joins[k-1]'s relation — the one arithmetic
+                // identity the whole multi-way generalization rests on
+                target = &catalog.getTable(stmt.joins[col->relation_slot - 1].join_table).schema;
             } else if (col->relation_slot == 0 || col->table_name.empty()) {
                 target = &schema;
             } else if (col->table_name == stmt.from_table) {
                 target = &schema;
-            } else if (stmt.join.has_value() && col->table_name == stmt.join->join_table) {
-                target = &catalog.getTable(stmt.join->join_table).schema;
+            } else {
+                for (const auto& j : stmt.joins) {
+                    if (col->table_name != j.join_table) continue;
+                    target = &catalog.getTable(j.join_table).schema;
+                    break;
+                }
             }
             if (!target || !target->hasColumn(col->column_name)) continue;
 
@@ -143,17 +150,22 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         }
     }
 
-    // JOIN table must exist (if present)
-    if (stmt.join.has_value()) {
-        if (!catalog.hasTable(stmt.join->join_table)) {
-            throw std::runtime_error(
-                "Join table not found: '" + stmt.join->join_table + "'");
+    // JOIN tables must exist (if present)
+    if (!stmt.joins.empty()) {
+        std::vector<std::pair<std::string, const Schema*>> relations{{stmt.from_table, &schema}};
+        for (const auto& j : stmt.joins) {
+            if (!catalog.hasTable(j.join_table)) {
+                throw std::runtime_error(
+                    "Join table not found: '" + j.join_table + "'");
+            }
+            relations.push_back({j.join_table, &catalog.getTable(j.join_table).schema});
         }
-        if (stmt.join->condition) {
-            // shape first (single cross-relation equality), then column existence
-            classifyJoinCondition(stmt.join->condition.get());
-            const Schema& right_schema = catalog.getTable(stmt.join->join_table).schema;
-            validateJoinCondition(stmt.join->condition.get(), schema, stmt.from_table, right_schema, stmt.join->join_table);
+        for (size_t i = 0; i < stmt.joins.size(); ++i) {
+            if (!stmt.joins[i].condition) continue;
+            // shape first (equi-join keys), then column existence — a shape
+            // error is the more useful message when both are wrong
+            classifyJoinCondition(stmt.joins[i].condition.get(), static_cast<int>(i) + 1);
+            validateJoinCondition(stmt.joins[i].condition.get(), relations);
         }
     }
 
@@ -206,13 +218,17 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         bool found;
         if (!g.table_name.empty()) {
             // qualified but unbound (validator-only callers that skip the Binder)
-            found = (g.table_name == stmt.from_table && schema.hasColumn(g.column_name))
-                 || (stmt.join.has_value() && g.table_name == stmt.join->join_table
-                     && catalog.getTable(stmt.join->join_table).schema.hasColumn(g.column_name));
+            found = (g.table_name == stmt.from_table && schema.hasColumn(g.column_name));
+            for (const auto& j : stmt.joins) {
+                if (found) break;
+                found = g.table_name == j.join_table
+                     && catalog.getTable(j.join_table).schema.hasColumn(g.column_name);
+            }
         } else {
             found = schema.hasColumn(g.column_name);
-            if (!found && stmt.join.has_value()) {
-                found = catalog.getTable(stmt.join->join_table).schema.hasColumn(g.column_name);
+            for (const auto& j : stmt.joins) {
+                if (found) break;
+                found = catalog.getTable(j.join_table).schema.hasColumn(g.column_name);
             }
         }
         if (!found) {
@@ -333,24 +349,60 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
 }
 
 
-void Validator::validateJoinCondition(const Expr* expr, const Schema& left_schema, const std::string& left_table, const Schema& right_schema, const std::string& right_table){
+void Validator::validateJoinCondition(const Expr* expr,
+        const std::vector<std::pair<std::string, const Schema*>>& relations){
+    if (!expr) return;
+
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        if (col->table_name == left_table) {
-            if (!left_schema.hasColumn(col->column_name)){
-                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in table '" + left_table + "'");
+        if (col->table_name.empty()) {
+            for (const auto& rel : relations) {
+                if (rel.second->hasColumn(col->column_name)) return;
             }
-        } else if (col->table_name == right_table) {
-            if (!right_schema.hasColumn(col->column_name)){
-                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in table '" + right_table + "'");
-            }
-        } else if (col->table_name.empty()) {
-            if (!left_schema.hasColumn(col->column_name) && !right_schema.hasColumn(col->column_name)){
-                throw std::runtime_error("JOIN ON: column '" + col->column_name + "' not found in either joined table");
-            }
+            throw std::runtime_error(
+                "JOIN ON: column '" + col->column_name + "' not found in any joined table");
         }
-        // qualified ref with unknown table prefix: skip (alias, deferred resolution)
-    } else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        validateJoinCondition(bin->left.get(),  left_schema, left_table, right_schema, right_table);
-        validateJoinCondition(bin->right.get(), left_schema, left_table, right_schema, right_table);
+        for (const auto& rel : relations) {
+            if (rel.first != col->table_name) continue;
+            if (!rel.second->hasColumn(col->column_name)){
+                throw std::runtime_error("JOIN ON: column '" + col->column_name
+                    + "' not found in table '" + rel.first + "'");
+            }
+            return;
+        }
+        return; // qualified ref with unknown table prefix: an alias, resolved by the Binder
     }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        validateJoinCondition(bin->left.get(),  relations);
+        validateJoinCondition(bin->right.get(), relations);
+        return;
+    }
+    // DISPATCH SITE 18. Silent on an unhandled subtype: no column-existence
+    // check inside it. Dormant until Week 26 relaxed classifyJoinCondition to
+    // accept AND-chains; Week 27 legalizes residual ON conjuncts, which is when
+    // the Week 25 shapes below actually arrive. Keep in lockstep with
+    // validateExpr above.
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr))   { validateJoinCondition(un->operand.get(), relations); return; }
+    if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) { validateJoinCondition(isn->operand.get(), relations); return; }
+    if (auto* in = dynamic_cast<const InExpr*>(expr))      { validateJoinCondition(in->operand.get(), relations); return; }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr))    { validateJoinCondition(lk->operand.get(), relations); return; }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            validateJoinCondition(w.condition.get(), relations);
+            validateJoinCondition(w.result.get(), relations);
+        }
+        validateJoinCondition(c->else_expr.get(), relations);   // nullptr-safe
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        validateJoinCondition(sub->operand.get(), relations);
+        validateJoinCondition(sub->start.get(), relations);
+        validateJoinCondition(sub->length.get(), relations);    // nullptr-safe
+        return;
+    }
+    if (dynamic_cast<const AggregateExpr*>(expr)) {
+        // meaningless in a join condition, and loud beats silent
+        throw std::runtime_error(
+            "JOIN ON: aggregate functions are not allowed in a join condition");
+    }
+    // Literal / IntervalLiteral: nothing to check
 }

@@ -182,5 +182,5 @@ void foldConstants(SelectStatement& stmt) {
         foldNode(folded);
         g.expr = std::shared_ptr<Expr>(std::move(folded));
     }
-    if (stmt.join.has_value()) foldNode(stmt.join->condition);
+    for (auto& j : stmt.joins) foldNode(j.condition);
 }
