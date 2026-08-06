@@ -65,7 +65,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `--storage row | columnar` — switches the storage backend
 - `--execution volcano | vectorized` — switches the execution model
 - Query result cache — identical queries served from cache without re-execution
-- Cost-based optimizer for vectorized execution — statistics, cardinality estimation, predicate pushdown, and physical join selection (Phase 4)
+- Cost-based optimizer for vectorized execution — statistics, cardinality estimation, predicate pushdown, and physical join selection (Phase 4); left-deep cost-based join ordering with a greedy fallback for large join graphs (Week 28)
 - Multi-way joins, richer expressions, subqueries, and TPC-H benchmarking (Phase 5)
 - CSV-based table storage with a `catalog.json` metadata file
 
@@ -663,12 +663,16 @@ Metrics per query: latency (ms, average of 5 runs), rows/sec, storage size.
 **Checkpoint:** The cheapest supported single-join plan is selected from estimates.
 
 > **Scope note (data-volume cost):** The Week 22 cost model implements the CPU and
-> hash-table memory terms; the data-volume (bytes-materialized) term is deferred to
+> hash-table memory terms; the data-volume (bytes-materialized) term was deferred to
 > Week 28. At single-join scope both build-side options move the same data volume, so
 > the term cannot change the decision and is not testable here — it first affects a
 > plan choice in Week 28, where differing intermediate-result widths across join
 > orderings make it discriminate. The hash-table memory term already uses real
 > per-column `avg_width` statistics, so build-side selection accounts for row width.
+> **Landed in Week 28** as `joinOutputCost`, applied per join by the enumerator and
+> deliberately kept *outside* `hashJoinCost`/`simdLoopJoinCost`: it is symmetric
+> under a build-side swap, so folding it in would change no decision here while
+> inflating every `cost=` string and invalidating `CPU_SIMD_COMPARE`'s calibration.
 
 ### Week 23 — Explainability + Phase 4 Benchmarks
 
@@ -927,7 +931,74 @@ there rather than inventing an encoding.
 - Add left-deep dynamic-programming join ordering with a configurable limit
 - Use a greedy fallback for larger join graphs
 
-**Checkpoint:** `EXPLAIN` shows cost-based multiway join order decisions.
+**Checkpoint:** `EXPLAIN` shows cost-based multiway join order decisions. ✅
+
+`JoinEnumeration::apply` runs between predicate pushdown and cardinality
+estimation — after pushdown, because a relation's leaf must already carry its own
+filters or every input costs at its raw table size; before estimation, because
+the stamps `--explain` prints and `VectorizedPlanBuilder` costs have to describe
+the tree that will actually run. It is a no-op below three relations: with one
+join there is no ordering decision, only Week 22's build-side one. The top
+`LogicalJoin` of an enumerated tree prints its decision:
+
+```
+LogicalJoin [driver_id@0 = driver_id]  order=laps@0,drivers@2,laps@1 cost=3044120 (written=10030120) method=dp
+```
+
+The week's work was not the search — that is ~90 lines of textbook System-R. It
+was that **the relation at the bottom of the left spine is binder slot 0** was an
+unstated assumption in four places, none of them asserted anywhere:
+
+| Shipped | Why it was required |
+|---|---|
+| **The merged join schema stamps its LEFT block too**, with the leftmost relation's binder slot | `LogicalPlanBuilder::build` never stamped it, and did not have to: relation 0's columns already carry 0. Put relation 1 at the bottom of the spine — which the search does whenever a small relation leads — and every reference from above that carries a binder slot (`SELECT`, the residual `WHERE`, `GROUP BY`, later joins' keys) stops resolving slot-first. A leaf's *own* schema must keep stamping 0, because its pushed filter's refs were re-stamped to 0 by `distribute()` and `ChunkPruner` reads `slot < 1` as scan-local. Two numbering domains, and the boundary is the first join |
+| **`JoinKey::from_slot` is the slot *as presented by the left child's own schema*** — 0 when that child is a single relation, the binder slot when it is a join subtree | Three consumers resolve `from_col` against exactly that schema: `leftKeyIndices()` (which **throws** on a miss, deliberately, since Week 27 — the bare-name fallback is the bug), `LogicalJoin::explain()` and `joinCardinality()`. At the bottom join the left input is a leaf stamping 0, so an enumerated tree that put a binder slot there would abort the query. Written-order trees hide the distinction entirely, because their bottom join's left child *is* relation 0 |
+| **One `joinCardinality`, shared by the search and the stamp** | The DP has to estimate every candidate's intermediates, and `CardinalityEstimator`'s JOIN case already did exactly that — with an NDV rule corrected **twice** during Week 26 (slot-exact left lookup; `have_ndv` tracked separately from the product, so an NDV of 1 stays a usable statistic). A second copy would have let the search rank orderings under one model while `--explain` printed another, which is unfalsifiable by inspection. Same argument that produced `key_encoding.h` |
+| **The leftmost leaf's `StatsContext` is re-stamped from the merged schema** | A leaf's context stamps slot 0 for the same reason its schema does. Merged above a non-zero leftmost relation, every later key lookup on that relation misses, `have_ndv` goes false, and the estimate silently degrades to the FK-like fallback. Nothing fails — the numbers just get worse, which is the failure mode statistics code specialises in |
+| **Week 22's deferred data-volume term, landed with its consumer** — `joinOutputCost(rows, width)`, applied per join by the enumerator and **not** folded into `hashJoinCost`/`simdLoopJoinCost` | Both join operators materialize every output row, and nothing charged for it: the CPU terms count *inputs* only, so a DP blind to output would happily pick the order that builds a five-million-row intermediate. It stays outside the two algorithm costs because it is symmetric under a build-side swap — folding it in changes no Week 22 decision while inflating every `cost=` string printed since Week 23 and invalidating `CPU_SIMD_COMPARE`'s measured calibration |
+| **`rowWidth` sums real per-relation widths for a multi-relation input** | It returned `columns * 8.0` for any join subtree, because `leafScanTable()` names relation 0 for the whole thing and a shared column name (`laps.team` 7.2 bytes, `drivers.team` 7.3) then took the wrong table's width. Week 27 refused to guess; Week 28 compares orderings whose whole difference is intermediate width, so the placeholder had become the measurement. Columns are attributed by the binder slot stamped on the merged schema, via a slot→table map read off the spine |
+| **The zone-map pruning hint is withheld when the leftmost relation is not slot 0** | `ChunkPruner` treats a `relation_slot < 1` ref in a scan hint as scan-local, and `chunk_pruner.h`'s justification silently assumes the FROM-side scan *is* relation 0. Put relation 2's table at the bottom and a slot-0 ref would prune its chunks on another table's value — rows vanish, no error. Unreachable today (post-pushdown the residual above a join holds only multi-relation, `OR` or constant conjuncts, none of which `collectSimplePredicates` accepts), but the reason it is unreachable is exactly the invariant this week deletes |
+
+Two scope decisions, both deliberate. **Enumeration is a no-op below three
+relations** — reordering two would change merged-schema column order and the
+`build=` text for zero modelled gain, and put every Week 22 / 23.5 steering
+assertion at risk for it. And **a two-relation residual still sits above the
+whole join tree**: the Starting note's precondition ("until the ordering exists")
+is now met, but attaching it to the lowest legal join needs the conjunct
+re-type-checked against an intermediate schema, changes *where* a predicate is
+evaluated — the exact semantics Week 29's outer join is about to redefine — and
+moves the checkpoint not at all.
+
+> **Starting notes, from Week 28's foundations.**
+> - **The tree Week 29 inherits may have any relation at the bottom of its left
+>   spine.** Every new consumer of a join's left input must read
+>   `output_schema.column(0).relation_slot` rather than assume 0, and every new
+>   `JoinKey` must follow the `from_slot` contract now written down in
+>   `join_condition.h`. A left outer join makes this sharper, not softer: it is
+>   not commutative, so the enumerator must be *told* which pairs it may
+>   reorder before it sees one — an unguarded outer join in the graph is a wrong
+>   answer, not a bad plan.
+> - **Residual `ON` conjuncts are still folded into the `WHERE` conjunction**
+>   (`logical_plan.cc`, and the marker in `join_condition.h`). That fold is
+>   inner-join-only and Week 29 must split it back apart *before* it can be
+>   correct — and now also before enumeration runs, since a conjunct that must
+>   stay attached to one specific join is no longer describable by "the relation
+>   slot that owns it".
+> - **The search costs the hash join only**, never the SIMD loop join. An
+>   ordering can change a join's key count (a triangle's last-added relation
+>   carries two keys whichever relation it is), and `int_keys` gates SIMD on
+>   `keys.size() == 1`, so eligibility is genuinely order-dependent. Costing it
+>   would buy accuracy only where the build side is under ~50 rows, where the
+>   absolute cost cannot flip an ordering. Documented in `join_enumeration.h`,
+>   not silent.
+> - **`CPU_MATERIALIZE_BYTE = 0.025` is derived, not measured.** It anchors one
+>   ~40-byte output row to the cost of one probe. `CPU_SIMD_COMPARE` earned its
+>   value from on-device measurement (`docs/hash-vs-simd-crossover.md`); this one
+>   has not, and Week 37's profiling is where it should.
+> - **`--no-optimize` keeps the written join order**, which is what makes
+>   `compare_against_sqlite.py`'s second vectorized run an oracle for this week
+>   rather than a duplicate of the first. Any future pass that reorders outside
+>   the `!no_optimize` block destroys that.
 
 ### Week 29 — Outer Join
 
@@ -1052,7 +1123,7 @@ there rather than inventing an encoding.
 | 25 | Predicates + scalar functions | `BETWEEN`/`LIKE`/`IN`/`CASE`/`SUBSTRING`, ISO dates, folded intervals; dispatch checklist corrected to 17 sites |
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly; pushdown routes by relation slot ✅ |
 | 27 | Multi-way join execution | General vectorized join trees execute ✅ |
-| 28 | Join enumeration | DP join ordering with greedy fallback works |
+| 28 | Join enumeration | DP join ordering with greedy fallback works ✅ |
 | 29 | Outer join | Left outer hash join correct |
 | 30 | Subquery parsing + binding | Nested scopes and subquery forms bind |
 | 31 | Scalar + uncorrelated subqueries | Uncorrelated subqueries execute |
@@ -1196,6 +1267,16 @@ Execution: 72.0ms
 - Commas inside string values not supported in CSV input
 - No persistence beyond CSV files and catalog JSON
 - Cost-based optimization applies only to columnar/vectorized execution
+- Join ordering is left-deep only, and its search costs the **hash** join alone —
+  never the SIMD loop join, whose eligibility is order-dependent (an ordering can
+  turn a one-key join into a composite one) but whose absolute cost, confined to
+  build sides under ~50 rows, cannot flip an ordering. Above 10 relations the DP
+  gives way to a greedy walk that is legal and connected but never optimal
+- Join cardinalities compound under the independence assumption: the estimator
+  divides by the product of per-key NDVs and filters do not narrow column
+  statistics, so estimation error grows multiplicatively along a join spine.
+  Histograms and multi-column correlation statistics are a Possible Extension,
+  not Phase 5 work
 - Result cache invalidation not implemented — cache is cleared on process restart only
 
 ---

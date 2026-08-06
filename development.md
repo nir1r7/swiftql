@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **614 tests, 0 failures.**
+Expected: **634 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,11 +223,16 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **568 passed, 0 failed, 0 errors**: 124 queries × 4 modes (row/Volcano,
+Expected: **596 passed, 0 failed, 0 errors**: 124 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
-`--no-optimize`), plus 12 rejections × the same 4 modes, plus Week 27's
-capability split — 6 multi-way queries × the 2 vectorized modes, diffed against
-SQLite, and the same 6 asserted to be refused × the 2 Volcano modes.
+`--no-optimize`), plus 12 rejections × the same 4 modes, plus the multi-way
+capability split — 13 multi-way queries × the 2 vectorized modes, diffed against
+SQLite, and the same 13 asserted to be refused × the 2 Volcano modes.
+
+The multi-way block is 6 Week 27 execution shapes plus 7 Week 28 join-ordering
+ones. Running the ordering queries in the `--no-optimize` vectorized mode as well
+is the point, not duplication: that mode keeps the **written** join order, so the
+pair is what makes this file able to catch a reordering that changes an answer.
 
 > A query that runs in only some modes has to be listed separately, not dropped
 > from the harness and not run everywhere. Multi-way joins are the first such
