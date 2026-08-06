@@ -937,3 +937,78 @@ TEST(VecPlanBuilder, MultiRelationRowWidthSumsPerRelationStats) {
     EXPECT_NEAR(cost, lo, 1.0);
     EXPECT_NEAR(alt,  hi, 1.0);
 }
+
+// ===== Week 28: the pruning hint under a reordered join tree =====
+
+// Collect every node in a lowered plan (both join branches).
+static void collectVec(const VecPlanNode* n, std::vector<const VecPlanNode*>& out) {
+    if (!n) return;
+    out.push_back(n);
+    for (const VecPlanNode* c : n->children()) collectVec(c, out);
+}
+
+// Build `Filter(lap_id = 1) over Join(laps, drivers)` where the join's MERGED
+// schema stamps its left block with `leftmost_slot` — the shape join enumeration
+// produces and no written-order tree can. Returns the laps scan's explain string.
+static std::string lapsScanExplain(const Catalog& cat, int leftmost_slot) {
+    Schema laps_schema({ColumnDef{"lap_id", TypeId::INT, 0, false},
+                        ColumnDef{"driver_id", TypeId::INT, 0, false}});
+    Schema drivers_schema({ColumnDef{"driver_id", TypeId::INT, 0, false}});
+    auto laps = std::make_unique<LogicalScan>("laps", laps_schema);
+    auto drivers = std::make_unique<LogicalScan>("drivers", drivers_schema);
+
+    // merged: [left block stamped leftmost_slot] ++ [right block stamped join_slot]
+    std::vector<ColumnDef> merged;
+    for (ColumnDef c : laps_schema.columns()) { c.relation_slot = leftmost_slot; merged.push_back(c); }
+    for (ColumnDef c : drivers_schema.columns()) { c.relation_slot = 1; merged.push_back(c); }
+    // bottom join: from_slot 0 addresses the leaf's own schema (JoinKey contract)
+    std::vector<JoinKey> keys{JoinKey{"driver_id", "driver_id", 0}};
+    auto join = std::make_unique<LogicalJoin>(std::move(laps), std::move(drivers),
+                                              std::move(keys), 1, Schema(merged));
+
+    // a prunable scan-local-looking conjunct: ColumnRef(slot 0) op Literal is
+    // exactly what ChunkPruner::collectSimplePredicates accepts
+    auto col = std::make_unique<ColumnRef>();
+    col->column_name = "lap_id";
+    col->relation_slot = 0;
+    auto pred = std::make_unique<BinaryExpr>();
+    pred->op = "=";
+    pred->left = std::move(col);
+    pred->right = std::make_unique<Literal>(Value(int64_t(1)));
+    std::unique_ptr<LogicalPlanNode> root =
+        std::make_unique<LogicalFilter>(std::move(join), std::move(pred));
+
+    std::unordered_map<std::string, ColumnarTable> tables;
+    for (const char* t : {"laps", "drivers"}) {
+        const auto& m = cat.getTable(t);
+        tables.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+    }
+    auto plan = VectorizedPlanBuilder::build(std::move(root), std::move(tables), cat);
+
+    std::vector<const VecPlanNode*> nodes;
+    collectVec(plan.get(), nodes);
+    for (const VecPlanNode* n : nodes) {
+        if (n->explain().rfind("VecScan [laps", 0) == 0) return n->explain();
+    }
+    return "";
+}
+
+// ChunkPruner treats a relation_slot < 1 ref in a scan hint as scan-local, which
+// is only true of the leftmost scan while the leftmost relation IS relation 0.
+// Join enumeration can put any relation at the bottom of the spine, and the hint
+// only ever descends children[0] — so a slot-0 ref would then prune ANOTHER
+// table's chunks on relation 0's value: rows vanish, with no error anywhere.
+//
+// Unreachable from the query surface (post-pushdown a residual above a join holds
+// no ColumnRef-op-Literal conjunct), which is exactly why it needs a hand-built
+// test: deleting the guard breaks nothing else in the suite.
+TEST(VecPlanBuilder, PruningHintIsWithheldWhenTheLeftmostRelationIsNotSlotZero) {
+    Catalog cat(CATALOG);
+    // control: relation 0 leads, so the hint is scan-local and must be attached
+    EXPECT_NE(lapsScanExplain(cat, /*leftmost_slot=*/0).find("pruning=on"),
+              std::string::npos);
+    // reordered: relation 2 leads, so a slot-0 ref in the hint does not describe
+    // this scan's table and the hint must not reach it
+    EXPECT_EQ(lapsScanExplain(cat, /*leftmost_slot=*/2).find("pruning"),
+              std::string::npos);
+}

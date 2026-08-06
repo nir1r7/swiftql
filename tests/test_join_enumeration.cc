@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Tests run from build/, so the catalog is one level up.
@@ -503,4 +504,118 @@ TEST(JoinEnumeration, ReorderedPlansReturnTheWrittenOrdersRows) {
         EXPECT_EQ(runVec(sql, cat, /*enumerate=*/true),
                   runVec(sql, cat, /*enumerate=*/false)) << sql;
     }
+}
+
+// ── the search may only improve on the written order ────────────────────────
+
+// Parse `cost=X (written=Y)` out of a decision string.
+static std::pair<double, double> costs(const std::string& decision) {
+    const size_t c = decision.find("cost=");
+    const size_t w = decision.find("(written=");
+    if (c == std::string::npos || w == std::string::npos) return {-1.0, -1.0};
+    return {std::stod(decision.substr(c + 5)), std::stod(decision.substr(w + 9))};
+}
+
+// Keeping ONE subplan per subset is sound only when the cost of finishing a
+// subset depends on the subset alone. rows(S) is supposed to be the pure product
+// (rows / ndv) over the edges inside S, which is a function of the set — but the
+// >=1-row floor used to be applied per join STEP inside joinCardinality, so a
+// candidate passing through a sub-1-row intermediate had every later estimate
+// inflated by 1/true_rows while one that never dipped below 1 did not. rows(S)
+// became path-dependent, optimal substructure was gone, and the DP could lock
+// onto a cheap prefix whose floored count poisoned every later transition.
+//
+// The written order is always legal and always inside the search space, so a
+// sound search can never return something strictly worse. Before the floor moved
+// to the stamping sites this query planned at cost=666 against a written order of
+// 629 — the pass advertising, in its own checkpoint string, that it had made the
+// plan worse.
+TEST(JoinEnumeration, NeverInstallsAnOrderWorseThanTheWrittenOne) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    const std::vector<std::string> cases = {
+        // THE repro: r0 (3 rows after age > 37) joined to r2 (3 rows) on team
+        // (NDV 10) estimates 0.9 rows — the floor's only trigger
+        "SELECT COUNT(*) FROM drivers r0 JOIN drivers r1 ON r1.team = r0.team "
+        "JOIN drivers r2 ON r2.team = r0.team JOIN laps r3 ON r3.team = r2.team "
+        "WHERE r0.age > 37 AND r1.age > 30 AND r2.age > 37 AND r3.lap_id < 500",
+        // two sub-1-row intermediates reachable on different paths
+        "SELECT COUNT(*) FROM drivers r0 JOIN drivers r1 ON r1.team = r0.team "
+        "JOIN drivers r2 ON r2.team = r1.team JOIN drivers r3 ON r3.team = r0.team "
+        "WHERE r0.age > 37 AND r1.age > 37 AND r2.age > 37 AND r3.age > 37",
+        // five relations, mixed tables
+        "SELECT COUNT(*) FROM laps r0 JOIN drivers r1 ON r1.driver_id = r0.driver_id "
+        "JOIN drivers r2 ON r2.driver_id = r1.driver_id "
+        "JOIN laps r3 ON r3.team = r0.team JOIN laps r4 ON r4.team = r0.team "
+        "WHERE r0.lap_id < 500 AND r1.age > 37 AND r2.age > 35",
+        // the ordinary shapes, which must keep working
+        "SELECT COUNT(*) FROM laps l JOIN laps l2 ON l.driver_id = l2.driver_id "
+        "JOIN drivers d ON l.driver_id = d.driver_id",
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN drivers d2 ON d.team = d2.team",
+    };
+    for (const std::string& sql : cases) {
+        auto plan = optimize(sql, cat);
+        auto [chosen, written] = costs(decisionOf(plan.get()));
+        ASSERT_GE(chosen, 0.0) << sql;
+        EXPECT_LE(chosen, written) << sql;
+    }
+}
+
+// The mechanism, isolated. joinCardinality must return the RAW product so the
+// search's transition function stays multiplicative and therefore
+// path-independent; the floor is a stamping policy applied on top.
+TEST(JoinEnumeration, JoinCardinalityIsUnflooredAndTheStampIsNot) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // 3 x 3 rows over a key with NDV 10 is 0.9 — the case the floor rewrites
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM drivers r0 JOIN drivers r1 ON r1.team = r0.team "
+        "JOIN laps r2 ON r2.team = r1.team WHERE r0.age > 37 AND r1.age > 37", cat);
+    std::vector<const LogicalJoin*> joins;
+    collectJoins(plan.get(), joins);
+    ASSERT_EQ(joins.size(), 2u);
+    const LogicalJoin* bottom = joins.back();
+
+    StatsContext left  = CardinalityEstimator::estimateSubtree(*bottom->children[0], cat);
+    StatsContext right = CardinalityEstimator::estimateSubtree(*bottom->children[1], cat);
+    const double l = bottom->children[0]->estimated_rows;
+    const double r = bottom->children[1]->estimated_rows;
+    const double raw = joinCardinality(l, r, bottom->keys, left, right);
+
+    // the raw rule does NOT floor — that is what the search consumes
+    EXPECT_LT(raw, 1.0);
+    // the stamp does, and it is what --explain prints
+    EXPECT_DOUBLE_EQ(flooredJoinCardinality(l, r, raw), 1.0);
+    EXPECT_DOUBLE_EQ(bottom->estimated_rows, 1.0);
+}
+
+// An unbound key (from_slot -1, join_condition.h's positional-routing path for
+// callers that skip the Binder) has no place in the join graph: keysBetween and
+// rebuild both test membership of the placed set, which a -1 endpoint can never
+// satisfy, so the key would be dropped from the rebuilt tree — a missing conjunct
+// and MORE rows if the join had a second key. Unreachable from the CLI, so this
+// is the shape of a planner bug and must be loud, like every other check here.
+TEST(JoinEnumeration, UnboundJoinKeyIsRefusedRatherThanDropped) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // A MULTI-key join is what makes this a wrong answer rather than an error:
+    // drop the unbound key and the join still has one, so the tree rebuilds
+    // cleanly, executes, and returns the rows the missing conjunct would have
+    // removed. With a single key the same bug surfaces as a spurious "produced a
+    // cross product" throw — also wrong, but at least loud.
+    Parser parser("SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+                  "JOIN drivers d2 ON d.team = d2.team AND d.driver_id = d2.driver_id");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
+    plan = PredicatePushdown::apply(std::move(plan), cat);
+
+    std::vector<const LogicalJoin*> joins;
+    collectJoins(plan.get(), joins);
+    ASSERT_FALSE(joins.empty());
+    ASSERT_GE(joins.front()->keys.size(), 2u);
+    const_cast<LogicalJoin*>(joins.front())->keys[0].from_slot = -1;
+
+    EXPECT_THROW(JoinEnumeration::apply(std::move(plan), cat), std::runtime_error);
 }

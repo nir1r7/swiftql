@@ -539,17 +539,21 @@ TEST(Cardinality, JoinCardinalityMatchesTheStampedJoinEstimate) {
                      join->estimated_rows);
 }
 
-// The >=1-row floor lives INSIDE joinCardinality, not at the stamping site, so
-// the Week 28 search sees the same floored number the plan will show. A zero-row
-// candidate that ranked infinitely better than it runs would win every ordering.
-TEST(Cardinality, JoinCardinalityFloorsAtOneRowLikeTheStamp) {
+// The >=1-row floor is a STAMPING policy, applied by flooredJoinCardinality on
+// top of the rule — never inside it. A per-step clamp makes a subset's row count
+// depend on the path that reached it, which destroys the optimal substructure the
+// Week 28 join DP rests on (see JoinEnumeration.NeverInstallsAnOrderWorseThanThe
+// WrittenOne for the plan that measured it).
+TEST(Cardinality, TheOneRowFloorBelongsToTheStampNotTheRule) {
     StatsContext empty;
-    EXPECT_DOUBLE_EQ(joinCardinality(1.0, 1.0, {}, empty, empty), 1.0);
     // no key NDV at all: the FK-like max() fallback, not a cross product
     EXPECT_DOUBLE_EQ(joinCardinality(1000.0, 20.0, {}, empty, empty), 1000.0);
-    // a genuinely empty input is NOT floored — the floor is conditional on both
-    // sides having rows
-    EXPECT_DOUBLE_EQ(joinCardinality(0.0, 20.0, {}, empty, empty), 20.0);
+    // the floor fires only when BOTH sides have rows, so a genuinely empty input
+    // still reports empty
+    EXPECT_DOUBLE_EQ(flooredJoinCardinality(1.0, 1.0, 0.25), 1.0);
+    EXPECT_DOUBLE_EQ(flooredJoinCardinality(0.0, 20.0, 0.25), 0.25);
+    // and it never lowers a value that already clears the floor
+    EXPECT_DOUBLE_EQ(flooredJoinCardinality(1000.0, 20.0, 50.0), 50.0);
 }
 
 // Week 28: a leaf's own StatsContext stamps slot 0, because a standalone scan
