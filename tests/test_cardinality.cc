@@ -329,6 +329,33 @@ TEST(Cardinality, JoinEstimateFloorsToOneRow) {
     EXPECT_DOUBLE_EQ(j->estimated_rows, 1.0);
 }
 
+// An NDV of 1 is a usable statistic, not a missing one: every left row matches
+// every right row, so l*r/1 is the exact answer. Testing the product against
+// 1.0 instead of tracking "did any key contribute an NDV" sent this to the
+// no-statistics fallback and underestimated a constant-key join by the table
+// size — the estimate then propagates into every ancestor and into join costs.
+TEST(Cardinality, SingleValuedJoinKeyEstimatesTheCrossProduct) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat, /*driver_id_ndv=*/1);
+
+    TableStats drivers_ts;
+    drivers_ts.row_count = 20;
+    ColumnStats key;
+    key.min_val = Value(int64_t(7));
+    key.max_val = Value(int64_t(7));
+    key.distinct_count = 1;
+    key.null_count = 0;
+    drivers_ts.columns.emplace("driver_id", key);
+    cat.setStats("drivers", std::move(drivers_ts));
+
+    auto plan = buildLogical(
+        "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+    const LogicalPlanNode* j = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(j, nullptr);
+    EXPECT_DOUBLE_EQ(j->estimated_rows, 20000.0);   // 1000 * 20 / 1, not max(1000,20)
+}
+
 TEST(Cardinality, JoinFallsBackToMaxWithoutStats) {
     Catalog cat(CATALOG);  // no stats on either table
     auto plan = buildLogical(

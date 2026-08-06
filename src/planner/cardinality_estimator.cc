@@ -248,18 +248,28 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // the independent-key generalization of the single-key formula
             // (Week 26 multi-key equi-joins). The left lookup goes by slot: the
             // merged left schema can hold the same column name at several slots.
+            // `have_ndv` is tracked separately from the product on purpose: an
+            // NDV of 1 leaves divisor == 1.0 while being a perfectly usable
+            // statistic — every left row matches every right row, so l*r/1 is
+            // the exact answer. Testing `divisor > 1.0` instead sent that case
+            // to the no-statistics fallback and underestimated a constant-key
+            // join by the table size.
             double divisor = 1.0;
+            bool have_ndv = false;
             for (const JoinKey& k : join.keys) {
                 const ColumnStatsEntry* lk = left.find(k.from_col, k.from_slot);
                 const ColumnStatsEntry* rk = right.find(k.join_col, -1);
                 int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
                                        rk ? rk->stats->distinct_count : int64_t(0));
-                if (ndv > 0) divisor *= static_cast<double>(ndv);
+                if (ndv > 0) {
+                    divisor *= static_cast<double>(ndv);
+                    have_ndv = true;
+                }
             }
 
             // no usable key NDV: assume the FK-like case (max) rather than a
             // cross product, which would explode and mislead Week 22 costing
-            node.estimated_rows = (divisor > 1.0) ? (l * r) / divisor : std::max(l, r);
+            node.estimated_rows = have_ndv ? (l * r) / divisor : std::max(l, r);
             // ≥1-row floor, matching the FILTER case
             if (l >= 1.0 && r >= 1.0) {
                 node.estimated_rows = std::max(node.estimated_rows, 1.0);
