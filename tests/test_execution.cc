@@ -758,6 +758,56 @@ TEST(HashJoinNode, IntAndDoubleKeysAgreeAtLargeIntegralMagnitudes) {
 // together. Volcano's DistinctNode was the one key serializer with no NULL
 // branch at all, so it returned one row where the vectorized path and SQLite
 // return two — a wrong answer on the correctness baseline.
+// The integer path has to cover the whole int64 domain, not a round number near
+// it: 2^63 - 1024 is exactly representable as a double AND exactly equal to the
+// INT of the same value, so SQLite's exact INTEGER-vs-REAL comparison joins
+// them. A guard at 9.2e18 dropped it back onto %.17g, where it rendered
+// "9.2233720368547748e+18" against the INT's digits and stopped matching.
+TEST(HashJoinNode, IntAndDoubleKeysAgreeUpToTheInt64Boundary) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::INT}, {"bk", TypeId::DOUBLE}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(9223372036854774784LL))}};
+    std::vector<Row> right_rows = {{Value(9223372036854774784.0)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+
+    EXPECT_EQ(drainAll(&join).size(), 1u);
+}
+
+// A NaN groups with itself, which is what key_encoding.h says. It did not:
+// %.17g renders a sign-bit-set NaN as "-nan", so the two NaNs formed two groups
+// — a rule the header stated and the code did not implement, which is worse than
+// no rule for the weeks documented as inheriting this contract.
+TEST(DistinctNode, BothNaNSignsAreOneRow) {
+    Schema schema = makeSchema({{"x", TypeId::DOUBLE}});
+    std::vector<Row> rows = {{Value(std::nan(""))},
+                             {Value(std::copysign(std::nan(""), -1.0))}};
+
+    DistinctNode distinct(makeScan(rows, schema));
+    EXPECT_EQ(drainAll(&distinct).size(), 1u);
+}
+
+// Volcano's explain was not brought along to the logical [FROM, JOIN] rule the
+// vectorized operators follow: on a swapped join it printed the physical
+// probe/build order, so the same logical join rendered two different ways
+// depending on a cost decision the reader cannot see. Asymmetric key names are
+// required to see it at all.
+TEST(HashJoinNode, ExplainRendersLogicalOrderWhenSwapped) {
+    Schema probe_schema = makeSchema({{"jid", TypeId::INT}});   // JOIN side probes
+    Schema build_schema = makeSchema({{"fid", TypeId::INT}});   // FROM side builds
+    Schema merged       = makeSchema({{"fid", TypeId::INT}, {"jid", TypeId::INT}});
+
+    HashJoinNode join(makeScan({}, probe_schema), makeScan({}, build_schema),
+                      std::vector<std::string>{"jid"}, std::vector<std::string>{"fid"},
+                      merged, /*swapped=*/true);
+    EXPECT_EQ(join.explain(), "HashJoin [fid = jid]");
+}
+
 TEST(DistinctNode, NullAndTheStringNullAreDifferentRows) {
     Schema schema = makeSchema({{"x", TypeId::STRING}});
     std::vector<Row> rows = {{Value(std::string("NULL"))}, {Value()}};
