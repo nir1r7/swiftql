@@ -142,7 +142,16 @@ SelectStatement Parser::parseSelect(){
         stmt.from_alias = consume().value;
     }
 
-    if (match(TokenType::JOIN)){
+    // Explicit joins, in written order. `while`, not `if`: joins[i] attaches
+    // relation slot i+1 (Week 26). Before this, a second JOIN fell through to
+    // Parser::parse's end-of-input check and raised "unexpected trailing input",
+    // which was the correct pre-state — pre-Week-25 it was silently discarded
+    // and the query returned a one-join answer with no error.
+    //
+    // The bare-alias branch needs no keyword exclusion list (unlike the FROM
+    // alias above): JOIN / ON / WHERE / GROUP / ORDER / LIMIT / HAVING are all
+    // their own TokenTypes, so check(IDENTIFIER) is already false for them.
+    while (match(TokenType::JOIN)){
         SelectStatement::JoinClause join;
         join.join_table = expect(TokenType::IDENTIFIER, "join table name").value;
 
@@ -155,7 +164,7 @@ SelectStatement Parser::parseSelect(){
 
         expect(TokenType::ON, "ON");
         join.condition = parseExpr();
-        stmt.join = std::move(join);
+        stmt.joins.push_back(std::move(join));
     }
 
     if (match(TokenType::WHERE)){

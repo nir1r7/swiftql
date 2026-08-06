@@ -147,13 +147,18 @@ struct SelectStatement {
     std::string from_table;
     std::string from_alias; // empty if FROM table has no alias
 
-    // optional JOIN
+    // optional JOINs
     struct JoinClause {
         std::string join_table;
         std::string alias; // empty if JOIN table has no alias
         std::unique_ptr<Expr> condition; // the ON expression
     };
-    std::optional<JoinClause> join;
+    // Written order is load-bearing: joins[i] attaches relation slot i+1 to the
+    // left-deep tree built from relations 0..i. That single identity is what the
+    // Binder's range table, the merged join schema, join-key routing and
+    // predicate pushdown all derive their slot arithmetic from. Empty = no join.
+    // (Was std::optional<JoinClause> through Phase 4 — one join only.)
+    std::vector<JoinClause> joins;
 
     // optional WHERE
     std::unique_ptr<Expr> where; // nullptr if no WHERE
