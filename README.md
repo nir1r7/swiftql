@@ -784,10 +784,11 @@ returns rows to diff).
 
 Both refusals are placed so that a genuine query defect outranks a temporary
 engine limitation. The **multi-key** refusal is deferred past `Planner::plan`'s
-plan-time type checks, because the merged join schema is built from the two
-children's schemas and never reads the keys — so those checks are valid for a
-multi-key query, and both engines report the same thing for
-`ON a.x = b.x AND a.y = b.y WHERE <type error>`.
+plan-time type checks — all of them, including the projection's, which
+`buildProjectSchema` performs last — because the merged join schema is built
+from the two children's schemas and never reads the keys. So those checks are
+valid for a multi-key query, and both engines report the same thing whichever
+clause the second fault is in.
 
 The **multi-way** refusal cannot be deferred the same way, and this is the one
 place the two engines differ. `Planner::plan` builds exactly one join, so with
@@ -862,7 +863,7 @@ Four things the two bullets did not anticipate:
 >   vectorized`), rather than deleting it and letting `HashJoinNode` produce
 >   something. `Planner::plan`'s *multi-key* refusal is deferred to after the
 >   plan-time type checks (a flag set in the join block, thrown after the ORDER
->   BY checks) — delete that flag with the guard, and keep the multi-way one
+>   BY checks and the projection's) — delete that flag with the guard, and keep the multi-way one
 >   early, since one join is all that function builds and a deferred check would
 >   run against a schema missing a relation.
 > - **De-duplicate join keys before building the hash-key tuple.**

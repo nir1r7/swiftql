@@ -258,6 +258,23 @@ TEST(PlannerTest, TypeErrorBeatsTheMultiKeyRefusal) {
     }
 }
 
+// The projection's type check is the LAST one Planner::plan performs
+// (buildProjectSchema calls inferExprType per select item), so the refusal has
+// to sit after it too — the vec path runs checkLowerable after the whole
+// logical plan, projection included.
+TEST(PlannerTest, SelectListTypeErrorBeatsTheMultiKeyRefusal) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id + 'x' FROM sj a JOIN sj b "
+                    "ON a.id = b.id AND a.grp = b.grp", catalog);
+        FAIL() << "expected a type error";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("numeric operands"), std::string::npos) << err;
+        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
+    }
+}
+
 // The multi-WAY guard stays ahead of the type checks: this function builds one
 // join, so a third relation's columns are absent from the merged schema and a
 // deferred check would report a misleading "column not found".

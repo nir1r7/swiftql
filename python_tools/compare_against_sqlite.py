@@ -286,6 +286,12 @@ WEEK26_REJECTED_QUERIES = [
      "ON l.driver_id = d.driver_id AND l.team = d.team WHERE l.team + 1 > 0",
      "requires numeric operands"),
 
+    # ...including a fault in the SELECT list, which buildProjectSchema
+    # type-checks last, so the refusal has to sit after that too
+    ("SELECT l.team + 1 FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.team = d.team",
+     "requires numeric operands"),
+
     # a query that is BOTH multi-way and multi-key must report the same reason
     # in every mode — the two engines check in different places, so only a query
     # with both properties can catch them disagreeing

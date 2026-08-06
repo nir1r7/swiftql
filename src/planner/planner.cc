@@ -158,13 +158,6 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
     }
 
-    // Week 26/27 boundary, deferred from the join block so that every plan-time
-    // type check above runs first — see the comment there.
-    if (multi_key_join) {
-        throw std::runtime_error(
-            "multi-key equi-joins are planned but not yet executable (Week 27)");
-    }
-
     // project; SELECT list — placed after Sort so sort expressions resolve against full schema
     if (stmt.select_star) {
         const Schema& child_schema = node->outputSchema();
@@ -195,6 +188,18 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // limit
     if (stmt.limit.has_value()) {
         node = std::make_unique<LimitNode>(std::move(node), stmt.limit.value());
+    }
+
+    // Week 26/27 boundary, deferred from the join block (see the comment there)
+    // so that EVERY plan-time type check runs first — including the projection's,
+    // which buildProjectSchema performs above via inferExprType. Refusing last is
+    // what makes this equivalent to the vectorized path, where checkLowerable
+    // runs after the whole logical plan is built; refusing anywhere earlier means
+    // a fault in whatever clause is checked after it reports the temporary engine
+    // limitation on Volcano and the real defect on the vec path.
+    if (multi_key_join) {
+        throw std::runtime_error(
+            "multi-key equi-joins are planned but not yet executable (Week 27)");
     }
 
     return node;
