@@ -403,8 +403,8 @@ WEEK27_KEY_ENCODING_QUERIES = [
 # builds exactly one join and row/Volcano never gains multi-way execution
 # (README, Week 27). This is the first deliberate per-mode capability difference
 # in the project, so it needs both halves — the rows where it runs
-# (WEEK27_MULTIWAY_QUERIES, diffed against SQLite in the two vec modes) and the
-# refusal where it does not (WEEK27_VOLCANO_REJECTED, in the two Volcano modes).
+# (MULTIWAY_QUERIES, diffed against SQLite in the two vec modes) and the refusal
+# where it does not (MULTIWAY_VOLCANO_REJECTED, in the two Volcano modes).
 WEEK27_MULTIWAY_QUERIES = [
     # THE slot query. The third join's key is `team` at relation slot 1, while
     # the left input's MERGED schema holds `team` at slot 0 first — so a
@@ -441,8 +441,56 @@ WEEK27_MULTIWAY_QUERIES = [
     "JOIN laps l2 ON d2.driver_id = l2.driver_id WHERE l.lap_id < 5",
 ]
 
-WEEK27_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path") for query in WEEK27_MULTIWAY_QUERIES
+# Week 28 gives multi-way joins a cost-chosen order. Reordering changes plan
+# shape and never results, so these are diffed against SQLite exactly like the
+# Week 27 block — the point is that they are shapes the search actually REORDERS,
+# where a mis-oriented key, a mis-stamped merged schema or a lost residual would
+# produce plausible rows rather than an error. The suite runs them in both
+# vectorized modes, and the second is --no-optimize, which keeps the WRITTEN
+# order: that pairing is what makes this file able to catch a reordering that
+# changes an answer.
+WEEK28_JOIN_ORDER_QUERIES = [
+    # Star centred on l: drivers (20 rows) is adjacent to both laps scans.
+    # Written order joins the two laps scans first — driver_id NDV 20 over 10k
+    # rows each — and the search puts drivers second instead.
+    "SELECT COUNT(*) AS c FROM laps l JOIN laps l2 ON l.driver_id = l2.driver_id "
+    "JOIN drivers d ON l.driver_id = d.driver_id WHERE l.lap_id < 200",
+    # THE non-zero-leftmost query: the search leads with drivers@1, so relation 0
+    # is NOT at the bottom of the spine. That is the case the merged-schema
+    # stamping and the bottom-join from_slot = 0 rewrite exist for, and no
+    # written-order tree can produce it. Wrong either way returns rows.
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team",
+    # same reordering, but projecting columns from relations 0 and 2 and sorting
+    # them: column identity has to survive a merged schema rebuilt in a new order
+    "SELECT l.team AS t, d2.name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team WHERE l.season = 2022 AND l.round < 3 ORDER BY t, n",
+    # triangle: every order is legal, and the last relation added carries TWO
+    # keys where the first carried one — so the ordering decides which join is
+    # composite, exercising the shared key encoding from the other direction
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team AND l.driver_id = d2.driver_id",
+    # a residual ON conjunct and a pushed WHERE on a reordered tree: predicate
+    # assignment runs BEFORE enumeration and every conjunct must survive the fold
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team AND d2.age > 25 WHERE l.season = 2024",
+    # aggregation over a reordered tree, grouped by a middle relation's column
+    "SELECT d.nationality AS nat, COUNT(*) AS c, MIN(l.speed) AS lo FROM laps l "
+    "JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team GROUP BY d.nationality ORDER BY nat",
+    # CONTROL: the same shape as the third query with a selective filter on laps
+    # instead. That filter drops laps below drivers, so leading with laps is now
+    # correct and the search keeps the written order — proving the decision reacts
+    # to FILTERED cardinality rather than to table size, and that "reordered" is
+    # not simply what this pass always does.
+    "SELECT l.team AS t, d2.name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team WHERE l.lap_id < 30 ORDER BY t, n",
+]
+
+MULTIWAY_QUERIES = WEEK27_MULTIWAY_QUERIES + WEEK28_JOIN_ORDER_QUERIES
+
+MULTIWAY_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path") for query in MULTIWAY_QUERIES
 ]
 
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
@@ -650,7 +698,7 @@ def main():
         extra_args=["--execution", "vectorized", "--storage", "columnar", "--no-optimize"],
     )
 
-    # Week 27: three-or-more-relation joins execute on the vectorized path only,
+    # Week 27/28: three-or-more-relation joins execute on the vectorized path only,
     # so they are diffed against SQLite in the two vec modes and asserted to be
     # refused in the two Volcano ones. Splitting the suite this way is what keeps
     # a deliberate capability difference from reading as four failures — and
@@ -664,7 +712,7 @@ def main():
     ]
     m_passed = m_failed = m_errors = 0
     for label, extra in vec_modes:
-        mp, mf, me = run_query_suite(conn, WEEK27_MULTIWAY_QUERIES, label, extra_args=extra)
+        mp, mf, me = run_query_suite(conn, MULTIWAY_QUERIES, label, extra_args=extra)
         m_passed += mp
         m_failed += mf
         m_errors += me
@@ -674,7 +722,7 @@ def main():
         ("Multi-way refused (columnar storage, Volcano)", ["--storage", "columnar"]),
     ]
     for label, extra in volcano_modes:
-        mp, mf, me = run_rejection_suite(WEEK27_VOLCANO_REJECTED, label, extra_args=extra)
+        mp, mf, me = run_rejection_suite(MULTIWAY_VOLCANO_REJECTED, label, extra_args=extra)
         m_passed += mp
         m_failed += mf
         m_errors += me

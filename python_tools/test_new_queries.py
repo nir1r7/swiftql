@@ -629,10 +629,204 @@ WEEK27_QUERIES = [
 ]
 
 
+# ─── Week 28: cost-based join ordering ───────────────────────────────────────
+# Three-relation-plus shapes where more than one order is legal, so the search
+# has a real choice. Vectorized-only (multi-way execution has been, since Week
+# 27), and bounded so the suite does not materialize a five-million-row
+# intermediate. A join order is a result-invariant internal, so these assert
+# output equality across optimized / --no-optimize / SQLite; the ORDER itself is
+# asserted separately from --explain (invariant 13), and the WORK it saves is
+# measured separately still, from --explain-analyze.
+#
+# The same query texts are in compare_against_sqlite.py, which is the external
+# oracle for them; this file adds the two decision assertions on top.
+WEEK28_QUERIES = [
+    # star centred on l: drivers (20 rows) is adjacent to both laps scans, so
+    # joining it second avoids an intermediate of 10000*10000/20 rows
+    ("w28_star_pivot_small",
+     "SELECT COUNT(*) FROM laps l JOIN laps l2 ON l.driver_id = l2.driver_id "
+     "JOIN drivers d ON l.driver_id = d.driver_id WHERE l.lap_id < 200"),
+
+    # the SAME join graph, written in the good order already. Under enumeration
+    # the two must execute identically — that is the pair run_join_order_work
+    # measures.
+    ("w28_star_written_good",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN laps l2 ON l.driver_id = l2.driver_id WHERE l.lap_id < 200"),
+
+    # the search leads with drivers@1, so relation 0 is NOT at the bottom of the
+    # spine — the case the merged-schema stamping and the bottom-join
+    # from_slot = 0 rewrite exist for, and one no written-order tree can produce
+    ("w28_nonzero_leftmost",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team"),
+
+    # same reordering, projecting columns from relations 0 and 2: column identity
+    # has to survive a merged schema rebuilt in a new order
+    ("w28_nonzero_leftmost_projection",
+     "SELECT l.team, d2.name FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team WHERE l.season = 2022 AND l.round < 3 "
+     "ORDER BY l.team, d2.name"),
+
+    # triangle: every order legal, and the last relation added carries TWO keys
+    # where the first carried one — the ordering decides which join is composite
+    ("w28_triangle",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team AND l.driver_id = d2.driver_id"),
+
+    # a residual ON conjunct and a pushed WHERE on a reordered tree: predicate
+    # assignment runs BEFORE enumeration and every conjunct must survive the fold
+    ("w28_residual_and_pushed_where",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team AND d2.age > 25 WHERE l.season = 2024"),
+
+    # aggregation over a reordered tree, grouped by a middle relation's column
+    ("w28_aggregate_over_reordered",
+     "SELECT d.nationality, COUNT(*), MIN(l.speed) FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team GROUP BY d.nationality ORDER BY d.nationality"),
+
+    # CONTROL: same shape as w28_nonzero_leftmost_projection but with a selective
+    # filter on laps. That filter drops laps below drivers, so leading with laps
+    # is now correct and the search KEEPS the written order — proving the decision
+    # reacts to filtered cardinality rather than to table size, and that
+    # "reordered" is not simply what this pass always does.
+    ("w28_selective_filter_keeps_written",
+     "SELECT l.team, d2.name FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team WHERE l.lap_id < 30 ORDER BY l.team, d2.name"),
+
+    # four relations: nothing in the DP is 3-specific
+    ("w28_four_way",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.driver_id = d2.driver_id "
+     "JOIN laps l2 ON d2.driver_id = l2.driver_id WHERE l.lap_id < 5"),
+]
+
+# Hand-derived from the shipped statistics (laps 10000 rows, drivers 20,
+# NDV(driver_id) = 20, NDV(team) = 10) — an expectation nobody can re-derive is
+# an expectation nobody can debug. `table@slot` because two relations can share a
+# table name.
+#   star_pivot_small:  l(199 after pushdown) x l2 estimates 199*10000/20 ~ 99500;
+#     l x d estimates 199*20/20 = 199 first, reaching the same final count with an
+#     intermediate 500x smaller. drivers must come SECOND.
+#   nonzero_leftmost:  d x d2 on team estimates 20*20/10 = 40 rows before laps is
+#     touched at all, against 10000 for l x d. A drivers relation must LEAD, which
+#     puts a relation other than slot 0 at the bottom of the spine.
+#   selective_filter_keeps_written: lap_id < 30 pushes laps to ~29 rows, below
+#     drivers' 20+20 — so the written order is now the cheap one and is kept.
+WEEK28_EXPECTED_ORDER = {
+    "w28_star_pivot_small": "laps@0,drivers@2,laps@1",
+    "w28_star_written_good": "laps@0,drivers@1,laps@2",
+    "w28_nonzero_leftmost": "drivers@1,drivers@2,laps@0",
+    "w28_nonzero_leftmost_projection": "drivers@1,drivers@2,laps@0",
+    "w28_triangle": "drivers@1,drivers@2,laps@0",
+    "w28_residual_and_pushed_where": "drivers@1,drivers@2,laps@0",
+    "w28_aggregate_over_reordered": "drivers@1,drivers@2,laps@0",
+    "w28_selective_filter_keeps_written": "laps@0,drivers@1,drivers@2",
+    "w28_four_way": "laps@0,drivers@1,drivers@2,laps@3",
+}
+
+# The same join graph written two ways. Under enumeration both must execute
+# identically — join order is CHOSEN, not inherited from how the user typed it.
+WEEK28_ORDER_EQUIVALENT_PAIRS = [
+    ("w28_star_pivot_small", "w28_star_written_good"),
+]
+
+
+def run_join_order_steering(queries):
+    """Week 28: assert each query's chosen join order matches the hand-derived
+    expectation, read from --explain's Optimized Logical Plan section. Mirrors
+    run_join_steering (Week 23.5): a cost decision is result-invariant, so
+    --explain is the only surface it can be asserted on (invariant 13)."""
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    passed, failed, errors = 0, 0, 0
+    fail_list = []
+    print(f"\n--- Week 28 join-order steering (--explain) ---")
+    for label, query in queries:
+        expected = WEEK28_EXPECTED_ORDER[label]
+        args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache",
+                *VEC, "--explain", "--query", query]
+        result = subprocess.run(args, capture_output=True, text=True)
+        section = result.stdout.split("=== Optimized Logical Plan ===")[-1] \
+                              .split("=== Physical Plan ===")[0]
+        match = re.search(r"order=(\S+)", section)
+        chosen = match.group(1) if match else "no order= decision"
+        if result.returncode == 0 and chosen == expected:
+            print(f"  PASS  [{label}]  order {chosen}")
+            passed += 1
+        else:
+            print(f"  FAIL  [{label}]  expected {expected}, chose {chosen}")
+            failed += 1
+            fail_list.append((f"order:{label}", query, chosen, expected))
+    print(f"  {passed} passed, {failed} failed, {errors} errors")
+    return passed, failed, errors, fail_list
+
+
+def joinRowsMaterialized(query, extra_args):
+    """Total rows emitted by every join node, read from --explain-analyze. This is
+    the quantity join ordering exists to minimize and the one the data-volume cost
+    term models — a MEASURED number, not the belief that a plan is good."""
+    args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache",
+            *extra_args, "--explain-analyze", "--query", query]
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    total = 0
+    for line in result.stdout.splitlines():
+        if "Join" not in line:
+            continue
+        m = re.search(r"rows_out=(\d+)", line)
+        if m:
+            total += int(m.group(1))
+    return total
+
+
+def run_join_order_work(pairs, queries):
+    """Week 28, measured rather than believed: two spellings of the SAME join
+    graph must do the SAME work once the order is chosen by cost instead of
+    inherited from the written order — and the chosen order must materialize
+    strictly fewer join rows than the written one, which is the claim the search
+    is making. The second assertion is what keeps the first from passing
+    vacuously if enumeration silently became a no-op."""
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    by_label = dict(queries)
+    passed, failed, errors = 0, 0, 0
+    fail_list = []
+    print(f"\n--- Week 28 join-order work (--explain-analyze, measured) ---")
+    for a, b in pairs:
+        try:
+            opt_a = joinRowsMaterialized(by_label[a], VEC)
+            opt_b = joinRowsMaterialized(by_label[b], VEC)
+            written_a = joinRowsMaterialized(by_label[a], VEC + ["--no-optimize"])
+            written_b = joinRowsMaterialized(by_label[b], VEC + ["--no-optimize"])
+            same = opt_a == opt_b
+            # the two spellings must diverge WITHOUT the optimizer, or the
+            # equality above proves nothing about the search
+            sensitive = written_a != written_b
+            cheaper = opt_a < max(written_a, written_b)
+            if same and sensitive and cheaper:
+                print(f"  PASS  [{a} == {b}]  {opt_a} join rows "
+                      f"(written: {written_a} / {written_b})")
+                passed += 1
+            else:
+                print(f"  FAIL  [{a} == {b}]  optimized {opt_a}/{opt_b}, "
+                      f"written {written_a}/{written_b}")
+                failed += 1
+                fail_list.append((f"order-work:{a}", by_label[a],
+                                  f"opt {opt_a}/{opt_b}", f"written {written_a}/{written_b}"))
+        except Exception as e:
+            print(f"  ERROR [{a} == {b}]  {e}")
+            errors += 1
+            fail_list.append((f"order-work:{a}", by_label[a], str(e), ""))
+    print(f"  {passed} passed, {failed} failed, {errors} errors")
+    return passed, failed, errors, fail_list
+
+
+
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES
 
     # existing surface on the default row/Volcano path (audit fixes and
     # Week 24 expressions affected both engines, so they run here too)
@@ -643,16 +837,22 @@ def main():
     r3 = run_optimizer_invariant(all_queries)
     # Week 23.5 plan-shape steering
     r4 = run_join_steering(WEEK23_5_QUERIES)
+    # Week 28 join-order steering: the chosen order, from --explain
+    r5 = run_join_order_steering(WEEK28_QUERIES)
+    # Week 28 join-order work: the same graph written two ways must execute
+    # identically, measured from --explain-analyze rather than assumed
+    r6 = run_join_order_work(WEEK28_ORDER_EQUIVALENT_PAIRS, WEEK28_QUERIES)
 
-    passed = r1[0] + r2[0] + r3[0] + r4[0]
-    failed = r1[1] + r2[1] + r3[1] + r4[1]
-    errors = r1[2] + r2[2] + r3[2] + r4[2]
-    fail_list = r1[3] + r2[3] + r3[3] + r4[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
           f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
-          f"+ {len(WEEK23_5_QUERIES)} steering)")
+          f"+ {len(WEEK23_5_QUERIES)} algorithm steering + {len(WEEK28_QUERIES)} order steering "
+          f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work)")
 
     if fail_list:
         print(f"\n{'='*70}")
