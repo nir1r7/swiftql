@@ -243,6 +243,29 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // nothing prunable in the case where it is withheld. The per-scan
             // hints pushdown created are unaffected: their refs were restamped to
             // 0 by distribute() and they sit directly above their own scan.
+            //
+            // Why testing the LEFTMOST relation is sufficient and not merely
+            // necessary — the hint only ever descends children[0], so it reaches
+            // exactly the leftmost leaf; every join down the spine re-evaluates
+            // this same test against its own merged schema, so the decision is
+            // consistent all the way down; and a pushed filter sitting above that
+            // leaf discards the incoming hint and substitutes its own predicate
+            // (the FILTER case below). So the only refs that can prune are those
+            // in a hint that reached relation 0's own scan, which is where they
+            // belong. Note this deliberately tests `== 0` while ChunkPruner
+            // accepts `relation_slot < 1`: a -1 (unbound) ref is still safe under
+            // this guard, because the hint only survives when the leftmost leaf IS
+            // relation 0. Loosening the test to `<= 0` would let a hint through
+            // for a leftmost stamp nobody can reason about — the wrong direction.
+            //
+            // Two preconditions this rests on, neither of them local:
+            //   1. every ColumnRef reaching a hint carries a real binder slot
+            //      (binder.cc stamps them; Validator rejects anything left at -1);
+            //   2. a post-pushdown residual holds no `ColumnRef op Literal`
+            //      conjunct, because soleSlot() routed every single-slot conjunct
+            //      to its own relation (predicate_pushdown.cc).
+            // If either stops holding, this guard is the thing that still has to
+            // be true, which is why it is tested directly rather than trusted.
             const bool leftmost_is_slot0 =
                 join->output_schema.size() > 0 &&
                 join->output_schema.column(0).relation_slot == 0;
