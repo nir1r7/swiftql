@@ -14,7 +14,14 @@ public:
     // swapped = true means the FROM table ended up as build_child (i.e. physical
     // probe-then-build order is the reverse of logical order) — nextChunk() must
     // swap column order when assembling output rows.
-    VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema, bool swapped = false);
+    //
+    // Keys arrive as resolved column INDICES, one per equi-join key, paired
+    // positionally (probe_key_indices[k] matches build_key_indices[k]). Week 27:
+    // names would not do, because the probe side's schema can be a MERGED join
+    // schema holding the same column name at several relation slots — only the
+    // planner knows which slot a key meant. Indices also take the per-chunk
+    // indexOf() out of the probe loop.
+    VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped = false);
 
     void open() override;
     DataChunk* nextChunk() override;
@@ -32,13 +39,17 @@ private:
     std::string cost_decision_;
     std::unique_ptr<VecPlanNode> probe_child_;
     std::unique_ptr<VecPlanNode> build_child_;
-    std::string probe_join_col_;
-    std::string build_join_col_;
+    std::vector<int> probe_key_idx_;
+    std::vector<int> build_key_idx_;
     Schema output_schema_;
     bool swapped_;
 
-    // build phase hash table: serialized join key -> matching build side rows
+    // build phase hash table: serialized join key tuple -> matching build side rows
     std::unordered_map<std::string, std::vector<Row>> hash_table_;
+
+    // scratch buffer for the serialized key, reused across rows so neither the
+    // build loop nor the probe loop allocates per row
+    std::string key_buf_;
 
     // rolling output buffer, filled per probe chunk, emitted in BATCH_SIZE slices
     std::vector<Row> output_buffer_;

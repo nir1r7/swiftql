@@ -185,7 +185,13 @@ class LimitNode : public PlanNode {
 // swapped_ means physical build/probe order is reversed and output must swap.
 class HashJoinNode : public PlanNode {
     public:
-        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema, bool swapped = false);
+        // Keys are paired positionally: left_cols[k] joins right_cols[k]. Both
+        // children are single-relation scans on this path (Planner::plan builds
+        // one join and refuses more), so their schemas cannot repeat a column
+        // name and by-name resolution is unambiguous — the vectorized builder,
+        // whose left input may be a merged join schema, resolves by slot into
+        // indices instead.
+        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped = false);
 
         void open() override;
         Row* next() override;
@@ -196,15 +202,20 @@ class HashJoinNode : public PlanNode {
     private:
         std::unique_ptr<PlanNode> left_; // left child node to pull rows from
         std::unique_ptr<PlanNode> right_; // right child node to pull rows from
-        std::string left_col_; // join column from left table
-        std::string right_col_; // join column from right table
+        std::vector<std::string> left_cols_;  // join columns from left table
+        std::vector<std::string> right_cols_; // join columns from right table
         Schema output_schema_;
         bool swapped_; // true: right_ (build) is logically first; see class comment
 
         std::unordered_map<std::string, std::vector<Row>> hash_table_;
-        
+
+        // resolved once in open(): re-resolving per row cost k lookups a row
+        std::vector<int> left_key_idx_;
+        std::vector<int> right_key_idx_;
+
         Row* current_probe_row_ = nullptr;
         int bucket_idx_;
+        std::string probe_key_;   // serialized key of current_probe_row_
 
         Row current_row_;
 };

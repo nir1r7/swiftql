@@ -3,7 +3,35 @@
 #include <chrono>
 #include <numeric>
 
-VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema, bool swapped) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_join_col_(std::move(probe_join_col)), build_join_col_(std::move(build_join_col)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+
+namespace {
+
+// Serialize one row's k-key tuple into `out`, reusing its capacity.
+//
+// The '\x01' sentinel goes after EVERY field, not between them: it is what stops
+// ("ab","c") and ("a","bc") from producing identical bytes and colliding in one
+// bucket. The single-key form appended exactly the same sentinel, so a one-key
+// tuple hashes byte-identically to the pre-Week-27 encoding.
+//
+// Returns false when any key column is NULL. SQL's NULL equals nothing, so with
+// k keys the rule composes: one NULL member makes the whole tuple unmatchable,
+// on either side. Dropping such rows keeps them out of the hash table instead of
+// bucketing them under toString()'s "NULL", which would make NULL = NULL match.
+bool serializeKey(const DataChunk& chunk, const std::vector<int>& key_idx, int r, std::string& out) {
+    out.clear();
+    for (int c : key_idx) {
+        // valueAt, never the typed vector directly: a raw read bypasses the
+        // validity mask and turns a NULL into the placeholder underneath it
+        Value v = valueAt(chunk.columns[c], r);
+        if (v.isNull()) return false;
+        out += v.toString();
+        out += '\x01';
+    }
+    return true;
+}
+
+} // namespace
 
 void VecHashJoinNode::open() {
     probe_child_->open();
@@ -14,9 +42,6 @@ void VecHashJoinNode::open() {
     output_cursor_ = 0;
 
     // build phase: consume all build side chunks into hash table
-    const Schema& build_schema = build_child_->outputSchema();
-    int build_key_idx = build_schema.indexOf(build_join_col_); // by name, never positional
-
     while (DataChunk* chunk = build_child_->nextChunk()) {
         // build work is self-time; the child pull above is excluded, matching
         // the per-chunk timing pattern of the other pipeline breakers
@@ -31,13 +56,9 @@ void VecHashJoinNode::open() {
             indices_ptr = &all_indices;
         }
         for (int r : *indices_ptr) {
-            // extract join key value, serialize with same '\x01' sentinel as Volcano HashJoinNode
-            Value key_val = valueAt(chunk->columns[build_key_idx], r);
-            // SQL: NULL never equals anything, so a NULL key can never match a
-            // probe row. Dropping it here keeps it out of the hash table
-            // instead of letting toString() bucket it under "NULL".
-            if (key_val.isNull()) continue;
-            std::string key = key_val.toString() + '\x01';
+            // serialize the key tuple with the same '\x01' sentinel Volcano's
+            // HashJoinNode uses; a NULL member makes the row unmatchable
+            if (!serializeKey(*chunk, build_key_idx_, r, key_buf_)) continue;
 
             // reconstruct full build-side Row and insert into hash table
             Row build_row;
@@ -45,7 +66,7 @@ void VecHashJoinNode::open() {
             for (const auto& cv : chunk->columns) {
                 build_row.push_back(valueAt(cv, r));
             }
-            hash_table_[key].push_back(std::move(build_row));
+            hash_table_[key_buf_].push_back(std::move(build_row));
         }
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
@@ -80,9 +101,6 @@ DataChunk* VecHashJoinNode::nextChunk() {
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        const Schema& probe_schema = probe_child_->outputSchema();
-        int probe_key_idx = probe_schema.indexOf(probe_join_col_); // by name, never positional
-
         // determine valid probe row indices
         const std::vector<int>* indices_ptr = nullptr;
         std::vector<int> all_indices;
@@ -97,11 +115,9 @@ DataChunk* VecHashJoinNode::nextChunk() {
         for (int r : *indices_ptr) {
             stats.rows_in++;
 
-            Value key_val = valueAt(probe_chunk->columns[probe_key_idx], r);
-            if (key_val.isNull()) continue;   // NULL matches nothing (see open())
-            std::string key = key_val.toString() + '\x01';
+            if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) continue;   // NULL matches nothing (see open())
 
-            auto it = hash_table_.find(key);
+            auto it = hash_table_.find(key_buf_);
             if (it == hash_table_.end()) continue;
 
             for (const Row& build_row : it->second) {
@@ -158,7 +174,16 @@ const Schema& VecHashJoinNode::outputSchema() const {
 }
 
 std::string VecHashJoinNode::explain() const {
-    std::string s = "VecHashJoin [" + probe_join_col_ + " = " + build_join_col_ + "] (materialize)";
+    // Names come from the children's schemas, so --explain still prints columns
+    // rather than the integers this node holds. A one-key join renders exactly
+    // the pre-Week-27 string.
+    std::string s = "VecHashJoin [";
+    for (size_t i = 0; i < probe_key_idx_.size(); ++i) {
+        if (i) s += " AND ";
+        s += probe_child_->outputSchema().column(probe_key_idx_[i]).name + " = "
+           + build_child_->outputSchema().column(build_key_idx_[i]).name;
+    }
+    s += "] (materialize)";
     if (!cost_decision_.empty()) s += " " + cost_decision_;
     return s;
 }

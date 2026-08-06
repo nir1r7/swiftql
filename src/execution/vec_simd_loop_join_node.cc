@@ -9,7 +9,7 @@
 #include <immintrin.h>
 #endif
 
-VecSimdLoopJoinNode::VecSimdLoopJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema, bool swapped, bool use_simd) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_join_col_(std::move(probe_join_col)), build_join_col_(std::move(build_join_col)), output_schema_(std::move(output_schema)), swapped_(swapped), use_simd_(use_simd) {}
+VecSimdLoopJoinNode::VecSimdLoopJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, int probe_key_index, int build_key_index, Schema output_schema, bool swapped, bool use_simd) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(probe_key_index), build_key_idx_(build_key_index), output_schema_(std::move(output_schema)), swapped_(swapped), use_simd_(use_simd) {}
 
 void VecSimdLoopJoinNode::open() {
     probe_child_->open();
@@ -22,8 +22,6 @@ void VecSimdLoopJoinNode::open() {
 
     // build phase: consume all build side chunks into the flat key buffer +
     // parallel payload rows
-    const Schema& build_schema = build_child_->outputSchema();
-    int build_key_idx = build_schema.indexOf(build_join_col_); // by name, never positional
 
     while (DataChunk* chunk = build_child_->nextChunk()) {
         // build work is self-time; the child pull above is excluded, matching
@@ -42,7 +40,7 @@ void VecSimdLoopJoinNode::open() {
 
         // the builder guarantees an INT key column; a non-INT key here is a
         // planning bug, so let std::get's bad_variant_access bubble
-        const ColumnVector& key_col = chunk->columns[build_key_idx];
+        const ColumnVector& key_col = chunk->columns[build_key_idx_];
         const auto& keys = std::get<std::vector<int64_t>>(key_col.data);
         for (int r : *indices_ptr) {
             // SQL: NULL never equals anything, so a NULL key can never match.
@@ -138,8 +136,6 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        const Schema& probe_schema = probe_child_->outputSchema();
-        int probe_key_idx = probe_schema.indexOf(probe_join_col_); // by name, never positional
 
         // determine valid probe row indices
         const std::vector<int>* indices_ptr = nullptr;
@@ -152,7 +148,7 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
             indices_ptr = &all_indices;
         }
 
-        const ColumnVector& probe_key_col = probe_chunk->columns[probe_key_idx];
+        const ColumnVector& probe_key_col = probe_chunk->columns[probe_key_idx_];
         const auto& probe_keys = std::get<std::vector<int64_t>>(probe_key_col.data);
 
         std::vector<int> matches;   // build indices matching one probe key
@@ -222,7 +218,11 @@ const Schema& VecSimdLoopJoinNode::outputSchema() const {
 }
 
 std::string VecSimdLoopJoinNode::explain() const {
-    std::string s = "VecSimdLoopJoin [" + probe_join_col_ + " = " + build_join_col_ + "] (materialize)";
+    // names come from the children's schemas, so --explain prints columns
+    // rather than the indices this node holds
+    std::string s = "VecSimdLoopJoin ["
+        + probe_child_->outputSchema().column(probe_key_idx_).name + " = "
+        + build_child_->outputSchema().column(build_key_idx_).name + "] (materialize)";
     if (!cost_decision_.empty()) s += " " + cost_decision_;
     return s;
 }

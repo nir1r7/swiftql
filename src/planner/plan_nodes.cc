@@ -590,7 +590,31 @@ std::vector<PlanNode*> LimitNode::children() const {
 
 
 // HashJoinNode
-HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::string left_col, std::string right_col, Schema output_schema, bool swapped) : left_(std::move(left)), right_(std::move(right)), left_col_(std::move(left_col)), right_col_(std::move(right_col)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped) : left_(std::move(left)), right_(std::move(right)), left_cols_(std::move(left_cols)), right_cols_(std::move(right_cols)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+
+namespace {
+
+// Serialize one row's k-key tuple. Identical encoding to VecHashJoinNode's: the
+// '\x01' sentinel after every field is what keeps ("ab","c") and ("a","bc")
+// apart, and a one-key tuple is byte-identical to the pre-Week-27 form.
+//
+// Returns false when any key member is NULL — SQL's NULL equals nothing, so the
+// row can neither be inserted nor matched. Volcano used to bucket a NULL key
+// under toString()'s "NULL", making NULL = NULL match where the vectorized path
+// dropped it; unreachable today (CSV cannot express NULL and a join key comes
+// straight off a scan), but Week 29's outer join puts real NULLs on join inputs.
+bool serializeRowKey(const Row& row, const std::vector<int>& key_idx, std::string& out) {
+    out.clear();
+    for (int c : key_idx) {
+        const Value& v = row[c];
+        if (v.isNull()) return false;
+        out += v.toString();
+        out += '\x01';
+    }
+    return true;
+}
+
+} // namespace
 
 void HashJoinNode::open() {
     left_->open();
@@ -599,8 +623,16 @@ void HashJoinNode::open() {
     // build phase
     hash_table_.clear();
     const Schema& build_schema = right_->outputSchema();
-    int build_key_idx = build_schema.indexOf(right_col_);
+    right_key_idx_.clear();
+    for (const std::string& c : right_cols_) right_key_idx_.push_back(build_schema.indexOf(c));
 
+    // resolved here rather than per row in next(), which re-resolved the probe
+    // key for every row it pulled
+    const Schema& probe_schema = left_->outputSchema();
+    left_key_idx_.clear();
+    for (const std::string& c : left_cols_) left_key_idx_.push_back(probe_schema.indexOf(c));
+
+    std::string key;
     while (true){
         Row* row = right_->next();
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -610,9 +642,9 @@ void HashJoinNode::open() {
             break;
         }
 
-        const Value& key_val = (*row)[build_key_idx];
-        std::string key = key_val.toString() + '\x01'; // same operator that serializeKey() uses
-        hash_table_[key].push_back(*row);
+        if (serializeRowKey(*row, right_key_idx_, key)) {
+            hash_table_[key].push_back(*row);
+        }
 
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
     }
@@ -622,14 +654,10 @@ void HashJoinNode::open() {
 }
 
 Row* HashJoinNode::next() {
-    const Schema& probe_schema = left_->outputSchema();
-    int probe_key_idx = probe_schema.indexOf(left_col_);
-
     while (true){
         if (current_probe_row_ != nullptr){
             // check if there are more matches in the current probe row's bucket
-            std::string key = (*current_probe_row_)[probe_key_idx].toString() + '\x01';
-            auto it = hash_table_.find(key);
+            auto it = hash_table_.find(probe_key_);
 
             if (it != hash_table_.end() && bucket_idx_ < static_cast<int>(it->second.size())){
                 auto t0 = std::chrono::high_resolution_clock::now();
@@ -662,8 +690,12 @@ Row* HashJoinNode::next() {
             }
 
             stats.rows_in++;
-            current_probe_row_ = probe_row;
-            bucket_idx_ = 0;
+            // a NULL key member matches nothing: leave current_probe_row_ null
+            // so the loop pulls the next probe row instead of looking it up
+            if (serializeRowKey(*probe_row, left_key_idx_, probe_key_)) {
+                current_probe_row_ = probe_row;
+                bucket_idx_ = 0;
+            }
 
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         }
@@ -681,7 +713,13 @@ const Schema& HashJoinNode::outputSchema() const {
 }
 
 std::string HashJoinNode::explain() const {
-    return "HashJoin [" + left_col_ + " = " + right_col_ + "]";
+    // one key renders exactly the pre-Week-27 string
+    std::string s = "HashJoin [";
+    for (size_t i = 0; i < left_cols_.size(); ++i) {
+        if (i) s += " AND ";
+        s += left_cols_[i] + " = " + right_cols_[i];
+    }
+    return s + "]";
 }
 
 std::vector<PlanNode*> HashJoinNode::children() const {

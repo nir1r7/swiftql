@@ -16,7 +16,13 @@ public:
     // logical order [FROM-table columns, JOIN-table columns]; swapped = true
     // means the FROM table ended up as build_child, so nextChunk() reorders.
     // use_simd = false forces the scalar reference path (tests + calibration).
-    VecSimdLoopJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::string probe_join_col, std::string build_join_col, Schema output_schema, bool swapped = false, bool use_simd = true);
+    //
+    // ONE key, as a resolved column index per side. One because a composite key
+    // cannot live in the flat int64 buffer this operator probes with SIMD — the
+    // planner declines multi-key here and lowers to the hash join instead. An
+    // index rather than a name because the probe side may be a merged join
+    // schema, where a bare name can match several relations (Week 27).
+    VecSimdLoopJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, int probe_key_index, int build_key_index, Schema output_schema, bool swapped = false, bool use_simd = true);
 
     void open() override;
     DataChunk* nextChunk() override;
@@ -34,8 +40,8 @@ private:
     std::string cost_decision_;
     std::unique_ptr<VecPlanNode> probe_child_;
     std::unique_ptr<VecPlanNode> build_child_;
-    std::string probe_join_col_;
-    std::string build_join_col_;
+    int probe_key_idx_;
+    int build_key_idx_;
     Schema output_schema_;
     bool swapped_;
     bool use_simd_;
