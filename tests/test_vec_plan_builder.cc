@@ -3,6 +3,8 @@
 #include "planner/logical_plan.h"
 #include "planner/predicate_pushdown.h"
 #include "planner/cardinality_estimator.h"
+#include "planner/join_enumeration.h"
+#include "planner/cost_model.h"
 #include "planner/binder.h"
 #include "planner/planner.h"
 #include "parser/parser.h"
@@ -845,4 +847,93 @@ TEST(VecPlanBuilder, SingleKeySingleJoinStillLowers) {
     auto plan = buildVec(
         "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
     ASSERT_NE(plan, nullptr);
+}
+
+// ===== Week 28: per-relation row width on a multi-relation join input =====
+
+// Week 27 refused to compute a width for a multi-relation join input and fell
+// back to columns * 8.0, because leafScanTable() names relation 0 for a whole
+// subtree — so `team` on a laps/drivers subtree took laps' avg_width for BOTH
+// copies. Week 28's join enumeration compares orderings whose whole difference
+// is intermediate width, which makes that placeholder the thing being measured.
+//
+// This fixture distinguishes all three answers: the shipped test data gives
+// laps.team avg_width 7.2 and drivers.team 7.333, so the real per-relation sum
+// differs from the uniform proxy (8.0 each) AND from the pre-Week-27
+// attribution error (7.2 twice).
+TEST(VecPlanBuilder, MultiRelationRowWidthSumsPerRelationStats) {
+    Catalog cat(CATALOG);
+    for (const char* t : {"laps", "drivers"}) {
+        const auto& m = cat.getTable(t);
+        cat.setStats(t, TableStats::compute(CSVLoader::load(m.filepath, m.schema), m.schema));
+    }
+
+    const std::string sql =
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.team = d.team "
+        "JOIN drivers d2 ON l.driver_id = d2.driver_id";
+
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    logical = PredicatePushdown::apply(std::move(logical), cat);
+    logical = JoinEnumeration::apply(std::move(logical), cat);
+    CardinalityEstimator::estimate(*logical, cat);
+
+    // capture the top join's inputs before lowering consumes the logical tree
+    const LogicalPlanNode* n = logical.get();
+    while (n && n->type != LogicalNodeType::JOIN) n = n->children[0].get();
+    ASSERT_NE(n, nullptr);
+    const auto* top = static_cast<const LogicalJoin*>(n);
+    const double from_rows = top->children[0]->estimated_rows;
+    const double join_rows = top->children[1]->estimated_rows;
+
+    // the width the fix must produce: every column read from ITS OWN relation's
+    // stats, keyed by the binder slot stamped on the merged schema
+    auto widthOf = [&cat](const Schema& s, const std::unordered_map<int, std::string>& m) {
+        double w = 0.0;
+        for (const ColumnDef& c : s.columns()) {
+            auto it = m.find(c.relation_slot);
+            const TableStats& ts = cat.getStats(it->second);
+            auto cs = ts.columns.find(c.name);
+            w += (cs != ts.columns.end()) ? cs->second.avg_width : 8.0;
+        }
+        return w;
+    };
+    // slot 0 = laps (l), slot 1 = drivers (d), slot 2 = drivers (d2)
+    const std::unordered_map<int, std::string> all_slots{
+        {0, "laps"}, {1, "drivers"}, {2, "drivers"}};
+    const double from_w = widthOf(top->children[0]->output_schema, all_slots);
+    const double join_w = widthOf(top->children[1]->output_schema, all_slots);
+
+    // the multi-relation side must NOT be the uniform proxy, or this fixture
+    // proves nothing
+    const LogicalPlanNode* multi = top->children[0]->children.empty()
+        ? top->children[1].get() : top->children[0].get();
+    ASSERT_NE(multi->output_schema.size() * 8.0,
+              (multi == top->children[0].get() ? from_w : join_w));
+
+    auto plan = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+    const VecPlanNode* j = plan.get();
+    while (j && j->explain().rfind("VecHashJoin", 0) != 0) {
+        auto kids = j->children();
+        j = kids.empty() ? nullptr : kids[0];
+    }
+    ASSERT_NE(j, nullptr);
+    const std::string d = j->explain();
+
+    // both costed assignments appear as cost= and alt=; each must be the value
+    // the real per-relation widths produce
+    ASSERT_NE(d.find("cost="), std::string::npos);
+    ASSERT_NE(d.find("(alt="), std::string::npos);
+    const double cost = std::stod(d.substr(d.find("cost=") + 5));
+    const double alt  = std::stod(d.substr(d.find("(alt=") + 5));
+    const double from_builds = hashJoinCost(from_rows, from_w, join_rows);
+    const double join_builds = hashJoinCost(join_rows, join_w, from_rows);
+    const double lo = std::min(from_builds, join_builds);
+    const double hi = std::max(from_builds, join_builds);
+    // explain prints costs at setprecision(0), so compare within a unit
+    EXPECT_NEAR(cost, lo, 1.0);
+    EXPECT_NEAR(alt,  hi, 1.0);
 }

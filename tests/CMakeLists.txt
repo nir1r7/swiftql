@@ -12,6 +12,7 @@ add_executable(swiftql_tests
     test_stats.cc
     test_cardinality.cc
     test_predicate_pushdown.cc
+    test_join_enumeration.cc
     test_cost_model.cc
     test_simd_loop_join.cc
 )

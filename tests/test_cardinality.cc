@@ -511,3 +511,81 @@ TEST(Cardinality, DuplicateJoinKeyDoesNotSquareTheNdvDivisor) {
     ASSERT_NE(j2, nullptr);
     EXPECT_DOUBLE_EQ(j1->estimated_rows, j2->estimated_rows);
 }
+
+// ===== Week 28: one cardinality rule, shared with join enumeration =====
+
+// joinCardinality was lifted out of estimateNode's JOIN case so the Week 28
+// search and the stamped plan cannot hold different models — the search would
+// otherwise rank orderings under one arithmetic while --explain printed another,
+// and the NDV rule this encodes has already been corrected twice. The anti-drift
+// test: estimate a plan, then recompute the same join by hand and demand the two
+// agree exactly.
+TEST(Cardinality, JoinCardinalityMatchesTheStampedJoinEstimate) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildLogical(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+    const auto* join = static_cast<const LogicalJoin*>(
+        findNode(plan.get(), LogicalNodeType::JOIN));
+    ASSERT_NE(join, nullptr);
+
+    StatsContext left  = CardinalityEstimator::estimateSubtree(*join->children[0], cat);
+    StatsContext right = CardinalityEstimator::estimateSubtree(*join->children[1], cat);
+    EXPECT_DOUBLE_EQ(joinCardinality(join->children[0]->estimated_rows,
+                                     join->children[1]->estimated_rows,
+                                     join->keys, left, right),
+                     join->estimated_rows);
+}
+
+// The >=1-row floor lives INSIDE joinCardinality, not at the stamping site, so
+// the Week 28 search sees the same floored number the plan will show. A zero-row
+// candidate that ranked infinitely better than it runs would win every ordering.
+TEST(Cardinality, JoinCardinalityFloorsAtOneRowLikeTheStamp) {
+    StatsContext empty;
+    EXPECT_DOUBLE_EQ(joinCardinality(1.0, 1.0, {}, empty, empty), 1.0);
+    // no key NDV at all: the FK-like max() fallback, not a cross product
+    EXPECT_DOUBLE_EQ(joinCardinality(1000.0, 20.0, {}, empty, empty), 1000.0);
+    // a genuinely empty input is NOT floored — the floor is conditional on both
+    // sides having rows
+    EXPECT_DOUBLE_EQ(joinCardinality(0.0, 20.0, {}, empty, empty), 20.0);
+}
+
+// Week 28: a leaf's own StatsContext stamps slot 0, because a standalone scan
+// has one relation and nothing to disambiguate. Once join enumeration may put a
+// relation other than 0 at the bottom of the spine, that stamp is a lie about
+// which relation the entries describe, and every later key lookup on it misses —
+// have_ndv goes false and the estimate silently degrades. The merge reads the
+// truth off the merged schema's first column. Hand-built, because no query can
+// produce this shape before the enumeration pass runs.
+TEST(Cardinality, LeftmostLeafContextTakesTheMergedSchemaSlot) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+
+    // laps sits at the BOTTOM of the spine while carrying binder slot 2
+    auto left_scan = std::make_unique<LogicalScan>(
+        "laps", Schema({ColumnDef{"driver_id", TypeId::INT, 0, false}}));
+    auto right_scan = std::make_unique<LogicalScan>(
+        "drivers", Schema({ColumnDef{"driver_id", TypeId::INT, 0, false}}));
+    Schema merged({ColumnDef{"driver_id", TypeId::INT, 2, false},
+                   ColumnDef{"driver_id", TypeId::INT, 1, false}});
+    // bottom join: from_slot 0 addresses the leaf's own schema (see JoinKey)
+    std::vector<JoinKey> keys{JoinKey{"driver_id", "driver_id", 0}};
+    auto join = std::make_unique<LogicalJoin>(std::move(left_scan), std::move(right_scan),
+                                              std::move(keys), 1, merged);
+
+    StatsContext out = CardinalityEstimator::estimateSubtree(*join, cat);
+
+    // laps' entry is addressable at slot 2, and it really is laps' (1000-row
+    // table) rather than drivers' 20-row one
+    const ColumnStatsEntry* l = out.findExact("driver_id", 2);
+    ASSERT_NE(l, nullptr);
+    EXPECT_EQ(l->table_rows, 1000);
+    const ColumnStatsEntry* r = out.findExact("driver_id", 1);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(r->table_rows, 20);
+    // and the key lookup that produced the estimate still hit: 1000*20/20
+    EXPECT_DOUBLE_EQ(join->estimated_rows, 1000.0);
+}

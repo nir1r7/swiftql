@@ -69,3 +69,48 @@ TEST(CostModel, SimdZeroRowsAreFiniteAndNonNegative) {
 TEST(CostModel, UnequalWidthBreaksRowCountEquivalence) {
     EXPECT_NE(hashJoinCost(100, 8, 100), hashJoinCost(100, 800, 100));
 }
+
+// ===== Week 28: the data-volume (bytes-materialized) term =====
+
+// The reason joinOutputCost lives OUTSIDE hashJoinCost/simdLoopJoinCost: output
+// rows and output width do not depend on which input builds, so the term is a
+// constant added to both sides of every Week 22 build-side comparison. Folding
+// it in would change no decision while inflating every cost= string --explain
+// has printed since Week 23 and invalidating CPU_SIMD_COMPARE's measured
+// calibration. Pin the property rather than the intention.
+TEST(CostModel, OutputCostIsSymmetricUnderBuildSideSwap) {
+    const double a_rows = 1000, a_w = 24, b_rows = 20, b_w = 16;
+    const double out_rows = 1000, out_w = a_w + b_w;
+
+    double a_builds = hashJoinCost(a_rows, a_w, b_rows);
+    double b_builds = hashJoinCost(b_rows, b_w, a_rows);
+    double a_total  = a_builds + joinOutputCost(out_rows, out_w);
+    double b_total  = b_builds + joinOutputCost(out_rows, out_w);
+
+    // the side decision is untouched: the same delta, the same winner
+    EXPECT_DOUBLE_EQ(a_total - b_total, a_builds - b_builds);
+    EXPECT_EQ(a_total < b_total, a_builds < b_builds);
+}
+
+// The term exists to make a WIDE intermediate cost more than a narrow one at
+// equal cardinality — the discrimination Week 22 deferred to Week 28 because
+// only differing join orderings can produce it.
+TEST(CostModel, OutputCostGrowsWithWidthAndRows) {
+    EXPECT_LT(joinOutputCost(1000, 16), joinOutputCost(1000, 64));
+    EXPECT_LT(joinOutputCost(1000, 16), joinOutputCost(4000, 16));
+    EXPECT_DOUBLE_EQ(joinOutputCost(1000, 40), 1000.0 * 40.0 * CPU_MATERIALIZE_BYTE);
+}
+
+// Derivation check: one ~40-byte output row is anchored to cost the same as one
+// probe (CPU_HASH_PROBE). If the constant is retuned, this is the statement in
+// the header that has to be retuned with it.
+TEST(CostModel, OutputCostAnchorsAFortyByteRowToOneProbe) {
+    EXPECT_DOUBLE_EQ(joinOutputCost(1, 40), CPU_HASH_PROBE);
+}
+
+// Same degenerate-input contract as the two algorithm costs.
+TEST(CostModel, OutputCostZeroRowsAreFiniteAndNonNegative) {
+    EXPECT_GE(joinOutputCost(0, 40), 0.0);
+    EXPECT_DOUBLE_EQ(joinOutputCost(0, 0), 0.0);
+    EXPECT_GE(joinOutputCost(-5, 40), 0.0);
+}
