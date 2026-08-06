@@ -342,9 +342,22 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // flooredJoinCardinality for why the search must chain the raw product
             const double l_rows = node.children[0]->estimated_rows;
             const double r_rows = node.children[1]->estimated_rows;
-            node.estimated_rows = flooredJoinCardinality(
+            double rows = flooredJoinCardinality(
                 l_rows, r_rows,
                 joinCardinality(l_rows, r_rows, join.keys, left, right));
+            // Week 29: a LEFT join emits every preserved-side row at least once,
+            // so its output is |R ⋈ S| + |unmatched R|. There is no statistic for
+            // the second term; max() is the standard containment. Applied HERE, at
+            // the stamp, and deliberately NOT inside joinCardinality: max() is not
+            // multiplicative, so a subset's row count would depend on the path that
+            // reached it and the DP's optimal substructure would be gone — the same
+            // reason the ≥1-row floor moved out in Week 28. (JoinEnumeration
+            // declines outer-join trees entirely, so the search never meets this
+            // rule; both facts have to stay true.) The ON residual's selectivity is
+            // ignored: it can only remove MATCHES, and the output is floored at
+            // l_rows regardless.
+            if (join.join_type == JoinType::LEFT) rows = std::max(rows, l_rows);
+            node.estimated_rows = rows;
 
             // merge contexts [left ++ added relation], restamping each block to
             // the slot the MERGED SCHEMA gives it — must stay in lockstep with

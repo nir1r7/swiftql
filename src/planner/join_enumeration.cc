@@ -45,6 +45,26 @@ int countRelations(const LogicalPlanNode* node) {
     return n;
 }
 
+// Week 29. An outer join is not commutative (R ⟕ S ≠ S ⟕ R) and not freely
+// associative, so an ordering that is sound for inner joins is a WRONG ANSWER
+// here, not a merely expensive one. The DP's premise — any relation may be added
+// to any subset in any order — is a LEGALITY claim, and repairing it needs
+// per-edge conflict/eligibility sets (Moerkotte TES/SES), which is a different
+// algorithm and buys nothing until a supported query has an outer join inside a
+// reorderable block. Decline the whole tree instead, in the same shape as the
+// <3-relation and >32-relation declines: return it untouched and print no
+// order= line, because there was no decision to report.
+bool containsOuterJoin(const LogicalPlanNode* node) {
+    if (node->type == LogicalNodeType::JOIN &&
+        static_cast<const LogicalJoin*>(node)->join_type != JoinType::INNER) {
+        return true;
+    }
+    for (const auto& child : node->children) {
+        if (containsOuterJoin(child.get())) return true;
+    }
+    return false;
+}
+
 // Per-relation row width, the same rule VectorizedPlanBuilder's rowWidth uses on
 // a single-relation input: real per-column avg_width, 8 bytes per column where
 // statistics are absent.
@@ -321,6 +341,9 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     const int n = countRelations(node.get());
     if (n < MIN_ENUMERATED_RELATIONS) return node;
     if (n > 32) return node;   // uint32_t subset masks; unreachable in practice
+    // Week 29 — BEFORE decompose(), which moves subtrees out of the tree: a
+    // decline discovered afterwards would have nothing clean to return.
+    if (containsOuterJoin(node.get())) return node;
 
     std::vector<std::unique_ptr<LogicalPlanNode>> leaves(n);
     std::vector<Edge> edges;

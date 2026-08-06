@@ -36,11 +36,24 @@
 //      count and optimal substructure does not hold for it. There is no
 //      path-independent estimate to fall back to instead, so the containment is
 //      (4) rather than a better formula.
+//      Note also that `cost=` and `est=` on the same --explain line are NOT
+//      reconcilable, deliberately: the search chains the RAW product from
+//      joinCardinality, while every est= on the tree is stamped through
+//      flooredJoinCardinality. A sub-1-row intermediate is SEARCHED at 0.9 and
+//      PRINTED as est=1, so cost= cannot be re-derived from any est= on the tree.
+//      The pass is not inconsistent; a test checking one against the other is
+//      testing the wrong thing.
 //   4. The search may only IMPROVE on the written order. reorder() costs the
 //      written order too and keeps it when the search's pick scores worse, which
 //      bounds (3) and any future cost-model change: the plan is never worse than
 //      what the user wrote by the model's own metric. `method=` names which of
 //      dp / greedy / written-floor / written-fallback produced the printed order.
+//   5. Outer joins are not reordered AT ALL. R ⟕ S ≠ S ⟕ R and associativity
+//      fails, so any tree containing one is declined whole (containsOuterJoin,
+//      Week 29) and --explain shows no order= line for it — there was no
+//      decision. The outer-join cardinality rule (max(rows, left_rows)) lives at
+//      the STAMPING site for the same reason the ≥1 floor does: it is not
+//      multiplicative, so the search must never meet it.
 //
 // Above 32 relations the pass declines entirely (uint32_t subset masks) and
 // --explain shows no order= line, because there is no decision to show. No TPC-H
