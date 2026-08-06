@@ -106,25 +106,69 @@ std::vector<int> rightKeyIndices(const Schema& right_schema, const std::vector<J
     return idx;
 }
 
+// slot -> table for every relation in a join subtree. children[1] of each join
+// IS relation join_slot; the leftmost block's slot is stamped on the merged
+// schema's first column, which is the only place it is recorded once join
+// enumeration (Week 28) may put a relation other than 0 at the bottom of the
+// spine.
+void collectSlotTables(const LogicalPlanNode* node,
+                       std::unordered_map<int, std::string>& out) {
+    if (node->type != LogicalNodeType::JOIN) return;
+    const auto* join = static_cast<const LogicalJoin*>(node);
+    out[join->join_slot] = leafScanTable(join->children[1].get());
+    const LogicalPlanNode* left = join->children[0].get();
+    if (isSingleRelation(left)) {
+        // A join always carries at least its own key columns per side, so the
+        // merged schema cannot be empty — but read defensively: an empty schema
+        // here would index out of bounds rather than lose a width.
+        if (join->output_schema.size() > 0)
+            out[join->output_schema.column(0).relation_slot] = leafScanTable(left);
+        return;
+    }
+    collectSlotTables(left, out);
+}
+
 // estimated bytes per row on one join input, for the hash-table memory cost.
 // Sums the real per-column avg_width (Week 19 stats) over the input's output
 // columns; a filter-over-scan child shares its scan's schema, all from one
 // table. Falls back to 8 bytes/column when stats are absent (e.g. unit tests
 // that don't seed them) — the same proxy the pre-Gap-3 code always used.
 double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
-    // Multi-relation input (Week 27): no single TableStats describes it, and
-    // looking its columns up in relation 0's stats would attribute one table's
-    // widths to another table's columns wherever a name is shared (laps.team /
-    // drivers.team) — wrong in a plausible direction, the hardest kind to
-    // notice. Fall back to the documented uniform proxy instead of guessing. A
-    // real per-relation width sum belongs with Week 28's join enumeration, where
-    // differing intermediate widths first change a plan choice.
-    if (!isSingleRelation(child)) return child->output_schema.size() * 8.0;
-    const std::string& table = leafScanTable(child);
-    if (!catalog.hasStats(table)) return child->output_schema.size() * 8.0;
-    const TableStats& ts = catalog.getStats(table);
+    if (isSingleRelation(child)) {
+        const std::string& table = leafScanTable(child);
+        if (!catalog.hasStats(table)) return child->output_schema.size() * 8.0;
+        const TableStats& ts = catalog.getStats(table);
+        double width = 0.0;
+        for (const auto& col : child->output_schema.columns()) {
+            auto it = ts.columns.find(col.name);
+            width += (it != ts.columns.end()) ? it->second.avg_width : 8.0;
+        }
+        return width;
+    }
+
+    // Week 28: multi-relation input. Every column of a merged join schema
+    // carries the binder slot of the relation it came from, so each avg_width
+    // comes from ITS OWN table instead of relation 0's — the attribution error
+    // Week 27 refused to make (leafScanTable() names relation 0 for a whole
+    // subtree, so a shared column name like laps.team / drivers.team took the
+    // wrong table's width) and the reason it fell back to columns * 8.0. That
+    // fallback is now the thing being measured: differing intermediate widths
+    // across orderings are what the data-volume term discriminates on, so the
+    // real per-relation sum lands with the enumeration that consumes it.
+    //
+    // The fallback stays PER COLUMN. A subtree where only one relation has
+    // stats must charge real widths for the columns it knows and 8.0 for the
+    // rest, rather than throwing away what it has.
+    std::unordered_map<int, std::string> slot_tables;
+    collectSlotTables(child, slot_tables);
     double width = 0.0;
-    for (const auto& col : child->output_schema.columns()) {
+    for (const ColumnDef& col : child->output_schema.columns()) {
+        auto t = slot_tables.find(col.relation_slot);
+        if (t == slot_tables.end() || !catalog.hasStats(t->second)) {
+            width += 8.0;
+            continue;
+        }
+        const TableStats& ts = catalog.getStats(t->second);
         auto it = ts.columns.find(col.name);
         width += (it != ts.columns.end()) ? it->second.avg_width : 8.0;
     }
@@ -181,8 +225,29 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 join_est = tables.at(leafScanTable(join->children[1].get())).num_rows;
             }
 
-            // pruning hint routes to the FROM side only
-            auto from_child = lower(join->children[0].get(), pruning_where);
+            // Pruning hint routes to the FROM side only — and only while that
+            // side's leaf scan is relation 0.
+            //
+            // ChunkPruner treats a relation_slot < 1 ref in a scan hint as
+            // scan-local (chunk_pruner.h). That is true of the leftmost scan only
+            // while the leftmost relation IS slot 0 — which join enumeration
+            // (Week 28) no longer guarantees. With relation 2 at the bottom of
+            // the spine, a slot-0 ref in the hint would prune relation 2's chunks
+            // on relation 0's value: rows vanish, no error.
+            //
+            // Unreachable today — post-pushdown the residual above a join holds
+            // only multi-relation, OR or constant conjuncts, none of which
+            // collectSimplePredicates accepts — but the reason it is unreachable
+            // is exactly the invariant being deleted. Withhold the hint instead
+            // of depending on it; it costs nothing, since the hint carries
+            // nothing prunable in the case where it is withheld. The per-scan
+            // hints pushdown created are unaffected: their refs were restamped to
+            // 0 by distribute() and they sit directly above their own scan.
+            const bool leftmost_is_slot0 =
+                join->output_schema.size() > 0 &&
+                join->output_schema.column(0).relation_slot == 0;
+            auto from_child = lower(join->children[0].get(),
+                                    leftmost_is_slot0 ? pruning_where : nullptr);
             auto join_child = lower(join->children[1].get(), nullptr);
 
             // Week 27: arbitrary key counts, and children[0] may itself be a
