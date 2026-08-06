@@ -211,6 +211,25 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
     // IntervalLiteral: a constant, nothing to collect
 }
 
+// Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty. The
+// inverse of splitConjuncts()/flattenAnd(). Shared by predicate pushdown (which
+// re-conjoins what it did not push) and by both planners (which fold residual ON
+// conjuncts into the WHERE conjunction, Week 27). Takes ownership; the parts are
+// MOVED, never cloned, so raw Expr* captured before the call — the scan pruning
+// hint in Planner::plan, for one — stay valid.
+inline std::unique_ptr<Expr> conjoinAll(std::vector<std::unique_ptr<Expr>> parts) {
+    if (parts.empty()) return nullptr;
+    std::unique_ptr<Expr> acc = std::move(parts[0]);
+    for (size_t i = 1; i < parts.size(); ++i) {
+        auto conj = std::make_unique<BinaryExpr>();
+        conj->op = "AND";
+        conj->left = std::move(acc);
+        conj->right = std::move(parts[i]);
+        acc = std::move(conj);
+    }
+    return acc;
+}
+
 // Deep copy of an expression tree, preserving binder stamps and alias.
 // DISPATCH SITE: every new Expr subtype must be added here.
 inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
