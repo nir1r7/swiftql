@@ -45,6 +45,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     }
 
     // build seqScan (bottom of tree) using narrowed schema
+    bool multi_key_join = false;
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
         node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, stmt.where.get());
@@ -82,10 +83,22 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         // classifyJoinCondition routes keys by binder-assigned slot — the only
         // way to disambiguate a self-join's two occurrences of the same table
         std::vector<JoinKey> keys = classifyJoinCondition(join_clause.condition.get(), 1);
-        if (keys.size() != 1) {
-            throw std::runtime_error(
-                "multi-key equi-joins are planned but not yet executable (Week 27)");
-        }
+
+        // Multi-key refusal is DEFERRED to after the plan-time type checks
+        // below. The merged schema is built from the two children's schemas and
+        // never reads `keys`, so those checks are valid for a multi-key query —
+        // and running them first reports a genuine query defect ahead of a
+        // temporary engine limitation, which is also what the vectorized path
+        // does (it type-checks the whole logical plan before checkLowerable
+        // refuses). The join node built from keys[0] is never opened, never
+        // returned, and freed when the throw unwinds.
+        //
+        // The multi-way guard at the top of this function cannot be deferred
+        // the same way: this function builds ONE join, so with three relations
+        // the merged schema would be missing a relation's columns entirely and
+        // the type checks would report a misleading "column not found".
+        multi_key_join = keys.size() != 1;
+
         std::string from_col = keys[0].from_col;
         std::string join_col = keys[0].join_col;
 
@@ -143,6 +156,13 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             inferExprType(item.expr.get(), node->outputSchema());
         }
         node = std::make_unique<SortNode>(std::move(node), std::move(stmt.order_by));
+    }
+
+    // Week 26/27 boundary, deferred from the join block so that every plan-time
+    // type check above runs first — see the comment there.
+    if (multi_key_join) {
+        throw std::runtime_error(
+            "multi-key equi-joins are planned but not yet executable (Week 27)");
     }
 
     // project; SELECT list — placed after Sort so sort expressions resolve against full schema

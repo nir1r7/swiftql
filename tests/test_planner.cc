@@ -240,6 +240,38 @@ TEST(PlannerTest, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
     }
 }
 
+// The multi-key refusal is deferred past the plan-time type checks, because the
+// merged schema is built from the two children's schemas and never reads the
+// keys. A genuine query defect therefore outranks a temporary engine
+// limitation, and both engines report the same thing — the vec path
+// type-checks the whole logical plan before checkLowerable refuses.
+TEST(PlannerTest, TypeErrorBeatsTheMultiKeyRefusal) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp "
+                    "WHERE a.id + 'x' > 0", catalog);
+        FAIL() << "expected a type error";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("numeric operands"), std::string::npos) << err;
+        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
+    }
+}
+
+// The multi-WAY guard stays ahead of the type checks: this function builds one
+// join, so a third relation's columns are absent from the merged schema and a
+// deferred check would report a misleading "column not found".
+TEST(PlannerTest, MultiWayRefusalStillPrecedesTypeChecks) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                    "JOIN sj c ON b.grp = c.id WHERE a.id + 'x' > 0", catalog);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("multi-way joins"), std::string::npos) << e.what();
+    }
+}
+
 TEST(PlannerTest, MultiKeyJoinRefusedUntilWeek27) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {
