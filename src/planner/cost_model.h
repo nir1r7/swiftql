@@ -34,3 +34,27 @@ constexpr double CPU_SIMD_COMPARE = 0.02;   // one probe-key-vs-build-key compar
 // retained payload) against `probe_rows`. Same unitless scale as hashJoinCost
 // so the two are directly comparable.
 double simdLoopJoinCost(double build_rows, double build_width, double probe_rows);
+
+// Week 28 — data-volume (bytes-materialized) term. Deferred here from Week 22,
+// which noted it "cannot change the decision" at single-join scope: output rows
+// and output width are invariant under a build-side swap, so the term cancels in
+// every Week 22 comparison. It first discriminates in Week 28, where two join
+// ORDERINGS produce different intermediate results.
+//
+// Deliberately NOT folded into hashJoinCost/simdLoopJoinCost. Those two are
+// compared against each other, and CPU_SIMD_COMPARE is calibrated against
+// measured on-device crossover (docs/hash-vs-simd-crossover.md); adding a term
+// to both changes no decision but invalidates the calibration's provenance and
+// inflates every cost= string --explain has printed since Week 23.
+//
+// Derivation: both join operators materialize every output row (VecHashJoinNode
+// builds a Row per match, then copies it into a DataChunk). Anchor the weight so
+// that materializing one ~40-byte row costs the same as probing one row
+// (CPU_HASH_PROBE = 1.0): 1.0 / 40 = 0.025. Re-derive from profiling in Week 37
+// if TPC-H orderings disagree with measurement.
+constexpr double CPU_MATERIALIZE_BYTE = 0.025;
+
+// cost of emitting `output_rows` rows of `output_width` bytes each. Applied by
+// join enumeration once per join in a candidate ordering; symmetric under a
+// build-side swap, which is why it lives outside the two algorithm costs.
+double joinOutputCost(double output_rows, double output_width);
