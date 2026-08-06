@@ -250,54 +250,45 @@ WEEK25_JOIN_QUERIES = [
     "WHERE laps.season BETWEEN 2021 AND 2023 GROUP BY drivers.team ORDER BY dt",
 ]
 
-# Week 26 (multi-way join language + binding). Nothing this week adds a query
-# that RETURNS rows: multi-way and multi-key joins bind and build a logical join
-# tree, but lowering them is Week 27, so there is nothing to diff against SQLite.
-# What can be pinned is the refusal — every one of these must fail with its own
-# message rather than return a wrong answer, which is the property the whole
-# dialect's error handling exists to protect. Checked in all four modes, since
-# the refusal comes from a different place on the Volcano and vectorized paths.
+# SQL that must be REFUSED in every mode rather than answered. Week 26 filled
+# this list with shapes that were merely unimplemented; Week 27 executes those,
+# so what remains is SQL SwiftQL genuinely does not support (an ON clause with no
+# equi-join key), plus binder and type faults that must outrank everything else.
+# Every entry must fail with its own message rather than return a wrong answer,
+# which is the property the whole dialect's error handling exists to protect.
+# Checked in all four modes: the refusals are raised from different places on the
+# Volcano and vectorized paths.
 #
 # Each entry: (query, required substring of the error).
 WEEK26_REJECTED_QUERIES = [
-    # planned and bound this week, executable in Week 27
-    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
-     "JOIN drivers d2 ON d.driver_id = d2.driver_id",
-     "multi-way joins are planned but not yet executable"),
-    ("SELECT l.team FROM laps l JOIN drivers d "
-     "ON l.driver_id = d.driver_id AND l.team = d.team",
-     "multi-key equi-joins are planned but not yet executable"),
-
-    # still rejected on shape: non-equality ON conjuncts become residuals in
-    # Week 27, and an OR in ON is not a key list at all
+    # An ON clause that yields NO equi-join key is a cross product with a filter
+    # on top, and SwiftQL has no cross-product operator. Week 26 refused these
+    # for a narrower reason ("non-equality" / "AND-chain"); Week 27 makes the
+    # non-equality conjunct legal ALONGSIDE a key, so what is left to refuse is
+    # exactly the missing key. SQLite answers all three — the property under test
+    # is a clean refusal rather than a cartesian product nobody asked for.
     ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id < d.driver_id",
-     "non-equality"),
-    ("SELECT l.team FROM laps l JOIN drivers d "
-     "ON l.driver_id = d.driver_id AND l.speed > d.age",
-     "non-equality"),
+     "at least one equality"),
+    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = 5",
+     "at least one equality"),
+    # an OR is one indivisible conjunct, so it contributes no key even though it
+    # contains equalities
     ("SELECT l.team FROM laps l JOIN drivers d "
      "ON l.driver_id = d.driver_id OR l.team = d.team",
-     "AND-chain of equalities"),
+     "at least one equality"),
 
-    # a second, independent fault must win over the temporary refusal, in every
-    # mode: the multi-key guard is deferred past the plan-time type checks
-    # because the merged schema does not depend on the key count
+    # a genuine query defect still outranks everything else, in every mode: the
+    # plan-time type checks that used to precede the multi-key refusal must keep
+    # firing now that the refusal is gone
     ("SELECT l.team FROM laps l JOIN drivers d "
      "ON l.driver_id = d.driver_id AND l.team = d.team WHERE l.team + 1 > 0",
      "requires numeric operands"),
 
     # ...including a fault in the SELECT list, which buildProjectSchema
-    # type-checks last, so the refusal has to sit after that too
+    # type-checks last
     ("SELECT l.team + 1 FROM laps l JOIN drivers d "
      "ON l.driver_id = d.driver_id AND l.team = d.team",
      "requires numeric operands"),
-
-    # a query that is BOTH multi-way and multi-key must report the same reason
-    # in every mode — the two engines check in different places, so only a query
-    # with both properties can catch them disagreeing
-    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
-     "JOIN drivers d2 ON d.driver_id = d2.driver_id AND d.team = d2.team",
-     "multi-way joins are planned but not yet executable"),
 
     # only reachable once a third relation exists: d2 is not in the tree yet
     ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d2.driver_id "
@@ -351,6 +342,70 @@ WEEK26_ALIAS_SHADOW_QUERIES = [
     "ON drivers.round = age ORDER BY n, lid LIMIT 10",
 ]
 
+# Week 27 (multi-way join execution). Shapes that Week 26 could only bind now
+# return rows, so they move out of the rejection list and are diffed against
+# SQLite like everything else. These four run in ALL modes — multi-KEY joins and
+# residual ON conjuncts are not vectorized-only; only the relation count is.
+WEEK27_JOIN_QUERIES = [
+    # multi-key equi-join (TPC-H Q9's shape). Both keys must constrain the match
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.team = d.team",
+    # a non-equality ON conjunct beside a key: the TPC-H Q21 shape, executed as a
+    # post-join residual rather than refused
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.speed > d.age",
+    # a single-relation residual, which predicate assignment pushes onto the
+    # drivers scan — same answer whether or not it is pushed
+    "SELECT d.name AS n, COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND d.nationality = 'British' "
+    "GROUP BY d.name ORDER BY n",
+    # both operands of an ON conjunct in one relation: a local filter, which
+    # Week 26 rejected because rerouting it across sides would have changed it
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.sector_1 < l.sector_2",
+]
+
+# Three or more relations execute on the VECTORIZED path only: Planner::plan
+# builds exactly one join and row/Volcano never gains multi-way execution
+# (README, Week 27). This is the first deliberate per-mode capability difference
+# in the project, so it needs both halves — the rows where it runs
+# (WEEK27_MULTIWAY_QUERIES, diffed against SQLite in the two vec modes) and the
+# refusal where it does not (WEEK27_VOLCANO_REJECTED, in the two Volcano modes).
+WEEK27_MULTIWAY_QUERIES = [
+    # THE slot query. The third join's key is `team` at relation slot 1, while
+    # the left input's MERGED schema holds `team` at slot 0 first — so a
+    # bare-name lookup joins l1.team instead of l2.team and returns 31440
+    # plausible rows instead of 32193. Only SQLite can tell the two apart
+    "SELECT COUNT(*) AS c FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
+    "JOIN drivers d ON l2.team = d.team",
+    # three relations, two tables, projected columns from all three
+    "SELECT l.team AS t, d.name AS n, d2.name AS n2 FROM laps l "
+    "JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team "
+    "WHERE l.lap_id < 20 ORDER BY t, n, n2",
+    # a multi-way tree whose predicates land on three different relations, plus
+    # a residual ON conjunct on the last one — predicate assignment across a
+    # left-deep spine, which is where routing a conjunct to the wrong relation
+    # would show up as a wrong count
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team AND d2.age > 25 "
+    "WHERE l.season = 2024 AND d.nationality IN ('British','German')",
+    # aggregation over a three-relation join, grouped by a column of the middle
+    # relation — the group key has to resolve to slot 1, not slot 0's same name
+    "SELECT d.team AS t, COUNT(*) AS c, MIN(l.speed) AS lo FROM laps l "
+    "JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team GROUP BY d.team ORDER BY t",
+    # four relations: nothing in lowering is 3-specific, and a fourth is what
+    # proves the recursion rather than a special case
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.driver_id = d2.driver_id "
+    "JOIN laps l2 ON d2.driver_id = l2.driver_id WHERE l.lap_id < 5",
+]
+
+WEEK27_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path") for query in WEEK27_MULTIWAY_QUERIES
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
@@ -359,7 +414,7 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + GROUP_KEY_QUALIFIER_QUERIES + CONSTANT_FOLDING_QUERIES + EXPRESSION_POSITION_QUERIES \
   + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
-  + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES
+  + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -555,10 +610,38 @@ def main():
         extra_args=["--execution", "vectorized", "--storage", "columnar", "--no-optimize"],
     )
 
-    # Week 26: the same four modes, for SQL that must be refused rather than
-    # answered. The refusal is raised from a different place on each path
-    # (Planner::plan on Volcano, VectorizedPlanBuilder on the vec path), so all
-    # four are checked.
+    # Week 27: three-or-more-relation joins execute on the vectorized path only,
+    # so they are diffed against SQLite in the two vec modes and asserted to be
+    # refused in the two Volcano ones. Splitting the suite this way is what keeps
+    # a deliberate capability difference from reading as four failures — and
+    # keeps the refusal itself under test, so a later refactor cannot delete it
+    # silently.
+    vec_modes = [
+        ("Multi-way joins (columnar storage, vec path)",
+         ["--execution", "vectorized", "--storage", "columnar"]),
+        ("Multi-way joins (vectorized, optimizer off)",
+         ["--execution", "vectorized", "--storage", "columnar", "--no-optimize"]),
+    ]
+    m_passed = m_failed = m_errors = 0
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(conn, WEEK27_MULTIWAY_QUERIES, label, extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+
+    volcano_modes = [
+        ("Multi-way refused (row storage, Volcano)", None),
+        ("Multi-way refused (columnar storage, Volcano)", ["--storage", "columnar"]),
+    ]
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(WEEK27_VOLCANO_REJECTED, label, extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+
+    # SQL that must be refused rather than answered, in all four modes. The
+    # refusal is raised from a different place on each path (Planner::plan on
+    # Volcano, the binder/validator or VectorizedPlanBuilder on the vec path).
     modes = [
         ("Rejections (row storage, Volcano)", None),
         ("Rejections (columnar storage, Volcano)", ["--storage", "columnar"]),
@@ -574,9 +657,9 @@ def main():
         r_failed += rf
         r_errors += re_
 
-    total_passed = p1 + p2 + p3 + p4 + r_passed
-    total_failed = f1 + f2 + f3 + f4 + r_failed
-    total_errors = e1 + e2 + e3 + e4 + r_errors
+    total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
+    total_failed = f1 + f2 + f3 + f4 + m_failed + r_failed
+    total_errors = e1 + e2 + e3 + e4 + m_errors + r_errors
     print(f"\nTotal: {total_passed} passed, {total_failed} failed, {total_errors} errors")
     if total_failed > 0 or total_errors > 0:
         sys.exit(1)

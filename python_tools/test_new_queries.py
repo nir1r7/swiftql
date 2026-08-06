@@ -581,11 +581,52 @@ def run_join_steering(queries):
     print(f"  {passed} passed, {failed} failed, 0 errors")
     return passed, failed, 0, fail_list
 
+# ─── Week 27: multi-way join execution ──────────────────────────────────────
+# Three or more relations execute on the VECTORIZED path only (Planner::plan
+# builds one join; row/Volcano never gains multi-way execution), so this block is
+# added to the vectorized run and the optimizer-invariant run — never to the
+# default row/Volcano run, where it would be a refusal rather than a result.
+# The multi-KEY and residual-ON shapes are not vectorized-only and live in
+# compare_against_sqlite.py's main suite, which runs all four modes.
+WEEK27_QUERIES = [
+    # the slot query: the third join's key `team` is at relation slot 1 while the
+    # merged left schema holds `team` at slot 0 first, so a bare-name lookup
+    # joins the wrong relation's column and returns a plausible wrong count
+    ("w27_three_way_slot_exact_key",
+     "SELECT COUNT(*) FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
+     "JOIN drivers d ON l2.team = d.team"),
+
+    ("w27_three_way_projection",
+     "SELECT l.team, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team WHERE l.lap_id < 20 "
+     "ORDER BY l.team, d.name, d2.name"),
+
+    # predicates on three different relations, plus a residual ON conjunct:
+    # pushdown routes each conjunct down the left-deep spine by relation slot
+    ("w27_three_way_predicates_per_relation",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team AND d2.age > 25 "
+     "WHERE l.season = 2024 AND d.nationality IN ('British','German')"),
+
+    # group key on the MIDDLE relation, whose column name also exists at slot 0
+    ("w27_three_way_group_by_middle_relation",
+     "SELECT d.team, COUNT(*), MIN(l.speed) FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team GROUP BY d.team ORDER BY d.team"),
+
+    # four relations: nothing in lowering is 3-specific
+    ("w27_four_way_join",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.driver_id = d2.driver_id "
+     "JOIN laps l2 ON d2.driver_id = l2.driver_id WHERE l.lap_id < 5"),
+]
+
 
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES
 
     # existing surface on the default row/Volcano path (audit fixes and
     # Week 24 expressions affected both engines, so they run here too)
