@@ -51,3 +51,13 @@ class Schema {
     private:
         std::vector<ColumnDef> columns_;
 };
+// Render a column for a plan's explain string, qualified with its relation slot
+// (`team@1`) only when the schema holds that name more than once.
+//
+// A merged join schema can carry `team` from several relations, and that is
+// precisely where resolving a join key by name rather than by slot picks the
+// wrong relation and still returns rows. A plan that prints `team = team` for
+// both the correct and the incorrect resolution hides the defect on the surface
+// used to debug it. Unambiguous names stay bare, so every pre-existing explain
+// string is unchanged.
+std::string qualifyIfAmbiguous(const Schema& schema, int index);

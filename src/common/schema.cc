@@ -39,3 +39,12 @@ int Schema::indexOf(const std::string& name, int relation_slot) const {
 bool Schema::hasColumn(const std::string& name) const {
     return indexOf(name) != -1;
 }
+std::string qualifyIfAmbiguous(const Schema& schema, int index) {
+    const ColumnDef& col = schema.column(index);
+    int matches = 0;
+    for (const ColumnDef& c : schema.columns()) {
+        if (c.name == col.name) ++matches;
+    }
+    if (matches < 2) return col.name;
+    return col.name + "@" + std::to_string(col.relation_slot);
+}
