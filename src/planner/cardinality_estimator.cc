@@ -245,13 +245,35 @@ double joinCardinality(double left_rows, double right_rows,
     }
 
     // no usable key NDV: assume the FK-like case (max) rather than a cross
-    // product, which would explode and mislead Week 22 costing
-    double rows = have_ndv ? (left_rows * right_rows) / divisor
-                           : std::max(left_rows, right_rows);
-    // ≥1-row floor, matching the FILTER case. Kept INSIDE this function so the
-    // Week 28 search sees the same floored number the stamp will show — a
-    // zero-row candidate must not rank infinitely better than it will run.
-    if (left_rows >= 1.0 && right_rows >= 1.0) rows = std::max(rows, 1.0);
+    // product, which would explode and mislead Week 22 costing.
+    //
+    // !! max() is not multiplicative, so a subset containing a stats-less
+    // relation has an order-dependent row estimate and the DP's optimal
+    // substructure does not hold for it. Unfixable inside this rule — there is no
+    // path-independent estimate to fall back to — so the containment is the
+    // written-order guard in JoinEnumeration::reorder, which bounds the search to
+    // "never worse than the written order" whatever the estimates do.
+    return have_ndv ? (left_rows * right_rows) / divisor
+                    : std::max(left_rows, right_rows);
+}
+
+double flooredJoinCardinality(double left_rows, double right_rows, double rows) {
+    // ≥1-row floor, matching the FILTER case: a zero estimate poisons join
+    // costing downstream, and a stamped 0 reads as "this returns nothing".
+    //
+    // Applied at the STAMPING sites only, never inside joinCardinality, because
+    // the join search must not see it. The clamp is per join step, so a candidate
+    // order passing through a sub-1-row intermediate has every later estimate
+    // inflated by 1/true_rows while an order that never dips below 1 does not —
+    // which makes rows(S) depend on the path that reached S, destroys the DP's
+    // optimal substructure, and lets it lock onto a cheap prefix whose floored
+    // count poisons every later transition. Measured before this split: a
+    // 4-relation shape where the DP returned cost=666 against the written order's
+    // 629, and a 5-relation one 4.81x worse, every violation carrying a floored
+    // est=1 intermediate. The search now chains the raw product, which is a pure
+    // function of the subset; the stamped tree is unchanged, because a floored
+    // child feeds the next stamp exactly as before.
+    if (left_rows >= 1.0 && right_rows >= 1.0) return std::max(rows, 1.0);
     return rows;
 }
 
@@ -316,9 +338,13 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // JoinKey contract in join_condition.h). Hoisting the restamp above
             // this call makes every bottom-join key lookup miss — nothing fails,
             // the estimates just quietly degrade.
-            node.estimated_rows = joinCardinality(node.children[0]->estimated_rows,
-                                                  node.children[1]->estimated_rows,
-                                                  join.keys, left, right);
+            // the floor belongs to the STAMP, not to the rule — see
+            // flooredJoinCardinality for why the search must chain the raw product
+            const double l_rows = node.children[0]->estimated_rows;
+            const double r_rows = node.children[1]->estimated_rows;
+            node.estimated_rows = flooredJoinCardinality(
+                l_rows, r_rows,
+                joinCardinality(l_rows, r_rows, join.keys, left, right));
 
             // merge contexts [left ++ added relation], restamping each block to
             // the slot the MERGED SCHEMA gives it — must stay in lockstep with

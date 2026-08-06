@@ -69,9 +69,22 @@ struct StatsContext {
 // was already corrected twice in Week 26 (the slot-exact left lookup, and
 // have_ndv tracked separately from the product so an NDV of 1 stays a usable
 // statistic instead of falling through to the no-stats branch).
+//
+// Returns the RAW expected value, which for keys with statistics is the pure
+// product (∏rows / ∏ndv) and therefore a function of the joined SET alone,
+// independent of the order the relations were added in. That is exactly what the
+// join search's dynamic program needs: keeping one subplan per subset is only
+// sound when the cost of FINISHING a subset depends on the subset alone. Apply
+// flooredJoinCardinality on top wherever the value is STAMPED on a plan node.
 double joinCardinality(double left_rows, double right_rows,
                        const std::vector<JoinKey>& keys,
                        const StatsContext& left, const StatsContext& right);
+
+// The ≥1-row floor, as a separate step. Stamping sites apply it; the join search
+// must not, because a per-step clamp makes a subset's row count depend on the
+// path that reached it and destroys the DP's optimal substructure. See the .cc
+// for the measured plans that motivated splitting the two apart.
+double flooredJoinCardinality(double left_rows, double right_rows, double rows);
 
 // annotates every logical node's estimated_rows in place, bottom-up.
 // runs after LogicalPlanBuilder::build and before VectorizedPlanBuilder::build
