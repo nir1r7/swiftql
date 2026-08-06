@@ -12,10 +12,11 @@
 // cascade (columnar_eval AND) does the least work.
 //
 // Runs after LogicalPlanBuilder::build and before CardinalityEstimator::estimate,
-// so the estimator annotates the rewritten shape. Inner-join only: for an inner
-// equi-join, pushing a single-relation predicate onto its side preserves the
-// result (σ_p(R⋈S) ≡ σ_p(R)⋈S). Week 29's outer join must revisit this — a
-// predicate on the null-supplying side cannot be pushed through an outer join.
+// so the estimator annotates the rewritten shape. For an inner equi-join,
+// pushing a single-relation predicate onto its side preserves the result
+// (σ_p(R⋈S) ≡ σ_p(R)⋈S) on BOTH sides. For a LEFT join it holds on the preserved
+// side only, so since Week 29 distribute() declines to push into children[1] of
+// a LEFT join and such conjuncts stay above the whole join tree.
 class PredicatePushdown {
     public:
         static std::unique_ptr<LogicalPlanNode> apply(std::unique_ptr<LogicalPlanNode> root, const Catalog& catalog);

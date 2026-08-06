@@ -184,7 +184,25 @@ std::unique_ptr<LogicalPlanNode> distribute(std::unique_ptr<LogicalPlanNode> nod
                                             const Catalog& catalog) {
     if (node->type == LogicalNodeType::JOIN) {
         auto* join = static_cast<LogicalJoin*>(node.get());
-        auto it = by_slot.find(join->join_slot);
+
+        // Week 29: children[1] of a LEFT join is the NULL-SUPPLYING relation, and
+        // σ_p(R ⟕ S) is NOT σ_p(R) ⟕ σ_p(S). Filtering S first makes left rows
+        // that HAD matches lose them, and the outer join then null-extends exactly
+        // the rows the WHERE existed to remove: MORE rows, no error, and both
+        // plans look reasonable in --explain. Leaving the bucket in by_slot is not
+        // a leak — pushIntoJoin's leftover loop lifts it above the whole tree,
+        // which is where WHERE semantics put it anyway ("degrade instead of drop",
+        // as that loop already documents).
+        //
+        // The recursion into children[0] below stays UNCONDITIONAL: the preserved
+        // side is safe (σ_p(R) ⟕ S ≡ σ_p(R ⟕ S)), and the test is re-applied at
+        // every join on the way down, so a conjunct owned by a relation that some
+        // deeper outer join null-supplies stops at that join.
+        //
+        // Written as `== INNER` rather than `!= LEFT` so a future RIGHT/FULL join
+        // is refused by default rather than pushed through by omission.
+        auto it = join->join_type == JoinType::INNER
+                      ? by_slot.find(join->join_slot) : by_slot.end();
         if (it != by_slot.end()) {
             // Below the join these execute against the standalone scan, whose
             // schema stamps every column slot 0. Re-stamp so slot lookups hit
