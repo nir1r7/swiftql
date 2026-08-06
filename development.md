@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **604 tests, 0 failures.**
+Expected: **611 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,7 +223,7 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **548 passed, 0 failed, 0 errors**: 119 queries × 4 modes (row/Volcano,
+Expected: **568 passed, 0 failed, 0 errors**: 124 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
 `--no-optimize`), plus 12 rejections × the same 4 modes, plus Week 27's
 capability split — 6 multi-way queries × the 2 vectorized modes, diffed against
@@ -378,6 +378,30 @@ kernel costs what a comparison costs.
 > ```
 
 Arithmetic (Week 24): `+`, `-`, `*`, `/`, unary `-`, with SQL precedence (unary > `* /` > `+ -` > comparisons > `AND` > `OR`). SQLite semantics: `INT / INT` truncates; `x / 0` is `NULL`. Select-list aliases (`AS`) are referenceable in `GROUP BY` and `ORDER BY`; in `GROUP BY`, input columns take precedence over aliases.
+
+### Key serialization
+
+Six operators build a string key from a row's key columns and compare the
+strings: both hash joins, both hash aggregates, both distinct operators. They all
+depend on the same two properties, and every one that restated the rules locally
+got at least one of them wrong — so the rules live in
+`src/execution/key_encoding.h` and nothing else may encode a key.
+
+| Property | What breaks without it |
+|---|---|
+| **Injective framing** — `<len>:<bytes>` per field, `'\x01'` terminated | A bare sentinel is decodable only if no field contains it, and a STRING cell reaches the key verbatim from the CSV. `("A\x01B","C")` and `("A","B\x01C")` encoded alike, so two rows differing in **both** keys joined |
+| **Identifying text, not display text** — exact DOUBLE rendering, never `Value::toString()`'s `%.15g` | 3245 distinct sector sums in `data/laps.csv` share only 2526 `%.15g` texts, so `DISTINCT` and `GROUP BY` merged 706 pairs of different numbers and miscounted every merged group |
+
+NULL is the one place the three uses legitimately differ, so it is the caller's
+choice: a join drops the row (NULL equals nothing, so it can never match), while
+`GROUP BY` and `DISTINCT` keep it as a group of its own under the `'N'` marker —
+which no value's text can imitate, since those start with a length digit. Volcano
+`DistinctNode` was missing that marker, so a NULL and the string `'NULL'` deduped
+together while the vectorized path kept them apart.
+
+A NaN key is dropped by a join for the same reason a NULL is: two NaNs serialize
+identically, but `Value::operator==` calls them unequal, so matching them would
+make a join accept a pair its own `WHERE` predicate rejects.
 
 ### NULL on the vectorized path
 
