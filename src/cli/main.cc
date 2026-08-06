@@ -122,6 +122,22 @@ struct NodeLine {
     std::string pct;
 };
 
+// Render an estimated row count as a whole number.
+//
+// NOT std::llround: estimates are doubles and a join tree multiplies them, so a
+// wide self-join overflows int64_t long before anything is wrong with the plan.
+// llround outside int64_t range is undefined and yields INT64_MIN on x86-64,
+// which printed `est=-9223372036854775808` on a ten-way join — inside the DP
+// limit, so it is a configuration Week 28 advertises rather than an exotic one. A
+// negative row estimate on the checkpoint surface is exactly what --explain
+// exists to prevent. Uses the same fixed/setprecision(0) rendering the cost=
+// string already relies on, which carries large magnitudes correctly.
+static std::string formatEstimate(double rows) {
+    std::ostringstream e;
+    e << std::fixed << std::setprecision(0) << rows;
+    return e.str();
+}
+
 // Format microseconds with ~4 significant digits, no scientific notation.
 static std::string formatMicros(double us) {
     if (us == 0.0) return "0";
@@ -158,7 +174,7 @@ void collectVecNodes(VecPlanNode* node, int depth, bool analyze, double exec_tot
     // (--no-optimize, Volcano) leaves the field empty and printAligned hides
     // the whole column
     if (node->estimated_rows >= 0.0) {
-        line.est = "est=" + std::to_string(std::llround(node->estimated_rows));
+        line.est = "est=" + formatEstimate(node->estimated_rows);
     }
     if (analyze) {
         // analyze mode implies full execution, so print rows_in/rows_out
@@ -184,7 +200,7 @@ void collectLogicalNodes(const LogicalPlanNode* node, int depth, std::vector<Nod
     NodeLine line;
     line.label = std::string(depth * 2, ' ') + node->explain();
     if (node->estimated_rows >= 0.0) {
-        line.est = "est=" + std::to_string(std::llround(node->estimated_rows));
+        line.est = "est=" + formatEstimate(node->estimated_rows);
     }
     out.push_back(std::move(line));
     for (const auto& child : node->children) {
