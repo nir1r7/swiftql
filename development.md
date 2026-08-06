@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **634 tests, 0 failures.**
+Expected: **638 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -245,6 +245,14 @@ both sides unconditionally is what made a broken sort comparator invisible to th
 harness for an entire phase.
 
 Use this after any engine change to check for regressions.
+
+> **Known blind spot.** Rows are normalized through a dict keyed by column
+> *name*, so duplicate names in a merged join schema (invariant 3 — two
+> `driver_id`, two `team`) collapse on both sides identically. A column-identity
+> or column-order regression in a `SELECT *` multi-way join is therefore
+> invisible to this file. Covered on the C++ side by
+> `JoinEnumeration.ReorderedPlansReturnTheWrittenOrdersRows`, which diffs raw
+> chunk values. Read the silence as absence of coverage, not as coverage.
 
 ---
 

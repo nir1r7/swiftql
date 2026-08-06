@@ -957,6 +957,10 @@ unstated assumption in four places, none of them asserted anywhere:
 | **The leftmost leaf's `StatsContext` is re-stamped from the merged schema** | A leaf's context stamps slot 0 for the same reason its schema does. Merged above a non-zero leftmost relation, every later key lookup on that relation misses, `have_ndv` goes false, and the estimate silently degrades to the FK-like fallback. Nothing fails — the numbers just get worse, which is the failure mode statistics code specialises in |
 | **Week 22's deferred data-volume term, landed with its consumer** — `joinOutputCost(rows, width)`, applied per join by the enumerator and **not** folded into `hashJoinCost`/`simdLoopJoinCost` | Both join operators materialize every output row, and nothing charged for it: the CPU terms count *inputs* only, so a DP blind to output would happily pick the order that builds a five-million-row intermediate. It stays outside the two algorithm costs because it is symmetric under a build-side swap — folding it in changes no Week 22 decision while inflating every `cost=` string printed since Week 23 and invalidating `CPU_SIMD_COMPARE`'s measured calibration |
 | **`rowWidth` sums real per-relation widths for a multi-relation input** | It returned `columns * 8.0` for any join subtree, because `leafScanTable()` names relation 0 for the whole thing and a shared column name (`laps.team` 7.2 bytes, `drivers.team` 7.3) then took the wrong table's width. Week 27 refused to guess; Week 28 compares orderings whose whole difference is intermediate width, so the placeholder had become the measurement. Columns are attributed by the binder slot stamped on the merged schema, via a slot→table map read off the spine |
+| **The ≥1-row cardinality floor moved from the rule to the stamping sites** (`flooredJoinCardinality`) | Keeping one subplan per subset is sound only when the cost of *finishing* a subset depends on the subset alone. `rows(S)` is the pure product `∏rows / ∏ndv` over the edges inside `S` — a function of the set — until a per-step `max(rows, 1.0)` is applied, at which point a candidate passing through a sub-1-row intermediate has every later estimate inflated by `1/true_rows` and one that never dips below 1 does not. Optimal substructure is gone and the DP can lock onto a cheap prefix whose floored count poisons every later transition. Measured: a 4-relation shape planned at `cost=666` against the written order's `629`, and a 5-relation one 4.81× worse — the pass advertising in its own checkpoint string that it had made the plan worse. The stamped tree is unchanged: a floored child feeds the next stamp exactly as before |
+| **The search may only improve on the written order** — `reorder()` costs the written fold too and keeps it when the search's pick scores worse | The written order is always legal and always inside the search space, so a sound search cannot return something strictly worse. Both numbers were already computed one line apart and never compared. This bounds the floor problem above, the `max(l, r)` no-statistics branch below, and any future cost-model change, and it makes the printed `cost=… (written=…)` pair self-consistent by construction — which is what makes it evidence rather than decoration. `method=` names which of `dp` / `greedy` / `written-floor` / `written-fallback` produced the printed order, so the field a reader trusts cannot name a search that did not run |
+| **An unbound join key is refused rather than dropped** | `from_slot == -1` (the positional-routing path for callers that skip the Binder) can never satisfy the placed-set test in `keysBetween`, so the key vanished from the rebuilt tree: a missing conjunct and therefore MORE rows if the join had a second key, or a spurious `produced a cross product` throw if it did not — on a query that runs fine under `--no-optimize`. Unreachable from the CLI, so it is the shape of a planner bug and now says so, like every other check in the file |
+| **`est=` renders through the same path as `cost=`** | `std::llround` outside `int64_t` range is undefined and yields `INT64_MIN`, so a ten-way self-join — *inside* the DP limit, a configuration this week advertises — printed `est=-9223372036854775808`. Estimates are `double` everywhere decisions are made, so this was display only; a negative row count on the checkpoint surface is exactly what `--explain` exists to prevent |
 | **The zone-map pruning hint is withheld when the leftmost relation is not slot 0** | `ChunkPruner` treats a `relation_slot < 1` ref in a scan hint as scan-local, and `chunk_pruner.h`'s justification silently assumes the FROM-side scan *is* relation 0. Put relation 2's table at the bottom and a slot-0 ref would prune its chunks on another table's value — rows vanish, no error. Unreachable today (post-pushdown the residual above a join holds only multi-relation, `OR` or constant conjuncts, none of which `collectSimplePredicates` accepts), but the reason it is unreachable is exactly the invariant this week deletes |
 
 Two scope decisions, both deliberate. **Enumeration is a no-op below three
@@ -984,6 +988,14 @@ moves the checkpoint not at all.
 >   correct — and now also before enumeration runs, since a conjunct that must
 >   stay attached to one specific join is no longer describable by "the relation
 >   slot that owns it".
+> - **The DP is exact only where every join key has statistics.**
+>   `joinCardinality`'s no-statistics branch falls back to `max(l, r)`, which is
+>   not multiplicative, so a subset containing a stats-less relation has an
+>   order-dependent row count and optimal substructure does not hold for it.
+>   There is no path-independent estimate to fall back to instead, so the
+>   containment is the written-order bound in `reorder()` rather than a better
+>   formula. Any week that adds a new cardinality rule inherits that bound and
+>   should keep it.
 > - **The search costs the hash join only**, never the SIMD loop join. An
 >   ordering can change a join's key count (a triangle's last-added relation
 >   carries two keys whichever relation it is), and `int_keys` gates SIMD on
@@ -1038,6 +1050,30 @@ moves the checkpoint not at all.
 - Represent scalar, set-returning, and correlated subqueries
 
 **Checkpoint:** Required TPC-H subquery forms bind correctly.
+
+> **Starting note, from a Week 28 audit.** `ORDER BY <alias>` over an
+> *unqualified* select-list column is refused in any query whose relations are
+> aliased, and this is the next week that owns binder scope resolution:
+>
+> ```sql
+> SELECT name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id ORDER BY n
+> -- Error: unknown table qualifier: 'drivers'
+> ```
+>
+> `Binder::resolveColumnRef`'s unqualified branch rewrites `table_name` to the
+> **table** name while the range entry it matched is keyed on `ref_name` — the
+> **alias**. `bindGroupByAlias`-style re-binding of the ORDER BY clone then takes
+> the qualified path and finds no relation called `drivers`. Pre-existing (it
+> reproduces at two relations, on every path); found while auditing join
+> ordering, which is unrelated to it.
+>
+> It is deliberately not a one-line fix. Writing `ref_name` back instead would
+> resolve it, but `exprToString` renders `table_name.column_name` and
+> `aggregateOutputName` is `exprToString` — the byte-for-byte contract between
+> `buildAggregateSchema` and `evaluate()`'s lookup — so every aggregate over an
+> unqualified column in an aliased query would change its **output column name**
+> (`AVG(laps.speed)` → `AVG(l.speed)`). That is a schema-visible change and wants
+> the gate a binder week already has.
 
 ### Week 31 — Scalar + Uncorrelated Subqueries
 
@@ -1267,6 +1303,13 @@ Execution: 72.0ms
 - Commas inside string values not supported in CSV input
 - No persistence beyond CSV files and catalog JSON
 - Cost-based optimization applies only to columnar/vectorized execution
+- Join ordering is bounded by the written order: the search installs its pick
+  only when the cost model scores it at or below the order the query was written
+  in. That bound is load-bearing rather than cosmetic — the DP's optimal
+  substructure holds only while a subset's estimated row count is a function of
+  the subset, which fails for any subset containing a relation with no
+  statistics (the estimator falls back to `max(l, r)`, which is not
+  multiplicative)
 - Join ordering is left-deep only, and its search costs the **hash** join alone —
   never the SIMD loop join, whose eligibility is order-dependent (an ordering can
   turn a one-key join into a composite one) but whose absolute cost, confined to
