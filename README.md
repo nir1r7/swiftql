@@ -782,16 +782,22 @@ same stance as Phase 1's stubbed hash join, and the reason
 `compare_against_sqlite.py` grew a rejection suite (nothing new this week
 returns rows to diff).
 
-The Volcano path refuses *earlier*, right after validation, because it has no
-logical layer: `Planner::plan` builds physical operators directly, and
-`HashJoinNode` holds one key pair and two inputs, so it can neither represent
-the join nor reach the plan-time type checks that come after it. A query with a
-second, independent fault therefore reports the type error on the vectorized
-path and the refusal on Volcano. Both messages are true and neither engine
-accepts what the other rejects; closing the gap would mean giving Volcano
-multi-way planning it is never going to execute, so the divergence is left in
-place and resolves in Week 27 into an ordinary capability difference between the
-two engines.
+Both refusals are placed so that a genuine query defect outranks a temporary
+engine limitation. The **multi-key** refusal is deferred past `Planner::plan`'s
+plan-time type checks, because the merged join schema is built from the two
+children's schemas and never reads the keys — so those checks are valid for a
+multi-key query, and both engines report the same thing for
+`ON a.x = b.x AND a.y = b.y WHERE <type error>`.
+
+The **multi-way** refusal cannot be deferred the same way, and this is the one
+place the two engines differ. `Planner::plan` builds exactly one join, so with
+three relations the merged schema would be missing a relation's columns entirely
+and a deferred type check would report a misleading `column not found`; Volcano
+therefore refuses immediately after validation, while the vectorized path builds
+the whole logical plan first and can report a real type error instead. Both
+messages are true, neither engine accepts what the other rejects, and Week 27
+turns it into an ordinary capability difference — row mode never gains multi-way
+execution.
 
 Four things the two bullets did not anticipate:
 
@@ -854,20 +860,26 @@ Four things the two bullets did not anticipate:
 >   has no multi-way execution planned: keep its refusal and narrow the message
 >   to name the path (`... not supported on the Volcano path; use --execution
 >   vectorized`), rather than deleting it and letting `HashJoinNode` produce
->   something. That rewording is also what closes the one diagnostic asymmetry
->   Week 26 leaves behind — a doubly-faulted query reports the type error on the
->   vec path and the refusal on Volcano, because Volcano refuses before the
->   plan-time type checks it structurally cannot reach.
+>   something. `Planner::plan`'s *multi-key* refusal is deferred to after the
+>   plan-time type checks (a flag set in the join block, thrown after the ORDER
+>   BY checks) — delete that flag with the guard, and keep the multi-way one
+>   early, since one join is all that function builds and a deferred check would
+>   run against a schema missing a relation.
 > - **De-duplicate join keys before building the hash-key tuple.**
 >   `ON a.x = b.x AND a.x = b.x` yields two identical `JoinKey`s today. Harmless
 >   while multi-key refuses, and semantically harmless as a predicate, but it
 >   makes the probe tuple wider than it needs to be and it already double-counts
 >   in `CardinalityEstimator`'s NDV product.
-> - **`Validator::validateJoinCondition` (site 18) goes live here.** Its Week 25
->   branches and its `AggregateExpr` branch are pre-positions: today
->   `classifyJoinCondition` refuses those shapes first, so nothing exercises
->   them. The moment non-equality `ON` conjuncts become legal residuals, that
->   function is their only column-existence check — write the tests with it.
+> - **`Validator::validateJoinCondition` (site 18) is a second opinion, not the
+>   authority.** For a bound statement the Binder is what proves a column
+>   exists, and site 18 re-checks it by *slot* — never by `table_name`, which
+>   for an unqualified ref the Binder rewrites to its relation's table name, so
+>   a name match lands on whichever relation is aliased to that name (this
+>   rejected a legal query for one round of Week 26). Its Week 25 branches and
+>   its `AggregateExpr` branch are pre-positions: `classifyJoinCondition`
+>   refuses those shapes first today. When non-equality `ON` conjuncts become
+>   legal residuals, bind them like any other expression and keep the slot check
+>   slot-based.
 > - **`keys[k].from_col` resolves against `children[0]`, whose merged schema can
 >   hold the same column name at several slots.** `JoinKey::from_slot` carries
 >   the binder slot for exactly this reason; use `Schema::indexOf(name, slot)`

@@ -1312,6 +1312,22 @@ Round 2 found two more. One was fixed; one was considered and deliberately left.
 | The join estimator's new slot-keyed left lookup went through `StatsContext::find`, whose bare-name fallback returns *some other relation's* column when the slot misses — and it misses whenever the key's own relation has no `TableStats`, because a stats-less scan contributes no entries | **Fixed.** `from_slot` was introduced this week exactly to disambiguate a merged context that can hold one name at several slots; honouring it only when it happens to hit makes it advisory. The JOIN case now uses a slot-exact `findExact`, so a miss means "no statistic" — which `have_ndv` already models. `find`'s fallback stays for unbound refs and hand-built contexts, which have no relation identity to be exact about |
 | A query that is *both* unlowerable and otherwise malformed reports the type error on the vec path and the Week-27 refusal on Volcano | **Left in place, deliberately.** Volcano has no logical layer: `Planner::plan` builds physical operators directly, and `HashJoinNode` holds one key pair and two inputs, so a multi-way or multi-key query can neither be represented nor reach the plan-time type checks that follow. Aligning the two would mean giving Volcano multi-way planning it will never execute. Both messages are true, neither engine accepts what the other rejects, and Week 27 turns the divergence into an ordinary capability difference. Documented in the README's Week 26 scope paragraph and folded into the Week 27 note about narrowing Volcano's message |
 
+Round 3 overturned one of those calls and found a regression in a round-1 fix.
+
+| Finding | Outcome |
+|---|---|
+| Site 18's ref-name keying (the round-1 MIN-3 fix) **rejected a legal single-join query** in all four modes: `Binder::resolveColumnRef` rewrites an *unqualified* ref's `table_name` to its relation's TABLE name, so a relation aliased to that name matched instead and the column was checked against the wrong schema | **Fixed.** For a bound ref, check the relation the Binder resolved it against — by slot, since `relations` is built in range-table order. Name matching survives only for the validator-only callers the round-1 fix was written for. The fix's own helper skipped the Binder, and `development.md` restated the same false premise, which is what hid it |
+| The round-2 rejection of the divergent-refusal finding was **wrong for the multi-key case** | **Overturned and fixed.** The merged join schema is built from the two children's schemas and never reads `keys`, so the plan-time type checks are valid for a multi-key query — the early refusal was statement order, not representability. It is now deferred to after those checks. The multi-way half stands, for a reason I had stated too broadly: `Planner::plan` builds one join, so with three relations the merged schema is missing a relation and a deferred check would report a misleading `column not found` |
+| `findExact` was applied to one of five `find` call sites with the same exposure | **Fixed.** The join key was not special among them; `selectivity`'s three sites and the AGGREGATE group-key site all see merged contexts. One shared `findForRef` now expresses the rule once: exact when a slot is present, bare-name only when it is not |
+
+Two lessons, both about how the earlier rounds were closed. A fix whose test
+helper bypasses the pipeline it changed proves nothing about that pipeline —
+`validateOnlyJoinError` skipped the Binder, so it could not see a defect that
+binding *causes*. And a finding closed by reasoning rather than by running the
+code is only as good as the reasoning: the claim that Volcano "cannot reach the
+plan-time type checks" was two lines away from being disproved by reading
+`planner.cc`.
+
 ### Definition of done
 
 - [ ] A three-relation query parses, binds with slots 0/1/2, and builds a
