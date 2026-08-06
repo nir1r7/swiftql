@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **590 tests, 0 failures.**
+Expected: **604 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,11 +223,11 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **532 passed, 0 failed, 0 errors**: 116 queries × 4 modes (row/Volcano,
+Expected: **548 passed, 0 failed, 0 errors**: 119 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
 `--no-optimize`), plus 12 rejections × the same 4 modes, plus Week 27's
-capability split — 5 multi-way queries × the 2 vectorized modes, diffed against
-SQLite, and the same 5 asserted to be refused × the 2 Volcano modes.
+capability split — 6 multi-way queries × the 2 vectorized modes, diffed against
+SQLite, and the same 6 asserted to be refused × the 2 Volcano modes.
 
 > A query that runs in only some modes has to be listed separately, not dropped
 > from the harness and not run everywhere. Multi-way joins are the first such
@@ -497,7 +497,7 @@ Ordered by how hard the failure is to find:
 | 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
 | 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
 | 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, two callers, never a private copy |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, two callers, never a private copy. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one |
 | 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps its own relation's slot (any `k >= 1`) below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
 | 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
