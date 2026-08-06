@@ -477,7 +477,19 @@ def parse_swiftql_output(output: str):
 
 
 def normalize(rows):
+    # Week 29: NULL canonicalization, mirroring compare_against_sqlite.py's
+    # normalize(). SwiftQL's aligned printer emits the literal "NULL" while
+    # SQLite's driver returns Python None, and str(None) is "None" — so before
+    # this, every SwiftQL NULL compared unequal to the SQLite NULL beside it.
+    # It went unnoticed because nothing here could PRODUCE a NULL from catalog
+    # data (invariant 14); a LEFT JOIN can. Same documented limitation as the
+    # sibling harness: a genuine string value "NULL" maps to the token too,
+    # since SwiftQL's text output carries no type information.
+    NULL_TOKEN = "\x00NULL"
+
     def coerce(v):
+        if v is None or v == "NULL":
+            return NULL_TOKEN
         try:
             return round(float(v), 6)
         except (ValueError, TypeError):
@@ -702,6 +714,114 @@ WEEK28_QUERIES = [
      "JOIN laps l2 ON d2.driver_id = l2.driver_id WHERE l.lap_id < 5"),
 ]
 
+# ─── Week 29: outer joins ───────────────────────────────────────────────────
+# Result-preservation is the property at risk here, not plan shape: predicate
+# pushdown must not move a WHERE conjunct onto the null-supplying side, and join
+# enumeration must not reorder across an outer join. Both bugs are invisible to a
+# single run — they show up as optimized != --no-optimize, which is what
+# run_optimizer_invariant compares. The ROWS themselves are diffed against SQLite
+# in compare_against_sqlite.py; this block exists for the optimizer half.
+#
+# Three-or-more-relation shapes are vectorized-only for the pre-existing Week 27
+# reason, which is also why this block joins the vectorized runs only.
+WEEK29_QUERIES = [
+    # a WHERE conjunct on the null-supplying side. Pushed onto the laps scan it
+    # produces null-extended rows the WHERE existed to remove -- MORE rows, no
+    # error, and only the --no-optimize leg can see it.
+    ("w29_where_on_null_supplying_side",
+     "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+     "WHERE l.season = 2024"),
+
+    # ...and the preserved-side control, which must STILL be pushed: a guard that
+    # declines both sides is correct and silently costs every outer join its
+    # pushdown, which no result test can see.
+    ("w29_where_on_preserved_side",
+     "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+     "WHERE d.age > 30"),
+
+    # both positions plus an ON residual, in one query
+    ("w29_all_three_predicate_positions",
+     "SELECT d.name, COUNT(*) FROM drivers d LEFT JOIN laps l "
+     "ON d.driver_id = l.driver_id AND l.round < 5 "
+     "WHERE d.age > 25 GROUP BY d.name ORDER BY d.name"),
+
+    # THE unmatched-heavy shape: lap_id runs to 10000, driver_id stops at 20, so
+    # almost every probe row is null-extended
+    ("w29_mostly_unmatched",
+     "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id"),
+
+    # TPC-H Q13's semantic: COUNT(col) is 0 for an unmatched row, COUNT(*) is 1
+    ("w29_q13_count_shape",
+     "SELECT d.name, COUNT(l.lap_id), COUNT(*) FROM drivers d "
+     "LEFT JOIN laps l ON d.driver_id = l.driver_id AND l.speed > 400 "
+     "GROUP BY d.name ORDER BY d.name"),
+
+    # three relations with an outer join: enumeration must DECLINE the whole tree,
+    # so optimized and --no-optimize execute the same order and agree
+    ("w29_three_way_outer_last",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "LEFT JOIN drivers d2 ON d.team = d2.team AND d2.age > 90"),
+
+    # the outer join FIRST, an inner one above it: the null-extended rows become a
+    # probe input, where their NULL key must stay unmatchable
+    ("w29_three_way_outer_first",
+     "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id "
+     "JOIN laps l2 ON l.driver_id = l2.driver_id WHERE l.lap_id < 30"),
+
+    # ORDER BY over null-extended rows on a reorder-declining tree
+    ("w29_order_by_nulls",
+     "SELECT l.lap_id, d.name FROM laps l LEFT JOIN drivers d "
+     "ON l.lap_id = d.driver_id WHERE l.lap_id < 25 ORDER BY d.name, l.lap_id"),
+]
+
+# Week 29: the decline, asserted on the checkpoint surface. An outer join anywhere
+# in the tree means the search never ran, so there is no order= line to print —
+# and printing one would claim a decision that was never made. Paired with a
+# control in WEEK28_QUERIES (w29_outer_decline_control) whose all-inner form of the
+# same shape MUST still show method=dp: a containsOuterJoin that fires too eagerly
+# would turn off join ordering for the whole project, and no result test can see it.
+WEEK29_NO_ORDER_DECISION = [
+    ("w29_three_way_outer_last",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "LEFT JOIN drivers d2 ON d.team = d2.team AND d2.age > 90"),
+    ("w29_three_way_outer_first",
+     "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id "
+     "JOIN laps l2 ON l.driver_id = l2.driver_id WHERE l.lap_id < 30"),
+]
+
+
+def run_outer_join_decline(queries):
+    """Week 29: an outer join in the tree means join enumeration declined, so
+    --explain must show NO order= line — there was no decision. Asserted on
+    --explain for the same reason the Week 28 steering checks are (invariant 13):
+    a planner decision that never changes rows has no result surface."""
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    passed, failed = 0, 0
+    fail_list = []
+    print(f"\n--- Week 29 outer-join reorder decline (--explain) ---")
+    for label, query in queries:
+        args = [SWIFTQL_BIN, "--catalog", CATALOG_PATH, "--no-cache",
+                *VEC, "--explain", "--query", query]
+        result = subprocess.run(args, capture_output=True, text=True)
+        section = result.stdout.split("=== Optimized Logical Plan ===")[-1] \
+                              .split("=== Physical Plan ===")[0]
+        order = re.search(r"order=(\S+)", section)
+        # and the plan must actually BE an outer join, or this asserts nothing
+        is_outer = "LogicalLeftJoin" in section
+        if result.returncode == 0 and order is None and is_outer:
+            print(f"  PASS  [{label}]  no order= decision, as required")
+            passed += 1
+        else:
+            got = order.group(1) if order else ("no LogicalLeftJoin in plan"
+                                                if not is_outer else result.stderr.strip())
+            print(f"  FAIL  [{label}]  {got}")
+            failed += 1
+            fail_list.append((f"decline:{label}", query, got,
+                              "no order= line, on a LogicalLeftJoin plan"))
+    print(f"  {passed} passed, {failed} failed, 0 errors")
+    return passed, failed, 0, fail_list
+
+
 # Hand-derived from the shipped statistics (laps 10000 rows, drivers 20,
 # NDV(driver_id) = 20, NDV(team) = 10) — an expectation nobody can re-derive is
 # an expectation nobody can debug. `table@slot` because two relations can share a
@@ -757,15 +877,28 @@ def run_join_order_steering(queries):
         # changes rows. Asserted on every steering query rather than on one, since
         # the trigger (a sub-1-row intermediate) is not a property of the shape.
         cw = re.search(r"cost=([\d.]+) \(written=([\d.]+)\)", section)
-        cost_ok = cw is not None and float(cw.group(1)) <= float(cw.group(2))
+        # Week 29: `cost <= written` holds BY CONSTRUCTION -- reorder() clamps
+        # chosen_cost = min(chosen_cost, written_cost) two statements before it
+        # builds this string -- so on its own it can never fail. Reintroduce the
+        # Week 28 floor defect and the DP again returns an order costed 666 against
+        # the written 629; reorder() silently downgrades to method=written-floor,
+        # prints cost=629 (written=629), and the old assertion still passed while
+        # the optimizer had stopped optimizing this shape. `method=dp` is the
+        # statement with content: the search did not need the bound. Both shipped
+        # tables carry full statistics, so the DP is exact on every steering query.
+        m = re.search(r"method=(\w+)", section)
+        cost_ok = (cw is not None and float(cw.group(1)) <= float(cw.group(2))
+                   and m is not None and m.group(1) == "dp")
         if result.returncode == 0 and chosen == expected and cost_ok:
             print(f"  PASS  [{label}]  order {chosen}")
             passed += 1
         elif result.returncode == 0 and chosen == expected:
-            got = f"cost={cw.group(1)} > written={cw.group(2)}" if cw else "no cost= pair"
+            got = (f"cost={cw.group(1)} > written={cw.group(2)}" if cw and
+                   float(cw.group(1)) > float(cw.group(2))
+                   else f"method={m.group(1)}" if m else "no cost= pair")
             print(f"  FAIL  [{label}]  order {chosen} but {got}")
             failed += 1
-            fail_list.append((f"order:{label}", query, got, "cost <= written"))
+            fail_list.append((f"order:{label}", query, got, "cost <= written and method=dp"))
         else:
             print(f"  FAIL  [{label}]  expected {expected}, chose {chosen}")
             failed += 1
@@ -867,7 +1000,7 @@ def run_explain_estimate_format():
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES + WEEK29_QUERIES
 
     # existing surface on the default row/Volcano path (audit fixes and
     # Week 24 expressions affected both engines, so they run here too)
@@ -885,17 +1018,21 @@ def main():
     r6 = run_join_order_work(WEEK28_ORDER_EQUIVALENT_PAIRS, WEEK28_QUERIES)
     # Week 28 estimate rendering: a wide self-join overflows int64_t
     r7 = run_explain_estimate_format()
+    # Week 29: an outer join in the tree means enumeration declined, so no
+    # order= line may be printed — a decision that never happened
+    r8 = run_outer_join_decline(WEEK29_NO_ORDER_DECISION)
 
-    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0]
-    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1]
-    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2]
-    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0] + r8[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1] + r8[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2] + r8[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3] + r8[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
           f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
           f"+ {len(WEEK23_5_QUERIES)} algorithm steering + {len(WEEK28_QUERIES)} order steering "
-          f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work + 1 estimate rendering)")
+          f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work + 1 estimate rendering "
+          f"+ {len(WEEK29_NO_ORDER_DECISION)} outer-join decline)")
 
     if fail_list:
         print(f"\n{'='*70}")

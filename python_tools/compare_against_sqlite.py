@@ -267,6 +267,17 @@ WEEK26_REJECTED_QUERIES = [
     # non-equality conjunct legal ALONGSIDE a key, so what is left to refuse is
     # exactly the missing key. SQLite answers all three — the property under test
     # is a clean refusal rather than a cartesian product nobody asked for.
+    # Week 29: a join key comparing a STRING column with a numeric one. The key is
+    # compared as TEXT, which carries no type tag, so "7" matched the INT 7 while
+    # "007" did not — half a match, while the identical predicate in a WHERE clause
+    # throws. SQLite answers all of these (its affinity rules convert), so the
+    # property under test is again SwiftQL's own refusal rather than a half-answer.
+    # Under an outer join the unmatched half comes back null-extended, which is why
+    # this is closed now.
+    ("SELECT l.team FROM laps l JOIN drivers d ON d.team = l.lap_id",
+     "cannot join a STRING column with a numeric one"),
+    ("SELECT l.team FROM laps l LEFT JOIN drivers d ON l.speed = d.name",
+     "cannot join a STRING column with a numeric one"),
     ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id < d.driver_id",
      "at least one equality"),
     ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = 5",
@@ -487,7 +498,110 @@ WEEK28_JOIN_ORDER_QUERIES = [
     "JOIN drivers d2 ON d.team = d2.team WHERE l.lap_id < 30 ORDER BY t, n",
 ]
 
-MULTIWAY_QUERIES = WEEK27_MULTIWAY_QUERIES + WEEK28_JOIN_ORDER_QUERIES
+# Week 29 — LEFT OUTER JOIN. Every query here exists because a LEFT JOIN that
+# silently behaves as an INNER JOIN passes every test that only inspects matched
+# rows, so each one is written so that the two differ. SQLite supports LEFT JOIN
+# natively, which makes it a true oracle for the first time on NULLs that come
+# from ORDINARY CATALOG DATA: invariant 14 says a CSV cannot express a NULL, so
+# until this week no query could produce one from a table.
+#
+# Two harness properties respected throughout: rows are keyed by column NAME by
+# normalize(), so these project named aliases rather than SELECT * (the merged
+# schema legally repeats names); and NULL is canonicalized across the engines
+# ("NULL" text vs Python None), which is what lets a null-extended row diff at all.
+#
+# Run in all four modes: Volcano implements the same rule (invariant 6), and the
+# only per-mode difference is the pre-existing multi-way one.
+WEEK29_OUTER_JOIN_QUERIES = [
+    # THE shape. laps.lap_id runs to 10000 while drivers.driver_id stops at 20, so
+    # the overwhelming majority of probe rows find NOTHING — an inner join returns
+    # 20 rows here and the outer join 10000. Nothing else in this file has that
+    # ratio, which is what makes an inner-join regression impossible to miss.
+    "SELECT COUNT(*) AS c FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id",
+    # the null-extended half, projected: the join's columns must be NULL, not the
+    # placeholder 0 / '' underneath the validity mask
+    "SELECT l.lap_id AS lid, d.name AS n FROM laps l LEFT JOIN drivers d "
+    "ON l.lap_id = d.driver_id WHERE l.lap_id < 25 ORDER BY lid",
+    # IS NULL over the null-supplying side is the anti-join idiom, and it only
+    # answers correctly if the NULL survived materialization
+    "SELECT COUNT(*) AS c FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id "
+    "WHERE d.driver_id IS NULL",
+    # TPC-H Q13's semantic, on this schema: COUNT(col) is 0 for an unmatched row
+    # while COUNT(*) is 1. If COUNT counts NULLs, every unmatched row reads as 1.
+    "SELECT d.name AS n, COUNT(l.lap_id) AS c, COUNT(*) AS star FROM drivers d "
+    "LEFT JOIN laps l ON d.driver_id = l.driver_id AND l.speed > 400 "
+    "GROUP BY d.name ORDER BY n",
+    # ...and the same query with a residual that DOES match some drivers, so the
+    # result mixes joined and null-extended rows in one aggregate
+    "SELECT d.name AS n, COUNT(l.lap_id) AS c FROM drivers d "
+    "LEFT JOIN laps l ON d.driver_id = l.driver_id AND l.speed > 349 "
+    "GROUP BY d.name ORDER BY c DESC, n",
+    # ON vs WHERE — the pair that makes predicate placement observable. Under an
+    # INNER join these two are the same query; under a LEFT join they are not, and
+    # only SQLite can say which number belongs to which.
+    "SELECT COUNT(*) AS c FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id AND l.speed > 400",
+    "SELECT COUNT(*) AS c FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id WHERE l.speed > 400",
+    # a WHERE conjunct on the null-supplying side must NOT be pushed onto its
+    # scan: pushing it produces null-extended rows the WHERE existed to remove
+    "SELECT COUNT(*) AS c FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE l.season = 2024",
+    # ...while a preserved-side conjunct still is, and must not change the answer
+    "SELECT COUNT(*) AS c FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE d.age > 30",
+    # both at once, plus a residual: the three predicate positions in one query
+    "SELECT d.name AS n, COUNT(*) AS c FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id AND l.round < 5 "
+    "WHERE d.age > 25 GROUP BY d.name ORDER BY n",
+    # ORDER BY over null-extended rows: compareForSort puts NULL first ascending,
+    # last descending, and the harness compares ORDER BY queries IN ORDER
+    "SELECT l.lap_id AS lid, d.name AS n FROM laps l LEFT JOIN drivers d "
+    "ON l.lap_id = d.driver_id WHERE l.lap_id < 25 ORDER BY n, lid",
+    "SELECT l.lap_id AS lid, d.name AS n FROM laps l LEFT JOIN drivers d "
+    "ON l.lap_id = d.driver_id WHERE l.lap_id < 25 ORDER BY n DESC, lid",
+    # DISTINCT over a null-extended column: NULL is one group of its own
+    "SELECT DISTINCT d.name AS n FROM laps l LEFT JOIN drivers d "
+    "ON l.lap_id = d.driver_id ORDER BY n",
+    # a STRING key, so the null-extended block is a STRING column rather than an
+    # INT one — the placeholder under a STRING NULL is "" and would diff as a row
+    "SELECT COUNT(*) AS c FROM drivers d LEFT JOIN laps l "
+    "ON d.nationality = l.team",
+    # a composite key on an outer join: the shared key encoding (Week 27) and the
+    # null-extension have to compose
+    "SELECT COUNT(*) AS c FROM laps l LEFT JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.team = d.team",
+    # a self outer join, where both sides carry the same column names and the
+    # merged schema repeats them — resolution is by slot, not by name
+    "SELECT COUNT(*) AS c FROM laps l LEFT JOIN laps l2 ON l.lap_id = l2.driver_id",
+    # aggregates over the preserved side only, so every unmatched row still
+    # contributes its group
+    "SELECT d.team AS t, MIN(l.speed) AS lo, MAX(l.speed) AS hi, COUNT(l.lap_id) AS c "
+    "FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id AND l.round = 99 "
+    "GROUP BY d.team ORDER BY t",
+    # an inner join FOLLOWED by an outer one: predicate routing and lowering must
+    # keep working per-join rather than per-query (vectorized path only)
+]
+
+# Three-relation shapes with an outer join in them — vectorized-only, for the
+# pre-existing Week 27 reason (Planner::plan builds exactly one join). They are
+# also the queries that prove join enumeration DECLINED: a reordering that moved
+# a relation across the outer join would change these answers.
+WEEK29_MULTIWAY_OUTER_QUERIES = [
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "LEFT JOIN drivers d2 ON d.team = d2.team AND d2.age > 90",
+    "SELECT d.name AS n, COUNT(l2.lap_id) AS c FROM drivers d "
+    "JOIN laps l ON d.driver_id = l.driver_id "
+    "LEFT JOIN laps l2 ON l.lap_id = l2.driver_id "
+    "WHERE l.lap_id < 40 GROUP BY d.name ORDER BY n",
+    # the outer join FIRST, an inner one on top of it: the null-extended rows flow
+    # into another join's probe side, where their NULL key must stay unmatchable
+    "SELECT COUNT(*) AS c FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id "
+    "JOIN laps l2 ON l.driver_id = l2.driver_id WHERE l.lap_id < 30",
+]
+
+MULTIWAY_QUERIES = WEEK27_MULTIWAY_QUERIES + WEEK28_JOIN_ORDER_QUERIES \
+    + WEEK29_MULTIWAY_OUTER_QUERIES
 
 MULTIWAY_VOLCANO_REJECTED = [
     (query, "not supported on the Volcano path") for query in MULTIWAY_QUERIES
@@ -502,7 +616,7 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
   + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES \
-  + WEEK27_KEY_ENCODING_QUERIES
+  + WEEK27_KEY_ENCODING_QUERIES + WEEK29_OUTER_JOIN_QUERIES
 
 # SQLite setup
 def load_sqlite():
