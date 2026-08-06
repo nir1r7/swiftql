@@ -362,6 +362,29 @@ void Validator::validateJoinCondition(const Expr* expr,
     if (!expr) return;
 
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        // A BOUND ref carries the relation the Binder resolved it against, so
+        // check that relation by slot. `relations` is built in range-table
+        // order, so index == slot.
+        //
+        // Matching a bound ref on table_name cannot work: Binder::resolveColumnRef
+        // rewrites an unqualified ref's table_name to the TABLE name of the
+        // relation it resolved to, while this list is keyed by REF name. When
+        // another relation is aliased to exactly that table name, the name match
+        // lands on the wrong entry and rejects a legal query —
+        // `FROM drivers x JOIN laps drivers ON age = drivers.driver_id` checked
+        // `age` against laps.
+        if (col->relation_slot >= 0 &&
+            col->relation_slot < static_cast<int>(relations.size())) {
+            const auto& rel = relations[col->relation_slot];
+            if (!rel.second->hasColumn(col->column_name)) {
+                throw std::runtime_error("JOIN ON: column '" + col->column_name
+                    + "' not found in table '" + rel.first + "'");
+            }
+            return;
+        }
+
+        // Unbound (validator-only callers that skip the Binder): resolve by the
+        // name as typed, against the ref names a qualified reference may use.
         if (col->table_name.empty()) {
             for (const auto& rel : relations) {
                 if (rel.second->hasColumn(col->column_name)) return;

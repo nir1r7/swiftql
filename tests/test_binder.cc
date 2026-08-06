@@ -454,6 +454,48 @@ TEST(JoinOnValidation, AliasedQualifierIsCheckedAgainstItsRelation) {
     EXPECT_NE(err.find("'b'"), std::string::npos) << err;
 }
 
+// Regression, round 3. Binder::resolveColumnRef rewrites an unqualified ref's
+// table_name to the TABLE name of the relation it resolved to. Site 18's
+// relation list is keyed by REF name, so when another relation is aliased to
+// exactly that table name the name match lands on the wrong entry — and a
+// legal, fully executable single-join query was rejected in all four modes.
+// Bound (not validate-only): the whole point is that binding is what breaks it.
+TEST(JoinOnValidation, UnqualifiedOnRefSurvivesAnAliasShadowingItsTableName) {
+    Catalog cat(CATALOG);
+    // `drivers` here is an ALIAS for laps; `age` belongs to the drivers table,
+    // aliased to x. Checking `age` against the alias's schema is the bug.
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT x.name FROM drivers x JOIN laps drivers ON age = drivers.round", cat), "");
+}
+
+// The mirror direction: the shadowing alias is on the FROM side and the
+// unqualified column belongs to the joined relation.
+TEST(JoinOnValidation, ShadowingAliasOnTheFromSideAlsoSurvives) {
+    Catalog cat(CATALOG);
+    // `drivers` is the alias of laps; the unqualified `age` belongs to the
+    // JOINED relation, and the binder stamps it with the table name `drivers`
+    // — which is the FROM side's ref name here.
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT y.name FROM laps drivers JOIN drivers y ON drivers.round = age", cat), "");
+}
+
+// A bound ref with a genuinely missing column must still be caught — by the
+// Binder, which is the column-existence authority once binding has run.
+TEST(JoinOnValidation, BoundRefWithMissingColumnStillRejected) {
+    Catalog cat(CATALOG);
+    // Binding is what rejects it — the Validator's slot check is a second
+    // opinion, not the authority, once the Binder has run.
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.id = b.nope");
+    auto stmt = p.parse();
+    try {
+        Binder::bind(stmt, cat);
+        Validator::validate(stmt, cat);
+        FAIL() << "expected an unknown-column error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("nope"), std::string::npos) << e.what();
+    }
+}
+
 TEST(JoinOnValidation, AliasedQualifierWithRealColumnAccepted) {
     Catalog cat(CATALOG);
     EXPECT_EQ(validateOnlyJoinError("SELECT a.id FROM sj a JOIN sj b ON a.id = b.grp", cat), "");
