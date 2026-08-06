@@ -54,6 +54,25 @@ struct StatsContext {
     const ColumnStatsEntry* findForRef(const std::string& name, int slot) const;
 };
 
+// Estimated output rows of an inner equi-join.
+//
+// `keys` are ORIENTED: from_col/from_slot address `left`, join_col addresses
+// `right`. `left` may be a merged context holding one column name at several
+// slots, which is why the left lookup is slot-EXACT (findForRef) — honouring the
+// slot only when it happens to hit would make the disambiguation advisory.
+// `right` is always exactly one relation (left-deep), so a bare-name match there
+// is unambiguous and -1 asks for it deliberately.
+//
+// Shared by CardinalityEstimator's JOIN case and Week 28's join enumeration.
+// The two MUST NOT hold separate copies: the search would then rank orderings
+// under one model while --explain prints another, and the NDV rule this encodes
+// was already corrected twice in Week 26 (the slot-exact left lookup, and
+// have_ndv tracked separately from the product so an NDV of 1 stays a usable
+// statistic instead of falling through to the no-stats branch).
+double joinCardinality(double left_rows, double right_rows,
+                       const std::vector<JoinKey>& keys,
+                       const StatsContext& left, const StatsContext& right);
+
 // annotates every logical node's estimated_rows in place, bottom-up.
 // runs after LogicalPlanBuilder::build and before VectorizedPlanBuilder::build
 // (lowering consumes the logical tree, so estimation must precede it).
@@ -66,6 +85,14 @@ class CardinalityEstimator {
         // fraction of input rows a predicate keeps, in [0, 1]. Public so the
         // Week 21 pushdown pass can order scan-local conjuncts by expected work.
         static double selectivity(const Expr* pred, const StatsContext& ctx);
+
+        // Estimate ONE subtree in isolation: stamps estimated_rows bottom-up and
+        // returns the column statistics visible above it. Week 28's join
+        // enumeration needs both for every leaf of the join graph before it can
+        // cost an ordering. Same function `estimate` drives, so a leaf costed
+        // here and the same leaf stamped by the final whole-tree pass cannot
+        // disagree.
+        static StatsContext estimateSubtree(LogicalPlanNode& node, const Catalog& catalog);
 
     private:
         // recursive worker: stamps node.estimated_rows, returns the column

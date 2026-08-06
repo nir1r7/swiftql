@@ -203,8 +203,64 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     return FALLBACK_SELECTIVITY;
 }
 
+double joinCardinality(double left_rows, double right_rows,
+                       const std::vector<JoinKey>& keys,
+                       const StatsContext& left, const StatsContext& right) {
+    // Lifted VERBATIM out of estimateNode's JOIN case in Week 28 so the join
+    // search and the stamped plan cannot hold different cardinality models.
+    //
+    // One NDV per key, divided out together — the independent-key generalization
+    // of the single-key formula (Week 26 multi-key equi-joins). The left lookup
+    // goes by slot: the merged left context can hold the same column name at
+    // several slots.
+    //
+    // `have_ndv` is tracked separately from the product on purpose: an NDV of 1
+    // leaves divisor == 1.0 while being a perfectly usable statistic — every left
+    // row matches every right row, so l*r/1 is the exact answer. Testing
+    // `divisor > 1.0` instead sent that case to the no-statistics fallback and
+    // underestimated a constant-key join by the table size.
+    double divisor = 1.0;
+    bool have_ndv = false;
+    for (const JoinKey& k : keys) {
+        // Left side: slot-EXACT. from_slot exists precisely because the merged
+        // left context can hold one column name at several slots, so honouring
+        // it only when it happens to hit would make the disambiguation advisory.
+        // It misses whenever the key's own relation has no TableStats (a
+        // stats-less scan contributes no entries at all), and the bare-name
+        // fallback would then hand back a different relation's column with no
+        // signal. A miss is "no statistic" — which have_ndv below already models.
+        // Right side: one relation, so a bare-name match is unambiguous and -1
+        // asks for it deliberately.
+        // An unbound key (from_slot -1, positional routing) has no relation
+        // identity to be exact about, so findForRef keeps the documented
+        // bare-name behaviour for it.
+        const ColumnStatsEntry* lk = left.findForRef(k.from_col, k.from_slot);
+        const ColumnStatsEntry* rk = right.find(k.join_col, -1);
+        int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
+                               rk ? rk->stats->distinct_count : int64_t(0));
+        if (ndv > 0) {
+            divisor *= static_cast<double>(ndv);
+            have_ndv = true;
+        }
+    }
+
+    // no usable key NDV: assume the FK-like case (max) rather than a cross
+    // product, which would explode and mislead Week 22 costing
+    double rows = have_ndv ? (left_rows * right_rows) / divisor
+                           : std::max(left_rows, right_rows);
+    // ≥1-row floor, matching the FILTER case. Kept INSIDE this function so the
+    // Week 28 search sees the same floored number the stamp will show — a
+    // zero-row candidate must not rank infinitely better than it will run.
+    if (left_rows >= 1.0 && right_rows >= 1.0) rows = std::max(rows, 1.0);
+    return rows;
+}
+
 void CardinalityEstimator::estimate(LogicalPlanNode& root, const Catalog& catalog) {
     estimateNode(root, catalog);
+}
+
+StatsContext CardinalityEstimator::estimateSubtree(LogicalPlanNode& node, const Catalog& catalog) {
+    return estimateNode(node, catalog);
 }
 
 StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Catalog& catalog) {
@@ -247,59 +303,38 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             auto& join = static_cast<LogicalJoin&>(node);
             StatsContext left  = estimateNode(*node.children[0], catalog);
             StatsContext right = estimateNode(*node.children[1], catalog);
-            double l = node.children[0]->estimated_rows;
-            double r = node.children[1]->estimated_rows;
 
             // children[0]=left input, children[1]=the relation this join adds
             // (fixed logical order, Week 16); keys were routed to their sides by
-            // classifyJoinCondition. One NDV per key, divided out together —
-            // the independent-key generalization of the single-key formula
-            // (Week 26 multi-key equi-joins). The left lookup goes by slot: the
-            // merged left schema can hold the same column name at several slots.
-            // `have_ndv` is tracked separately from the product on purpose: an
-            // NDV of 1 leaves divisor == 1.0 while being a perfectly usable
-            // statistic — every left row matches every right row, so l*r/1 is
-            // the exact answer. Testing `divisor > 1.0` instead sent that case
-            // to the no-statistics fallback and underestimated a constant-key
-            // join by the table size.
-            double divisor = 1.0;
-            bool have_ndv = false;
-            for (const JoinKey& k : join.keys) {
-                // Left side: slot-EXACT. from_slot exists precisely because the
-                // merged left context can hold one column name at several
-                // slots, so honouring it only when it happens to hit would make
-                // the disambiguation advisory. It misses whenever the key's own
-                // relation has no TableStats (a stats-less scan contributes no
-                // entries at all), and the bare-name fallback would then hand
-                // back a different relation's column with no signal. A miss is
-                // "no statistic" — which have_ndv below already models.
-                // Right side: one relation, so a bare-name match is unambiguous
-                // and -1 asks for it deliberately.
-                // An unbound key (from_slot -1, positional routing) has no
-                // relation identity to be exact about, so findForRef keeps the
-                // documented bare-name behaviour for it.
-                const ColumnStatsEntry* lk = left.findForRef(k.from_col, k.from_slot);
-                const ColumnStatsEntry* rk = right.find(k.join_col, -1);
-                int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
-                                       rk ? rk->stats->distinct_count : int64_t(0));
-                if (ndv > 0) {
-                    divisor *= static_cast<double>(ndv);
-                    have_ndv = true;
-                }
-            }
+            // classifyJoinCondition. The formula itself lives in
+            // joinCardinality() since Week 28, shared with join enumeration so
+            // the search and the stamp cannot disagree.
+            //
+            // The key lookups happen HERE, before the merge restamp below: at the
+            // bottom join the left context is a leaf's, stamped slot 0, and the
+            // keys' from_slot is 0 to match (see JoinEnumeration::rebuild and the
+            // JoinKey contract in join_condition.h). Hoisting the restamp above
+            // this call makes every bottom-join key lookup miss — nothing fails,
+            // the estimates just quietly degrade.
+            node.estimated_rows = joinCardinality(node.children[0]->estimated_rows,
+                                                  node.children[1]->estimated_rows,
+                                                  join.keys, left, right);
 
-            // no usable key NDV: assume the FK-like case (max) rather than a
-            // cross product, which would explode and mislead Week 22 costing
-            node.estimated_rows = have_ndv ? (l * r) / divisor : std::max(l, r);
-            // ≥1-row floor, matching the FILTER case
-            if (l >= 1.0 && r >= 1.0) {
-                node.estimated_rows = std::max(node.estimated_rows, 1.0);
-            }
-
-            // merge contexts [left ++ added relation], restamping the added
-            // side's entries to the join's relation slot — must stay in lockstep
-            // with the merged-schema construction in LogicalPlanBuilder::build
+            // merge contexts [left ++ added relation], restamping each block to
+            // the slot the MERGED SCHEMA gives it — must stay in lockstep with
+            // the merged-schema construction in LogicalPlanBuilder::build and in
+            // JoinEnumeration::rebuild.
             StatsContext out = std::move(left);
+            // Week 28: a leaf's own context stamps slot 0, because a standalone
+            // scan has one relation and nothing to disambiguate. That is the
+            // leftmost relation's real identity only while the leftmost relation
+            // IS slot 0 — which join enumeration no longer guarantees. Read the
+            // truth off the merged schema's first column. No-op in written order.
+            if (node.children[0]->type != LogicalNodeType::JOIN &&
+                node.output_schema.size() > 0) {
+                const int left_slot = node.output_schema.column(0).relation_slot;
+                for (ColumnStatsEntry& e : out.entries) e.relation_slot = left_slot;
+            }
             for (ColumnStatsEntry e : right.entries) {
                 e.relation_slot = join.join_slot;
                 out.entries.push_back(std::move(e));
