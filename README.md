@@ -1044,6 +1044,71 @@ moves the checkpoint not at all.
 > - Both are dialect facts until closed, so they are listed in Limitations and
 >   the Week 36 correctness report inherits them.
 
+> **Starting notes, from Week 28's foundations.** Four findings from Week 28's
+> second audit. None is a defect on the tree they were found on — it is green —
+> but each is one change away from becoming one, and Week 29 is the first week to
+> make that change: a left outer join is **not commutative**, so it touches the
+> join ordering, the cardinality rule and the result-preservation contract at
+> once. Before reordering anything, the enumerator has to be *told* which pairs
+> it may reorder; an unguarded outer join in the graph is a wrong answer, not a
+> bad plan.
+> - **`cost=` and `est=` on the same `--explain` line are deliberately no longer
+>   reconcilable, and nothing on the surface says so.** Week 28 moved the ≥1-row
+>   floor off the search's transition function — `joinCardinality`
+>   (`src/planner/cardinality_estimator.cc`) returns the raw product, and
+>   `flooredJoinCardinality` is applied only where a value is *stamped* on a plan
+>   node — because a per-step clamp made a subset's row count depend on the path
+>   that reached it and destroyed the DP's optimal substructure. The side effect
+>   is that a sub-1-row intermediate is *searched* at 0.9 and *printed* as
+>   `est=1`: the round-1 repro plans at `cost=542` above two joins both stamped
+>   `est=1`, so `cost=` cannot be re-derived from any `est=` on the tree.
+>   `join_enumeration.h`'s approximation list is where a reader goes for what
+>   `cost=` means and it does not mention the divergence. Any week adding a
+>   cardinality rule — or any test checking one number against the other — must
+>   know the two are intentionally different; the pass is not inconsistent. One
+>   line in approximation 3 closes it.
+> - **The two assertions that pin the written-order bound cannot fail.**
+>   `JoinEnumeration.NeverInstallsAnOrderWorseThanTheWrittenOne`
+>   (`tests/test_join_enumeration.cc`) and `cost_ok` in
+>   `run_join_order_steering` (`python_tools/test_new_queries.py`) both parse
+>   `cost=X (written=Y)` out of `order_decision` and assert `X <= Y` — but
+>   `reorder()` builds that string *after* clamping
+>   `chosen_cost = min(chosen_cost, written_cost)`, so the predicate holds by
+>   construction two statements earlier. Reintroduce the floor defect exactly and
+>   the DP again returns an order costed 666 against the written 629; `reorder`
+>   silently downgrades to `method=written-floor`, prints `cost=629 (written=629)`,
+>   and both assertions pass while the optimizer has stopped optimizing that
+>   shape. The non-tautological form is one token away: assert **`method=dp`** on
+>   those queries, which is the statement "the search did not need the bound".
+>   Week 29 will lean on this bound for outer-join orderings, so fix the assertion
+>   before adding cases to it.
+> - **The unbound-key throw is the one place the optimized path can now fail on
+>   input `--no-optimize` accepts.** For a `from_slot == -1` edge at three or more
+>   relations, `JoinEnumeration::apply` (`src/planner/join_enumeration.cc`) throws,
+>   while the same plan runs to completion unoptimized — Volcano and the
+>   written-order vectorized path never consult `from_slot` for placement. It is
+>   deliberate (a silently dropped key is a wrong answer, and the state is
+>   unreachable: only `classifyJoinCondition`'s unbound-left-operand path produces
+>   a negative `from_slot`, and `Validator` rejects those first), but `return
+>   node;` — decline to reorder, as the sub-3-relation and over-32-relation paths
+>   already do — would keep optimized ≡ `--no-optimize` intact even if the
+>   precondition broke. **Week 30 is where this becomes live:** the check reads
+>   `e.slot_a >= n` where `n` is `countRelations()`, and subqueries introduce scans
+>   that are not range-table entries of the outer query, at which point the
+>   condition stops meaning "unbound key" and starts firing on legitimate plans.
+>   Re-derive it against the binder range table, or convert it to a decline, in
+>   the same commit that admits a subquery scan.
+> - **`method=written-floor` has never executed.** Both shipped tables carry full
+>   column statistics, so `have_ndv` is true for every key on every query this
+>   build can run, so `rows(S)` is the pure product, so the DP is exact, so
+>   `written_cost < chosen_cost` cannot hold: `method=dp` in 300/300 randomized
+>   3–8 relation shapes and on every repro case. The branch is reachable only from
+>   a catalog with a stats-less table — a C++ fixture — and no test builds one, so
+>   the path that silently changes which tree `rebuild` folds ships untried. One
+>   fixture withholding a table's `TableStats` exercises both that guard and
+>   `joinCardinality`'s non-multiplicative `max(l, r)` branch, which is the reason
+>   the guard exists.
+
 ### Week 30 — Subquery Parsing + Binding
 
 - Add nested query AST nodes and scoped name resolution
@@ -1109,6 +1174,30 @@ moves the checkpoint not at all.
 - Add parameterized queries, warmups, repetitions, and reference comparison
 
 **Checkpoint:** TPC-H data generation and automated query runs are reproducible.
+
+> **Starting note, from Week 28's foundations.** **Week 28's randomized coverage
+> is at *plan* level, not at *result* level, and the blocker is the data file
+> rather than the time budget.** 300 randomized 3–8 relation shapes were checked
+> for a legal `order=`, `cost <= written` and no negative `est=`; randomized
+> *result* differencing never completed, because the `--no-optimize` leg of a
+> multi-way self-join over the 10k-row `laps` table takes tens of seconds to
+> minutes (35.6 s measured on one query), so batches of 100, 40 and 14 queries all
+> timed out on the unoptimized leg. Randomized result preservation therefore rests
+> on hand-written differentials — 44 queries in one audit round, 9 in the next —
+> rather than on a generator, and every later optimizer week inherits that shape
+> of coverage.
+>
+> It lands here rather than with Week 29 because the fix is a data-and-harness
+> one and this is the week that owns both: a scale-factor workflow makes a small
+> fixture a first-class artifact instead of a second catalog to keep in sync.
+> `--no-optimize`'s cost is dominated by the unfiltered scan, so a 500-row `laps`
+> would let a 40-query randomized differential run in under a minute while
+> exercising the same orderings. Two traps to build in from the start: a query
+> with no `ORDER BY` must be **sorted before diffing**, since reordering a join
+> legitimately changes physical emission order and the difference is not a result
+> difference; and `compare_against_sqlite.py`'s `normalize()` keys rows by column
+> *name*, so a generator emitting `SELECT *` over a multi-way join has to compare
+> raw sorted output instead — see the blind spot recorded at that function.
 
 ### Week 36 — Query Coverage + Correctness
 
