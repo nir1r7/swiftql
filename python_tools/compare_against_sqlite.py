@@ -363,6 +363,18 @@ WEEK27_JOIN_QUERIES = [
     # Week 26 rejected because rerouting it across sides would have changed it
     "SELECT COUNT(*) AS c FROM laps l JOIN drivers d "
     "ON l.driver_id = d.driver_id AND l.sector_1 < l.sector_2",
+    # two STRING keys. The tuple encoding has to be injective for whatever bytes
+    # a CSV cell contains, and a bare per-field sentinel is not: it only
+    # separates fields that do not themselves contain it
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.team = d.team AND d.name = d.name",
+    # DOUBLE keys are compared through their serialized text, so the text has to
+    # identify the double rather than merely display it — SQLite compares REALs
+    # exactly, and every sector value here is distinct at the 15th digit or not
+    # at all
+    "SELECT COUNT(*) AS c FROM laps l1 JOIN laps l2 ON l1.sector_1 = l2.sector_1",
+    "SELECT COUNT(*) AS c FROM laps l1 JOIN laps l2 "
+    "ON l1.sector_1 = l2.sector_1 AND l1.sector_2 = l2.sector_2",
 ]
 
 # Three or more relations execute on the VECTORIZED path only: Planner::plan
@@ -390,6 +402,11 @@ WEEK27_MULTIWAY_QUERIES = [
     "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
     "JOIN drivers d2 ON d.team = d2.team AND d2.age > 25 "
     "WHERE l.season = 2024 AND d.nationality IN ('British','German')",
+    # a residual belonging to an EARLIER relation, attached to a LATER join's ON
+    # clause: predicate assignment must walk past the join that owns the clause
+    # and land the conjunct on relation 1's scan, not relation 2's
+    "SELECT COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "JOIN drivers d2 ON d.team = d2.team AND d.age > 30",
     # aggregation over a three-relation join, grouped by a column of the middle
     # relation — the group key has to resolve to slot 1, not slot 0's same name
     "SELECT d.team AS t, COUNT(*) AS c, MIN(l.speed) AS lo FROM laps l "

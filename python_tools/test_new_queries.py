@@ -615,6 +615,12 @@ WEEK27_QUERIES = [
      "JOIN drivers d ON l.driver_id = d.driver_id "
      "JOIN drivers d2 ON d.team = d2.team GROUP BY d.team ORDER BY d.team"),
 
+    # a residual belonging to an earlier relation, on a later join's ON clause:
+    # distribute() has to walk past the join that owns the clause
+    ("w27_residual_for_an_earlier_relation",
+     "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team AND d.age > 30"),
+
     # four relations: nothing in lowering is 3-specific
     ("w27_four_way_join",
      "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
