@@ -35,10 +35,16 @@ struct JoinKey {
 // machinery that places WHERE conjuncts (soleSlot()/distribute() in
 // predicate_pushdown.cc), which routes it to the relation slot that owns it.
 //
-// !! Week 29 (outer join) must revisit this. For a LEFT OUTER join an ON
-// predicate filters the match test (unmatched left rows survive with NULLs)
-// while a WHERE predicate filters the result, so merging the two changes the
-// answer. Same trap predicate_pushdown.h documents for pushdown itself.
+// !! Week 29 resolved this, in the CALLERS rather than here. For a LEFT OUTER
+// join an ON predicate filters the match test (a left row whose only candidate
+// fails it is null-extended, not deleted) while a WHERE predicate filters the
+// result, so merging the two changes the answer — that is exactly TPC-H Q13's
+// `o_comment not like '%special%requests%'`. `residuals` are therefore folded
+// into the WHERE conjunction only for an INNER join; for an outer join they are
+// conjoined onto LogicalJoin::on_residual and evaluated inside the probe loop.
+// The decomposition itself is identical either way, which is why this function
+// still takes no join type. Same trap predicate_pushdown.h documents for
+// pushdown itself.
 //
 // `residuals` are BORROWED pointers into the statement's ON trees — this
 // function owns nothing. Callers that need to keep one past the statement's

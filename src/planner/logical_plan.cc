@@ -494,7 +494,13 @@ std::string LogicalJoin::explain() const {
     // (`team@1`). Without it the correct and the incorrect plan render
     // identically, on the surface used to debug them. Unambiguous names stay
     // bare, so a single-key single-join plan is unchanged.
-    std::string s = "LogicalJoin [";
+    //
+    // Week 29: the node NAME carries the join type. A suffix or a bracketed flag
+    // would have changed every inner-join plan string; a distinct name leaves all
+    // of them byte-identical and is unmissable in a plan dump. It also keeps the
+    // substring "Join", which python_tools/test_new_queries.py greps for when it
+    // sums the rows a plan's joins materialize.
+    std::string s = (join_type == JoinType::LEFT ? "LogicalLeftJoin [" : "LogicalJoin [");
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i) s += " AND ";
         const Schema& left = children[0]->output_schema;
@@ -504,6 +510,9 @@ std::string LogicalJoin::explain() const {
            + " = " + keys[i].join_col;
     }
     s += "]";
+    // Week 29: outer joins only — an inner join's residuals are in the WHERE
+    // conjunction and print on their own filter node, as they always have.
+    if (on_residual) s += " residual=" + exprToString(on_residual.get());
     // Week 28: the join-order decision, on the top join of an enumerated tree
     // only. Empty everywhere else, so every pre-existing plan string — single
     // joins, --no-optimize, hand-built test trees — is unchanged.
@@ -611,7 +620,21 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // and hands back every non-key conjunct as a residual (Week 27).
         JoinCondition on = classifyJoinCondition(jc.condition.get(), join_slot);
         std::vector<JoinKey> keys = std::move(on.keys);
-        for (const Expr* r : on.residuals) on_residuals.push_back(cloneExpr(r));
+
+        // Week 29: where the residuals go is decided by the join type, and only
+        // here. INNER: R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S), so they join the WHERE
+        // conjunction below and inherit pushdown for free (Week 27). LEFT: that
+        // identity is false — moving q out of the ON deletes the left rows it
+        // rejects instead of null-extending them — so they stay attached to this
+        // join and become part of its match test.
+        std::unique_ptr<Expr> on_pred;
+        if (jc.type == JoinType::LEFT) {
+            std::vector<std::unique_ptr<Expr>> parts;
+            for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
+            if (!parts.empty()) on_pred = conjoinAll(std::move(parts));
+        } else {
+            for (const Expr* r : on.residuals) on_residuals.push_back(cloneExpr(r));
+        }
 
         // Output schema order is always [relation 0 columns, relation 1, ...] —
         // fixed logical order. The left child already carries slots
@@ -628,6 +651,19 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // no build/probe swap decision here — that's a physical concern
         // (Week 18/22), not part of the logical plan.
         node = std::make_unique<LogicalJoin>(std::move(node), std::move(join_scan), std::move(keys), join_slot, Schema(merged_cols));
+
+        if (jc.type == JoinType::LEFT) {
+            auto* lj = static_cast<LogicalJoin*>(node.get());
+            lj->join_type = JoinType::LEFT;
+            if (on_pred) {
+                // plan-time type check against the MERGED schema, exactly as the
+                // WHERE conjunction is checked below — an ill-typed residual must
+                // fail here, not per row inside the probe loop. It has to be the
+                // merged schema: a residual may span both sides.
+                inferExprType(on_pred.get(), lj->output_schema);
+                lj->on_residual = std::move(on_pred);
+            }
+        }
     }
 
     // Residual ON conjuncts join the WHERE conjunction rather than getting their

@@ -61,7 +61,7 @@ struct LogicalScan : LogicalPlanNode {
     std::string explain() const override;
 };
 
-// inner equi-join. keys[k].from_col resolves against children[0]'s schema,
+// equi-join, INNER by default. keys[k].from_col resolves against children[0]'s schema,
 // keys[k].join_col against children[1]'s. Multi-key since Week 26 (TPC-H Q9).
 // join_slot is the binder relation slot of children[1] — it stamps the merged
 // schema and is what predicate pushdown routes conjuncts by. Left-deep only:
@@ -77,6 +77,23 @@ struct LogicalJoin : LogicalPlanNode {
     // the same rule: never print it when estimates did not drive the decision,
     // or --explain claims an optimizer choice that never happened.
     std::string order_decision;
+
+    // Week 29 — LEFT OUTER. Keys, merged schema and slot stamping are identical;
+    // what changes is that an unmatched children[0] row is emitted with NULLs
+    // across children[1]'s block, and that four passes must now ask which kind
+    // of join this is (pushdown, enumeration, estimation, lowering). Set AFTER
+    // construction, like order_decision, so the five-argument constructor — and
+    // every hand-built test tree that calls it — is unchanged.
+    JoinType join_type = JoinType::INNER;
+
+    // Non-key ON conjuncts, conjoined. NON-NULL ONLY FOR AN OUTER JOIN: an inner
+    // join's residuals are folded into the WHERE conjunction instead (Week 27),
+    // because ON and WHERE are interchangeable there and the fold buys pushdown.
+    // For an outer join they are part of the MATCH TEST — a left row whose every
+    // candidate fails this predicate is null-extended, not deleted. Resolves
+    // against THIS node's merged output_schema, and is MOVED into the physical
+    // operator at lowering (like LogicalFilter::predicate).
+    std::unique_ptr<Expr> on_residual;
 
     LogicalJoin(std::unique_ptr<LogicalPlanNode> from_child, std::unique_ptr<LogicalPlanNode> join_child, std::vector<JoinKey> keys, int join_slot, Schema merged) : LogicalPlanNode(LogicalNodeType::JOIN, std::move(merged)), keys(std::move(keys)), join_slot(join_slot) {
         children.push_back(std::move(from_child));
