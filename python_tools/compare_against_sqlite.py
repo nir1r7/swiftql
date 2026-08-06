@@ -377,6 +377,28 @@ WEEK27_JOIN_QUERIES = [
     "ON l1.sector_1 = l2.sector_1 AND l1.sector_2 = l2.sector_2",
 ]
 
+# Week 27 round 2: the group-by and dedup key serializers hold the same contract
+# the join key does — the serialized text has to IDENTIFY a value, not display it
+# — and neither had been brought along. Both of these are wrong answers on the
+# shipped 10k-row dataset, in every mode, so only SQLite can see them: the four
+# modes agree with each other and disagree with the oracle.
+WEEK27_KEY_ENCODING_QUERIES = [
+    # `%.15g` renders 3245 distinct doubles as 2526 distinct texts, so DISTINCT
+    # and GROUP BY collapse 706 pairs that SQLite (which compares REALs exactly)
+    # keeps apart — and every collapsed group's COUNT(*) is wrong with it
+    "SELECT DISTINCT sector_1 + sector_2 AS s FROM laps ORDER BY s",
+    "SELECT sector_1 + sector_2 AS s, COUNT(*) AS c FROM laps GROUP BY s ORDER BY s",
+    # a NULL key member and the literal string 'NULL' must not dedup together.
+    # A CASE with no ELSE is the reachable way to get a NULL into a dedup key
+    "SELECT DISTINCT CASE WHEN speed > 300 THEN 'NULL' END AS x FROM laps ORDER BY x",
+    "SELECT CASE WHEN speed > 300 THEN 'NULL' END AS x, COUNT(*) AS c FROM laps "
+    "GROUP BY x ORDER BY x",
+    # the same value reached through a group key and through a join key must
+    # agree with each other as well as with SQLite
+    "SELECT l.sector_1 AS s, COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id GROUP BY l.sector_1 ORDER BY s LIMIT 50",
+]
+
 # Three or more relations execute on the VECTORIZED path only: Planner::plan
 # builds exactly one join and row/Volcano never gains multi-way execution
 # (README, Week 27). This is the first deliberate per-mode capability difference
@@ -431,7 +453,8 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + GROUP_KEY_QUALIFIER_QUERIES + CONSTANT_FOLDING_QUERIES + EXPRESSION_POSITION_QUERIES \
   + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
-  + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES
+  + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES \
+  + WEEK27_KEY_ENCODING_QUERIES
 
 # SQLite setup
 def load_sqlite():
