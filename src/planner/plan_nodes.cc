@@ -579,7 +579,16 @@ std::vector<PlanNode*> LimitNode::children() const {
 
 
 // HashJoinNode
-HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped) : left_(std::move(left)), right_(std::move(right)), left_cols_(std::move(left_cols)), right_cols_(std::move(right_cols)), output_schema_(std::move(output_schema)), swapped_(swapped) {}
+HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual) : left_(std::move(left)), right_(std::move(right)), left_cols_(std::move(left_cols)), right_cols_(std::move(right_cols)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)) {
+    // Same guard as VecHashJoinNode: with swapped_ the build block is the LEFT
+    // half of the output row, so a null-extended row would null the preserved
+    // side's own columns and still look like data. Planner::plan forces the side,
+    // so reaching this is a planner bug.
+    if (left_outer_ && swapped_) {
+        throw std::runtime_error(
+            "internal: a left outer join requires the preserved side on the probe input");
+    }
+}
 
 namespace {
 
@@ -630,6 +639,9 @@ void HashJoinNode::open() {
 
     // build phase
     hash_table_.clear();
+    // Week 29: width of the NULL block for a left outer join, from the schema
+    // this node was given rather than from any row it happens to see
+    build_width_ = right_->outputSchema().size();
     right_key_idx_ = resolve(right_->outputSchema(), right_cols_, "build");
     // resolved here rather than per row in next(), which re-resolved the probe
     // key for every row it pulled
@@ -654,9 +666,27 @@ void HashJoinNode::open() {
 
     current_probe_row_ = nullptr;
     bucket_idx_ = 0;
+    probe_matched_ = false;
 }
 
 Row* HashJoinNode::next() {
+    // The ON residual of a left outer join: boolean-as-INT with an explicit null
+    // test, so UNKNOWN is not a match — the same three-valued rule FilterNode
+    // applies. Evaluated against the assembled merged row, exactly as a filter
+    // above the join would have.
+    auto passes = [&](const Row& row) {
+        if (!on_residual_) return true;
+        Value v = evaluate(on_residual_.get(), row, output_schema_);
+        return !v.isNull() && v.asInt() != 0;
+    };
+    // One preserved-side row with no surviving match. !swapped_ is guaranteed by
+    // the constructor, so the build block is the trailing columns.
+    auto nullExtend = [&](const Row& probe_row) {
+        current_row_.clear();
+        for (const Value& v : probe_row) current_row_.push_back(v);
+        for (int i = 0; i < build_width_; ++i) current_row_.push_back(Value::null());
+    };
+
     while (true){
         if (current_probe_row_ != nullptr){
             // check if there are more matches in the current probe row's bucket
@@ -676,10 +706,29 @@ Row* HashJoinNode::next() {
                     for (const Value& v : build_row) current_row_.push_back(v);
                 }
 
+                // A candidate failing the ON residual is not a match: it must not
+                // set probe_matched_, or the probe row is neither emitted joined
+                // nor null-extended and disappears from the result.
+                if (!passes(current_row_)) {
+                    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+                    continue;
+                }
+                probe_matched_ = true;
+
                 stats.rows_out++;
                 stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
                 return &current_row_;
             } else {
+                // Bucket exhausted. Assemble the null-extended row BEFORE clearing
+                // current_probe_row_ — it is the source of the preserved half.
+                if (left_outer_ && !probe_matched_) {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    nullExtend(*current_probe_row_);
+                    current_probe_row_ = nullptr;
+                    stats.rows_out++;
+                    stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+                    return &current_row_;
+                }
                 current_probe_row_ = nullptr;
             }
         } else {
@@ -693,11 +742,20 @@ Row* HashJoinNode::next() {
             }
 
             stats.rows_in++;
+            probe_matched_ = false;
             // a NULL key member matches nothing: leave current_probe_row_ null
-            // so the loop pulls the next probe row instead of looking it up
+            // so the loop pulls the next probe row instead of looking it up.
+            // Week 29: for a LEFT join, "matches nothing" is precisely the row
+            // that must still be emitted — null-extended, right here, since there
+            // is no bucket to drain first.
             if (serializeRowKey(*probe_row, left_key_idx_, probe_key_)) {
                 current_probe_row_ = probe_row;
                 bucket_idx_ = 0;
+            } else if (left_outer_) {
+                nullExtend(*probe_row);
+                stats.rows_out++;
+                stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+                return &current_row_;
             }
 
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -724,12 +782,16 @@ std::string HashJoinNode::explain() const {
     // renders exactly the pre-Week-27 string.
     const std::vector<std::string>& from_cols = swapped_ ? right_cols_ : left_cols_;
     const std::vector<std::string>& join_cols = swapped_ ? left_cols_  : right_cols_;
-    std::string s = "HashJoin [";
+    // Week 29: the node name carries the join type, leaving every inner-join
+    // plan string byte-identical.
+    std::string s = left_outer_ ? "LeftHashJoin [" : "HashJoin [";
     for (size_t i = 0; i < from_cols.size(); ++i) {
         if (i) s += " AND ";
         s += from_cols[i] + " = " + join_cols[i];
     }
-    return s + "]";
+    s += "]";
+    if (on_residual_) s += " residual=" + exprToString(on_residual_.get());
+    return s;
 }
 
 std::vector<PlanNode*> HashJoinNode::children() const {

@@ -40,11 +40,21 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // join_condition.h for why Week 29 must revisit it. conjoinAll MOVES the old
     // predicate rather than cloning it, so any raw Expr* taken afterwards is of
     // the merged tree and stays valid.
+    // Week 29: the fold is INNER-only. For a LEFT join, ON and WHERE are
+    // different queries (a left row whose only candidate fails the residual is
+    // null-extended, not deleted), so an outer join's residuals stay on the join
+    // and become part of its match test.
+    const bool outer = !stmt.joins.empty() && stmt.joins[0].type == JoinType::LEFT;
     std::vector<JoinKey> join_keys;
+    std::unique_ptr<Expr> on_residual;
     if (!stmt.joins.empty()) {
         JoinCondition on = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
         join_keys = std::move(on.keys);
-        if (!on.residuals.empty()) {
+        if (outer) {
+            std::vector<std::unique_ptr<Expr>> parts;
+            for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
+            if (!parts.empty()) on_residual = conjoinAll(std::move(parts));
+        } else if (!on.residuals.empty()) {
             std::vector<std::unique_ptr<Expr>> parts;
             for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
             if (stmt.where) parts.push_back(std::move(stmt.where));
@@ -136,11 +146,19 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         }
         Schema merged_schema(merged_cols);
 
-        bool swap = from_row_count < join_row_count;
+        // Week 29: an outer join never swaps — the preserved (FROM) side must be
+        // the probe input, because a build-side-preserved outer join needs a
+        // matched flag per build row and an end-of-probe drain. The side is
+        // forced, not costed.
+        bool swap = !outer && from_row_count < join_row_count;
         if (swap) {
             node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_cols, from_cols, merged_schema, /*swapped=*/true);
         } else {
-            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_cols, join_cols, merged_schema, /*swapped=*/false);
+            // plan-time type check of the ON residual against the merged schema,
+            // mirroring LogicalPlanBuilder::build — an ill-typed residual fails
+            // here, not per row inside the probe loop
+            if (on_residual) inferExprType(on_residual.get(), merged_schema);
+            node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_cols, join_cols, merged_schema, /*swapped=*/false, outer, std::move(on_residual));
         }
 
     }

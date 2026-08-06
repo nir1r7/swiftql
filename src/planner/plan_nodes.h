@@ -191,7 +191,16 @@ class HashJoinNode : public PlanNode {
         // name and by-name resolution is unambiguous — the vectorized builder,
         // whose left input may be a merged join schema, resolves by slot into
         // indices instead.
-        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped = false);
+        //
+        // Week 29 — same contract as VecHashJoinNode. left_outer emits every
+        // probe row at least once, null-extended across the build block, and is
+        // legal only with swapped == false: the PRESERVED side must be the probe
+        // input, so Planner::plan forces the side rather than costing it.
+        // on_residual holds the non-key ON conjuncts of an outer join, which
+        // filter the MATCH TEST (a probe row whose every candidate fails them is
+        // null-extended, not deleted) — nullptr for every inner join, whose
+        // residuals are folded into the WHERE conjunction instead.
+        HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanNode> right, std::vector<std::string> left_cols, std::vector<std::string> right_cols, Schema output_schema, bool swapped = false, bool left_outer = false, std::unique_ptr<Expr> on_residual = nullptr);
 
         void open() override;
         Row* next() override;
@@ -206,6 +215,12 @@ class HashJoinNode : public PlanNode {
         std::vector<std::string> right_cols_; // join columns from right table
         Schema output_schema_;
         bool swapped_; // true: right_ (build) is logically first; see class comment
+        bool left_outer_;
+        std::unique_ptr<Expr> on_residual_;
+        // per probe row, and it must survive across next() calls: the
+        // null-extended row is emitted when the bucket drains, one call later
+        bool probe_matched_ = false;
+        int build_width_ = 0;   // NULL block width, resolved in open()
 
         std::unordered_map<std::string, std::vector<Row>> hash_table_;
 
