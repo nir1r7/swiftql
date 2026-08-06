@@ -716,11 +716,18 @@ const Schema& HashJoinNode::outputSchema() const {
 }
 
 std::string HashJoinNode::explain() const {
-    // one key renders exactly the pre-Week-27 string
+    // Rendered in logical [FROM, JOIN] order, which is right_/left_ when the
+    // planner swapped the children to build from the smaller side. The physical
+    // probe/build order is a cost decision the reader cannot see, so printing it
+    // made the same logical join render two different ways — the rule the two
+    // vectorized join operators already follow. One key on an unswapped join
+    // renders exactly the pre-Week-27 string.
+    const std::vector<std::string>& from_cols = swapped_ ? right_cols_ : left_cols_;
+    const std::vector<std::string>& join_cols = swapped_ ? left_cols_  : right_cols_;
     std::string s = "HashJoin [";
-    for (size_t i = 0; i < left_cols_.size(); ++i) {
+    for (size_t i = 0; i < from_cols.size(); ++i) {
         if (i) s += " AND ";
-        s += left_cols_[i] + " = " + right_cols_[i];
+        s += from_cols[i] + " = " + join_cols[i];
     }
     return s + "]";
 }

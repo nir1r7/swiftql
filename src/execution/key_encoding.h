@@ -43,21 +43,30 @@
 // DOUBLE is the only interesting case:
 //   - an integral double goes through the integer path, so 7.0 and the INT 7
 //     produce the same text and still join, matching SQLite's numeric affinity.
-//     Doing it by digits rather than by `%g` also removes an exponent cliff:
-//     `%.17g` renders 1e17 as "1e+17" while the INT prints
-//     "100000000000000000", so the two stopped matching above that magnitude.
+//     Doing it by digits rather than by `%g` removes an exponent cliff: `%.17g`
+//     renders 1e17 as "1e+17" while the INT prints "100000000000000000", so the
+//     two stopped matching above that magnitude. The bound is the exact `int64_t`
+//     domain — the two powers of two are the only cast-safe comparison points,
+//     and a round number near them leaves a narrower cliff rather than none
+//     (2^63 - 1024 is exactly representable and exactly equal to its INT, and
+//     SQLite's INTEGER-vs-REAL comparison is exact, so it must still match).
 //     -0.0 falls out of this branch as "0", which is the normalisation IEEE and
 //     SQLite both want — they call the two zeros equal, their texts differ.
 //   - anything else gets `%.17g`, which round-trips, so distinct doubles get
 //     distinct text: 0.1 + 0.2 -> "0.30000000000000004" against 0.3 ->
 //     "0.29999999999999999". `%.15g` gave both "0.3".
-//   - NaN renders "nan" and therefore groups with itself. That is a grouping
-//     choice, not an equality one; a join must NOT match two NaNs, which is
-//     what isUnmatchableKey below is for.
+//   - NaN renders "nan" and therefore groups with itself. `%.17g` alone does not
+//     deliver that — it prints a sign-bit-set NaN as "-nan", which split the two
+//     signs into two groups — so the sign is dropped here. That is a grouping
+//     choice, not an equality one; a join must NOT match two NaNs, which is what
+//     isUnmatchableKey below is for. A NaN group still exists where SQLite has
+//     none (it converts NaN to NULL on storage); see README's Limitations.
 inline std::string keyFieldText(const Value& v) {
     if (!v.isNull() && v.type() == TypeId::DOUBLE) {
         const double d = v.asDouble();
-        if (std::isfinite(d) && std::trunc(d) == d && d >= -9.2e18 && d <= 9.2e18) {
+        if (std::isnan(d)) return "nan";
+        if (std::isfinite(d) && std::trunc(d) == d &&
+            d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
             return std::to_string(static_cast<int64_t>(d));
         }
         char buf[40];
