@@ -709,54 +709,106 @@ TEST(VecPlanBuilder, RowWidthFallsBackPerMissingColumn) {
 }
 
 
-// ===== Week 26/27 boundary =====
+// ===== Multi-way + multi-key lowering (Week 27) =====
 //
-// The logical layer builds arbitrary join trees this week; lowering them is
-// Week 27. Until then the builder refuses shapes VecHashJoinNode cannot
-// express, rather than lowering something unverified — the Phase 1
-// stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
+// The logical layer has built arbitrary join trees since Week 26; Week 27 lowers
+// them. Nothing in lowerNode() is 3-relation-specific — the JOIN case recurses
+// through children[0] — so these tests exist to prove the recursion and the
+// slot-exact key resolution around it, not a special case.
 
-TEST(VecPlanBuilder, ThreeWayJoinRefusedUntilWeek27) {
-    Catalog cat(CATALOG);
-    try {
-        buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
-                 "JOIN sj c ON b.grp = c.id", cat);
-        FAIL() << "expected a refusal";
-    } catch (const std::runtime_error& e) {
-        // assert on the message: "something threw" would also pass for an
-        // unrelated failure inside lowering
-        std::string err = e.what();
-        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
-        EXPECT_NE(err.find("not yet executable"), std::string::npos) << err;
-    }
+// Count join operators anywhere in the physical tree (a join's probe child is
+// another join in a left-deep plan, so the children()[0] spine is not enough).
+static int countJoinNodes(const VecPlanNode* n) {
+    if (!n) return 0;
+    int total = isJoinNode(n) ? 1 : 0;
+    for (const VecPlanNode* c : n->children()) total += countJoinNodes(c);
+    return total;
 }
 
-TEST(VecPlanBuilder, MultiKeyJoinRefusedUntilWeek27) {
+TEST(VecPlanBuilder, ThreeWayJoinLowersToTwoJoins) {
     Catalog cat(CATALOG);
-    try {
-        buildVec("SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
-        FAIL() << "expected a refusal";
-    } catch (const std::runtime_error& e) {
-        std::string err = e.what();
-        EXPECT_NE(err.find("multi-key"), std::string::npos) << err;
-    }
+    auto plan = buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                         "JOIN sj c ON b.grp = c.id", cat);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(countJoinNodes(plan.get()), 2);
 }
 
-// A query that is both multi-way and multi-key must give the SAME reason here
-// as on the Volcano path, which tests the join count first. Interleaving the two
-// checks in one preorder walk made this answer "multi-key" while `--storage row`
-// answered "multi-way" — same query, same refusal, two different explanations.
-TEST(VecPlanBuilder, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
+// Four relations, to prove the recursion rather than a hardcoded depth.
+TEST(VecPlanBuilder, FourWayJoinLowersToThreeJoins) {
     Catalog cat(CATALOG);
-    try {
-        buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
-                 "JOIN sj c ON b.grp = c.id AND b.val = c.val", cat);
-        FAIL() << "expected a refusal";
-    } catch (const std::runtime_error& e) {
-        std::string err = e.what();
-        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
-        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
+    auto plan = buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                         "JOIN sj c ON b.grp = c.id JOIN sj d ON c.grp = d.id", cat);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(countJoinNodes(plan.get()), 3);
+}
+
+TEST(VecPlanBuilder, MultiKeyJoinLowersWithBothKeys) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec("SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    // both keys rendered, in written order — a dropped key is invisible in the
+    // row count whenever the first key already implies the second
+    EXPECT_NE(join->explain().find("id = id AND grp = grp"), std::string::npos)
+        << join->explain();
+}
+
+// A composite key cannot live in the SIMD operator's flat int64 buffer, so the
+// planner must decline it there and lower to the hash join — even on INT keys
+// with a tiny build side, which is precisely when SIMD would otherwise win.
+TEST(VecPlanBuilder, MultiKeyJoinDeclinesSimd) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecOptimized(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain().rfind("VecHashJoin", 0), 0u) << join->explain();
+}
+
+// THE slot hazard. The third join's key is `team` at relation slot 1, and the
+// left input's MERGED schema holds `team` at slot 0 first — so a bare-name
+// lookup silently joins on the wrong relation's column and returns plausible
+// rows. Compared against the row/Volcano baseline for the same shape is
+// impossible (Volcano has no multi-way), so the expected count is computed from
+// the CSVs directly.
+TEST(VecPlanBuilder, ThreeWayJoinResolvesAKeyByRelationSlotNotName) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecOptimized(
+        "SELECT l2.team FROM laps l1 JOIN laps l2 ON l1.lap_id = l2.driver_id "
+        "JOIN drivers d ON l2.team = d.team", cat);
+    auto rows = drainVec(*plan);
+
+    const auto& lm = cat.getTable("laps");
+    const auto& dm = cat.getTable("drivers");
+    auto laps = CSVLoader::load(lm.filepath, lm.schema);
+    auto drivers = CSVLoader::load(dm.filepath, dm.schema);
+    const int lap_id = lm.schema.indexOf("lap_id"), driver_id = lm.schema.indexOf("driver_id");
+    const int l_team = lm.schema.indexOf("team"), d_team = dm.schema.indexOf("team");
+    size_t expected = 0;
+    for (const Row& a : laps)
+        for (const Row& b : laps) {
+            if (!(a[lap_id] == b[driver_id])) continue;
+            for (const Row& d : drivers) if (b[l_team] == d[d_team]) ++expected;
+        }
+    // joining l1.team instead of l2.team gives a different, plausible count
+    EXPECT_EQ(rows.size(), expected);
+}
+
+// Residual ON conjuncts reach the same predicate assignment as WHERE conjuncts:
+// a single-relation one lands on its own scan, below the join.
+TEST(VecPlanBuilder, SingleRelationResidualOnConjunctIsPushedToItsScan) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecOptimized(
+        "SELECT laps.team FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id AND drivers.age > 30", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    // the drivers side is a filter over its scan, not a bare scan
+    bool filtered = false;
+    for (const VecPlanNode* side : join->children()) {
+        if (side->explain().rfind("VecFilter", 0) == 0) filtered = true;
     }
+    EXPECT_TRUE(filtered) << join->children()[0]->explain() << " / " << join->children()[1]->explain();
 }
 
 // The refusal must not have narrowed what already worked.

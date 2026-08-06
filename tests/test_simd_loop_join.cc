@@ -148,9 +148,10 @@ TEST(VecSimdLoopJoin, ScalarMatchesHashJoinBasic) {
     };
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema, /*swapped=*/false, /*use_simd=*/false);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, /*swapped=*/false, /*use_simd=*/false);
     VecHashJoinNode hash(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                         "pid", "bid", out_schema);
+                         std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+                         out_schema);
 
     EXPECT_EQ(serialize(drainRows(loop), false), serialize(drainRows(hash), false));
 }
@@ -167,7 +168,7 @@ TEST(VecSimdLoopJoin, SwappedEmitsFromSideFirst) {
     std::vector<Row> build_rows = {{Value(int64_t(7)), Value(std::string("from_side"))}};
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                             "jid", "fid", out_schema, /*swapped=*/true, /*use_simd=*/false);
+                             probe_schema.indexOf("jid"), build_schema.indexOf("fid"), out_schema, /*swapped=*/true, /*use_simd=*/false);
     auto rows = drainRows(loop);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0].asInt(), 7);
@@ -188,7 +189,7 @@ TEST(VecSimdLoopJoin, DuplicateBuildKeys) {
         {Value(int64_t(1)), Value(std::string("z"))},
     };
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema, false, /*use_simd=*/false);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/false);
     auto rows = drainRows(loop);
     ASSERT_EQ(rows.size(), 3u);
     EXPECT_EQ(rows[0][2].asString(), "x");   // build insertion order preserved
@@ -202,7 +203,7 @@ TEST(VecSimdLoopJoin, EmptyBuildSide) {
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
     std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, {}),
-                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/true);
     EXPECT_TRUE(drainRows(loop).empty());
 }
 
@@ -212,7 +213,7 @@ TEST(VecSimdLoopJoin, EmptyProbeSide) {
     Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
     std::vector<Row> build_rows = {{Value(int64_t(1))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, {}), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/true);
     loop.open();
     EXPECT_EQ(loop.nextChunk(), nullptr);
     loop.close();
@@ -238,7 +239,7 @@ TEST(VecSimdLoopJoin, FilteredBuildChildRespected) {
         makeScan(build_schema, build_rows), binOp(">", col("bval"), intLit(15)));
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), std::move(filtered_build),
-                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/true);
     auto rows = drainRows(loop);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0][2].asInt(), 20);
@@ -260,7 +261,7 @@ TEST(VecSimdLoopJoin, FilteredProbeChildRespected) {
         makeScan(probe_schema, probe_rows), binOp(">", col("pval"), intLit(15)));
 
     VecSimdLoopJoinNode loop(std::move(filtered_probe), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/true);
     auto rows = drainRows(loop);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0][1].asInt(), 20);
@@ -285,9 +286,9 @@ TEST(VecSimdLoopJoin, SimdMatchesScalarAcrossTailSizes) {
         std::vector<Row> build_rows = intKeyRows(n, 1000);
 
         VecSimdLoopJoinNode simd(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                                 "pkey", "bkey", out_schema, false, /*use_simd=*/true);
+                                 probe_schema.indexOf("pkey"), build_schema.indexOf("bkey"), out_schema, false, /*use_simd=*/true);
         VecSimdLoopJoinNode scalar(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                                   "pkey", "bkey", out_schema, false, /*use_simd=*/false);
+                                   probe_schema.indexOf("pkey"), build_schema.indexOf("bkey"), out_schema, false, /*use_simd=*/false);
         EXPECT_EQ(serialize(drainRows(simd), false), serialize(drainRows(scalar), false))
             << "build size " << n;
     }
@@ -304,9 +305,10 @@ TEST(VecSimdLoopJoin, SimdMatchesHashJoinMultiChunk) {
     std::vector<Row> build_rows = intKeyRows(15, 1000);      // ~2 matches per probe row
 
     VecSimdLoopJoinNode simd(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                             "pkey", "bkey", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pkey"), build_schema.indexOf("bkey"), out_schema, false, /*use_simd=*/true);
     VecHashJoinNode hash(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                         "pkey", "bkey", out_schema);
+                         std::vector<int>{probe_schema.indexOf("pkey")}, std::vector<int>{build_schema.indexOf("bkey")},
+                         out_schema);
     EXPECT_EQ(serialize(drainRows(simd), true), serialize(drainRows(hash), true));
 }
 
@@ -318,7 +320,8 @@ TEST(VecSimdLoopJoin, ExplainNamesOperatorAndMaterializes) {
     Schema s = vecSchema({{"pid", TypeId::INT}});
     Schema b = vecSchema({{"bid", TypeId::INT}});
     Schema o = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
-    VecSimdLoopJoinNode loop(makeScan(s, {}), makeScan(b, {}), "pid", "bid", o);
+    VecSimdLoopJoinNode loop(makeScan(s, {}), makeScan(b, {}),
+                             s.indexOf("pid"), b.indexOf("bid"), o);
     std::string e = loop.explain();
     EXPECT_EQ(e.rfind("VecSimdLoopJoin", 0), 0u) << e;
     EXPECT_NE(e.find("pid = bid"), std::string::npos) << e;
@@ -332,7 +335,7 @@ TEST(VecSimdLoopJoin, StatsCountProbeRowsInAndJoinedRowsOut) {
     std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(9))}};
     std::vector<Row> build_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
     VecSimdLoopJoinNode loop(makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema);
     drainRows(loop);
     EXPECT_EQ(loop.stats.rows_in, 3);
     EXPECT_EQ(loop.stats.rows_out, 2);
@@ -349,7 +352,7 @@ TEST(VecSimdLoopJoin, BuildPhaseIsTimed) {
     for (int i = 0; i < 5000; ++i) build_rows.push_back({Value(int64_t(i))});
 
     VecSimdLoopJoinNode loop(makeScan(probe_schema, {}), makeScan(build_schema, build_rows),
-                             "pid", "bid", out_schema, false, /*use_simd=*/true);
+                             probe_schema.indexOf("pid"), build_schema.indexOf("bid"), out_schema, false, /*use_simd=*/true);
     loop.open();
     while (loop.nextChunk()) {}
     loop.close();

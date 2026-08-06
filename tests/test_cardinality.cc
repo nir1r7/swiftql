@@ -485,3 +485,29 @@ TEST(Cardinality, EveryNodeEstimatedOnFullQuery) {
             << "unestimated node type " << static_cast<int>(n->type);
     }
 }
+
+// ===== Duplicate join keys (Week 27) =====
+
+// `ON a.x = b.x AND a.x = b.x` is a legal predicate but two identical JoinKeys.
+// The estimator divides by one NDV per key, so the duplicate squared the divisor
+// and underestimated the join by a factor of NDV. Deduped in
+// classifyJoinCondition, which is why the two forms must now estimate alike.
+TEST(Cardinality, DuplicateJoinKeyDoesNotSquareTheNdvDivisor) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+
+    auto once  = buildLogical(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat);
+    auto twice = buildLogical(
+        "SELECT l.team FROM laps l JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND l.driver_id = d.driver_id", cat);
+    CardinalityEstimator::estimate(*once, cat);
+    CardinalityEstimator::estimate(*twice, cat);
+
+    const LogicalPlanNode* j1 = findNode(once.get(), LogicalNodeType::JOIN);
+    const LogicalPlanNode* j2 = findNode(twice.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(j1, nullptr);
+    ASSERT_NE(j2, nullptr);
+    EXPECT_DOUBLE_EQ(j1->estimated_rows, j2->estimated_rows);
+}

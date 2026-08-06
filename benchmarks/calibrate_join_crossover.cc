@@ -66,13 +66,19 @@ double timedRunMs(Algo algo, const Schema& probe_s, const ColumnarTable& probe_t
     auto probe = std::make_unique<VecScanNode>("p", probe_t, probe_s);
     auto build = std::make_unique<VecScanNode>("b", build_t, build_s);
 
+    // Week 27: both operators take resolved key column INDICES, since the
+    // planner is the only layer that knows which relation slot a name meant.
+    const int probe_key = probe_s.indexOf("pkey");
+    const int build_key = build_s.indexOf("bkey");
+
     std::unique_ptr<VecPlanNode> join;
     if (algo == Algo::HASH) {
         join = std::make_unique<VecHashJoinNode>(
-            std::move(probe), std::move(build), "pkey", "bkey", out_s);
+            std::move(probe), std::move(build),
+            std::vector<int>{probe_key}, std::vector<int>{build_key}, out_s);
     } else {
         join = std::make_unique<VecSimdLoopJoinNode>(
-            std::move(probe), std::move(build), "pkey", "bkey", out_s,
+            std::move(probe), std::move(build), probe_key, build_key, out_s,
             /*swapped=*/false, /*use_simd=*/algo == Algo::SIMD);
     }
 

@@ -459,7 +459,7 @@ TEST(HashJoinNode, BasicInnerJoin) {
     HashJoinNode join(
         makeScan(left_rows,  left_schema),
         makeScan(right_rows, right_schema),
-        "driver_id", "driver_id",
+        std::vector<std::string>{"driver_id"}, std::vector<std::string>{"driver_id"},
         merged);
 
     auto result = drainAll(&join);
@@ -489,7 +489,7 @@ TEST(HashJoinNode, NoMatch) {
     HashJoinNode join(
         makeScan(left_rows,  left_schema),
         makeScan(right_rows, right_schema),
-        "pid", "bid", merged);
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
 
     EXPECT_TRUE(drainAll(&join).empty());
 }
@@ -510,7 +510,7 @@ TEST(HashJoinNode, MultipleMatchesPerKey) {
     HashJoinNode join(
         makeScan(left_rows,  left_schema),
         makeScan(right_rows, right_schema),
-        "pid", "bid", merged);
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
 
     auto result = drainAll(&join);
     ASSERT_EQ(result.size(), 2u);
@@ -532,7 +532,7 @@ TEST(HashJoinNode, EmptyBuildSide) {
     HashJoinNode join(
         makeScan(left_rows, left_schema),
         makeScan({},        right_schema),
-        "pid", "bid", merged);
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
 
     EXPECT_TRUE(drainAll(&join).empty());
 }
@@ -548,9 +548,92 @@ TEST(HashJoinNode, EmptyProbeSide) {
     HashJoinNode join(
         makeScan({},         left_schema),
         makeScan(right_rows, right_schema),
-        "pid", "bid", merged);
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
 
     EXPECT_TRUE(drainAll(&join).empty());
+}
+
+// ===== Composite (multi-key) join keys, Week 27 =====
+
+TEST(HashJoinNode, MultiKeyRequiresEveryKeyToMatch) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+
+    std::vector<Row> left_rows = {
+        {Value(int64_t(1)), Value(int64_t(7))},
+        {Value(int64_t(1)), Value(int64_t(8))},   // first key matches, second does not
+    };
+    std::vector<Row> right_rows = {{Value(int64_t(1)), Value(int64_t(7))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid", "pgrp"}, std::vector<std::string>{"bid", "bgrp"},
+        merged);
+
+    auto result = drainAll(&join);
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result[0][1].asInt(), 7);
+}
+
+// The '\x01' sentinel goes after every field, not between them: otherwise the
+// STRING tuples ("ab","c") and ("a","bc") serialize to identical bytes.
+TEST(HashJoinNode, MultiKeyStringTupleBoundariesDoNotCollide) {
+    Schema left_schema  = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema right_schema = makeSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema merged       = makeSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(std::string("ab")), Value(std::string("c"))}};
+    std::vector<Row> right_rows = {{Value(std::string("a")),  Value(std::string("bc"))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"p1", "p2"}, std::vector<std::string>{"b1", "b2"},
+        merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+// SQL: NULL equals nothing, so a row with a NULL key member matches nothing —
+// on either side, and with any number of keys. Volcano used to bucket such a row
+// under toString()'s "NULL", which made NULL = NULL match while the vectorized
+// path dropped it: the two engines disagreed. Unreachable from CSV today, but
+// Week 29's outer join puts real NULLs on join inputs.
+TEST(HashJoinNode, NullKeyMemberMatchesNothing) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1)), Value()}};   // NULL second key
+    std::vector<Row> right_rows = {{Value(int64_t(1)), Value()}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid", "pgrp"}, std::vector<std::string>{"bid", "bgrp"},
+        merged);
+
+    EXPECT_TRUE(drainAll(&join).empty());
+}
+
+TEST(HashJoinNode, ExplainRendersEveryKeyAndKeepsTheSingleKeyForm) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    HashJoinNode two(makeScan({}, left_schema), makeScan({}, right_schema),
+                     std::vector<std::string>{"pid", "pgrp"},
+                     std::vector<std::string>{"bid", "bgrp"}, merged);
+    EXPECT_EQ(two.explain(), "HashJoin [pid = bid AND pgrp = bgrp]");
+
+    HashJoinNode one(makeScan({}, left_schema), makeScan({}, right_schema),
+                     std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
+    EXPECT_EQ(one.explain(), "HashJoin [pid = bid]");
 }
 
 // ===== full pipeline =====
@@ -668,7 +751,7 @@ TEST(Pipeline, HashJoinWithFilterAndAggregate) {
     auto join = std::make_unique<HashJoinNode>(
         makeScan(laps_rows,    laps_schema),
         makeScan(drivers_rows, drivers_schema),
-        "driver_id", "driver_id",
+        std::vector<std::string>{"driver_id"}, std::vector<std::string>{"driver_id"},
         merged);
 
     // WHERE speed > 200.0

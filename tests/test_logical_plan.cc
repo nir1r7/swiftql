@@ -915,3 +915,73 @@ TEST(ConstantFolding, OutOfRangeDateArithmeticIsAnError) {
     EXPECT_NO_THROW(plan("date '1994-01-01' + interval '1' year"));
     EXPECT_NO_THROW(plan("date '1994-01-01' + interval '8000' year"));
 }
+
+// ===== Week 27: residual ON conjuncts =====
+
+// A non-key ON conjunct becomes a predicate over the join's output. It is folded
+// into the WHERE conjunction rather than given its own LogicalFilter, because
+// PredicatePushdown only rewrites a FILTER whose DIRECT child is a JOIN — a
+// stacked pair would leave the WHERE unpushed.
+TEST(LogicalPlan, ResidualOnConjunctBecomesTheFilterAboveTheJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->children[0]->type, LogicalNodeType::JOIN);
+    EXPECT_EQ(filter->explain(), "LogicalFilter [(a.grp < b.grp)]");
+
+    // and the join kept exactly the one real key
+    const auto* lj = static_cast<const LogicalJoin*>(filter->children[0].get());
+    ASSERT_EQ(lj->keys.size(), 1u);
+    EXPECT_EQ(lj->keys[0].from_col, "id");
+}
+
+// One filter, not two: a written WHERE and a residual ON conjunct share it.
+TEST(LogicalPlan, ResidualOnConjunctAndWhereShareOneFilter) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp "
+        "WHERE a.val > 1", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->children[0]->type, LogicalNodeType::JOIN)
+        << "a second stacked filter would break pushdown's FILTER-over-JOIN match";
+}
+
+// The residual is CLONED out of the statement's ON tree: the statement dies with
+// build(), so a borrowed pointer would dangle. Cloning must preserve the binder
+// slots, or the conjunct resolves against the wrong relation after the fold.
+TEST(LogicalPlan, ResidualOnConjunctKeepsItsRelationSlots) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* bin = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(bin, nullptr);
+    const auto* lhs = dynamic_cast<const ColumnRef*>(bin->left.get());
+    const auto* rhs = dynamic_cast<const ColumnRef*>(bin->right.get());
+    ASSERT_NE(lhs, nullptr);
+    ASSERT_NE(rhs, nullptr);
+    EXPECT_EQ(lhs->relation_slot, 0);
+    EXPECT_EQ(rhs->relation_slot, 1);
+}
+
+// A residual column must survive scan narrowing: buildScanSchema collects from
+// every ON condition, so a column referenced ONLY by a residual still reaches
+// its scan. Without that the plan fails later with "column not found".
+TEST(LogicalPlan, ResidualOnlyColumnSurvivesScanNarrowing) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.val > 1", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const LogicalPlanNode* join = filter->children[0].get();
+    EXPECT_GE(join->children[1]->output_schema.indexOf("val"), 0);
+}

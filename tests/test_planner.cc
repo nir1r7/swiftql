@@ -209,11 +209,39 @@ TEST(ValidatorTest, BareColumnWithGroupByButNoAggregatesRejected) {
 }
 
 
-// ===== Week 26/27 boundary (Volcano path) =====
+// ===== Multi-way vs multi-key on the Volcano path (Week 27) =====
 
-// HashJoinNode executes exactly one single-key equi-join. Multi-way and
-// multi-key trees bind and plan logically this week but must not execute.
-TEST(PlannerTest, ThreeWayJoinRefusedUntilWeek27) {
+// First node whose explain() starts with `prefix`, in preorder.
+static const PlanNode* findNode(const PlanNode* node, const std::string& prefix) {
+    if (!node) return nullptr;
+    if (node->explain().rfind(prefix, 0) == 0) return node;
+    for (const PlanNode* child : node->children()) {
+        if (const PlanNode* hit = findNode(child, prefix)) return hit;
+    }
+    return nullptr;
+}
+
+// Expected row count of `sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp`,
+// computed straight off the CSV so the test states the answer independently of
+// the engine that is being tested.
+static int countMultiKeyMatches() {
+    Catalog catalog("../tests/data/test_catalog.json");
+    const auto& meta = catalog.getTable("sj");
+    auto rows = CSVLoader::load(meta.filepath, meta.schema);
+    const int id = meta.schema.indexOf("id"), grp = meta.schema.indexOf("grp");
+    int n = 0;
+    for (const Row& a : rows)
+        for (const Row& b : rows)
+            if (a[id] == b[id] && a[grp] == b[grp]) ++n;
+    return n;
+}
+
+// Volcano builds exactly ONE join and is not planned to gain more: it is the
+// correctness baseline, not the feature-complete path. The refusal must name the
+// path rather than promise a later week, and it must not be deleted — the single
+// HashJoinNode would otherwise build one join out of two clauses and silently
+// drop a relation.
+TEST(PlannerTest, ThreeWayJoinRefusedOnVolcano) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {
         bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
@@ -222,12 +250,15 @@ TEST(PlannerTest, ThreeWayJoinRefusedUntilWeek27) {
     } catch (const std::runtime_error& e) {
         std::string err = e.what();
         EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
+        // names the capable path: this is a mode difference, not a missing feature
+        EXPECT_NE(err.find("--execution vectorized"), std::string::npos) << err;
     }
 }
 
-// Same query as VecPlanBuilder.MultiWayAndMultiKeyReportsTheJoinCountFirst:
-// the two engines must agree on which reason they report.
-TEST(PlannerTest, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
+// Multi-KEY is a different axis and executes here: only the relation count is
+// vectorized-only. A query with both properties must therefore still report the
+// relation count, which is the half Volcano cannot do.
+TEST(PlannerTest, MultiWayAndMultiKeyReportsTheJoinCount) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {
         bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
@@ -240,44 +271,9 @@ TEST(PlannerTest, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
     }
 }
 
-// The multi-key refusal is deferred past the plan-time type checks, because the
-// merged schema is built from the two children's schemas and never reads the
-// keys. A genuine query defect therefore outranks a temporary engine
-// limitation, and both engines report the same thing — the vec path
-// type-checks the whole logical plan before checkLowerable refuses.
-TEST(PlannerTest, TypeErrorBeatsTheMultiKeyRefusal) {
-    Catalog catalog("../tests/data/test_catalog.json");
-    try {
-        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp "
-                    "WHERE a.id + 'x' > 0", catalog);
-        FAIL() << "expected a type error";
-    } catch (const std::runtime_error& e) {
-        std::string err = e.what();
-        EXPECT_NE(err.find("numeric operands"), std::string::npos) << err;
-        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
-    }
-}
-
-// The projection's type check is the LAST one Planner::plan performs
-// (buildProjectSchema calls inferExprType per select item), so the refusal has
-// to sit after it too — the vec path runs checkLowerable after the whole
-// logical plan, projection included.
-TEST(PlannerTest, SelectListTypeErrorBeatsTheMultiKeyRefusal) {
-    Catalog catalog("../tests/data/test_catalog.json");
-    try {
-        bindAndPlan("SELECT a.id + 'x' FROM sj a JOIN sj b "
-                    "ON a.id = b.id AND a.grp = b.grp", catalog);
-        FAIL() << "expected a type error";
-    } catch (const std::runtime_error& e) {
-        std::string err = e.what();
-        EXPECT_NE(err.find("numeric operands"), std::string::npos) << err;
-        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
-    }
-}
-
-// The multi-WAY guard stays ahead of the type checks: this function builds one
-// join, so a third relation's columns are absent from the merged schema and a
-// deferred check would report a misleading "column not found".
+// The multi-WAY guard stays ahead of the plan-time type checks: this function
+// builds one join, so a third relation's columns are absent from the merged
+// schema and a deferred check would report a misleading "column not found".
 TEST(PlannerTest, MultiWayRefusalStillPrecedesTypeChecks) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {
@@ -289,13 +285,65 @@ TEST(PlannerTest, MultiWayRefusalStillPrecedesTypeChecks) {
     }
 }
 
-TEST(PlannerTest, MultiKeyJoinRefusedUntilWeek27) {
+// The plan-time type checks that used to outrank the deferred multi-key refusal
+// must still fire on a multi-key query — the refusal is gone, the typing is not.
+TEST(PlannerTest, TypeErrorInWhereStillCaughtOnAMultiKeyJoin) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {
-        bindAndPlan("SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", catalog);
-        FAIL() << "expected a refusal";
+        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp "
+                    "WHERE a.id + 'x' > 0", catalog);
+        FAIL() << "expected a type error";
     } catch (const std::runtime_error& e) {
-        std::string err = e.what();
-        EXPECT_NE(err.find("multi-key"), std::string::npos) << err;
+        EXPECT_NE(std::string(e.what()).find("numeric operands"), std::string::npos) << e.what();
     }
+}
+
+// The projection's check is the LAST one Planner::plan performs
+// (buildProjectSchema calls inferExprType per select item).
+TEST(PlannerTest, TypeErrorInSelectListStillCaughtOnAMultiKeyJoin) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id + 'x' FROM sj a JOIN sj b "
+                    "ON a.id = b.id AND a.grp = b.grp", catalog);
+        FAIL() << "expected a type error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("numeric operands"), std::string::npos) << e.what();
+    }
+}
+
+// Week 27: a multi-key equi-join executes on Volcano — the composite key is one
+// serialized tuple, so both keys must actually constrain the match.
+TEST(PlannerTest, MultiKeyJoinExecutesOnVolcano) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlan(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", catalog);
+    ASSERT_NE(plan, nullptr);
+
+    // both keys in the operator's explain string, in written order
+    const PlanNode* join = findNode(plan.get(), "HashJoin");
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain(), "HashJoin [id = id AND grp = grp]");
+
+    // and both actually constrain the match: sj rows sharing id but not grp
+    // must not join. Dropping the second key would emit more rows than this.
+    plan->open();
+    int rows = 0;
+    while (plan->next()) ++rows;
+    plan->close();
+    EXPECT_EQ(rows, countMultiKeyMatches());
+}
+
+// Residual ON conjuncts execute here too, so the two engines accept exactly the
+// same ON clauses and differ only in how many relations they can join.
+TEST(PlannerTest, ResidualOnConjunctPlansOnVolcano) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlan(
+        "SELECT a.val FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", catalog);
+    ASSERT_NE(plan, nullptr);
+
+    // the residual became a Filter above the join, and the join kept one key
+    const PlanNode* join = findNode(plan.get(), "HashJoin");
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->explain(), "HashJoin [id = id]");
+    EXPECT_NE(findNode(plan.get(), "Filter"), nullptr);
 }

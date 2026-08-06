@@ -295,7 +295,8 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
     auto join_scan = std::make_unique<SeqScanNode>("b", join_rows, join_schema);
     // probe = FROM, build = JOIN, not swapped -> output [FROM, JOIN]
     auto join = std::make_unique<HashJoinNode>(
-        std::move(from_scan), std::move(join_scan), "k", "k", merged, /*swapped=*/false);
+        std::move(from_scan), std::move(join_scan),
+        std::vector<std::string>{"k"}, std::vector<std::string>{"k"}, merged, /*swapped=*/false);
 
     // WHERE b.w IS NULL  -> operand is the slot-1 "w" column
     auto w_ref = std::make_unique<ColumnRef>();
@@ -319,10 +320,12 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
 }
 
 // ===== JOIN ON condition validation =====
-// Week 26 accepts a cross-relation equality or an AND-chain of them (multi-key
-// equi-joins, TPC-H Q9). Anything else must be rejected with a specific error
-// instead of silently executing as an equi-join (or worse). Non-equality ON
-// conjuncts become post-join residuals in Week 27.
+// An ON clause decomposes into equi-join keys (a cross-relation equality or an
+// AND-chain of them — multi-key equi-joins, TPC-H Q9) plus residuals: every
+// other conjunct, routed as a post-join filter since Week 27, which is legal
+// because the join is inner. Two things are still errors, and both would
+// otherwise be answered wrongly rather than slowly: an ON that yields NO key
+// (a cross product) and a forward reference to a relation joined later.
 
 #include "planner/validator.h"
 #include "planner/join_condition.h"
@@ -360,18 +363,40 @@ TEST(JoinOnValidation, SingleEquiJoinAccepted) {
         "SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat), "");
 }
 
-TEST(JoinOnValidation, NonEqualityOperatorRejected) {
+// A non-equality conjunct alone yields no key, so it is a cross product with a
+// filter on top — the one shape that must still be refused. It was refused for a
+// different reason before Week 27 ("non-equality"); the message must now name
+// the real problem, which is the missing key.
+TEST(JoinOnValidation, NonEqualityOnlyConditionRejectedForHavingNoKey) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
         "SELECT a.id FROM sj a JOIN sj b ON a.grp < b.id", cat);
-    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
+    EXPECT_NE(err.find("at least one equality"), std::string::npos) << err;
 }
 
-TEST(JoinOnValidation, NotEqualOperatorRejected) {
+TEST(JoinOnValidation, NotEqualOnlyConditionRejectedForHavingNoKey) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
         "SELECT a.id FROM sj a JOIN sj b ON a.id != b.id", cat);
-    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
+    EXPECT_NE(err.find("at least one equality"), std::string::npos) << err;
+}
+
+// Week 27: alongside a real key, a non-equality conjunct is a residual — the
+// TPC-H Q21 shape (`l1.l_suppkey <> l2.l_suppkey`). It becomes a predicate over
+// the join's output, not a key, and executes.
+TEST(JoinOnValidation, NonEqualityConjunctBesideAKeyIsAResidual) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat), "");
+
+    auto stmt = bindQuery("SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat);
+    JoinCondition on = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    EXPECT_EQ(on.keys.size(), 1u);
+    ASSERT_EQ(on.residuals.size(), 1u);
+    // the residual is the ORIGINAL conjunct, borrowed — callers clone it
+    auto* bin = dynamic_cast<const BinaryExpr*>(on.residuals[0]);
+    ASSERT_NE(bin, nullptr);
+    EXPECT_EQ(bin->op, "<");
 }
 
 // Week 26 lifts exactly this restriction: the AND-chain that used to be
@@ -382,20 +407,13 @@ TEST(JoinOnValidation, MultiKeyEquiJoinAccepted) {
         "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp = b.grp", cat), "");
 }
 
-// ...but only when every conjunct is an equality. A mixed compound still
-// throws: routing non-equality ON conjuncts as residuals is Week 27.
-TEST(JoinOnValidation, MixedCompoundWithNonEqualityRejected) {
-    Catalog cat(CATALOG);
-    std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.grp < b.grp", cat);
-    EXPECT_NE(err.find("non-equality"), std::string::npos) << err;
-}
-
-TEST(JoinOnValidation, OrConditionRejected) {
+// An OR is one indivisible conjunct, so it contributes no key even though it
+// contains equalities — a cross product, still refused.
+TEST(JoinOnValidation, OrConditionRejectedForHavingNoKey) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
         "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id OR a.grp = b.grp", cat);
-    EXPECT_NE(err.find("AND-chain"), std::string::npos) << err;
+    EXPECT_NE(err.find("at least one equality"), std::string::npos) << err;
 }
 
 // Only reachable with three relations: `c` is not in the tree when b is joined.
@@ -515,13 +533,24 @@ TEST(JoinOnValidation, QualifiedUnknownColumnInsideMultiKeyRejectedByBinder) {
     }
 }
 
-// Week 25 shapes inside ON are still refused on shape, so site 18's new
-// branches stay dormant until Week 27 routes residual ON conjuncts.
-TEST(JoinOnValidation, Week25NodeInsideOnRejectedOnShape) {
+// Week 27 makes site 18's Week 25 branches live: a Week 25 node inside ON is a
+// residual now, and validateJoinCondition is the ONLY thing that checks its
+// columns (Validator::validate runs before the residual is folded into WHERE,
+// so validateExpr never sees it).
+TEST(JoinOnValidation, Week25NodeInsideOnIsAResidual) {
     Catalog cat(CATALOG);
-    std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.val IN (1, 2)", cat);
-    EXPECT_NE(err.find("AND-chain of equalities"), std::string::npos) << err;
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.val IN (1, 2)", cat), "");
+}
+
+// ...and the column inside it is still checked — by site 18, whose IN branch
+// was a dormant pre-position until now. Assert the message: a bare "it threw"
+// also passes when inferExprType reports `column not found` far from the cause.
+TEST(JoinOnValidation, UnknownColumnInsideAWeek25ResidualRejectedBySite18) {
+    Catalog cat(CATALOG);
+    std::string err = validateOnlyJoinError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.nope IN (1, 2)", cat);
+    EXPECT_NE(err.find("JOIN ON: column 'nope' not found"), std::string::npos) << err;
 }
 
 // classifyJoinCondition normalizes operand order: whichever side carries the
@@ -530,7 +559,7 @@ TEST(JoinOnValidation, KeysNormalizeOperandOrder) {
     Catalog cat(CATALOG);
     auto stmt = bindQuery("SELECT a.id FROM sj a JOIN sj b ON b.grp = a.id", cat);
     ASSERT_EQ(stmt.joins.size(), 1u);
-    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1).keys;
     ASSERT_EQ(keys.size(), 1u);
     EXPECT_EQ(keys[0].from_col, "id");
     EXPECT_EQ(keys[0].join_col, "grp");
@@ -541,7 +570,7 @@ TEST(JoinOnValidation, MultiKeyConditionYieldsOneKeyPerConjunct) {
     Catalog cat(CATALOG);
     auto stmt = bindQuery(
         "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.grp = a.grp", cat);
-    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    std::vector<JoinKey> keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1).keys;
     ASSERT_EQ(keys.size(), 2u);
     EXPECT_EQ(keys[0].from_col, "id");
     EXPECT_EQ(keys[0].join_col, "id");
@@ -549,32 +578,65 @@ TEST(JoinOnValidation, MultiKeyConditionYieldsOneKeyPerConjunct) {
     EXPECT_EQ(keys[1].join_col, "grp");
 }
 
-// classifyJoinCondition's operand check fires first, so this is what the user
-// sees. validateJoinCondition's AggregateExpr branch is a Week 27 pre-position
-// for when residual ON conjuncts make that function the only column check —
-// asserting the specific message keeps the two apart. Without it this test
-// would pass with the whole branch deleted.
-TEST(JoinOnValidation, AggregateInsideJoinConditionRejectedOnShape) {
+// An aggregate in ON is meaningless with no GROUP BY to aggregate over, and it
+// stays refused — but by site 18 now, not on shape: classifyJoinCondition hands
+// it on as a residual instead of demanding two ColumnRefs. Assert the specific
+// message; without it the test passes with site 18's branch deleted.
+TEST(JoinOnValidation, AggregateInsideJoinConditionRejectedBySite18) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = SUM(b.grp)", cat);
-    EXPECT_NE(err.find("both sides of the join equality must be column references"),
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.id = SUM(b.grp)", cat);
+    EXPECT_NE(err.find("aggregate functions are not allowed in a join condition"),
               std::string::npos) << err;
 }
 
-TEST(JoinOnValidation, LiteralOperandRejected) {
+// `ON key = key AND col = literal` is ordinary SQL that SQLite accepts; the
+// literal conjunct is a single-relation residual, which pushdown then lands on
+// that relation's own scan.
+TEST(JoinOnValidation, LiteralOperandIsAResidual) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND b.grp = 5", cat), "");
+}
+
+// Both operands in one relation is a local filter, not a cross-side key. Week 26
+// refused it because rerouting it across sides would have executed a.id = b.grp;
+// as a residual it means exactly what it says.
+TEST(JoinOnValidation, SameRelationBothSidesIsAResidual) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.id = a.grp", cat), "");
+}
+
+// A key list with no key at all is a cross product — the one thing residuals
+// must not silently turn a JOIN into.
+TEST(JoinOnValidation, ConditionWithNoKeyRejected) {
     Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
         "SELECT a.id FROM sj a JOIN sj b ON a.id = 5", cat);
-    EXPECT_NE(err.find("column"), std::string::npos) << err;
+    EXPECT_NE(err.find("at least one equality"), std::string::npos) << err;
 }
 
-TEST(JoinOnValidation, SameRelationBothSidesRejected) {
+// Identical keys are a legal predicate (k AND k ≡ k) but not a legal key list:
+// the probe tuple gains a redundant field and CardinalityEstimator divides by
+// the same NDV twice. Assert the COUNT — the pre-fix code did not throw either.
+TEST(JoinOnValidation, DuplicateKeysCollapseToOne) {
     Catalog cat(CATALOG);
-    // Previously executed silently as a.id = b.grp (cross-side reroute).
+    auto stmt = bindQuery(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND a.id = b.id", cat);
+    auto keys = classifyJoinCondition(stmt.joins[0].condition.get(), 1).keys;
+    EXPECT_EQ(keys.size(), 1u);
+}
+
+// A forward reference inside a RESIDUAL has to be caught too: those columns are
+// absent from this join's output schema, so it is not merely un-keyable. Only
+// reachable now that a non-equality conjunct gets that far.
+TEST(JoinOnValidation, ForwardReferenceInsideAResidualRejected) {
+    Catalog cat(CATALOG);
     std::string err = joinOnValidationError(
-        "SELECT a.id FROM sj a JOIN sj b ON a.id = a.grp", cat);
-    EXPECT_NE(err.find("each joined table"), std::string::npos) << err;
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND c.val > 1 "
+        "JOIN sj c ON b.grp = c.id", cat);
+    EXPECT_NE(err.find("joined later"), std::string::npos) << err;
 }
 
 // ===== GROUP BY / aggregate resolution (Phase 4 audit fixes) =====

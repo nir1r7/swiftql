@@ -786,3 +786,57 @@ TEST(PredicatePushdown, ThreeWayCrossRelationConjunctStaysResidual) {
     ASSERT_NE(residual, nullptr);
     EXPECT_EQ(residual->children[0]->type, LogicalNodeType::JOIN);
 }
+
+// ===== Residual ON conjuncts (Week 27) =====
+//
+// A non-key ON conjunct is folded into the WHERE conjunction by the logical
+// planner, so it reaches exactly the assignment machinery below — that fold is
+// what these tests are really pinning. A second, stacked LogicalFilter would
+// have left the WHERE unpushed instead (apply() only rewrites a FILTER whose
+// DIRECT child is a JOIN), so the third test is the regression guard.
+
+TEST(PredicatePushdown, SingleRelationResidualOnConjunctIsPushedToItsScan) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND d.age > 30", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);          // d.age > 30 landed here
+    EXPECT_EQ(join->children[1]->children[0]->type, LogicalNodeType::SCAN);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN);            // laps untouched
+}
+
+TEST(PredicatePushdown, CrossRelationResidualOnConjunctStaysAboveTheJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND l.speed > d.age", cat);
+
+    const LogicalPlanNode* residual = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(residual, nullptr);
+    EXPECT_EQ(residual->children[0]->type, LogicalNodeType::JOIN);
+    // neither side gained a filter: the conjunct belongs to no single relation
+    EXPECT_EQ(residual->children[0]->children[0]->type, LogicalNodeType::SCAN);
+    EXPECT_EQ(residual->children[0]->children[1]->type, LogicalNodeType::SCAN);
+}
+
+TEST(PredicatePushdown, WhereIsStillPushedWhenAResidualOnConjunctExists) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND d.age > 30 WHERE l.season = 2025", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::FILTER);  // WHERE conjunct
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);  // ON residual
+
+    // and nothing was left stranded above the join
+    const LogicalPlanNode* n = plan.get();
+    while (n && n->type != LogicalNodeType::JOIN) {
+        EXPECT_NE(n->type, LogicalNodeType::FILTER) << "no filter should remain above the join";
+        n = n->children.empty() ? nullptr : n->children[0].get();
+    }
+}

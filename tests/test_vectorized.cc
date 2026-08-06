@@ -2125,7 +2125,8 @@ TEST(VecHashJoin, BasicInnerJoin) {
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 3u);
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -2142,7 +2143,8 @@ TEST(VecHashJoin, NoMatch) {
     std::vector<Row> build_rows = {{Value(int64_t(3))}, {Value(int64_t(4))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     EXPECT_TRUE(rows.empty());
 }
@@ -2160,7 +2162,8 @@ TEST(VecHashJoin, MultipleMatchesPerKey) {
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 3u);
     for (const auto& r : rows) EXPECT_EQ(r[0].asInt(), 1);
@@ -2174,7 +2177,8 @@ TEST(VecHashJoin, EmptyBuildSide) {
     std::vector<Row> build_rows;
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     EXPECT_TRUE(rows.empty());
 }
@@ -2187,7 +2191,8 @@ TEST(VecHashJoin, EmptyProbeSide) {
     std::vector<Row> build_rows = {{Value(int64_t(1))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     join->open();
     EXPECT_EQ(join->nextChunk(), nullptr);
     join->close();
@@ -2202,7 +2207,8 @@ TEST(VecHashJoin, ProbeColsFirst) {
     std::vector<Row> build_rows = {{Value(int64_t(1)), Value(std::string("build"))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     const Schema& s = join->outputSchema();
     ASSERT_EQ(s.size(), 4);
     EXPECT_EQ(s.column(0).name, "pid");
@@ -2225,7 +2231,8 @@ TEST(VecHashJoin, SwappedEmitsFromSideFirst) {
     std::vector<Row> build_rows = {{Value(int64_t(1)), Value(std::string("fromrow"))}};
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "jid", "fid", out_schema, /*swapped=*/true);
+        std::vector<int>{probe_schema.indexOf("jid")}, std::vector<int>{build_schema.indexOf("fid")},
+        out_schema, /*swapped=*/true);
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 1u);
     // FROM (build) columns must come first despite being the physical build side
@@ -2250,7 +2257,8 @@ TEST(VecHashJoin, MultiChunkProbe) {
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 2u);
     std::vector<int64_t> pids;
@@ -2278,7 +2286,8 @@ TEST(VecHashJoin, KeyByName) {
     };
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0][1].asInt(), 1);
@@ -2335,7 +2344,8 @@ TEST(VecHashJoin, FilteredBuildSide) {
 
     auto join = std::make_unique<VecHashJoinNode>(
         std::move(probe_scan), std::move(build_filtered),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
 
     auto rows = drainRows(*join);
     ASSERT_EQ(rows.size(), 2u);
@@ -2374,6 +2384,65 @@ TEST(VecHashAggregate, FilteredInput) {
     EXPECT_EQ(rows[0][1].asInt(), 3);
 }
 
+// ===== Composite (multi-key) join keys, Week 27 =====
+
+// Two keys are one serialized tuple. Both must constrain the match: rows that
+// agree on the first key alone must not join.
+TEST(VecHashJoin, MultiKeyRequiresEveryKeyToMatch) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    std::vector<Row> probe_rows = {
+        {Value(int64_t(1)), Value(int64_t(7))},
+        {Value(int64_t(1)), Value(int64_t(8))},   // first key matches, second does not
+    };
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(int64_t(7))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{probe_schema.indexOf("pid"), probe_schema.indexOf("pgrp")},
+        std::vector<int>{build_schema.indexOf("bid"), build_schema.indexOf("bgrp")},
+        out_schema);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][1].asInt(), 7);
+}
+
+// The '\x01' sentinel after EVERY field, not between them: without it the STRING
+// tuples ("ab","c") and ("a","bc") serialize identically and share one bucket.
+TEST(VecHashJoin, MultiKeyStringTupleBoundariesDoNotCollide) {
+    Schema probe_schema = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"p1", TypeId::STRING}, {"p2", TypeId::STRING},
+                                      {"b1", TypeId::STRING}, {"b2", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(std::string("ab")), Value(std::string("c"))}};
+    std::vector<Row> build_rows = {{Value(std::string("a")),  Value(std::string("bc"))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{probe_schema.indexOf("p1"), probe_schema.indexOf("p2")},
+        std::vector<int>{build_schema.indexOf("b1"), build_schema.indexOf("b2")},
+        out_schema);
+    EXPECT_TRUE(drainRows(*join).empty());
+}
+
+// explain() renders names from the children's schemas; a one-key join must
+// still print exactly the pre-Week-27 string.
+TEST(VecHashJoin, ExplainRendersEveryKeyAndKeepsTheSingleKeyForm) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pgrp", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bgrp", TypeId::INT}});
+    VecHashJoinNode two(makeScan(probe_schema, {}), makeScan(build_schema, {}),
+                        std::vector<int>{0, 1}, std::vector<int>{0, 1}, out_schema);
+    EXPECT_EQ(two.explain(), "VecHashJoin [pid = bid AND pgrp = bgrp] (materialize)");
+
+    VecHashJoinNode one(makeScan(probe_schema, {}), makeScan(build_schema, {}),
+                        std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    EXPECT_EQ(one.explain(), "VecHashJoin [pid = bid] (materialize)");
+}
+
 // VecSortNode must extract only sel.indices rows when filter_applied=true.
 TEST(VecSort, FilteredInput) {
     // scan [5,3,1,4,2]; filter id > 2 → physical rows 0(5),1(3),3(4) pass.
@@ -2400,7 +2469,8 @@ TEST(VecHashJoin, ProbeOutputOverflow) {
     for (int i = 0; i < n; ++i) build_rows.push_back({Value(int64_t(1))});
     auto join = std::make_unique<VecHashJoinNode>(
         makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
-        "pid", "bid", out_schema);
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema);
     auto rows = drainRows(*join);
     ASSERT_EQ(static_cast<int>(rows.size()), n);
     for (const auto& r : rows) {
@@ -2485,7 +2555,8 @@ TEST(VecHashJoinTiming, BuildPhaseIsTimed) {
     Schema merged(std::vector<ColumnDef>{{"k", TypeId::INT, 0}, {"k", TypeId::INT, 1}});
 
     VecHashJoinNode join(makeScan(side, {}), makeScan(side, build_rows),
-                         "k", "k", merged, /*swapped=*/false);
+                         std::vector<int>{side.indexOf("k")}, std::vector<int>{side.indexOf("k")},
+                         merged, /*swapped=*/false);
     join.open();
     while (join.nextChunk()) {}
     join.close();
