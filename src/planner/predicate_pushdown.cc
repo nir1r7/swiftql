@@ -43,8 +43,17 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         collectSlots(sub->length.get(), out);   // nullptr-safe
         return;
     }
-    // Literal / IntervalLiteral: no slot. AggregateExpr cannot appear in WHERE
-    // (Validator forbids it) and is refused inside ON by validateJoinCondition.
+    // An aggregate cannot appear in WHERE (Validator forbids it), but it CAN
+    // appear inside an ON conjunct, where classifyJoinCondition uses this walker
+    // to spot a forward reference. `SUM(c.val) > 1` on a join that has not
+    // reached relation c must be refused for naming a later relation, not
+    // accepted as a residual — and validateJoinCondition's own refusal a line
+    // later masks the difference, so it cannot be relied on to cover this.
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        collectSlots(agg->argument.get(), out);   // nullptr-safe: COUNT(*)
+        return;
+    }
+    // Literal / IntervalLiteral: no slot.
 }
 
 namespace {
@@ -111,6 +120,15 @@ void restampSlots(Expr* expr, int slot) {
         restampSlots(sub->operand.get(), slot);
         restampSlots(sub->start.get(), slot);
         restampSlots(sub->length.get(), slot);   // nullptr-safe
+        return;
+    }
+    // Unreachable today — no conjunct containing an aggregate survives to
+    // pushdown (forbidden in WHERE by the Validator, refused inside ON by
+    // validateJoinCondition) — but collectSlots now descends here, and the
+    // lockstep above is only true if both do. A ref collected but not restamped
+    // keeps its own relation's slot below a join whose scan schema stamps 0.
+    if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
+        restampSlots(agg->argument.get(), slot);
     }
 }
 

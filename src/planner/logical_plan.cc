@@ -488,10 +488,20 @@ std::string LogicalScan::explain() const {
 // LogicalJoin — single-key output is byte-identical to the pre-Week-26 form,
 // so existing --explain assertions keep passing
 std::string LogicalJoin::explain() const {
+    // The left input's merged schema can hold one column name at several
+    // relation slots, and a key resolved to the wrong one still returns rows —
+    // so an ambiguous name is printed with the slot the key actually carries
+    // (`team@1`). Without it the correct and the incorrect plan render
+    // identically, on the surface used to debug them. Unambiguous names stay
+    // bare, so a single-key single-join plan is unchanged.
     std::string s = "LogicalJoin [";
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i) s += " AND ";
-        s += keys[i].from_col + " = " + keys[i].join_col;
+        const Schema& left = children[0]->output_schema;
+        int idx = keys[i].from_slot >= 0
+            ? left.indexOf(keys[i].from_col, keys[i].from_slot) : -1;
+        s += (idx >= 0 ? qualifyIfAmbiguous(left, idx) : keys[i].from_col)
+           + " = " + keys[i].join_col;
     }
     return s + "]";
 }

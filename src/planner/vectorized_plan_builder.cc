@@ -156,16 +156,6 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         case LogicalNodeType::JOIN: {
             auto* join = static_cast<LogicalJoin*>(node);
 
-            // Week 27: arbitrary key counts, and children[0] may itself be a
-            // JOIN — the recursion below handles a left-deep tree of any depth
-            // with no extra machinery. Resolve both sides' key columns to
-            // physical indices ONCE, here, where the binder slots are still in
-            // scope; the operators then index without ever resolving a name.
-            const Schema& from_schema = join->children[0]->output_schema;
-            const Schema& jn_schema   = join->children[1]->output_schema;
-            std::vector<int> left_idx  = leftKeyIndices(from_schema, join->keys);
-            std::vector<int> right_idx = rightKeyIndices(jn_schema, join->keys);
-
             // Week 22: choose the build side from filtered cardinality estimates.
             // Post-pushdown, a child may be a LogicalFilter, so its estimated_rows
             // is the count *after* the WHERE — which can invert the raw table-size
@@ -194,6 +184,28 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // pruning hint routes to the FROM side only
             auto from_child = lower(join->children[0].get(), pruning_where);
             auto join_child = lower(join->children[1].get(), nullptr);
+
+            // Week 27: arbitrary key counts, and children[0] may itself be a
+            // JOIN — the recursion above handles a left-deep tree of any depth
+            // with no extra machinery. Resolve both sides' key columns to
+            // physical indices ONCE, here, where the binder slots are still in
+            // scope; the operators then index without ever resolving a name.
+            //
+            // Resolved against the PHYSICAL children, not the logical nodes.
+            // They agree today — every lowering case forwards or copies its
+            // logical schema — but these indices are what the operator will feed
+            // to chunk->columns[i], which is unchecked, so they must come from
+            // the schema the operator actually sees. The size check makes a
+            // future divergence a plan-time error rather than a wrong column.
+            const Schema& from_schema = from_child->outputSchema();
+            const Schema& jn_schema   = join_child->outputSchema();
+            if (from_schema.size() != join->children[0]->output_schema.size() ||
+                jn_schema.size() != join->children[1]->output_schema.size()) {
+                throw std::runtime_error(
+                    "VectorizedPlanBuilder: lowered join input does not match its logical schema");
+            }
+            std::vector<int> left_idx  = leftKeyIndices(from_schema, join->keys);
+            std::vector<int> right_idx = rightKeyIndices(jn_schema, join->keys);
 
             // Week 22 (build side) + Week 23.5 (algorithm): cost every legal
             // (side, algorithm) assignment and take the cheapest jointly. With

@@ -27,6 +27,31 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // LogicalPlanBuilder::build (no-op without expression keys)
     substituteGroupKeyRefs(stmt);
 
+    // ON decomposition runs BEFORE the FROM scan is built, because the scan is
+    // handed `stmt.where.get()` as its zone-map pruning hint: folding the
+    // residuals in afterwards would leave the hint pointing at the pre-fold
+    // predicate, so a relation-0 residual (`ON k = k AND l.season = 2024`) would
+    // prune chunks on the vectorized path and none here. Same conjuncts, same
+    // rows, silently different work — a per-mode difference with nothing to
+    // catch it, since results agree either way.
+    //
+    // For an inner join ON and WHERE are interchangeable, so the residuals join
+    // the WHERE conjunction; see logical_plan.cc for the same fold and
+    // join_condition.h for why Week 29 must revisit it. conjoinAll MOVES the old
+    // predicate rather than cloning it, so any raw Expr* taken afterwards is of
+    // the merged tree and stays valid.
+    std::vector<JoinKey> join_keys;
+    if (!stmt.joins.empty()) {
+        JoinCondition on = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+        join_keys = std::move(on.keys);
+        if (!on.residuals.empty()) {
+            std::vector<std::unique_ptr<Expr>> parts;
+            for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
+            if (stmt.where) parts.push_back(std::move(stmt.where));
+            stmt.where = conjoinAll(std::move(parts));
+        }
+    }
+
     const TableMetadata& meta = catalog.getTable(stmt.from_table);
 
     // narrowed scan schema via the shared logical-layer helper — this also
@@ -86,16 +111,15 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(table_rows.at(join_clause.join_table)), join_meta.schema);
         }
 
-        // classifyJoinCondition routes keys by binder-assigned slot — the only
-        // way to disambiguate a self-join's two occurrences of the same table
-        JoinCondition on = classifyJoinCondition(join_clause.condition.get(), 1);
-
+        // Keys were routed by binder-assigned slot above — the only way to
+        // disambiguate a self-join's two occurrences of the same table.
+        //
         // Both children are single-relation scans here (one join), so their
         // schemas cannot repeat a column name and the join node resolves keys by
         // bare name. The vectorized builder cannot: its left input may be a
         // merged join schema, so it resolves by slot (see leftKeyIndices).
         std::vector<std::string> from_cols, join_cols;
-        for (const JoinKey& k : on.keys) {
+        for (const JoinKey& k : join_keys) {
             from_cols.push_back(k.from_col);
             join_cols.push_back(k.join_col);
         }
@@ -119,17 +143,6 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             node = std::make_unique<HashJoinNode>(std::move(node), std::move(right), from_cols, join_cols, merged_schema, /*swapped=*/false);
         }
 
-        // Residual ON conjuncts join the WHERE conjunction — inner join, so ON
-        // and WHERE are interchangeable (see logical_plan.cc for the same fold).
-        // conjoinAll MOVES the old predicate, so the raw Expr* handed to the FROM
-        // SeqScanNode above as its zone-map pruning hint still points at the same
-        // live subtree; rebuilding it by cloning would dangle that pointer.
-        if (!on.residuals.empty()) {
-            std::vector<std::unique_ptr<Expr>> parts;
-            for (const Expr* r : on.residuals) parts.push_back(cloneExpr(r));
-            if (stmt.where) parts.push_back(std::move(stmt.where));
-            stmt.where = conjoinAll(std::move(parts));
-        }
     }
 
     // fliter (WHERE)
