@@ -57,6 +57,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `DISTINCT` — eliminates duplicate rows from output
 - `IS NULL` / `IS NOT NULL` — null-aware predicate evaluation
 - `JOIN ... ON` — hash join execution over columnar storage (Phase 2+). `AND`-chained equi-join keys (`ON a.x = b.x AND a.y = b.y`) and non-equality `ON` conjuncts (executed as post-join residual filters) work on every path as of Week 27; three or more relations execute on `--execution vectorized` only, since `Planner::plan` builds exactly one join and Volcano is the correctness baseline, not the feature-complete path. An `ON` clause must still yield at least one equi-join key — there is no cross-product operator
+- `LEFT [OUTER] JOIN` (Week 29) — every left row survives, null-extended across the joined relation's columns when nothing matches (including when its own key is NULL, which matches nothing). Executes on every path at the relation counts each supports. An outer join's `ON` residuals filter the *match test* rather than the result, predicate pushdown will not cross to the null-supplying side, and join enumeration declines to reorder any tree containing one. `RIGHT`/`FULL` are out of scope — no TPC-H query in the documented dialect needs them
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — `COUNT` returns `INT`, `SUM`/`AVG` return `DOUBLE`, and `MIN`/`MAX` preserve their argument type (so `MIN(team)` is a `STRING`)
 - General expressions (Week 24) — arithmetic `+ - * /` with SQL precedence and unary minus, expression aliases (`SELECT expr AS name`, referenceable in `GROUP BY`/`ORDER BY`), expressions in projection, aggregate arguments (`SUM(price * (1 - discount))`), grouping, and ordering; plan-time expression type checking. SQLite semantics: `INT / INT` truncates, `x / 0` is `NULL`
 - Predicates and scalar functions (Week 25) — `[NOT] BETWEEN`, `[NOT] LIKE` (ASCII case-insensitive, matching SQLite), `[NOT] IN` over a constant list, searched `CASE`, `SUBSTRING`, ISO-8601 date literals (`date '1998-12-01'`, stored as `STRING`), and constant-folded interval arithmetic (`date '1994-01-01' + interval '1' year`)
@@ -95,6 +96,8 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 | Scalar functions other than `SUBSTRING` — `ABS(x)`, `UPPER(x)` | parse error at the `(` | The call form accepts only the five aggregate keywords plus `SUBSTRING`. No TPC-H query in the documented dialect needs another one |
 | General `NOT` — `WHERE NOT (x = 1)` | `NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL` | Those four cover every TPC-H negation. A general prefix `NOT` would need its own node and three-valued kernel for no query's benefit. Both the leading position (`NOT x = 1`, what users write) and the postfix one (`x NOT 5`) give this message |
 | `IN (subquery)` — `x IN (SELECT ...)` | `IN accepts a list of constant values only` | Week 32 lowers set-membership subqueries to semi-/anti-joins; that is a different production, not an extension of the constant list |
+| A join key comparing a STRING column with a numeric one — `ON d.team = l.lap_id` | `JOIN ON: cannot join a STRING column with a numeric one` | Keys are compared as serialized **text**, which carries no type tag, so a STRING `"7"` matched the INT `7` while `"007"` did not — half a match, while the identical predicate in a `WHERE` clause throws `Type mismatch`. Found in the Week 27 audit, closed in Week 29 because an outer join returns the unmatched half as null-extended rows that look like data. INT vs DOUBLE stays legal: `7.0` and `7` must still join, which is SQLite's numeric affinity. Also makes the SIMD loop join's INT-key gate rest on a stated rule rather than an accident |
+| `RIGHT` / `FULL OUTER JOIN` | parse error — `RIGHT` lexes as an identifier and trips the end-of-input check | A `RIGHT` join is not a flag on the left one: swapping the operands would change the merged schema's column order, which the fixed `[FROM, JOIN]` output order forbids. No TPC-H query in the documented dialect needs either |
 | `JOIN ... ON` with no equi-join key — `ON a.x < b.x`, `ON a.x = b.x OR a.y = b.y`, `ON a.x = 5` | `JOIN ON: at least one equality between the joined table and an already-joined table is required` | Such a join is a cross product with a filter on top, and there is no cross-product operator to run it on. Every other `ON` conjunct is legal as of Week 27 and becomes a post-join residual, so what is left to refuse is exactly the missing key. An `OR` is one indivisible conjunct, which is why it contributes no key even though it contains equalities |
 | Computed `LIKE` patterns — `x LIKE y` | parse error — a constant pattern string is required | TPC-H never computes a pattern, and a constant one is analysed once per query rather than per row |
 | `LIKE ... ESCAPE` — matching a literal `%` or `_` | `unexpected trailing input after the end of the query` | There is no escape clause and no default escape character, so a literal wildcard cannot be matched. SQLite supports this; no TPC-H pattern needs it. Until Week 25 the parser silently **discarded** everything after the last clause it recognised, so an `ESCAPE` was dropped and the query returned wildcard results — a wrong answer, not an error. `Parser::parse` now requires end-of-input (a trailing `;` is still fine) |
@@ -206,13 +209,15 @@ Takes a raw SQL string and produces a structured Abstract Syntax Tree (AST). Han
 
 ```
 select_stmt  → SELECT [DISTINCT] select_list FROM table_ref
-               (JOIN table_ref ON join_cond)*   ← Week 26: repeatable
+               (join_kind table_ref ON join_cond)*  ← Week 26: repeatable
                [WHERE expr]
                [GROUP BY group_list]
                [HAVING expr]
                [ORDER BY order_list]
                [LIMIT INT_LITERAL]
 
+join_kind    → JOIN | LEFT [OUTER] JOIN        ← Week 29: per-clause join type;
+                                                 a bare JOIN is INNER
 table_ref    → IDENT [[AS] IDENT]              ← table alias, required for a self-join
 join_cond    → equality (AND equality)*        ← Week 26: multi-key equi-join;
                                                  each equality compares a column of
@@ -271,7 +276,7 @@ unit         → day[s] | month[s] | year[s]     ← matched as identifier text 
 - `UnaryExpr` — prefix operator (unary minus) + operand
 - `IsNullExpr` — expr + is_not_null flag
 - `AggregateExpr` — function name, argument expr (any expression as of Week 24), is_star flag
-- `SelectStatement` — select list, from table, optional join, where, group-by, having, order-by, limit, distinct flag
+- `SelectStatement` — select list, from table, ordered join clauses (each carrying its own `JoinType`: `INNER` or `LEFT`), where, group-by, having, order-by, limit, distinct flag
 
 ### Layer 5 — Planner & Validator
 
@@ -295,7 +300,7 @@ Bridges the gap between the AST and the execution plan.
 - `DistinctNode` — deduplication via hash set
 - `SortNode` — `ORDER BY`
 - `LimitNode` — `LIMIT N`
-- `HashJoinNode` — build/probe hash join (execution wired in Phase 2; stubbed in Phase 1)
+- `HashJoinNode` — build/probe hash join (execution wired in Phase 2; stubbed in Phase 1). A `LEFT OUTER` join is the same node with the preserved side forced onto the probe input, emitting a null-extended row when nothing matches (Week 29)
 
 **Example plan** for `SELECT team, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE season = 2025 GROUP BY team HAVING AVG(speed) > 300`:
 
@@ -1017,7 +1022,45 @@ moves the checkpoint not at all.
 - Add logical and vectorized left outer hash join
 - Preserve unmatched rows and stable output slots
 
-**Checkpoint:** TPC-H Q13 join semantics are supported.
+**Checkpoint:** TPC-H Q13 join semantics are supported. ✅
+
+Q13's join half — `customer left outer join orders on c_custkey = o_custkey and
+o_comment not like '%special%requests%'`, with `count(o_orderkey)` returning 0
+for a customer with no surviving order — executes on every path. Its derived
+table and column list remain Week 34.
+
+The operator is the small part. A left outer join is where four identities the
+rest of the engine was built on stop holding, and every one of them is a *wrong
+answer* rather than a bad plan:
+
+| Shipped | Why it was required |
+|---|---|
+| **An unmatchable key is emitted, not skipped** — the `serializeKey(...) == false → continue` in both probe loops | `key_encoding.h` deliberately leaves the NULL policy to the caller, and the two existing callers agreed: a NULL (or NaN) key matches nothing, so drop the row. For a preserved-side row "matches nothing" is *precisely* the case that must be emitted. The comment was true and the action was wrong, and it is the only line in either operator that drops rows without erroring. Unreachable from a CSV (invariant 14 — `ColumnarTable` cannot express NULL), so it is pinned by operator-level tests in both engines |
+| **`ON` residuals stop being `WHERE` conjuncts** — an outer join carries them on `LogicalJoin::on_residual` and evaluates them inside the probe loop | `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)` is an INNER identity, and Week 27 leaned on it to get pushdown for residuals for free. Under an outer join the two are different queries: a candidate failing `q` is *not a match*, so the left row is null-extended, where the `WHERE` form deletes it. That is exactly Q13's `not like` conjunct, and under the fold every customer whose only orders are special requests would vanish instead of landing in `c_count = 0` — the largest bucket in the reference answer. A candidate rejected by the residual must also not set `matched`, or the row is neither joined nor preserved and disappears entirely |
+| **Predicate pushdown declines the null-supplying side** (`distribute()`) | `σ_p(R ⟕ S) ≢ σ_p(R) ⟕ σ_p(S)`: filtering `S` first makes left rows lose their matches, and the join then null-extends exactly the rows the `WHERE` existed to remove — MORE rows, no error, on a query that is correct under `--no-optimize`. The conjunct stays above the join, where three-valued logic (`NULL = 2024` is UNKNOWN) drops the null-extended rows. The preserved side still pushes: `σ_p(R) ⟕ S` IS equivalent, and declining both sides would be silently correct and cost every outer join its pushdown. The test is re-applied at each join down the spine, so an inner join *below* an outer one keeps pushing |
+| **Join enumeration declines any tree containing an outer join** | `R ⟕ S ≠ S ⟕ R`, and associativity fails too, so the DP's premise — any relation may be added to any subset in any order — is a *legality* claim rather than a cost one. Repairing it needs per-edge conflict/eligibility sets (Moerkotte TES/SES), a different algorithm that buys nothing until a supported query has an outer join inside a reorderable block. `--explain` prints no `order=` line for such a tree, because there was no decision — the same shape as the sub-3-relation and over-32-relation declines |
+| **The build side is forced, not costed** | The preserved side must be the probe input: with it building, the operator would need a matched flag per build row plus an end-of-probe drain. `--explain` prints `build=<table> cost=… (outer: the preserved side must probe)` and no `(alt=…)`, because there was no alternative. The SIMD loop join is not costed either — it is an inner equi-join whose probe loop has no unmatched path, and an ineligible algorithm is not a fallback |
+| **The outer cardinality rule is stamped, never searched** — `max(rows, left_rows)` in `CardinalityEstimator`, not in `joinCardinality` | `max()` is not multiplicative, so a subset's row count would depend on the path that reached it and the DP's optimal substructure would be gone — the identical defect that moved the ≥1-row floor out of the search in Week 28. Enumeration declines outer trees anyway; both facts have to stay true independently |
+| **A join key mixing STRING and numeric is refused** (`Validator`) | Handed here by the Week 27 audit. Keys are compared as text, which carries no type tag, so `"7"` matched the INT `7` while `"007"` did not, while the identical predicate in `WHERE` throws. Landed now because an outer join returns the unmatched half as null-extended rows that look like data. One check in `Validator::validate` covers all four modes; INT vs DOUBLE stays legal, since `7.0` and `7` must keep joining |
+
+Volcano implements the same rule rather than refusing. It is the correctness
+baseline (invariant 6), the whole risk this week is NULL semantics, and
+`compare_against_sqlite.py`'s two Volcano modes are half the evidence that the
+vectorized operator is right — the argument that made multi-way joins
+vectorized-only does not transfer, because `Planner::plan`'s single join is
+exactly Q13's shape. Three or more relations stay refused there for the
+pre-existing Week 27 reason, outer join or not.
+
+Week 24's claim that the validity mask was added "specifically to make the Week 29
+outer join implementable" checks out, and was load-bearing: `fillOutChunk` already
+writes through `appendColumnValue`, which back-fills the validity prefix on the
+first NULL, so the operator needed **no** materialization change — and every
+consumer downstream (`propagateNulls` in the expression executor, `scanColumn`'s
+`all_valid` branch, `compareForSort`, `appendGroupKeyField`, and
+`VecHashAggregate`'s `non_null_count`, which is what makes Q13's `COUNT` return 0)
+was already NULL-aware. What it did not cover was the join's own key policy, and
+invariant 14: a NULL could never reach a query from catalog data, so this is the
+first week the SQLite harness can act as a NULL oracle at all.
 
 > **Starting notes, from Week 27's foundations.** Two findings from Week 27's
 > audits that belong to a week that is already changing join keys and NULL
@@ -1108,6 +1151,40 @@ moves the checkpoint not at all.
 >   fixture withholding a table's `TableStats` exercises both that guard and
 >   `joinCardinality`'s non-multiplicative `max(l, r)` branch, which is the reason
 >   the guard exists.
+
+> **Starting notes, from Week 29's foundations.**
+> - **The forced outer build side is a real regression waiting for a
+>   measurement.** A left outer join always hashes the null-supplying relation,
+>   which in Q13's shape is the larger one. The alternative (a matched flag per
+>   build row plus an end-of-probe drain) is ~30 lines in each operator and
+>   changes which side is scanned twice; Week 37's profiling is where it earns its
+>   keep or does not. Do not add it on intuition — the current rule is stated in
+>   `--explain` and in Limitations, which is what makes it auditable.
+> - **The enumeration decline is blunt, and gets blunter as queries grow.** One
+>   outer join anywhere in the tree turns off ordering for every join in the
+>   query. That is sound and cheap today (no supported query has an outer join
+>   inside a reorderable inner block), but the first query that pays for it should
+>   buy conflict/eligibility sets rather than a special case — a partial reorder
+>   guarded by anything less than TES/SES is a wrong answer, not a bad plan.
+> - **Week 30 makes `JoinEnumeration`'s unbound-key throw live**, and Week 29's
+>   decline is the shape it should take. The check reads `e.slot_a >= n` where `n`
+>   is `countRelations()`; a subquery introduces scans that are not range-table
+>   entries of the outer query, at which point the condition stops meaning
+>   "unbound key" and starts firing on legitimate plans. `containsOuterJoin`'s
+>   `return node;` sits three lines above it as the precedent: declining to
+>   reorder keeps optimized ≡ `--no-optimize` intact, where a throw does not.
+> - **`LogicalJoin::on_residual` is evaluated per candidate pair by the scalar
+>   `evaluate()`**, not by a compiled chunk kernel — the same correct-but-slow
+>   fallback `CASE` uses. Only an outer join that *has* a residual pays for it,
+>   and Q13's is one `LIKE` over the matched rows. If Week 37's profiling shows it
+>   dominating, the fix is a masked kernel over the assembled chunk, never a
+>   semantic shortcut.
+> - **`compare_against_sqlite.py` is a NULL oracle for the first time.** Invariant
+>   14 meant NULL semantics were previously reachable only from in-memory operator
+>   tests; a `LEFT JOIN` puts real NULLs into query results from ordinary catalog
+>   data. Any future week touching sorting, grouping, dedup or key encoding should
+>   add its shape to `WEEK29_OUTER_JOIN_QUERIES` rather than to a unit test — that
+>   block is now the cheapest way to get a NULL through the whole pipeline.
 
 ### Week 30 — Subquery Parsing + Binding
 
@@ -1249,7 +1326,7 @@ moves the checkpoint not at all.
 | 26 | Multi-way join language + binding | Arbitrary explicit joins bind correctly; pushdown routes by relation slot ✅ |
 | 27 | Multi-way join execution | General vectorized join trees execute ✅ |
 | 28 | Join enumeration | DP join ordering with greedy fallback works ✅ |
-| 29 | Outer join | Left outer hash join correct |
+| 29 | Outer join | Left outer hash join correct ✅ |
 | 30 | Subquery parsing + binding | Nested scopes and subquery forms bind |
 | 31 | Scalar + uncorrelated subqueries | Uncorrelated subqueries execute |
 | 32 | Semi-joins + anti-joins | Set-membership subqueries optimized |
@@ -1386,7 +1463,9 @@ Execution: 72.0ms
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
 - Joins of three or more relations execute on the columnar/vectorized path only; row and columnar Volcano refuse them with `multi-way joins are not supported on the Volcano path; use --execution vectorized`. Multi-key and residual-`ON` joins execute on every path (Week 27)
 - No subqueries or correlated expressions
-- A NaN is its own `GROUP BY` / `DISTINCT` group (both signs together), and matches nothing in a join. SQLite has neither case: it converts NaN to NULL on storage, so its NaNs land in the NULL group. Reachable only by writing `nan` into a CSV cell — no engine arithmetic produces one, since `x / 0` is NULL — and closing it means converting at load, which is a storage-layer decision noted for Week 29
+- A NaN is its own `GROUP BY` / `DISTINCT` group (both signs together), and matches nothing in a join. SQLite has neither case: it converts NaN to NULL on storage, so its NaNs land in the NULL group. Reachable only by writing `nan` into a CSV cell — no engine arithmetic produces one, since `x / 0` is NULL. Week 29 looked at closing it at load and did not: `CSVLoader::parseField` returning `Value::null()` breaks the very next stage, because `CSVToColumnar::convert` calls `row[c].asDouble()` unconditionally and `ColumnarTable` has no NULL representation at all. Closing it therefore means giving columnar storage a validity mask, which touches every scan, encoding and zone map — so it belongs to Week 35, which rewrites the loader anyway. The outer join does not make it more urgent: a NaN key on the preserved side is unmatchable and is now emitted null-extended, which is what SQLite does with the same row
+- An outer join's build side is **forced, not costed**: the preserved side must be the probe input, so the null-supplying relation is always hashed however large it is (`build=<table> ... (outer: the preserved side must probe)`). Costing the alternative needs a matched flag per build row and an end-of-probe drain; whether that pays is a Week 37 measurement, not a hunch. The SIMD loop join is never selected for an outer join at all — its probe loop emits matches and has no unmatched path
+- Join ordering is not attempted at all for a query containing an outer join: the pass declines the whole tree, since `R ⟕ S ≠ S ⟕ R` and associativity fails, and legality here needs conflict/eligibility sets rather than a better cost model. One outer join therefore turns off reordering for every join in the query, and `--explain` shows no `order=` line
 - DOUBLE keys — join, `GROUP BY` and `DISTINCT` alike — are compared exactly while results are *displayed* with `%.15g`, so two rows that legitimately fail to group together can print identical values. The alternative, comparing what is displayed, silently merges distinct doubles, which is the worse of the two. Stated here because Week 36's correctness report has to declare it alongside the `SUM` precision divergence below
 - `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
 - Commas inside string values not supported in CSV input

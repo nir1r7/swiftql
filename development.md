@@ -275,11 +275,13 @@ The `Execution` line from `--explain-analyze` is the number to watch when optimi
 ```sql
 SELECT [DISTINCT] expr [AS alias], AGG(expr), ...
 FROM table
-[JOIN other_table ON key = key [AND key = key ...]]* -- Phase 2; multi-key +
+[[LEFT [OUTER]] JOIN other ON key = key [AND ...]]* -- Phase 2; multi-key +
                                                      -- residual ON conjuncts:
                                                      -- Week 27 (all modes).
                                                      -- 3+ relations: vectorized
-                                                     -- only (Week 27)
+                                                     -- only (Week 27).
+                                                     -- LEFT OUTER: Week 29
+                                                     -- (all modes)
 [WHERE expr [AND expr ...]]
 [GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
@@ -309,6 +311,33 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 > vectorized`. It is the correctness baseline, not the feature-complete path, and
 > deleting the guard would make its single `HashJoinNode` silently drop a
 > relation. Multi-key and residual-`ON` joins execute on **every** path.
+
+> **Week 29 outer joins.** `LEFT [OUTER] JOIN` preserves every row of the left
+> input: one whose key matches nothing is emitted once, with NULL across the
+> joined relation's columns. Three things change relative to an inner join, and
+> all three are semantic rather than cosmetic:
+>
+> - **`ON` and `WHERE` stop being interchangeable.** `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)`
+>   is an inner-join identity. For an outer join, a row failing `q` in the `ON`
+>   is *not a match* and is null-extended, while the same `q` in the `WHERE`
+>   deletes it. So an outer join's residual conjuncts stay on the join
+>   (`LogicalJoin::on_residual`) instead of joining the `WHERE` conjunction — it
+>   is TPC-H Q13's `o_comment not like '%special%requests%'`.
+> - **Predicate pushdown declines the null-supplying side.** `σ_p(R ⟕ S)` is not
+>   `σ_p(R) ⟕ σ_p(S)`: filtering `S` first makes left rows lose matches, and the
+>   join then null-extends exactly the rows the `WHERE` existed to remove. Such a
+>   conjunct stays above the join, where three-valued logic drops the
+>   null-extended rows. The preserved side still pushes.
+> - **Join enumeration declines the whole tree.** `R ⟕ S ≠ S ⟕ R` and
+>   associativity fails, so no reordering is legal without conflict/eligibility
+>   sets. `--explain` prints no `order=` line for such a tree, because there was
+>   no decision.
+>
+> The build side is forced rather than costed: the preserved side must be the
+> probe input (`build=<table> ... (outer: the preserved side must probe)`), and
+> the SIMD loop join — an inner equi-join with no unmatched path — is never
+> selected. `RIGHT`/`FULL` are out of scope; no TPC-H query in the documented
+> dialect needs them.
 
 Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
 literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
@@ -431,6 +460,15 @@ Every operator reads and writes chunk cells through three helpers in
 `src/execution/vec_types.h` — `valueAt` / `readColumnValue` to read, and
 `appendColumnValue` to write. Reading a typed vector directly bypasses the mask
 and silently turns a NULL into the placeholder value stored underneath it.
+
+**Where NULLs come from.** Until Week 29 a NULL could only be *computed*
+(`x / 0`, a `CASE` with no matching branch), because `ColumnarTable` cannot
+express one and a CSV cell cannot either. A `LEFT JOIN` is the first construct
+that manufactures NULLs from ordinary catalog data, which is also what makes
+`compare_against_sqlite.py` a real NULL oracle: before it, NULL semantics were
+only reachable from in-memory operator tests. `VecHashJoinNode` needed no
+materialization change for it — `fillOutChunk` already writes through
+`appendColumnValue`, which back-fills the validity prefix on the first NULL.
 
 **Comparing NULL.** `Value`'s comparison operators are SQL three-valued: every one
 returns false when either side is NULL, and callers are expected to test
