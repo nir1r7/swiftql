@@ -2,11 +2,15 @@
 #include "parser/ast.h"
 #include <algorithm>
 
+const ColumnStatsEntry* StatsContext::findExact(const std::string& name, int slot) const {
+    if (slot < 0) return nullptr;
+    for (const auto& e : entries)
+        if (e.relation_slot == slot && e.name == name) return &e;
+    return nullptr;
+}
+
 const ColumnStatsEntry* StatsContext::find(const std::string& name, int slot) const {
-    if (slot >= 0) {
-        for (const auto& e : entries)
-            if (e.relation_slot == slot && e.name == name) return &e;
-    }
+    if (const ColumnStatsEntry* e = findExact(name, slot)) return e;
     for (const auto& e : entries)
         if (e.name == name) return &e;   // bare-name fallback, first match wins
     return nullptr;
@@ -257,7 +261,22 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             double divisor = 1.0;
             bool have_ndv = false;
             for (const JoinKey& k : join.keys) {
-                const ColumnStatsEntry* lk = left.find(k.from_col, k.from_slot);
+                // Left side: slot-EXACT. from_slot exists precisely because the
+                // merged left context can hold one column name at several
+                // slots, so honouring it only when it happens to hit would make
+                // the disambiguation advisory. It misses whenever the key's own
+                // relation has no TableStats (a stats-less scan contributes no
+                // entries at all), and the bare-name fallback would then hand
+                // back a different relation's column with no signal. A miss is
+                // "no statistic" — which have_ndv below already models.
+                // Right side: one relation, so a bare-name match is unambiguous
+                // and -1 asks for it deliberately.
+                // An unbound key (from_slot -1, positional routing) has no
+                // relation identity to be exact about, so it keeps the
+                // documented bare-name behaviour.
+                const ColumnStatsEntry* lk = k.from_slot >= 0
+                    ? left.findExact(k.from_col, k.from_slot)
+                    : left.find(k.from_col, -1);
                 const ColumnStatsEntry* rk = right.find(k.join_col, -1);
                 int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
                                        rk ? rk->stats->distinct_count : int64_t(0));

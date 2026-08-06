@@ -31,8 +31,18 @@ struct StatsContext {
     std::vector<ColumnStatsEntry> entries;
 
     // slot-first lookup with bare-name fallback, mirroring
-    // Schema::indexOf(name, slot) resolution order
+    // Schema::indexOf(name, slot) resolution order. The fallback is what makes
+    // unbound refs (slot -1) and hand-built contexts resolvable, so it stays —
+    // but it means a slot MISS silently returns some other relation's column of
+    // the same name. Use findExact wherever the slot is a real relation
+    // identity rather than a hint.
     const ColumnStatsEntry* find(const std::string& name, int slot) const;
+
+    // Slot-exact lookup: no bare-name fallback, so a miss means "this relation
+    // has no statistic for this column" instead of "here is a different
+    // relation's". Returns nullptr for slot < 0, which has no relation to be
+    // exact about.
+    const ColumnStatsEntry* findExact(const std::string& name, int slot) const;
 };
 
 // annotates every logical node's estimated_rows in place, bottom-up.

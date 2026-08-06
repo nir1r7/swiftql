@@ -356,6 +356,34 @@ TEST(Cardinality, SingleValuedJoinKeyEstimatesTheCrossProduct) {
     EXPECT_DOUBLE_EQ(j->estimated_rows, 20000.0);   // 1000 * 20 / 1, not max(1000,20)
 }
 
+// A join key whose own relation has no statistics must estimate as "no
+// statistic", not borrow a same-named column from another relation. A
+// stats-less scan contributes no entries at all, so the slot lookup misses —
+// and StatsContext::find's bare-name fallback then returns the first `team` it
+// sees, which here belongs to `drivers` rather than to `laps`. That is exactly
+// the confusion JoinKey::from_slot was introduced to prevent, so the join case
+// asks for a slot-exact match.
+TEST(Cardinality, JoinKeyOnStatslessRelationDoesNotBorrowAnotherRelationsNdv) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // drivers only: team NDV 10, driver_id NDV 20
+                             // laps deliberately has NO stats
+
+    auto plan = buildLogical(
+        "SELECT d.name FROM drivers d JOIN laps l ON d.driver_id = l.driver_id "
+        "JOIN laps l2 ON l.team = l2.team", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+
+    // join 1: drivers(20) x laps(fallback 1000) / driver_id NDV 20 = 1000
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    ASSERT_EQ(top->children[0]->type, LogicalNodeType::JOIN);
+    EXPECT_DOUBLE_EQ(top->children[0]->estimated_rows, 1000.0);
+
+    // join 2 keys on laps.team (slot 1, no stats) — neither side has a usable
+    // NDV, so the fallback is max(l, r), not 1000 * 1000 / drivers.team's 10
+    EXPECT_DOUBLE_EQ(top->estimated_rows, 1000.0);
+}
+
 TEST(Cardinality, JoinFallsBackToMaxWithoutStats) {
     Catalog cat(CATALOG);  // no stats on either table
     auto plan = buildLogical(
