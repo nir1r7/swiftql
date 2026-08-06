@@ -152,13 +152,21 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
     // JOIN tables must exist (if present)
     if (!stmt.joins.empty()) {
-        std::vector<std::pair<std::string, const Schema*>> relations{{stmt.from_table, &schema}};
+        // Keyed by the name a qualified reference can actually use — the alias
+        // when there is one, the table name otherwise — mirroring the Binder's
+        // range table. Keying by table name made every aliased `ON` reference
+        // fall through validateJoinCondition's "unknown qualifier" escape, so
+        // its column-existence check did nothing for exactly the shapes Week 26
+        // adds (a self-join cannot be written without aliases).
+        std::vector<std::pair<std::string, const Schema*>> relations{
+            {stmt.from_alias.empty() ? stmt.from_table : stmt.from_alias, &schema}};
         for (const auto& j : stmt.joins) {
             if (!catalog.hasTable(j.join_table)) {
                 throw std::runtime_error(
                     "Join table not found: '" + j.join_table + "'");
             }
-            relations.push_back({j.join_table, &catalog.getTable(j.join_table).schema});
+            relations.push_back({j.alias.empty() ? j.join_table : j.alias,
+                                 &catalog.getTable(j.join_table).schema});
         }
         for (size_t i = 0; i < stmt.joins.size(); ++i) {
             if (!stmt.joins[i].condition) continue;
