@@ -384,6 +384,45 @@ TEST(Cardinality, JoinKeyOnStatslessRelationDoesNotBorrowAnotherRelationsNdv) {
     EXPECT_DOUBLE_EQ(top->estimated_rows, 1000.0);
 }
 
+// The same borrowing hazard one level up the plan: a GROUP BY key whose own
+// relation has no statistics must not take its NDV from another relation's
+// column of the same name. child_ctx here is the join's MERGED context, so the
+// bare-name fallback had `drivers.team` (NDV 10) standing in for `laps.team`.
+TEST(Cardinality, GroupKeyOnStatslessRelationDoesNotBorrowAnotherRelationsNdv) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // drivers only; laps deliberately unseeded
+
+    auto plan = buildLogical(
+        "SELECT l.team, COUNT(*) FROM drivers d JOIN laps l "
+        "ON d.driver_id = l.driver_id GROUP BY l.team", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+
+    const LogicalPlanNode* agg = findNode(plan.get(), LogicalNodeType::AGGREGATE);
+    ASSERT_NE(agg, nullptr);
+    // join: 20 * 1000 / 20 = 1000 rows in; laps.team has no NDV, so the group
+    // count cannot be reduced below the input — not drivers.team's 10
+    EXPECT_DOUBLE_EQ(agg->children[0]->estimated_rows, 1000.0);
+    EXPECT_DOUBLE_EQ(agg->estimated_rows, 1000.0);
+}
+
+// And in selectivity(), which sees a merged context whenever a WHERE conjunct
+// sits above a join (a residual, or any plan estimated without pushdown).
+TEST(Cardinality, PredicateOnStatslessRelationDoesNotBorrowAnotherRelationsStats) {
+    Catalog cat(CATALOG);
+    seedDriversStats(cat);   // drivers only; laps deliberately unseeded
+
+    auto plan = buildLogical(
+        "SELECT l.lap_id FROM drivers d JOIN laps l ON d.driver_id = l.driver_id "
+        "WHERE l.driver_id = 5", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    // laps.driver_id has no stats, so equality falls back to 0.1 — not to
+    // drivers.driver_id's NDV of 20, which would give 0.05 and halve the estimate
+    EXPECT_DOUBLE_EQ(filter->estimated_rows, 1000.0 * FALLBACK_EQ_SELECTIVITY);
+}
+
 TEST(Cardinality, JoinFallsBackToMaxWithoutStats) {
     Catalog cat(CATALOG);  // no stats on either table
     auto plan = buildLogical(

@@ -43,6 +43,15 @@ struct StatsContext {
     // relation's". Returns nullptr for slot < 0, which has no relation to be
     // exact about.
     const ColumnStatsEntry* findExact(const std::string& name, int slot) const;
+
+    // Lookup for a reference that carries a binder-assigned relation identity:
+    // exact when a slot is present, bare-name only when it is not. Every caller
+    // holding a real slot wants this — a merged context can hold one column
+    // name at several slots, and the slot MISSES whenever the owning relation
+    // has no TableStats (a stats-less scan contributes no entries at all), at
+    // which point find() would hand back a different relation's column with no
+    // signal. Every consumer already models "no statistic" with a fallback.
+    const ColumnStatsEntry* findForRef(const std::string& name, int slot) const;
 };
 
 // annotates every logical node's estimated_rows in place, bottom-up.

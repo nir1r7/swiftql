@@ -9,6 +9,10 @@ const ColumnStatsEntry* StatsContext::findExact(const std::string& name, int slo
     return nullptr;
 }
 
+const ColumnStatsEntry* StatsContext::findForRef(const std::string& name, int slot) const {
+    return slot >= 0 ? findExact(name, slot) : find(name, -1);
+}
+
 const ColumnStatsEntry* StatsContext::find(const std::string& name, int slot) const {
     if (const ColumnStatsEntry* e = findExact(name, slot)) return e;
     for (const auto& e : entries)
@@ -26,7 +30,7 @@ static bool comparable(const Value& a, const Value& b) {
 double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& ctx) {
     if (auto* isnull = dynamic_cast<const IsNullExpr*>(pred)) {
         auto* col = dynamic_cast<const ColumnRef*>(isnull->operand.get());
-        const ColumnStatsEntry* e = col ? ctx.find(col->column_name, col->relation_slot) : nullptr;
+        const ColumnStatsEntry* e = col ? ctx.findForRef(col->column_name, col->relation_slot) : nullptr;
         if (!e || e->table_rows == 0) {
             // fallback is the assumed null fraction, so it must respect polarity:
             // IS NOT NULL keeps ~everything, not ~nothing
@@ -45,7 +49,7 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     // alone does not misprice it.
     if (auto* in = dynamic_cast<const InExpr*>(pred)) {
         auto* col = dynamic_cast<const ColumnRef*>(in->operand.get());
-        const ColumnStatsEntry* e = col ? ctx.find(col->column_name, col->relation_slot) : nullptr;
+        const ColumnStatsEntry* e = col ? ctx.findForRef(col->column_name, col->relation_slot) : nullptr;
 
         // Distinct values only. `x IN (2022, 2022, 2022)` matches exactly the
         // rows `x = 2022` does; counting the duplicates inflated k past NDV,
@@ -151,7 +155,7 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     if (!col || !lit)
         return (op == "=") ? FALLBACK_EQ_SELECTIVITY : FALLBACK_SELECTIVITY;
 
-    const ColumnStatsEntry* e = ctx.find(col->column_name, col->relation_slot);
+    const ColumnStatsEntry* e = ctx.findForRef(col->column_name, col->relation_slot);
 
     if (op == "=" || op == "!=") {
         double eq = FALLBACK_EQ_SELECTIVITY;
@@ -272,11 +276,9 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 // Right side: one relation, so a bare-name match is unambiguous
                 // and -1 asks for it deliberately.
                 // An unbound key (from_slot -1, positional routing) has no
-                // relation identity to be exact about, so it keeps the
-                // documented bare-name behaviour.
-                const ColumnStatsEntry* lk = k.from_slot >= 0
-                    ? left.findExact(k.from_col, k.from_slot)
-                    : left.find(k.from_col, -1);
+                // relation identity to be exact about, so findForRef keeps the
+                // documented bare-name behaviour for it.
+                const ColumnStatsEntry* lk = left.findForRef(k.from_col, k.from_slot);
                 const ColumnStatsEntry* rk = right.find(k.join_col, -1);
                 int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
                                        rk ? rk->stats->distinct_count : int64_t(0));
@@ -317,7 +319,7 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 for (const auto& g : agg.group_by) {
                     // slot-first lookup mirrors execution: a qualified GROUP BY
                     // reads NDV from the named join side
-                    const ColumnStatsEntry* e = child_ctx.find(g.column_name, g.relation_slot);
+                    const ColumnStatsEntry* e = child_ctx.findForRef(g.column_name, g.relation_slot);
                     // unknown NDV contributes no reduction; the clamp bounds it
                     groups *= (e && e->stats->distinct_count > 0)
                             ? static_cast<double>(e->stats->distinct_count)
