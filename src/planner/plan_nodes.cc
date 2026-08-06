@@ -1,4 +1,5 @@
 #include "plan_nodes.h"
+#include "execution/join_key.h"
 #include "execution/evaluator.h"
 #include "parser/expr_utils.h"
 #include "storage/chunk_pruner.h"
@@ -594,9 +595,8 @@ HashJoinNode::HashJoinNode(std::unique_ptr<PlanNode> left, std::unique_ptr<PlanN
 
 namespace {
 
-// Serialize one row's k-key tuple. Identical encoding to VecHashJoinNode's: the
-// '\x01' sentinel after every field is what keeps ("ab","c") and ("a","bc")
-// apart, and a one-key tuple is byte-identical to the pre-Week-27 form.
+// Serialize one row's k-key tuple, through the encoder VecHashJoinNode shares
+// (join_key.h) so the two engines cannot drift apart on it.
 //
 // Returns false when any key member is NULL — SQL's NULL equals nothing, so the
 // row can neither be inserted nor matched. Volcano used to bucket a NULL key
@@ -604,12 +604,12 @@ namespace {
 // dropped it; unreachable today (CSV cannot express NULL and a join key comes
 // straight off a scan), but Week 29's outer join puts real NULLs on join inputs.
 bool serializeRowKey(const Row& row, const std::vector<int>& key_idx, std::string& out) {
+    const bool prefixed = key_idx.size() > 1;
     out.clear();
     for (int c : key_idx) {
         const Value& v = row[c];
         if (v.isNull()) return false;
-        out += v.toString();
-        out += '\x01';
+        appendJoinKeyField(out, v, prefixed);
     }
     return true;
 }
@@ -620,17 +620,32 @@ void HashJoinNode::open() {
     left_->open();
     right_->open();
 
+    // A key column missing from its side's schema is a planner bug, and
+    // indexOf returns -1 for it — which serializeRowKey would hand to row[-1],
+    // an out-of-bounds read with no diagnostic. Throw instead, matching what
+    // the vectorized builder does with the same situation: a lookup miss is an
+    // error, never a value to carry forward.
+    auto resolve = [](const Schema& schema, const std::vector<std::string>& cols,
+                      const char* side) {
+        std::vector<int> idx;
+        idx.reserve(cols.size());
+        for (const std::string& c : cols) {
+            int i = schema.indexOf(c);
+            if (i < 0) {
+                throw std::runtime_error(
+                    "HashJoin: join key '" + c + "' not found on the " + side + " input");
+            }
+            idx.push_back(i);
+        }
+        return idx;
+    };
+
     // build phase
     hash_table_.clear();
-    const Schema& build_schema = right_->outputSchema();
-    right_key_idx_.clear();
-    for (const std::string& c : right_cols_) right_key_idx_.push_back(build_schema.indexOf(c));
-
+    right_key_idx_ = resolve(right_->outputSchema(), right_cols_, "build");
     // resolved here rather than per row in next(), which re-resolved the probe
     // key for every row it pulled
-    const Schema& probe_schema = left_->outputSchema();
-    left_key_idx_.clear();
-    for (const std::string& c : left_cols_) left_key_idx_.push_back(probe_schema.indexOf(c));
+    left_key_idx_ = resolve(left_->outputSchema(), left_cols_, "probe");
 
     std::string key;
     while (true){

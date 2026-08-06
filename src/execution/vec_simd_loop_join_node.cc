@@ -218,10 +218,11 @@ const Schema& VecSimdLoopJoinNode::outputSchema() const {
 }
 
 std::string VecSimdLoopJoinNode::explain() const {
-    // names come from the children's schemas, so --explain prints columns
-    // rather than the indices this node holds
+    // Names come from the children's schemas, so --explain prints columns rather
+    // than the indices this node holds; an ambiguous probe-side name carries its
+    // relation slot, for the reason VecHashJoinNode::explain spells out.
     std::string s = "VecSimdLoopJoin ["
-        + probe_child_->outputSchema().column(probe_key_idx_).name + " = "
+        + qualifyIfAmbiguous(probe_child_->outputSchema(), probe_key_idx_) + " = "
         + build_child_->outputSchema().column(build_key_idx_).name + "] (materialize)";
     if (!cost_decision_.empty()) s += " " + cost_decision_;
     return s;
