@@ -54,10 +54,18 @@ std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot
                 "JOIN ON: condition must compare a column from each joined table; "
                 "both sides reference '" + lc->table_name + "'");
         }
+        // The rule has two halves, and checking only the first accepts the same
+        // forward reference the second rejects, purely on operand order: one
+        // side must be the relation being joined, AND the other must already be
+        // in the left tree.
+        const ColumnRef* joined_ref;   // the side in relation `right_slot`
+        const ColumnRef* left_ref;     // the side that must already be joined
         if (rc->relation_slot == right_slot) {
-            keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
+            joined_ref = rc;
+            left_ref = lc;
         } else if (lc->relation_slot == right_slot) {
-            keys.push_back({rc->column_name, lc->column_name, rc->relation_slot});
+            joined_ref = lc;
+            left_ref = rc;
         } else {
             // Neither side is the relation being joined in: with two relations
             // this was unreachable, with three it is a forward reference
@@ -67,6 +75,18 @@ std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot
                 + lc->table_name + "." + lc->column_name + " = "
                 + rc->table_name + "." + rc->column_name + "' does not");
         }
+        if (left_ref->relation_slot > right_slot) {
+            // The other operand names a relation joined LATER. keys[k].from_col
+            // is defined to resolve against children[0] — the left tree — so
+            // accepting this silently rewires the key to whatever column of that
+            // name the left tree happens to have, and explain() renders a plan
+            // indistinguishable from the correct one.
+            throw std::runtime_error(
+                "JOIN ON: '" + left_ref->table_name + "." + left_ref->column_name
+                + "' references a table that is joined later; a condition may only "
+                  "reference the table being joined and tables already joined");
+        }
+        keys.push_back({left_ref->column_name, joined_ref->column_name, left_ref->relation_slot});
     }
     return keys;
 }

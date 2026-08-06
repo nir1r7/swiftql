@@ -340,6 +340,20 @@ static std::string joinOnValidationError(const std::string& sql, const Catalog& 
     }
 }
 
+// Validate WITHOUT binding. Site 18 is only reachable this way for a qualified
+// reference — in the full pipeline Binder::resolveColumnRef throws first — and
+// validator-only callers are exactly the case its unbound fallbacks exist for.
+static std::string validateOnlyJoinError(const std::string& sql, const Catalog& cat) {
+    Parser p(sql);
+    auto stmt = p.parse();
+    try {
+        Validator::validate(stmt, cat);
+        return "";
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+}
+
 TEST(JoinOnValidation, SingleEquiJoinAccepted) {
     Catalog cat(CATALOG);
     EXPECT_EQ(joinOnValidationError(
@@ -392,6 +406,29 @@ TEST(JoinOnValidation, ForwardReferenceToLaterRelationRejected) {
     EXPECT_NE(err.find("table being joined"), std::string::npos) << err;
 }
 
+// The SAME query with the operands swapped. One side is now the relation being
+// joined, so the "references the table being joined" test passes and the other
+// half of the rule — the remaining operand must already be in the left tree —
+// is what has to reject it. Checking only the first half accepted this and
+// rewired keys[0].from_col to whatever column of that name relation 0 had,
+// producing a wrong join tree that explain() renders identically to a right one.
+TEST(JoinOnValidation, ForwardReferenceOnLeftOperandRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT a.id FROM sj a JOIN sj b ON b.grp = c.id JOIN sj c ON a.id = c.id", cat);
+    EXPECT_NE(err.find("joined later"), std::string::npos) << err;
+}
+
+// Worse form of the same bug: the borrowed name need not exist in the relation
+// the key would silently resolve against.
+TEST(JoinOnValidation, ForwardReferenceToColumnAbsentFromLeftTreeRejected) {
+    Catalog cat(CATALOG);
+    std::string err = joinOnValidationError(
+        "SELECT l.team FROM laps l JOIN drivers d ON d.driver_id = d2.age "
+        "JOIN drivers d2 ON l.driver_id = d2.driver_id", cat);
+    EXPECT_NE(err.find("joined later"), std::string::npos) << err;
+}
+
 // Dispatch site 18. An unqualified name matching no relation is left
 // unresolved by the Binder (it does not throw) and slips past
 // classifyJoinCondition's unbound-positional branch, so validateJoinCondition
@@ -403,6 +440,23 @@ TEST(JoinOnValidation, UnknownColumnInsideMultiKeyConditionRejected) {
         "SELECT a.id FROM sj a JOIN sj b ON a.id = b.id AND nope = b.grp", cat);
     EXPECT_NE(err.find("nope"), std::string::npos) << err;
     EXPECT_NE(err.find("JOIN ON"), std::string::npos) << err;
+}
+
+// Site 18's relation list is keyed by the name a qualified ref can actually
+// use — the alias when there is one. Keying it by table name made `b` match no
+// entry, so the check silently returned and validated nothing for exactly the
+// shapes Week 26 adds (a self-join cannot be written without aliases).
+TEST(JoinOnValidation, AliasedQualifierIsCheckedAgainstItsRelation) {
+    Catalog cat(CATALOG);
+    std::string err = validateOnlyJoinError(
+        "SELECT a.id FROM sj a JOIN sj b ON a.id = b.nope", cat);
+    EXPECT_NE(err.find("nope"), std::string::npos) << err;
+    EXPECT_NE(err.find("'b'"), std::string::npos) << err;
+}
+
+TEST(JoinOnValidation, AliasedQualifierWithRealColumnAccepted) {
+    Catalog cat(CATALOG);
+    EXPECT_EQ(validateOnlyJoinError("SELECT a.id FROM sj a JOIN sj b ON a.id = b.grp", cat), "");
 }
 
 // A qualified bad column inside the same AND-chain is caught earlier, by the
@@ -453,12 +507,17 @@ TEST(JoinOnValidation, MultiKeyConditionYieldsOneKeyPerConjunct) {
     EXPECT_EQ(keys[1].join_col, "grp");
 }
 
-TEST(JoinOnValidation, AggregateInsideJoinConditionRejected) {
+// classifyJoinCondition's operand check fires first, so this is what the user
+// sees. validateJoinCondition's AggregateExpr branch is a Week 27 pre-position
+// for when residual ON conjuncts make that function the only column check —
+// asserting the specific message keeps the two apart. Without it this test
+// would pass with the whole branch deleted.
+TEST(JoinOnValidation, AggregateInsideJoinConditionRejectedOnShape) {
     Catalog cat(CATALOG);
-    // shape check fires first; the point is that neither path lets it through
     std::string err = joinOnValidationError(
         "SELECT a.id FROM sj a JOIN sj b ON a.id = SUM(b.grp)", cat);
-    EXPECT_FALSE(err.empty());
+    EXPECT_NE(err.find("both sides of the join equality must be column references"),
+              std::string::npos) << err;
 }
 
 TEST(JoinOnValidation, LiteralOperandRejected) {
@@ -612,7 +671,24 @@ TEST(Binder, DuplicateAliasAcrossNonAdjacentRelationsRejected) {
         FAIL() << "expected a duplicate-reference error";
     } catch (const std::runtime_error& e) {
         std::string err = e.what();
-        // same table twice under one name -> the self-join message
+        // every relation IS aliased here; the fault is that `a` is used twice,
+        // so telling the user to add aliases would be advice they already took
+        EXPECT_NE(err.find("duplicate table alias"), std::string::npos) << err;
+        EXPECT_NE(err.find("'a'"), std::string::npos) << err;
+    }
+}
+
+// The sibling diagnostic: nothing is aliased, so "add aliases" is the fix.
+TEST(Binder, AliaslessSelfJoinAcrossThreeRelationsAsksForAliases) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT id FROM sj JOIN drivers ON sj.id = drivers.driver_id "
+             "JOIN sj ON drivers.driver_id = sj.grp");
+    auto stmt = p.parse();
+    try {
+        Binder::bind(stmt, cat);
+        FAIL() << "expected a duplicate-reference error";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
         EXPECT_NE(err.find("self-join requires table aliases"), std::string::npos) << err;
         EXPECT_NE(err.find("'sj'"), std::string::npos) << err;
     }
