@@ -279,6 +279,13 @@ WEEK26_REJECTED_QUERIES = [
      "ON l.driver_id = d.driver_id OR l.team = d.team",
      "AND-chain of equalities"),
 
+    # a second, independent fault must win over the temporary refusal, in every
+    # mode: the multi-key guard is deferred past the plan-time type checks
+    # because the merged schema does not depend on the key count
+    ("SELECT l.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.team = d.team WHERE l.team + 1 > 0",
+     "requires numeric operands"),
+
     # a query that is BOTH multi-way and multi-key must report the same reason
     # in every mode — the two engines check in different places, so only a query
     # with both properties can catch them disagreeing
@@ -323,6 +330,21 @@ WEEK26_REJECTED_QUERIES = [
      "ambiguous column reference"),
 ]
 
+# Week 26 regression: Binder::resolveColumnRef rewrites an unqualified ON
+# reference's table_name to the TABLE name of the relation it resolved to, so a
+# relation aliased to exactly that name shadows it. Site 18 matched on that name
+# and checked the column against the wrong schema, rejecting these legal,
+# fully-executable single-join queries in all four modes. SQLite accepts both,
+# so the rows are the oracle.
+WEEK26_ALIAS_SHADOW_QUERIES = [
+    "SELECT x.name AS n, drivers.lap_id AS lid FROM drivers x JOIN laps drivers "
+    "ON age = drivers.round ORDER BY n, lid LIMIT 10",
+    # the mirror: the shadowing alias is on the FROM side and the unqualified
+    # column belongs to the joined relation
+    "SELECT y.name AS n, drivers.lap_id AS lid FROM laps drivers JOIN drivers y "
+    "ON drivers.round = age ORDER BY n, lid LIMIT 10",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
@@ -331,7 +353,7 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + GROUP_KEY_QUALIFIER_QUERIES + CONSTANT_FOLDING_QUERIES + EXPRESSION_POSITION_QUERIES \
   + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
-  + WEEK25_JOIN_QUERIES
+  + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES
 
 # SQLite setup
 def load_sqlite():
