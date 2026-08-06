@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **611 tests, 0 failures.**
+Expected: **614 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -401,7 +401,10 @@ together while the vectorized path kept them apart.
 
 A NaN key is dropped by a join for the same reason a NULL is: two NaNs serialize
 identically, but `Value::operator==` calls them unequal, so matching them would
-make a join accept a pair its own `WHERE` predicate rejects.
+make a join accept a pair its own `WHERE` predicate rejects. Grouping keeps NaN
+instead, as one group covering both signs — `%.17g` renders a sign-bit-set NaN
+as `-nan`, so the encoder drops the sign rather than splitting the group. SQLite
+has neither case, since it stores NaN as NULL; see readme.md's Limitations.
 
 ### NULL on the vectorized path
 

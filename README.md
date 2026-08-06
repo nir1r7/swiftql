@@ -868,7 +868,7 @@ been standing in front of:
 |---|---|
 | **Join keys resolve by relation slot, not by name** — the physical operators now take resolved column *indices*, computed once by the planner via `Schema::indexOf(name, from_slot)` | The left input's merged schema can hold one column name at several slots (`laps.team` and `drivers.team`), so a bare-name lookup silently joins the wrong relation's column: `... JOIN laps l2 ON l1.lap_id = l2.driver_id JOIN drivers d ON l2.team = d.team` returns **31440** rows by name and **32193** by slot, with no error either way. The only defect this week that produced rows rather than a message. A slot miss now throws — the bare-name fallback *is* the bug |
 | **Composite hash keys in both engines**, one serialized tuple, length-prefixed per field | TPC-H Q9 joins on `(ps_partkey, ps_suppkey)`. Putting the second key in a filter above the join is semantically equal for an inner join but materializes every partial match first. The tuple must be an *injective* encoding, which a bare `'\x01'` sentinel per field is not: nothing stops a field from containing the sentinel (`CSVLoader::parseField` returns a STRING cell verbatim), so `("A\x01B","C")` and `("A","B\x01C")` serialize alike and two rows differing in **both** keys join. `<len>:<bytes>` is injective for any bytes; a one-key tuple keeps the old sentinel-only form, which was already injective, so single-key joins stay byte-identical. A NULL member makes the whole tuple unmatchable, which also removed a latent divergence — Volcano used to bucket a NULL key under `"NULL"` and match it against itself while the vectorized path dropped it |
-| **Every key is compared by text that identifies the value, not text that displays it** — join keys, `GROUP BY` keys and `DISTINCT` keys alike | `Value::toString()` formats a DOUBLE with `%.15g` for human output, which is lossy. Over the shipped 10k-row dataset `sector_1 + sector_2` takes **3245** distinct values but only **2526** distinct `%.15g` texts, so `SELECT DISTINCT sector_1 + sector_2 FROM laps` returned 2526 rows against SQLite's 3245, and every collapsed `GROUP BY` group's `COUNT(*)` was wrong with it — in all four modes, so only the SQLite oracle could see it. Keys now render an integral double through the integer path (`7.0` and the INT `7` still join, which is SQLite's numeric affinity, and there is no `%g` exponent cliff) and everything else through round-tripping `%.17g`. Both zeros collapse, since IEEE and SQLite call them equal. Pre-existing; found by auditing the encoding this week rewrote |
+| **Every key is compared by text that identifies the value, not text that displays it** — join keys, `GROUP BY` keys and `DISTINCT` keys alike | `Value::toString()` formats a DOUBLE with `%.15g` for human output, which is lossy. Over the shipped 10k-row dataset `sector_1 + sector_2` takes **3245** distinct values but only **2526** distinct `%.15g` texts, so `SELECT DISTINCT sector_1 + sector_2 FROM laps` returned 2526 rows against SQLite's 3245, and every collapsed `GROUP BY` group's `COUNT(*)` was wrong with it — in all four modes, so only the SQLite oracle could see it. Keys now render an integral double through the integer path across the whole `int64_t` domain (`7.0` and the INT `7` still join, which is SQLite's numeric affinity; the bound is the exact power of two, because a round number near it leaves a narrower cliff rather than none — 2^63 - 1024 is exactly representable *and* exactly equal to its INT) and everything else through round-tripping `%.17g`. Both zeros collapse, since IEEE and SQLite call them equal. Pre-existing; found by auditing the encoding this week rewrote |
 | **A NaN join key matches nothing, including another NaN** | Two NaNs serialize to the same text, so a text-compared key put them in one bucket — while `Value::operator==` on the same pair is false, meaning the join matched a pair the identical predicate in a `WHERE` clause rejects. SQLite never has the case (it stores NaN as NULL), so dropping the row agrees with both |
 | **Volcano's `DISTINCT` gained the NULL marker its three siblings had** | It was the one key serializer with no NULL branch at all, so a NULL cell and the literal string `'NULL'` both encoded as `4:NULL` and deduped together: `SELECT DISTINCT CASE WHEN speed > 300 THEN 'NULL' END FROM laps` returned one row on both Volcano modes where the vectorized path and SQLite return two. A wrong answer on the correctness baseline, and a live cross-engine divergence of exactly the kind centralising the encoding exists to prevent |
 | **An ambiguous join key prints its relation slot** in `--explain` (`team@1 = team`) | The wrong-relation plan this week exists to prevent rendered *byte-identically* to the correct one — `[team = team]` either way — on the surface used to debug it. Only a name the schema holds more than once is qualified, so every pre-existing plan string is unchanged |
@@ -935,6 +935,31 @@ there rather than inventing an encoding.
 - Preserve unmatched rows and stable output slots
 
 **Checkpoint:** TPC-H Q13 join semantics are supported.
+
+> **Starting notes, from Week 27's foundations.** Two findings from Week 27's
+> audits that belong to a week that is already changing join keys and NULL
+> handling, rather than to the week that found them.
+> - **An `ON` clause comparing a STRING column to a numeric one is accepted and
+>   silently half-matches, while the identical predicate in `WHERE` throws.**
+>   `inferExprType` type-checks only the arithmetic operators — `=` falls
+>   through to `INT` — and `classifyJoinCondition` accepts any cross-slot
+>   `ColumnRef = ColumnRef` as a key. The key is then compared as text, which
+>   carries no type tag, so a STRING `"7"` matches an INT `7` while `"007"` does
+>   not; `Value::operator==` throws `Type mismatch` for the same pair. Both
+>   halves are reachable on the shipped catalog (`drivers.team` vs
+>   `laps.lap_id`). The containment is a plan-time check that a join's two key
+>   columns are both STRING or both numeric, which also makes the `int_keys`
+>   SIMD gate's assumption explicit. Deferred rather than landed in Week 27
+>   because it adds a *rejection* path — new error, new harness entries, queries
+>   that execute today stop executing — and that wants its own gate.
+> - **NaN reaches keys as its own group where SQLite has none.** SQLite converts
+>   NaN to NULL at storage; SwiftQL keeps it, so a NaN forms a `GROUP BY` /
+>   `DISTINCT` group of its own (both signs together — `key_encoding.h` drops the
+>   sign) and matches nothing in a join. Converting at load in `CSVLoader` would
+>   align all three, and it is a storage decision, not a key-encoding one — the
+>   encoder can only choose what to do with a NaN it is handed.
+> - Both are dialect facts until closed, so they are listed in Limitations and
+>   the Week 36 correctness report inherits them.
 
 ### Week 30 — Subquery Parsing + Binding
 
@@ -1165,6 +1190,7 @@ Execution: 72.0ms
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
 - Joins of three or more relations execute on the columnar/vectorized path only; row and columnar Volcano refuse them with `multi-way joins are not supported on the Volcano path; use --execution vectorized`. Multi-key and residual-`ON` joins execute on every path (Week 27)
 - No subqueries or correlated expressions
+- A NaN is its own `GROUP BY` / `DISTINCT` group (both signs together), and matches nothing in a join. SQLite has neither case: it converts NaN to NULL on storage, so its NaNs land in the NULL group. Reachable only by writing `nan` into a CSV cell — no engine arithmetic produces one, since `x / 0` is NULL — and closing it means converting at load, which is a storage-layer decision noted for Week 29
 - DOUBLE keys — join, `GROUP BY` and `DISTINCT` alike — are compared exactly while results are *displayed* with `%.15g`, so two rows that legitimately fail to group together can print identical values. The alternative, comparing what is displayed, silently merges distinct doubles, which is the worse of the two. Stated here because Week 36's correctness report has to declare it alongside the `SUM` precision divergence below
 - `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
 - Commas inside string values not supported in CSV input
