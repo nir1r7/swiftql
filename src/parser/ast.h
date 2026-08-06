@@ -17,7 +17,8 @@ struct Expr {
 struct ColumnRef : Expr {
     std::string table_name;
     std::string column_name;
-    // Relation identity assigned by the Binder: 0 = FROM side, 1 = JOIN side,
+    // Relation identity assigned by the Binder: the range-table position —
+    // 0 = FROM, then one per JOIN in written order (joins[i] -> i+1);
     // -1 = unresolved. Distinguishes self-join occurrences (l1 vs l2) that
     // share a canonical table_name. Evaluation resolves by (slot, name) when
     // slot >= 0, falling back to bare name otherwise.
@@ -128,7 +129,7 @@ struct OrderByItem {
 struct GroupByColumn {
     std::string table_name;   // as typed; empty if unqualified
     std::string column_name;
-    int relation_slot = -1;   // 0 = FROM, 1 = JOIN; -1 = unresolved
+    int relation_slot = -1;   // range-table position (0 = FROM); -1 = unresolved
     // non-null for expression grouping (GROUP BY season - 1): the group key
     // is evaluate(expr) per row instead of a column read. shared_ptr (not
     // unique_ptr) keeps the struct copyable — planner/test sites copy

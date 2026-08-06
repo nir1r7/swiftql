@@ -833,6 +833,33 @@ Four things the two bullets did not anticipate:
 
 **Checkpoint:** Three-or-more-table joins execute correctly.
 
+> **Starting notes, from Week 26's foundations.**
+> - **Two guards must come down together with the lowering work**, and they are
+>   the only reason a wrong multi-way answer is impossible today:
+>   `checkLowerable` in `vectorized_plan_builder.cc` (join count, then key count
+>   — that order is load-bearing, so both engines report the same reason) and the
+>   `stmt.joins.size() > 1` / `keys.size() != 1` pair in `Planner::plan`. Volcano
+>   has no multi-way execution planned: keep its refusal and narrow the message,
+>   rather than deleting it and letting `HashJoinNode` produce something.
+> - **De-duplicate join keys before building the hash-key tuple.**
+>   `ON a.x = b.x AND a.x = b.x` yields two identical `JoinKey`s today. Harmless
+>   while multi-key refuses, and semantically harmless as a predicate, but it
+>   makes the probe tuple wider than it needs to be and it already double-counts
+>   in `CardinalityEstimator`'s NDV product.
+> - **`Validator::validateJoinCondition` (site 18) goes live here.** Its Week 25
+>   branches and its `AggregateExpr` branch are pre-positions: today
+>   `classifyJoinCondition` refuses those shapes first, so nothing exercises
+>   them. The moment non-equality `ON` conjuncts become legal residuals, that
+>   function is their only column-existence check — write the tests with it.
+> - **`keys[k].from_col` resolves against `children[0]`, whose merged schema can
+>   hold the same column name at several slots.** `JoinKey::from_slot` carries
+>   the binder slot for exactly this reason; use `Schema::indexOf(name, slot)`
+>   when locating the probe column, not the bare-name overload, or a join on
+>   `team` across three relations binds to whichever side comes first.
+> - `--explain` of a multi-way join currently errors instead of printing the
+>   logical section, because `main.cc` lowers before it prints the captured
+>   sections. Lifting the guard fixes it for free; no reordering needed.
+
 ### Week 28 — Join Enumeration
 
 - Add left-deep dynamic-programming join ordering with a configurable limit

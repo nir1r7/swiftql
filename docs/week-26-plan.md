@@ -469,11 +469,13 @@ std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot
                 "JOIN ON: condition must compare a column from each joined table; "
                 "both sides reference '" + lc->table_name + "'");
         }
-        if (rc->relation_slot == right_slot) {
-            keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
-        } else if (lc->relation_slot == right_slot) {
-            keys.push_back({rc->column_name, lc->column_name, rc->relation_slot});
-        } else {
+        // BOTH halves of the rule, or the same forward reference is accepted or
+        // rejected purely on operand order.
+        const ColumnRef* joined_ref;   // the side in relation `right_slot`
+        const ColumnRef* left_ref;     // the side that must already be joined
+        if (rc->relation_slot == right_slot)      { joined_ref = rc; left_ref = lc; }
+        else if (lc->relation_slot == right_slot) { joined_ref = lc; left_ref = rc; }
+        else {
             // Neither side is the relation being joined in: with two relations
             // this was unreachable, with three it is a forward reference
             // (ON a.x = c.x before c is joined) or a stale join.
@@ -482,6 +484,18 @@ std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot
                 + lc->table_name + "." + lc->column_name + " = " + rc->table_name + "."
                 + rc->column_name + "' does not");
         }
+        if (left_ref->relation_slot > right_slot) {
+            // Half two. keys[k].from_col is DEFINED to resolve against
+            // children[0], so accepting a reference to a later relation rewires
+            // the key to whatever column of that name the left tree has — and
+            // explain() renders a plan indistinguishable from the correct one.
+            throw std::runtime_error(
+                "JOIN ON: '" + left_ref->table_name + "." + left_ref->column_name
+                + "' references a table that is joined later; a condition may only "
+                  "reference the table being joined and tables already joined");
+        }
+        keys.push_back({left_ref->column_name, joined_ref->column_name,
+                        left_ref->relation_slot});
     }
     return keys;
 }
@@ -644,12 +658,18 @@ void Validator::validateJoinCondition(
 ```cpp
 // src/planner/validator.cc — Validator::validate, the JOIN block
     if (!stmt.joins.empty()) {
-        std::vector<std::pair<std::string, const Schema*>> relations{{stmt.from_table, &schema}};
+        // Keyed by REF NAME (alias when there is one), mirroring the Binder's
+        // range table. Keying by table name makes every aliased qualifier fall
+        // through validateJoinCondition's unknown-qualifier escape, so its
+        // column check does nothing for exactly the shapes Week 26 adds.
+        std::vector<std::pair<std::string, const Schema*>> relations{
+            {stmt.from_alias.empty() ? stmt.from_table : stmt.from_alias, &schema}};
         for (const auto& j : stmt.joins) {
             if (!catalog.hasTable(j.join_table)) {
                 throw std::runtime_error("Join table not found: '" + j.join_table + "'");
             }
-            relations.push_back({j.join_table, &catalog.getTable(j.join_table).schema});
+            relations.push_back({j.alias.empty() ? j.join_table : j.alias,
+                                 &catalog.getTable(j.join_table).schema});
         }
         for (size_t i = 0; i < stmt.joins.size(); ++i) {
             if (!stmt.joins[i].condition) continue;
@@ -839,15 +859,22 @@ std::string LogicalJoin::explain() const {
 // src/planner/cardinality_estimator.cc — JOIN case, kept in lockstep with the merge above
             // one NDV per key; independent-key assumption, same shape as the
             // single-key formula it generalizes
+            // Track "did any key contribute an NDV" SEPARATELY from the
+            // product. An NDV of 1 is a usable statistic (every left row
+            // matches every right row, so l*r/1 is exact) but leaves the
+            // divisor at 1.0 — testing `divisor > 1.0` sends it to the
+            // no-statistics fallback and underestimates a constant-key join by
+            // the table size.
             double divisor = 1.0;
+            bool have_ndv = false;
             for (const JoinKey& k : join.keys) {
                 const ColumnStatsEntry* lk = left.find(k.from_col, k.from_slot);
                 const ColumnStatsEntry* rk = right.find(k.join_col, -1);
                 int64_t ndv = std::max(lk ? lk->stats->distinct_count : int64_t(0),
                                        rk ? rk->stats->distinct_count : int64_t(0));
-                if (ndv > 0) divisor *= static_cast<double>(ndv);
+                if (ndv > 0) { divisor *= static_cast<double>(ndv); have_ndv = true; }
             }
-            node.estimated_rows = (divisor > 1.0) ? (l * r) / divisor : std::max(l, r);
+            node.estimated_rows = have_ndv ? (l * r) / divisor : std::max(l, r);
             ...
             StatsContext out = std::move(left);
             for (ColumnStatsEntry e : right.entries) {
@@ -1108,19 +1135,32 @@ the guard: `VectorizedPlanBuilder::build` and `Planner::plan` (row/Volcano).
 // this builder still lowers exactly one single-key equi-join. Refuse loudly
 // rather than lower a shape VecHashJoinNode cannot express — the Phase 1
 // stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
-void checkLowerable(const LogicalPlanNode* node, int& joins_seen) {
-    if (node->type == LogicalNodeType::JOIN) {
-        const auto* join = static_cast<const LogicalJoin*>(node);
-        if (join->keys.size() != 1) {
-            throw std::runtime_error(
-                "multi-key equi-joins are planned but not yet executable (Week 27)");
-        }
-        if (++joins_seen > 1) {
-            throw std::runtime_error(
-                "multi-way joins are planned but not yet executable (Week 27)");
-        }
+// Two walks, join count first — the same order Planner::plan checks in. A query
+// that is both multi-way and multi-key must report the same reason in every
+// mode; interleaving the checks in one preorder walk made the vec path answer
+// "multi-key" where Volcano answered "multi-way".
+void countJoins(const LogicalPlanNode* node, int& joins_seen) {
+    if (node->type == LogicalNodeType::JOIN) ++joins_seen;
+    for (const auto& child : node->children) countJoins(child.get(), joins_seen);
+}
+
+void checkKeyCounts(const LogicalPlanNode* node) {
+    if (node->type == LogicalNodeType::JOIN &&
+        static_cast<const LogicalJoin*>(node)->keys.size() != 1) {
+        throw std::runtime_error(
+            "multi-key equi-joins are planned but not yet executable (Week 27)");
     }
-    for (const auto& child : node->children) checkLowerable(child.get(), joins_seen);
+    for (const auto& child : node->children) checkKeyCounts(child.get());
+}
+
+void checkLowerable(const LogicalPlanNode* root) {
+    int joins_seen = 0;
+    countJoins(root, joins_seen);
+    if (joins_seen > 1) {
+        throw std::runtime_error(
+            "multi-way joins are planned but not yet executable (Week 27)");
+    }
+    checkKeyCounts(root);
 }
 ```
 
@@ -1246,6 +1286,24 @@ Then three CLI smoke checks:
 ./build/swiftql --catalog catalog.json --query \
   "SELECT a.id FROM sj a JOIN sj b ON a.grp < b.id"   # -> "non-equality"
 ```
+
+### Corrections from the round-1 audit
+
+Four things below were wrong in this plan as first written; the code and the
+snippets above now carry the fixed form. Recorded because the failure mode is
+identical in each: a rule stated in prose but only half-checked in code.
+
+| Was | Why it was wrong |
+|---|---|
+| `classifyJoinCondition` checked only "one side is the relation being joined" | The rule has two halves. Without the second (`the other operand's slot < right_slot`), the *same* forward reference is rejected on the right operand and accepted on the left — and an accepted one rewires `keys[0].from_col` to a column of the left tree, producing a wrong join tree that `explain()` renders identically to a correct one. The borrowed name need not even exist in that relation |
+| `divisor > 1.0` in the estimator | An NDV of 1 is a usable statistic, not a missing one. It fell to the `max(l, r)` fallback and underestimated a constant-key join by the table size, on the *single-key* path this task called behaviour-preserving. Track `have_ndv` separately |
+| One preorder walk in `checkLowerable` | A query that is both multi-way and multi-key reported different reasons on the two engines, breaking the "same text in every mode" rule this plan states two tasks earlier. Count joins first, keys second |
+| `relations` keyed by table name | Every aliased qualified `ON` reference fell through the unknown-qualifier escape, so site 18 checked nothing for exactly the shapes Week 26 adds. Key by ref name |
+
+The lesson for later weeks: when a task's prose states a conjunction, write one
+test per conjunct, and write the operand-swapped form of every asymmetric rule.
+`JoinOnValidation.KeysNormalizeOperandOrder` existed *because* operand order is
+not trusted — and the forward-reference test was still written one way only.
 
 ### Definition of done
 

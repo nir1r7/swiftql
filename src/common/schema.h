@@ -13,10 +13,11 @@ using Row = std::vector<Value>;
 struct ColumnDef {
     std::string name;
     TypeId type;
-    // Relation identity: 0 = FROM side (default, so all single-relation schemas
-    // are slot 0 automatically), 1 = JOIN side. Stamped on the merged join
-    // schema so qualified column references resolve to the correct side even
-    // when both sides share a column name (incl. self-joins).
+    // Relation identity: the query's range-table position — 0 = FROM (the
+    // default, so all single-relation schemas are slot 0 automatically), then
+    // one slot per JOIN in written order (joins[i] -> i+1). Stamped on the
+    // merged join schema so qualified column references resolve to the correct
+    // relation even when several share a column name (incl. self-joins).
     int relation_slot = 0;
     // true for aggregate outputs referenced only in HAVING/ORDER BY: they are
     // computed and flow through Filter/Sort, but SELECT * synthesis skips them
