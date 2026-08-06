@@ -379,3 +379,92 @@ TEST(PlannerTest, ResidualOnConjunctReachesTheFromScanAsAPruningHint) {
     EXPECT_NE(scan->explain().find("chunks_skipped=1/1"), std::string::npos)
         << scan->explain();
 }
+
+// ===== Week 29: outer joins, and the join-key type check =====
+
+// A join key is compared as TEXT, which carries no type tag: a STRING "7" matches
+// an INT 7 while "007" does not, and the identical predicate in a WHERE clause
+// throws Type mismatch. Half a match, with no error either way. Deferred out of
+// Week 27 because it adds a REJECTION path; landed here because an outer join
+// returns the unmatched half as null-extended rows, which look like data.
+// Validator runs on both engines, so this one check covers all four modes.
+TEST(ValidatorTest, JoinKeyMixingStringAndNumericIsRejected) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT laps.team FROM laps JOIN drivers ON drivers.team = laps.lap_id");
+    auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
+    EXPECT_THROW(Validator::validate(stmt, catalog), std::runtime_error);
+}
+
+// INT vs DOUBLE must stay legal: keyFieldText deliberately makes 7.0 and 7 join,
+// which is SQLite's numeric affinity and is pinned by the Week 27 encoding tests.
+TEST(ValidatorTest, JoinKeyMixingIntAndDoubleIsAccepted) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT laps.team FROM laps JOIN drivers ON laps.speed = drivers.age");
+    auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
+    EXPECT_NO_THROW(Validator::validate(stmt, catalog));
+}
+
+TEST(PlannerTest, BuildsLeftOuterJoinPlan) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlan(
+        "SELECT drivers.name FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id",
+        catalog);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(planSpine(plan.get()),
+              (std::vector<std::string>{"Project", "LeftHashJoin", "SeqScan"}));
+}
+
+// The preserved side must probe, so the build-side swap Week 22 makes for an
+// inner join is skipped entirely — drivers (the smaller table) stays on the
+// probe side even though the row-count heuristic would swap it.
+TEST(PlannerTest, LeftOuterJoinNeverSwapsTheBuildSide) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto outer = bindAndPlan(
+        "SELECT drivers.name FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id",
+        catalog);
+    auto inner = bindAndPlan(
+        "SELECT drivers.name FROM drivers JOIN laps ON drivers.driver_id = laps.driver_id",
+        catalog);
+    // the inner join swaps (drivers is smaller, so it builds); the outer one must
+    // not, or the null-extended rows would carry NULLs in the preserved columns
+    const PlanNode* outer_join = outer->children()[0];
+    const PlanNode* inner_join = inner->children()[0];
+    ASSERT_NE(outer_join, nullptr);
+    ASSERT_NE(inner_join, nullptr);
+    // children()[0] of a swapped join is the JOIN-side scan; of an unswapped one,
+    // the FROM-side scan. Reading the scanned table names apart is the observable
+    // difference without exposing swapped_.
+    EXPECT_NE(outer_join->children()[0]->explain(), inner_join->children()[0]->explain());
+}
+
+// An outer join's ON residual must not be folded into the WHERE conjunction:
+// for a LEFT join those are different queries. It stays on the join node, which
+// prints it.
+TEST(PlannerTest, LeftOuterJoinKeepsItsOnResidualOnTheJoin) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlan(
+        "SELECT drivers.name FROM drivers LEFT JOIN laps "
+        "ON drivers.driver_id = laps.driver_id AND laps.speed > 340", catalog);
+    const PlanNode* join = plan->children()[0];
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(join->explain().find("residual="), std::string::npos) << join->explain();
+    // and no Filter node was synthesized above the join for it
+    EXPECT_EQ(planSpine(plan.get()),
+              (std::vector<std::string>{"Project", "LeftHashJoin", "SeqScan"}));
+}
+
+// Volcano still builds exactly one join, so a three-relation query is refused for
+// the pre-existing Week 27 reason whether or not one of its joins is outer —
+// there is no second refusal, and the message still names the capable path.
+TEST(PlannerTest, MultiWayOuterJoinKeepsTheExistingVolcanoRefusal) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+                    "LEFT JOIN drivers d2 ON d.team = d2.team", catalog);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("Volcano path"), std::string::npos);
+    }
+}

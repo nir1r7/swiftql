@@ -62,9 +62,12 @@ static std::vector<Row> drainVec(VecPlanNode& node) {
             Row row;
             row.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
-                std::visit([&](const auto& vec) {
-                    row.push_back(Value(vec[r]));
-                }, cv.data);
+                // valueAt, never the typed vector directly: a raw read bypasses
+                // the validity mask and turns a SQL NULL into the placeholder
+                // underneath it (vec_types.h). Harmless until Week 29, since
+                // nothing on this path manufactured a NULL — an outer join does,
+                // and this loop claims to mirror main.cc, which reads NULL-aware.
+                row.push_back(valueAt(cv, r));
             }
             rows.push_back(std::move(row));
         }
@@ -299,10 +302,12 @@ static std::unique_ptr<VecPlanNode> buildVecOptimized(const std::string& sql, co
 }
 
 // Descend children()[0] to the join node (either physical join operator —
-// Week 23.5 added VecSimdLoopJoin alongside VecHashJoin).
+// Week 23.5 added VecSimdLoopJoin alongside VecHashJoin, Week 29
+// VecLeftHashJoin).
 static bool isJoinNode(const VecPlanNode* n) {
     const std::string e = n->explain();
-    return e.rfind("VecHashJoin", 0) == 0 || e.rfind("VecSimdLoopJoin", 0) == 0;
+    return e.rfind("VecHashJoin", 0) == 0 || e.rfind("VecSimdLoopJoin", 0) == 0
+        || e.rfind("VecLeftHashJoin", 0) == 0;
 }
 
 static const VecPlanNode* findJoin(const VecPlanNode* root) {
@@ -1011,4 +1016,66 @@ TEST(VecPlanBuilder, PruningHintIsWithheldWhenTheLeftmostRelationIsNotSlotZero) 
     // this scan's table and the hint must not reach it
     EXPECT_EQ(lapsScanExplain(cat, /*leftmost_slot=*/2).find("pruning"),
               std::string::npos);
+}
+
+// ===== Week 29: outer-join lowering =====
+
+// The SIMD loop join is an INNER equi-join — its probe loop emits matches and has
+// no unmatched path — so an outer join must never select it, even in the exact
+// configuration that selects it for an inner join. An ineligible algorithm is not
+// a fallback; the hash join is always correct.
+TEST(VecPlanBuilder, OuterJoinNeverSelectsTheSimdLoopJoin) {
+    Catalog cat(CATALOG);
+    seedSimdStats(cat);
+    auto inner = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300", cat);
+    ASSERT_NE(findJoin(inner.get()), nullptr);
+    ASSERT_EQ(findJoin(inner.get())->explain().rfind("VecSimdLoopJoin", 0), 0u);
+
+    auto outer = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps LEFT JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id WHERE laps.speed > 300", cat);
+    const VecPlanNode* join = findJoin(outer.get());
+    ASSERT_NE(join, nullptr);
+    const std::string e = join->explain();
+    EXPECT_EQ(e.rfind("VecLeftHashJoin", 0), 0u) << e;
+    EXPECT_EQ(e.find("algo="), std::string::npos) << e;   // no algorithm choice was made
+}
+
+// The build side is forced, not costed, so explain() must not print an (alt=)
+// that was never an option — the same rule that keeps cost= off --no-optimize.
+TEST(VecPlanBuilder, OuterJoinReportsAForcedBuildSide) {
+    Catalog cat(CATALOG);
+    seedSimdStats(cat);
+    auto plan = buildVecOptimized(
+        "SELECT laps.lap_id, drivers.name FROM laps LEFT JOIN drivers "
+        "ON laps.driver_id = drivers.driver_id", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    const std::string e = join->explain();
+    EXPECT_NE(e.find("build=drivers"), std::string::npos) << e;
+    EXPECT_NE(e.find("outer: the preserved side must probe"), std::string::npos) << e;
+    EXPECT_EQ(e.find("(alt="), std::string::npos) << e;
+}
+
+// The residual travels from LogicalJoin::on_residual into the operator, and the
+// rows prove it filters the match test rather than the result: every preserved
+// row survives.
+TEST(VecPlanBuilder, OuterJoinCarriesItsOnResidualIntoTheOperator) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT drivers.driver_id, laps.lap_id FROM drivers LEFT JOIN laps "
+        "ON drivers.driver_id = laps.driver_id AND laps.speed > 100000", cat);
+    const VecPlanNode* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_NE(join->explain().find("residual="), std::string::npos) << join->explain();
+
+    auto rows = drainVec(*plan);
+    // no lap can pass speed > 100000, so every driver comes back null-extended
+    Catalog cat2(CATALOG);
+    const auto& dm = cat2.getTable("drivers");
+    const size_t drivers_rows = CSVLoader::load(dm.filepath, dm.schema).size();
+    ASSERT_EQ(rows.size(), drivers_rows);
+    for (const Row& r : rows) EXPECT_TRUE(r[1].isNull());
 }

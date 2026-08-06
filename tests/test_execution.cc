@@ -554,6 +554,167 @@ TEST(HashJoinNode, EmptyProbeSide) {
     EXPECT_TRUE(drainAll(&join).empty());
 }
 
+// ===== Left outer join on the Volcano baseline, Week 29 =====
+//
+// Volcano is the correctness baseline (invariant 6), and an outer join is the
+// first feature whose whole risk is NULL semantics — so it must produce the same
+// rows as the vectorized operator rather than refuse. The iterator has one extra
+// fact to carry across next() calls: whether the current probe row matched.
+
+TEST(HashJoinNode, LeftOuterEmitsUnmatchedProbeRowsNullExtended) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bname", TypeId::STRING}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bname", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(3))}};
+    std::vector<Row> right_rows = {{Value(int64_t(2)), Value(std::string("two"))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged,
+        /*swapped=*/false, /*left_outer=*/true);
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_TRUE(rows[0][1].isNull());
+    EXPECT_TRUE(rows[0][2].isNull());
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_EQ(rows[1][2].asString(), "two");
+    EXPECT_EQ(rows[2][0].asInt(), 3);
+    EXPECT_TRUE(rows[2][1].isNull());
+}
+
+TEST(HashJoinNode, LeftOuterWithEmptyBuildSideEmitsEveryProbeRow) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+
+    std::vector<Row> left_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+
+    HashJoinNode join(
+        makeScan(left_rows, left_schema),
+        makeScan({},        right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged,
+        /*swapped=*/false, /*left_outer=*/true);
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_TRUE(rows[0][1].isNull());
+    EXPECT_TRUE(rows[1][1].isNull());
+}
+
+// A matched probe row must not ALSO be null-extended, and a multi-match row
+// emits one output per match — probe_matched_ has to survive across the next()
+// calls that drain the bucket.
+TEST(HashJoinNode, LeftOuterDoesNotNullExtendMatchedRows) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1))}, {Value(int64_t(9))}};
+    std::vector<Row> right_rows = {
+        {Value(int64_t(1)), Value(std::string("x"))},
+        {Value(int64_t(1)), Value(std::string("y"))},
+    };
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged,
+        /*swapped=*/false, /*left_outer=*/true);
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 3u);
+    int nulls = 0;
+    for (const Row& r : rows) if (r[1].isNull()) ++nulls;
+    EXPECT_EQ(nulls, 1);
+}
+
+// A NULL key member is unmatchable — and for a LEFT join that is precisely the
+// row that must still be emitted. Reachable here because Volcano's rows are built
+// in memory; CSV cannot express a NULL (invariant 14).
+TEST(HashJoinNode, LeftOuterEmitsAProbeRowWhoseKeyIsNull) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
+                                      {"bid", TypeId::INT}});
+
+    std::vector<Row> left_rows = {
+        {Value(int64_t(1)), Value(std::string("one"))},
+        {Value::null(),     Value(std::string("none"))},
+    };
+    std::vector<Row> right_rows = {{Value(int64_t(1))}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged,
+        /*swapped=*/false, /*left_outer=*/true);
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[1][1].asString(), "none");
+    EXPECT_TRUE(rows[1][2].isNull());
+
+    // the same input as an INNER join drops it — the behaviours are genuinely
+    // different, not an artifact of this fixture
+    HashJoinNode inner(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged);
+    EXPECT_EQ(drainAll(&inner).size(), 1u);
+}
+
+// An ON residual filters the MATCH TEST: a candidate that fails it is not a
+// match, so a probe row whose every candidate fails is null-extended rather than
+// dropped. Get this wrong and the row vanishes — neither joined nor preserved.
+TEST(HashJoinNode, LeftOuterOnResidualNullExtendsRatherThanDropping) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}, {"bage", TypeId::INT}});
+    Schema merged       = makeSchema({{"pid", TypeId::INT},
+                                      {"bid", TypeId::INT}, {"bage", TypeId::INT}});
+
+    std::vector<Row> left_rows  = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+    std::vector<Row> right_rows = {
+        {Value(int64_t(1)), Value(int64_t(10))},   // fails bage > 50
+        {Value(int64_t(2)), Value(int64_t(99))},   // passes
+    };
+
+    auto residual = makeBinary(">", colRef("bage"), lit(Value(int64_t(50))));
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"}, merged,
+        /*swapped=*/false, /*left_outer=*/true, std::move(residual));
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_TRUE(rows[0][1].isNull());
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_EQ(rows[1][2].asInt(), 99);
+}
+
+// The preserved side must be the probe input: with swapped_ the build block is
+// the LEFT half of the output row, so a null-extended row would null the
+// preserved side's own columns. Planner::plan forces the side, so this is the
+// shape of a planner bug and must be loud.
+TEST(HashJoinNode, LeftOuterRefusesToBuildFromThePreservedSide) {
+    Schema left_schema  = makeSchema({{"pid", TypeId::INT}});
+    Schema right_schema = makeSchema({{"bid", TypeId::INT}});
+    Schema merged       = makeSchema({{"bid", TypeId::INT}, {"pid", TypeId::INT}});
+    EXPECT_THROW(
+        HashJoinNode(makeScan({}, left_schema), makeScan({}, right_schema),
+                     std::vector<std::string>{"pid"}, std::vector<std::string>{"bid"},
+                     merged, /*swapped=*/true, /*left_outer=*/true),
+        std::runtime_error);
+}
+
 // ===== Composite (multi-key) join keys, Week 27 =====
 
 TEST(HashJoinNode, MultiKeyRequiresEveryKeyToMatch) {

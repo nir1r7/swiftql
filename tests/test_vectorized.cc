@@ -2294,6 +2294,220 @@ TEST(VecHashJoin, KeyByName) {
     EXPECT_EQ(rows[1][1].asInt(), 2);
 }
 
+// ============================================================
+// VecLeftHashJoin (Week 29) — the null-extended row IS the feature.
+// A LEFT JOIN that quietly behaves as an INNER JOIN passes every test above,
+// because every one of them only inspects matched rows.
+// ============================================================
+
+// A chunk source that can carry a SQL NULL. ColumnarTable cannot express one
+// (invariant 14), so makeScan cannot build a probe row with a NULL join key —
+// and that row is exactly the outer-join case the engine must still emit. Built
+// through appendColumnValue so the validity mask is set the same way every
+// operator sets it.
+namespace {
+class NullableSourceNode : public VecPlanNode {
+public:
+    NullableSourceNode(Schema schema, std::vector<Row> rows)
+        : schema_(std::move(schema)), rows_(std::move(rows)) {}
+    void open() override { emitted_ = false; }
+    DataChunk* nextChunk() override {
+        if (emitted_) return nullptr;
+        emitted_ = true;
+        chunk_.columns.clear();
+        chunk_.num_rows = static_cast<int>(rows_.size());
+        chunk_.filter_applied = false;
+        chunk_.sel.indices.clear();
+        chunk_.sel.size = 0;
+        for (int c = 0; c < schema_.size(); ++c) {
+            ColumnVector cv = makeColumnVector(schema_.column(c).type);
+            for (const Row& r : rows_) appendColumnValue(cv, r[c]);
+            chunk_.columns.push_back(std::move(cv));
+        }
+        return &chunk_;
+    }
+    void close() override {}
+    const Schema& outputSchema() const override { return schema_; }
+    std::string explain() const override { return "NullableSource"; }
+    std::vector<VecPlanNode*> children() const override { return {}; }
+private:
+    Schema schema_;
+    std::vector<Row> rows_;
+    DataChunk chunk_;
+    bool emitted_ = false;
+};
+}  // namespace
+
+TEST(VecLeftHashJoin, UnmatchedProbeRowIsEmittedNullExtended) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
+                                     {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    std::vector<Row> probe_rows = {
+        {Value(int64_t(1)), Value(std::string("p1"))},
+        {Value(int64_t(2)), Value(std::string("p2"))},   // no build row
+        {Value(int64_t(3)), Value(std::string("p3"))},
+    };
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(std::string("b1"))},
+        {Value(int64_t(3)), Value(std::string("b3"))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{probe_schema.indexOf("pid")}, std::vector<int>{build_schema.indexOf("bid")},
+        out_schema, /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 3u);
+    // the preserved half is intact on every row, in probe order
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_EQ(rows[2][0].asInt(), 3);
+    // and the unmatched row's build block is a REAL null, not a placeholder 0/""
+    EXPECT_FALSE(rows[0][2].isNull());
+    EXPECT_TRUE(rows[1][2].isNull());
+    EXPECT_TRUE(rows[1][3].isNull());
+    EXPECT_FALSE(rows[2][2].isNull());
+}
+
+// An empty build side is the degenerate form of the same case: every probe row
+// survives. Under an inner join this returns nothing (VecHashJoin.EmptyBuildSide).
+TEST(VecLeftHashJoin, EmptyBuildSideEmitsEveryProbeRow) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+    std::vector<Row> build_rows;
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        out_schema, /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_TRUE(rows[0][1].isNull());
+    EXPECT_TRUE(rows[1][1].isNull());
+}
+
+// A matched probe row must NOT also produce a null-extended row, and a row with
+// several matches produces one output per match — the two ways an over-eager
+// emit shows up.
+TEST(VecLeftHashJoin, MatchedRowsAreNotAlsoNullExtended) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT},
+                                     {"bid", TypeId::INT}, {"bval", TypeId::STRING}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(9))}};
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(std::string("x"))},
+        {Value(int64_t(1)), Value(std::string("y"))},
+    };
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        out_schema, /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 3u);   // 2 matches for pid=1, 1 null-extended for pid=9
+    int nulls = 0;
+    for (const Row& r : rows) if (r[1].isNull()) ++nulls;
+    EXPECT_EQ(nulls, 1);
+}
+
+// THE regression. A NULL key member is unmatchable — SQL's NULL equals nothing —
+// and Week 27's probe loop therefore skipped the row. For a LEFT join "matches
+// nothing" is precisely the row that must be emitted, so the skip is a silently
+// dropped row. Only reachable through a chunk built by hand: ColumnarTable has no
+// NULL (invariant 14).
+TEST(VecLeftHashJoin, NullProbeKeyIsUnmatchableButStillEmitted) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"pval", TypeId::STRING},
+                                     {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {
+        {Value(int64_t(1)),  Value(std::string("p1"))},
+        {Value::null(),      Value(std::string("pnull"))},
+    };
+    std::vector<Row> build_rows = {{Value(int64_t(1))}};
+    auto join = std::make_unique<VecHashJoinNode>(
+        std::make_unique<NullableSourceNode>(probe_schema, probe_rows),
+        makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        out_schema, /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[1][1].asString(), "pnull");
+    EXPECT_TRUE(rows[1][0].isNull());   // the key itself
+    EXPECT_TRUE(rows[1][2].isNull());   // and it matched nothing
+
+    // the same input as an INNER join drops it, which is what makes the two
+    // behaviours distinguishable rather than a coincidence of this fixture
+    auto inner = std::make_unique<VecHashJoinNode>(
+        std::make_unique<NullableSourceNode>(probe_schema, probe_rows),
+        makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    EXPECT_EQ(drainRows(*inner).size(), 1u);
+}
+
+// An ON residual filters the MATCH TEST: a candidate that fails it is not a
+// match, so if it was the only candidate the probe row is null-extended rather
+// than dropped. Getting this wrong makes the row vanish entirely — neither
+// joined nor preserved.
+TEST(VecLeftHashJoin, OnResidualRejectingEveryCandidateNullExtends) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"bage", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT},
+                                     {"bid", TypeId::INT}, {"bage", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))}};
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(int64_t(10))},   // fails bage > 50
+        {Value(int64_t(2)), Value(int64_t(99))},   // passes
+    };
+    auto residual = std::make_unique<BinaryExpr>();
+    residual->op = ">";
+    residual->left = col("bage");
+    residual->right = std::make_unique<Literal>(Value(int64_t(50)));
+
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        out_schema, /*swapped=*/false, /*left_outer=*/true, std::move(residual));
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_TRUE(rows[0][1].isNull());    // candidate rejected -> preserved, not joined
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_EQ(rows[1][2].asInt(), 99);
+}
+
+// The preserved side MUST be the probe input: with swapped_ the build block is
+// the LEFT half of the output row, so a null-extended row would null the
+// preserved side's own columns and still look like data. VectorizedPlanBuilder
+// forces the side, so reaching this is a planner bug and must be loud.
+TEST(VecLeftHashJoin, RefusesToBuildFromThePreservedSide) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"bid", TypeId::INT}, {"pid", TypeId::INT}});
+    std::vector<Row> rows_a = {{Value(int64_t(1))}};
+    EXPECT_THROW(
+        VecHashJoinNode(makeScan(probe_schema, rows_a), makeScan(build_schema, rows_a),
+                        std::vector<int>{0}, std::vector<int>{0},
+                        out_schema, /*swapped=*/true, /*left_outer=*/true),
+        std::runtime_error);
+}
+
+TEST(VecLeftHashJoin, ExplainNamesTheJoinType) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> rows_a = {{Value(int64_t(1))}};
+    VecHashJoinNode outer(makeScan(probe_schema, rows_a), makeScan(build_schema, rows_a),
+                          std::vector<int>{0}, std::vector<int>{0},
+                          out_schema, false, /*left_outer=*/true);
+    EXPECT_NE(outer.explain().find("VecLeftHashJoin"), std::string::npos);
+    // and an inner join's string is byte-identical to what it has always been
+    VecHashJoinNode inner(makeScan(probe_schema, rows_a), makeScan(build_schema, rows_a),
+                          std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    EXPECT_EQ(inner.explain(), "VecHashJoin [pid = bid] (materialize)");
+}
+
 // T1: LIMIT exactly at one full chunk boundary — available == remaining, non-truncating path.
 TEST(VecLimit, LimitAtChunkBoundary) {
     std::vector<int64_t> vals(BATCH_SIZE);

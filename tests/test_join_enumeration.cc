@@ -556,9 +556,22 @@ TEST(JoinEnumeration, NeverInstallsAnOrderWorseThanTheWrittenOne) {
     };
     for (const std::string& sql : cases) {
         auto plan = optimize(sql, cat);
-        auto [chosen, written] = costs(decisionOf(plan.get()));
+        const std::string decision = decisionOf(plan.get());
+        auto [chosen, written] = costs(decision);
         ASSERT_GE(chosen, 0.0) << sql;
         EXPECT_LE(chosen, written) << sql;
+        // Week 29: `chosen <= written` alone is a TAUTOLOGY. reorder() clamps
+        // chosen_cost = min(chosen_cost, written_cost) two statements before it
+        // builds the string this parses, so the predicate holds by construction:
+        // reintroduce the Week 28 floor defect exactly and the DP again returns an
+        // order costed 666 against the written 629, reorder() silently downgrades
+        // to method=written-floor, prints cost=629 (written=629), and the
+        // assertion above still passes while the optimizer has stopped optimizing
+        // this shape. `method=dp` is the statement with content: the search did
+        // not need the bound. Both shipped tables carry full statistics, so the DP
+        // is exact here and this must hold on every case in the list.
+        EXPECT_NE(decision.find("method=dp"), std::string::npos)
+            << sql << "  decision: " << decision;
     }
 }
 
@@ -618,4 +631,94 @@ TEST(JoinEnumeration, UnboundJoinKeyIsRefusedRatherThanDropped) {
     const_cast<LogicalJoin*>(joins.front())->keys[0].from_slot = -1;
 
     EXPECT_THROW(JoinEnumeration::apply(std::move(plan), cat), std::runtime_error);
+}
+
+// ── the guards that had never executed ──────────────────────────────────────
+
+// Week 28 shipped `method=written-floor` untried: both shipped tables carry full
+// column statistics, so have_ndv is true for every key on every query this build
+// can run, so rows(S) is the pure product, so the DP is exact and
+// written_cost < chosen_cost cannot hold. The branch is reachable only from a
+// catalog with a stats-less table, which no fixture built. This one does — and it
+// exercises joinCardinality's non-multiplicative max(l, r) branch at the same
+// time, which is the exact condition the written-order bound exists to contain.
+static void seedStatsExcept(Catalog& cat, const std::string& skip) {
+    Catalog full(CATALOG);
+    seedStats(full);
+    for (const char* t : {"laps", "drivers"}) {
+        if (skip == t) continue;
+        cat.setStats(t, TableStats(full.getStats(t)));
+    }
+}
+
+TEST(JoinEnumeration, WrittenOrderBoundIsReachableWithoutStatistics) {
+    Catalog cat(CATALOG);
+    seedStatsExcept(cat, "drivers");   // drivers has no TableStats at all
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN drivers d2 ON d.team = d2.team", cat);
+    const std::string decision = decisionOf(plan.get());
+    ASSERT_FALSE(decision.empty());
+    auto [chosen, written] = costs(decision);
+    ASSERT_GE(chosen, 0.0);
+    // The bound must still hold with a non-multiplicative estimate in play, and
+    // method= must name whichever search actually produced the printed order.
+    // Asserted as a disjunction on purpose: which branch fires depends on the
+    // cost numbers, and pinning the wrong one is brittle without being stronger.
+    EXPECT_LE(chosen, written);
+    EXPECT_TRUE(decision.find("method=dp") != std::string::npos ||
+                decision.find("method=written-floor") != std::string::npos) << decision;
+    // and the tree still executes: every relation present, no cross product
+    EXPECT_EQ(chosenOrder(plan.get()).size(), 3u);
+}
+
+// ── Week 29: outer joins are never reordered ────────────────────────────────
+
+// R ⟕ S is not S ⟕ R and associativity fails, so an ordering that is sound for
+// inner joins is a WRONG ANSWER here rather than a bad plan. The pass declines
+// the whole tree, which --explain shows by printing no order= line at all: there
+// was no decision to report.
+TEST(JoinEnumeration, DeclinesAnyTreeContainingAnOuterJoin) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // the shape the search DOES reorder when all three joins are inner (it leads
+    // with drivers@1), so a decline is visible as a change of outcome
+    const std::string outer =
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "LEFT JOIN drivers d2 ON d.team = d2.team";
+    auto plan = optimize(outer, cat);
+    EXPECT_TRUE(decisionOf(plan.get()).empty());
+    // written order preserved: relation 0 stays at the bottom of the spine
+    EXPECT_EQ(chosenOrder(plan.get()), (std::vector<int>{0, 1, 2}));
+
+    // CONTROL: the all-inner version of the same shape must STILL be reordered.
+    // Without this, a containsOuterJoin that returns true too eagerly would turn
+    // off join ordering for the entire project and this file would not notice.
+    auto inner = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN drivers d2 ON d.team = d2.team", cat);
+    EXPECT_NE(decisionOf(inner.get()).find("method=dp"), std::string::npos);
+    EXPECT_NE(chosenOrder(inner.get()), (std::vector<int>{0, 1, 2}));
+}
+
+// The outer join's cardinality rule is stamped, never searched: max() is not
+// multiplicative, so letting the DP's transition function see it would make a
+// subset's row count depend on the path that reached it — the same defect that
+// moved the >=1-row floor out in Week 28.
+TEST(JoinEnumeration, OuterJoinEstimateIsFlooredAtThePreservedSide) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // drivers (20 rows) LEFT JOIN laps on team: NDV 10 both sides, so the inner
+    // estimate is 20*1000/10 = 2000, already above 20 — use the reverse direction
+    // for a case where the inner product is BELOW the preserved side's row count.
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.lap_id = d.driver_id", cat);
+    const LogicalJoin* j = topJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    // inner estimate is 1000*20/1000 = 20; the LEFT join must emit >= 1000
+    EXPECT_DOUBLE_EQ(j->estimated_rows, 1000.0);
+
+    auto inner_plan = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.lap_id = d.driver_id", cat);
+    EXPECT_DOUBLE_EQ(topJoin(inner_plan.get())->estimated_rows, 20.0);
 }

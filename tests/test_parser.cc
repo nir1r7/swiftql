@@ -172,6 +172,48 @@ TEST(ParserTest, MultipleJoinsFollowedByOtherClauses) {
     EXPECT_EQ(stmt.limit.value(), 2);
 }
 
+// Week 29. LEFT and OUTER are reserved TokenTypes rather than identifier text
+// (the way interval units are), because the bare-alias branch in parseSelect
+// would otherwise read `FROM laps LEFT JOIN ...` as the alias `LEFT`.
+TEST(ParserTest, LeftJoinIsAnOuterJoin) {
+    Parser p("SELECT team FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.joins.size(), 1u);
+    EXPECT_EQ(stmt.joins[0].join_table, "laps");
+    EXPECT_EQ(stmt.joins[0].type, JoinType::LEFT);
+}
+
+TEST(ParserTest, LeftOuterJoinIsTheSameJoin) {
+    Parser p("SELECT team FROM drivers d LEFT OUTER JOIN laps l ON d.driver_id = l.driver_id");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.joins.size(), 1u);
+    EXPECT_EQ(stmt.joins[0].alias, "l");
+    EXPECT_EQ(stmt.joins[0].type, JoinType::LEFT);
+}
+
+// A bare JOIN keeps meaning INNER, and the two kinds mix in one statement — the
+// join type is a property of the CLAUSE, not of the query.
+TEST(ParserTest, InnerAndOuterJoinsMixInOneStatement) {
+    Parser p("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id LEFT JOIN sj c ON b.grp = c.id");
+    auto stmt = p.parse();
+    ASSERT_EQ(stmt.joins.size(), 2u);
+    EXPECT_EQ(stmt.joins[0].type, JoinType::INNER);
+    EXPECT_EQ(stmt.joins[1].type, JoinType::LEFT);
+}
+
+// LEFT is not swallowed as the FROM table's alias — the reason it is a keyword.
+TEST(ParserTest, LeftIsNotReadAsATableAlias) {
+    Parser p("SELECT drivers.team FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id");
+    auto stmt = p.parse();
+    EXPECT_TRUE(stmt.from_alias.empty());
+    ASSERT_EQ(stmt.joins.size(), 1u);
+}
+
+TEST(ParserTest, LeftWithoutJoinIsSyntaxError) {
+    Parser p("SELECT team FROM drivers LEFT laps ON drivers.driver_id = laps.driver_id");
+    EXPECT_THROW(p.parse(), ParseError);
+}
+
 TEST(ParserTest, AndPrecedence) {
     Parser p("SELECT team FROM laps WHERE season = 2025 AND speed > 300");
     auto stmt = p.parse();

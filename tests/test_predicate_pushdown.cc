@@ -840,3 +840,68 @@ TEST(PredicatePushdown, WhereIsStillPushedWhenAResidualOnConjunctExists) {
         n = n->children.empty() ? nullptr : n->children[0].get();
     }
 }
+
+// ── Week 29: an outer join's null-supplying side is not pushable ─────────────
+
+// σ_p(R ⟕ S) is NOT σ_p(R) ⟕ σ_p(S). Filtering S first makes left rows that HAD
+// matches lose them, and the outer join then null-extends exactly the rows the
+// WHERE existed to remove — MORE rows, no error. The conjunct must stay above the
+// join, where three-valued logic drops the null-extended rows.
+TEST(PredicatePushdown, NullSupplyingSidePredicateIsNotPushedThroughALeftJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+        "WHERE l.season = 2025", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    // the null-supplying input is untouched
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::SCAN);
+    // and the conjunct is still above the join
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->children[0]->type, LogicalNodeType::JOIN);
+}
+
+// The preserved side keeps its pushdown: σ_p(R) ⟕ S ≡ σ_p(R ⟕ S), because
+// null-extension never touches R's columns and never invents an R row. Without
+// this control, a guard that declines both sides would look correct here and
+// silently cost every outer-join query its pushdown.
+TEST(PredicatePushdown, PreservedSidePredicateStillPushesThroughALeftJoin) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+        "WHERE d.age > 30", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(join->children[0]->children[0]->type, LogicalNodeType::SCAN);
+    // nothing left above the join
+    const LogicalPlanNode* n = plan.get();
+    while (n && n->type != LogicalNodeType::JOIN) {
+        EXPECT_NE(n->type, LogicalNodeType::FILTER);
+        n = n->children.empty() ? nullptr : n->children[0].get();
+    }
+}
+
+// A conjunct owned by a relation an INNER join adds still pushes when the outer
+// join is elsewhere in the tree: the test is re-applied per join on the way down,
+// not once for the whole tree.
+TEST(PredicatePushdown, InnerJoinBelowAnOuterJoinStillPushes) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "LEFT JOIN drivers d2 ON d.team = d2.team "
+        "WHERE d.age > 30 AND d2.age > 20", cat);
+
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    // d2 is null-supplied by the LEFT join: not pushed
+    EXPECT_EQ(top->children[1]->type, LogicalNodeType::SCAN);
+    // d is added by the inner join below: pushed onto its own scan
+    const LogicalPlanNode* inner = top->children[0].get();
+    ASSERT_EQ(inner->type, LogicalNodeType::JOIN);
+    EXPECT_EQ(inner->children[1]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(inner->children[1]->children[0]->type, LogicalNodeType::SCAN);
+}
