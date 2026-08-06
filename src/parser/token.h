@@ -14,6 +14,14 @@ enum class TokenType {
     BETWEEN, LIKE, IN,
     CASE, WHEN, THEN, ELSE, END,
 
+    // Week 29 outer joins. Reserved rather than matched as identifier text (the
+    // way interval units are) because Parser::parseSelect's bare-alias branch
+    // would otherwise read `FROM laps LEFT JOIN ...` as the alias `LEFT` and then
+    // fail at JOIN with a message about neither. Verified against catalog.json
+    // and the TPC-H column names: no collision. INNER is deliberately absent —
+    // nothing needs it, and it is one more identifier taken away.
+    LEFT, OUTER,
+
     // aggregate functions
     COUNT, SUM, AVG, MIN, MAX,
 

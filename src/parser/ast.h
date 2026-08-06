@@ -118,6 +118,15 @@ struct IntervalLiteral : Expr {
     Unit unit = Unit::DAY;
 };
 
+// Week 29. Per-JOIN-CLAUSE, not per-statement: a query may mix inner and outer
+// joins (A JOIN B ... LEFT JOIN C ...), and predicate pushdown and join
+// enumeration both have to ask the question one join at a time. INNER is the
+// default so every pre-existing brace-init and hand-built test tree keeps its
+// meaning. RIGHT/FULL are out of scope: a RIGHT join is not a flag flip, since
+// swapping the operands would change the merged schema's column order, which
+// invariant 1 forbids.
+enum class JoinType { INNER, LEFT };
+
 // one ORDER BY entry: an expression plus sort direction
 struct OrderByItem {
     std::unique_ptr<Expr> expr;
@@ -153,6 +162,10 @@ struct SelectStatement {
         std::string join_table;
         std::string alias; // empty if JOIN table has no alias
         std::unique_ptr<Expr> condition; // the ON expression
+        // Week 29. LAST field, so positional brace-inits that predate it stay
+        // valid — the same discipline AggregateSpec::argument and
+        // GroupByColumn::expr follow.
+        JoinType type = JoinType::INNER;
     };
     // Written order is load-bearing: joins[i] attaches relation slot i+1 to the
     // left-deep tree built from relations 0..i. That single identity is what the

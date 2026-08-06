@@ -151,8 +151,21 @@ SelectStatement Parser::parseSelect(){
     // The bare-alias branch needs no keyword exclusion list (unlike the FROM
     // alias above): JOIN / ON / WHERE / GROUP / ORDER / LIMIT / HAVING are all
     // their own TokenTypes, so check(IDENTIFIER) is already false for them.
-    while (match(TokenType::JOIN)){
+    //
+    // Week 29: `check`, not `match`, because the loop head now has two entry
+    // tokens. LEFT and JOIN are both TokenTypes of their own, so the bare-alias
+    // branch above already declines them and needs no new exclusion.
+    while (check(TokenType::JOIN) || check(TokenType::LEFT)){
         SelectStatement::JoinClause join;
+
+        if (match(TokenType::LEFT)) {
+            match(TokenType::OUTER);   // noise word, as in SQL: LEFT JOIN == LEFT OUTER JOIN
+            expect(TokenType::JOIN, "JOIN after LEFT [OUTER]");
+            join.type = JoinType::LEFT;
+        } else {
+            consume();                 // the JOIN token
+        }
+
         join.join_table = expect(TokenType::IDENTIFIER, "join table name").value;
 
         // optional join table alias (i.e, JOIN drivers d / JOIN drivers AS d)

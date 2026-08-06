@@ -194,6 +194,11 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     {"THEN",      TokenType::THEN},
     {"ELSE",      TokenType::ELSE},
     {"END",       TokenType::END},
+    // Week 29. Same rule as the Week 25 block above: verified against
+    // catalog.json and the TPC-H schema (whose columns are all prefixed) that
+    // neither name is a column.
+    {"LEFT",      TokenType::LEFT},
+    {"OUTER",     TokenType::OUTER},
     {"SUBSTRING", TokenType::SUBSTRING},
     {"FOR",       TokenType::FOR},
     {"DATE",      TokenType::DATE},
