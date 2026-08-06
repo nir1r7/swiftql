@@ -349,7 +349,20 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
 
     std::vector<uint32_t> adj(n, 0u);
     for (const Edge& e : edges) {
-        if (e.slot_a < 0 || e.slot_a >= n || e.slot_b < 0 || e.slot_b >= n) continue;
+        // An endpoint outside the range table can only be an unbound key
+        // (from_slot -1, join_condition.h's positional-routing path for callers
+        // that skip the Binder). Skipping it here while leaving it in `edges`
+        // would drop the key from the rebuilt tree entirely — a missing conjunct
+        // and therefore MORE rows if the join had another key, or a spurious
+        // "produced a cross product" throw if it did not, on a query that runs
+        // fine under --no-optimize. Unreachable from the CLI (Binder stamps every
+        // ref and Validator rejects any it leaves unresolved), so this is the
+        // shape of a planner bug: say so, like every other check in this file.
+        if (e.slot_a < 0 || e.slot_a >= n || e.slot_b < 0 || e.slot_b >= n) {
+            throw std::runtime_error(
+                "internal: join enumeration cannot reorder a tree with an unbound "
+                "join key (relation slot out of range)");
+        }
         adj[e.slot_a] |= 1u << e.slot_b;
         adj[e.slot_b] |= 1u << e.slot_a;
     }
@@ -358,27 +371,53 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     std::vector<int> order = use_dp ? enumerateDP(rels, edges, adj)
                                     : enumerateGreedy(rels, edges, adj);
 
+    // The written order is always legal and always in the search space, so it is
+    // both the fallback and the bound.
+    std::vector<int> written(n);
+    for (int r = 0; r < n; ++r) written[r] = r;
+
     // A search that could not cover every relation (only reachable from a
     // disconnected graph, which classifyJoinCondition makes impossible) falls
     // back to the written order rather than dropping a relation.
-    std::vector<int> written(n);
-    for (int r = 0; r < n; ++r) written[r] = r;
-    if (static_cast<int>(order.size()) != n) order = written;
+    bool searched = static_cast<int>(order.size()) == n;
+    if (!searched) order = written;
 
-    const double chosen_cost  = orderCost(order, rels, edges);
+    double chosen_cost = orderCost(order, rels, edges);
     const double written_cost = orderCost(written, rels, edges);
+
+    // Never install an order this cost model scores WORSE than the one the user
+    // wrote. The written order is inside the search space, so a sound search
+    // could not return something strictly worse — but soundness rests on
+    // rows(S) being path-independent, which joinCardinality's no-statistics
+    // max() branch breaks (and which the ≥1 floor broke until it moved to the
+    // stamping sites). Rather than trust every future estimate to keep that
+    // property, bound the outcome here: the search may only improve on the
+    // written order. This also makes the printed `cost=… (written=…)` pair
+    // self-consistent by construction, which is what makes it evidence rather
+    // than decoration.
+    bool kept_written = false;
+    if (written_cost < chosen_cost) {
+        order = written;
+        chosen_cost = written_cost;
+        kept_written = true;
+    }
 
     std::unique_ptr<LogicalPlanNode> root = rebuild(order, rels, edges);
 
     // The checkpoint surface. Costs are unitless (cost_model.h) — never append a
     // time unit. `written=` is the comparand that makes this a decision rather
-    // than a number.
+    // than a number, and `method=` must name what actually produced the printed
+    // order — reporting `dp` for an order the DP did not choose would make the
+    // one field a reader uses to trust the decision the one field that lies.
+    const char* method = !searched ? "written-fallback"
+                       : kept_written ? "written-floor"
+                       : use_dp ? "dp" : "greedy";
     std::ostringstream d;
     d << std::fixed << std::setprecision(0)
       << "order=" << renderOrder(order, rels)
       << " cost=" << chosen_cost
       << " (written=" << written_cost << ")"
-      << " method=" << (use_dp ? "dp" : "greedy");
+      << " method=" << method;
     static_cast<LogicalJoin*>(root.get())->order_decision = d.str();
     return root;
 }

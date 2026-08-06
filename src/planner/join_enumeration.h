@@ -18,7 +18,7 @@
 // invariant rightKeyIndices(), rowWidth()'s isSingleRelation() split and the
 // whole lowering path are written against.
 //
-// Two documented approximations, both deliberate:
+// Four documented approximations, all deliberate:
 //   1. The search costs the HASH join only, never the SIMD loop join. SIMD
 //      eligibility depends on key count and key type, and an ordering can change
 //      a join's key count. Modelling a per-join decision lowering will re-make
@@ -27,6 +27,24 @@
 //   2. Independence. joinCardinality divides by the NDV product and filters do
 //      not narrow column statistics, so errors compound multiplicatively along a
 //      spine. Standard System-R; histograms are a README "Possible Extension".
+//   3. The DP is exact only where every join key has statistics. Keeping one
+//      subplan per subset is sound because rows(S) is the pure product
+//      ∏rows / ∏ndv, a function of the SET — which is why the ≥1 floor had to
+//      move to the stamping sites (flooredJoinCardinality). joinCardinality's
+//      no-statistics branch falls back to max(l, r), which is NOT multiplicative,
+//      so a subset containing a stats-less relation has an order-dependent row
+//      count and optimal substructure does not hold for it. There is no
+//      path-independent estimate to fall back to instead, so the containment is
+//      (4) rather than a better formula.
+//   4. The search may only IMPROVE on the written order. reorder() costs the
+//      written order too and keeps it when the search's pick scores worse, which
+//      bounds (3) and any future cost-model change: the plan is never worse than
+//      what the user wrote by the model's own metric. `method=` names which of
+//      dp / greedy / written-floor / written-fallback produced the printed order.
+//
+// Above 32 relations the pass declines entirely (uint32_t subset masks) and
+// --explain shows no order= line, because there is no decision to show. No TPC-H
+// query comes close — Q9 and Q21 top out at 6 relations.
 
 // No-op below three relations: with one join there is no ordering decision.
 // Which side builds is Week 22's decision, made at lowering from the same
