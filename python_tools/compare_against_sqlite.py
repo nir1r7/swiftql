@@ -250,6 +250,57 @@ WEEK25_JOIN_QUERIES = [
     "WHERE laps.season BETWEEN 2021 AND 2023 GROUP BY drivers.team ORDER BY dt",
 ]
 
+# Week 26 (multi-way join language + binding). Nothing this week adds a query
+# that RETURNS rows: multi-way and multi-key joins bind and build a logical join
+# tree, but lowering them is Week 27, so there is nothing to diff against SQLite.
+# What can be pinned is the refusal — every one of these must fail with its own
+# message rather than return a wrong answer, which is the property the whole
+# dialect's error handling exists to protect. Checked in all four modes, since
+# the refusal comes from a different place on the Volcano and vectorized paths.
+#
+# Each entry: (query, required substring of the error).
+WEEK26_REJECTED_QUERIES = [
+    # planned and bound this week, executable in Week 27
+    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.driver_id = d2.driver_id",
+     "multi-way joins are planned but not yet executable"),
+    ("SELECT l.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.team = d.team",
+     "multi-key equi-joins are planned but not yet executable"),
+
+    # still rejected on shape: non-equality ON conjuncts become residuals in
+    # Week 27, and an OR in ON is not a key list at all
+    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id < d.driver_id",
+     "non-equality"),
+    ("SELECT l.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.speed > d.age",
+     "non-equality"),
+    ("SELECT l.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id OR l.team = d.team",
+     "AND-chain of equalities"),
+
+    # only reachable once a third relation exists: d2 is not in the tree yet
+    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d2.driver_id "
+     "JOIN drivers d2 ON d.driver_id = d2.driver_id",
+     "table being joined"),
+
+    # N-relation range table: the clash is between entries 0 and 2, which the
+    # old pairwise [0]/[1] check never compared
+    ("SELECT laps.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+     "JOIN laps ON drivers.driver_id = laps.driver_id",
+     "self-join requires table aliases"),
+    # two DIFFERENT tables under one name -> the duplicate-alias message, not
+    # the self-join one; the clash is again entries 0 and 2
+    ("SELECT x.team FROM laps x JOIN drivers d ON x.driver_id = d.driver_id "
+     "JOIN drivers x ON d.driver_id = x.driver_id",
+     "duplicate table alias"),
+
+    # `team` exists on both relations — ambiguity is correct SQL behaviour and
+    # gets more likely as relations are added
+    ("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id",
+     "ambiguous column reference"),
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
@@ -375,6 +426,36 @@ def run_swiftql(query: str, extra_args: list = None):
     return parse_swiftql_output(result.stdout)
 
 
+def run_rejection_suite(queries, label: str, extra_args: list = None):
+    """Assert each query fails, and fails for the stated reason.
+
+    SQLite is not an oracle here — it accepts all of these. The property under
+    test is SwiftQL's own: unsupported SQL is a clean, specific error rather
+    than a wrong answer. Matching the message (not just "it failed") is what
+    stops an unrelated failure from passing this suite, the same rule the C++
+    tests follow.
+    """
+    passed = failed = errors = 0
+    print(f"\n--- {label} ---")
+    for query, expected in queries:
+        try:
+            run_swiftql(query, extra_args)
+            print(f"  FAIL  {query[:70]}\n    expected a rejection, got rows")
+            failed += 1
+        except RuntimeError as e:
+            if expected in str(e):
+                print(f"  PASS  {query[:70]}")
+                passed += 1
+            else:
+                print(f"  FAIL  {query[:70]}\n    expected: {expected}\n    actual:   {e}")
+                failed += 1
+        except Exception as e:
+            print(f"  ERROR {query[:70]}\n    {e}")
+            errors += 1
+    print(f"{passed} passed, {failed} failed, {errors} errors")
+    return passed, failed, errors
+
+
 def run_query_suite(conn, queries, label: str, extra_args: list = None):
     passed = failed = errors = 0
     print(f"\n--- {label} ---")
@@ -424,9 +505,28 @@ def main():
         extra_args=["--execution", "vectorized", "--storage", "columnar", "--no-optimize"],
     )
 
-    total_passed = p1 + p2 + p3 + p4
-    total_failed = f1 + f2 + f3 + f4
-    total_errors = e1 + e2 + e3 + e4
+    # Week 26: the same four modes, for SQL that must be refused rather than
+    # answered. The refusal is raised from a different place on each path
+    # (Planner::plan on Volcano, VectorizedPlanBuilder on the vec path), so all
+    # four are checked.
+    modes = [
+        ("Rejections (row storage, Volcano)", None),
+        ("Rejections (columnar storage, Volcano)", ["--storage", "columnar"]),
+        ("Rejections (columnar storage, vec path)",
+         ["--execution", "vectorized", "--storage", "columnar"]),
+        ("Rejections (vectorized, optimizer off)",
+         ["--execution", "vectorized", "--storage", "columnar", "--no-optimize"]),
+    ]
+    r_passed = r_failed = r_errors = 0
+    for label, extra in modes:
+        rp, rf, re_ = run_rejection_suite(WEEK26_REJECTED_QUERIES, label, extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+
+    total_passed = p1 + p2 + p3 + p4 + r_passed
+    total_failed = f1 + f2 + f3 + f4 + r_failed
+    total_errors = e1 + e2 + e3 + e4 + r_errors
     print(f"\nTotal: {total_passed} passed, {total_failed} failed, {total_errors} errors")
     if total_failed > 0 or total_errors > 0:
         sys.exit(1)
