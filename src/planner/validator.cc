@@ -170,8 +170,10 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
         }
         for (size_t i = 0; i < stmt.joins.size(); ++i) {
             if (!stmt.joins[i].condition) continue;
-            // shape first (equi-join keys), then column existence — a shape
-            // error is the more useful message when both are wrong
+            // shape first (at least one equi-join key, no forward reference),
+            // then column existence — a shape error is the more useful message
+            // when both are wrong. The returned keys/residuals are rebuilt by
+            // the planners; only the throw matters here.
             classifyJoinCondition(stmt.joins[i].condition.get(), static_cast<int>(i) + 1);
             validateJoinCondition(stmt.joins[i].condition.get(), relations);
         }
@@ -409,8 +411,13 @@ void Validator::validateJoinCondition(const Expr* expr,
     }
     // DISPATCH SITE 18. Silent on an unhandled subtype: no column-existence
     // check inside it. Dormant until Week 26 relaxed classifyJoinCondition to
-    // accept AND-chains; Week 27 legalizes residual ON conjuncts, which is when
-    // the Week 25 shapes below actually arrive. Keep in lockstep with
+    // accept AND-chains; LIVE since Week 27, which routes every non-key ON
+    // conjunct as a residual, so the shapes below actually arrive.
+    //
+    // For a residual this is the ONLY column check there is: Validator::validate
+    // runs before the planners fold residuals into the WHERE conjunction, so
+    // validateExpr never sees them. A gap here surfaces as a far-from-the-cause
+    // "column not found" out of inferExprType. Keep in lockstep with
     // validateExpr above.
     if (auto* un = dynamic_cast<const UnaryExpr*>(expr))   { validateJoinCondition(un->operand.get(), relations); return; }
     if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) { validateJoinCondition(isn->operand.get(), relations); return; }

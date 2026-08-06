@@ -15,20 +15,48 @@ struct JoinKey {
     int from_slot = -1;
 };
 
-// Validate and decompose an ON condition into one or more equi-join keys.
+// Result of decomposing an ON clause: the equi-join keys, plus every conjunct
+// that is not one.
+//
+// Week 27 stopped rejecting the non-key conjuncts. For an INNER join, ON and
+// WHERE are interchangeable — R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S) — so a residual needs
+// no new node and no new position; it is handed to the same predicate-assignment
+// machinery that places WHERE conjuncts (soleSlot()/distribute() in
+// predicate_pushdown.cc), which routes it to the relation slot that owns it.
+//
+// !! Week 29 (outer join) must revisit this. For a LEFT OUTER join an ON
+// predicate filters the match test (unmatched left rows survive with NULLs)
+// while a WHERE predicate filters the result, so merging the two changes the
+// answer. Same trap predicate_pushdown.h documents for pushdown itself.
+//
+// `residuals` are BORROWED pointers into the statement's ON trees — this
+// function owns nothing. Callers that need to keep one past the statement's
+// lifetime clone it (cloneExpr, dispatch site 11).
+struct JoinCondition {
+    std::vector<JoinKey> keys;
+    std::vector<const Expr*> residuals;
+};
+
+// Validate and decompose an ON condition into equi-join keys plus residuals.
 // `right_slot` is the binder range-table slot of the relation this JOIN adds
 // (stmt.joins[i] -> i + 1).
 //
-// Week 26 accepts a single equality or an AND-chain of them (multi-key
-// equi-joins, required for TPC-H Q9). OR, non-equality operators, computed
-// operands and same-relation conjuncts still throw a specific error instead of
-// silently degrading (compound conditions used to produce out-of-bounds key
-// indices, non-equality operators executed as `=`, and same-relation conditions
-// were rerouted across sides). Routing non-equality ON conjuncts as post-join
-// residual filters is Week 27.
+// Per conjunct of the flattened AND-chain, in this order:
+//   1. any ColumnRef naming a slot > right_slot is a forward reference and
+//      throws — those columns are absent from this join's output schema, so the
+//      conjunct cannot even be a residual;
+//   2. `=` between two ColumnRefs, one at right_slot and the other below it, is
+//      an equi-join key (multi-key equi-joins, Week 26, required for TPC-H Q9);
+//   3. everything else — non-equality operators, OR, literal or computed
+//      operands, same-relation equalities, Week 25 nodes — is a residual.
+// Identical keys are collapsed: `ON a.x = b.x AND a.x = b.x` is a legal
+// predicate but not a legal key list (see the .cc for what it costs).
+//
+// Throws when no key survives: SwiftQL has no cross-product join operator, so a
+// JOIN whose ON yields zero keys is a cartesian product with a filter on top.
 //
 // Slot routing requires a bound statement. When a ref carries no slot
 // (validator-only callers that skip the Binder), keys fall back to positional
-// routing (left = already-joined side) and the cross-relation check is skipped
-// — the real pipeline always binds first.
-std::vector<JoinKey> classifyJoinCondition(const Expr* condition, int right_slot);
+// routing (left = already-joined side) and the slot checks are skipped — the
+// real pipeline always binds first.
+JoinCondition classifyJoinCondition(const Expr* condition, int right_slot);

@@ -3,6 +3,7 @@
 #include "catalog/catalog.h"
 #include "planner/logical_plan.h"
 #include <memory>
+#include <unordered_set>
 
 // Week 21 — predicate pushdown optimizer pass.
 // Rewrites the logical plan so single-relation WHERE predicates are evaluated on
@@ -19,3 +20,11 @@ class PredicatePushdown {
     public:
         static std::unique_ptr<LogicalPlanNode> apply(std::unique_ptr<LogicalPlanNode> root, const Catalog& catalog);
 };
+
+// The set of relation slots a predicate's columns reference. DISPATCH SITE 8 —
+// an unhandled Expr subtype yields an empty slot set, which costs pushdown
+// silently here and, since Week 27, makes a forward reference invisible in
+// classifyJoinCondition (the second caller). Declared rather than file-local so
+// join_condition.cc shares this one walker instead of growing an eleventh
+// silent site; keep it in lockstep with restampSlots.
+void collectSlots(const Expr* expr, std::unordered_set<int>& out);

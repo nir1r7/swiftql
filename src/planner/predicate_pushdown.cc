@@ -1,29 +1,18 @@
 #include "predicate_pushdown.h"
 #include "cardinality_estimator.h"
 #include "parser/ast.h"
+#include "parser/expr_utils.h"   // conjoinAll
 #include <algorithm>
 #include <map>
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-// Flatten an AND-chain into its atomic conjuncts, moving ownership out of the
-// tree. OR / comparison / IS NULL are indivisible — each becomes one leaf.
-// Mirrors the recursion shape of collectCols() in logical_plan.cc.
-void splitConjuncts(std::unique_ptr<Expr> pred, std::vector<std::unique_ptr<Expr>>& out) {
-    auto* bin = dynamic_cast<BinaryExpr*>(pred.get());
-    if (bin && bin->op == "AND") {
-        // move both operands out before the AND node dies at end of scope
-        splitConjuncts(std::move(bin->left), out);
-        splitConjuncts(std::move(bin->right), out);
-        return;
-    }
-    out.push_back(std::move(pred));
-}
-
 // Collect the set of relation slots a predicate's columns reference. Same
 // dispatch as collectCols(), reading relation_slot instead of name.
+//
+// Declared in the header since Week 27: classifyJoinCondition uses it to spot a
+// forward reference inside a residual ON conjunct of any shape. Two callers, one
+// walker — a private copy would be an eleventh silent dispatch site.
 void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     if (!expr) return;
     if (auto* cr = dynamic_cast<const ColumnRef*>(expr)) { out.insert(cr->relation_slot); return; }
@@ -55,7 +44,23 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         return;
     }
     // Literal / IntervalLiteral: no slot. AggregateExpr cannot appear in WHERE
-    // (Validator forbids it).
+    // (Validator forbids it) and is refused inside ON by validateJoinCondition.
+}
+
+namespace {
+
+// Flatten an AND-chain into its atomic conjuncts, moving ownership out of the
+// tree. OR / comparison / IS NULL are indivisible — each becomes one leaf.
+// Mirrors the recursion shape of collectCols() in logical_plan.cc.
+void splitConjuncts(std::unique_ptr<Expr> pred, std::vector<std::unique_ptr<Expr>>& out) {
+    auto* bin = dynamic_cast<BinaryExpr*>(pred.get());
+    if (bin && bin->op == "AND") {
+        // move both operands out before the AND node dies at end of scope
+        splitConjuncts(std::move(bin->left), out);
+        splitConjuncts(std::move(bin->right), out);
+        return;
+    }
+    out.push_back(std::move(pred));
 }
 
 // The single relation slot a conjunct references, or -1 when it references none
@@ -109,20 +114,6 @@ void restampSlots(Expr* expr, int slot) {
     }
 }
 
-// Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty.
-std::unique_ptr<Expr> conjoin(std::vector<std::unique_ptr<Expr>> parts) {
-    if (parts.empty()) return nullptr;
-    std::unique_ptr<Expr> acc = std::move(parts[0]);
-    for (size_t i = 1; i < parts.size(); ++i) {
-        auto conj = std::make_unique<BinaryExpr>();
-        conj->op = "AND";
-        conj->left = std::move(acc);
-        conj->right = std::move(parts[i]);
-        acc = std::move(conj);
-    }
-    return acc;
-}
-
 // Build a one-table StatsContext for a scan-local filter's child, exactly as
 // CardinalityEstimator's SCAN case does, so selectivity() can score conjuncts.
 StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog) {
@@ -164,7 +155,7 @@ std::unique_ptr<LogicalPlanNode> filterOnto(std::unique_ptr<LogicalPlanNode> chi
                                             const Catalog& catalog) {
     if (conjuncts.empty()) return child;
     orderByWork(conjuncts, child.get(), catalog);
-    return std::make_unique<LogicalFilter>(std::move(child), conjoin(std::move(conjuncts)));
+    return std::make_unique<LogicalFilter>(std::move(child), conjoinAll(std::move(conjuncts)));
 }
 
 // Attach each bucket to the subtree that owns its relation. The tree is
@@ -250,7 +241,7 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
         std::vector<std::unique_ptr<Expr>> parts;
         splitConjuncts(std::move(f->predicate), parts);
         orderByWork(parts, f->children[0].get(), catalog);
-        f->predicate = conjoin(std::move(parts));
+        f->predicate = conjoinAll(std::move(parts));
         return node;
     }
 
