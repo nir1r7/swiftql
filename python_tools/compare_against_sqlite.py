@@ -279,10 +279,27 @@ WEEK26_REJECTED_QUERIES = [
      "ON l.driver_id = d.driver_id OR l.team = d.team",
      "AND-chain of equalities"),
 
+    # a query that is BOTH multi-way and multi-key must report the same reason
+    # in every mode — the two engines check in different places, so only a query
+    # with both properties can catch them disagreeing
+    ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.driver_id = d2.driver_id AND d.team = d2.team",
+     "multi-way joins are planned but not yet executable"),
+
     # only reachable once a third relation exists: d2 is not in the tree yet
     ("SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d2.driver_id "
      "JOIN drivers d2 ON d.driver_id = d2.driver_id",
      "table being joined"),
+    # ...and the same forward reference with the operands swapped, which passes
+    # the "references the table being joined" test and needs the other half of
+    # the rule to reject it. Accepting it silently rewires the join key to a
+    # column of the left tree and renders a plan that looks correct
+    ("SELECT l.team FROM laps l JOIN drivers d ON d.driver_id = d2.driver_id "
+     "JOIN drivers d2 ON l.driver_id = d2.driver_id",
+     "joined later"),
+    ("SELECT l.team FROM laps l JOIN drivers d ON d.driver_id = d2.age "
+     "JOIN drivers d2 ON l.driver_id = d2.driver_id",
+     "joined later"),
 
     # N-relation range table: the clash is between entries 0 and 2, which the
     # old pairwise [0]/[1] check never compared
@@ -293,6 +310,11 @@ WEEK26_REJECTED_QUERIES = [
     # the self-join one; the clash is again entries 0 and 2
     ("SELECT x.team FROM laps x JOIN drivers d ON x.driver_id = d.driver_id "
      "JOIN drivers x ON d.driver_id = x.driver_id",
+     "duplicate table alias"),
+    # the same table twice under one ALIAS: every relation is aliased, so the
+    # advice is "pick distinct names", not "add aliases you already wrote"
+    ("SELECT d.name FROM drivers d JOIN laps l ON d.driver_id = l.driver_id "
+     "JOIN drivers d ON l.driver_id = d.driver_id",
      "duplicate table alias"),
 
     # `team` exists on both relations — ambiguity is correct SQL behaviour and
