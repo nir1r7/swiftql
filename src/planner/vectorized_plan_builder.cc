@@ -44,19 +44,32 @@ void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int
 // stubbed-hash-join stance: a clean "not yet implemented" beats a wrong answer.
 // Counts over the WHOLE tree: after pushdown a join's child is a FILTER over a
 // JOIN, so a type check one level down would miss it.
-void checkLowerable(const LogicalPlanNode* node, int& joins_seen) {
-    if (node->type == LogicalNodeType::JOIN) {
-        const auto* join = static_cast<const LogicalJoin*>(node);
-        if (join->keys.size() != 1) {
-            throw std::runtime_error(
-                "multi-key equi-joins are planned but not yet executable (Week 27)");
-        }
-        if (++joins_seen > 1) {
-            throw std::runtime_error(
-                "multi-way joins are planned but not yet executable (Week 27)");
-        }
+// Join count first, key count second — the same order Planner::plan uses. A
+// query that is both multi-way and multi-key must report the same reason in
+// every mode; interleaving the two checks in one preorder walk made the vec
+// path answer "multi-key" where Volcano answered "multi-way".
+void countJoins(const LogicalPlanNode* node, int& joins_seen) {
+    if (node->type == LogicalNodeType::JOIN) ++joins_seen;
+    for (const auto& child : node->children) countJoins(child.get(), joins_seen);
+}
+
+void checkKeyCounts(const LogicalPlanNode* node) {
+    if (node->type == LogicalNodeType::JOIN &&
+        static_cast<const LogicalJoin*>(node)->keys.size() != 1) {
+        throw std::runtime_error(
+            "multi-key equi-joins are planned but not yet executable (Week 27)");
     }
-    for (const auto& child : node->children) checkLowerable(child.get(), joins_seen);
+    for (const auto& child : node->children) checkKeyCounts(child.get());
+}
+
+void checkLowerable(const LogicalPlanNode* root) {
+    int joins_seen = 0;
+    countJoins(root, joins_seen);
+    if (joins_seen > 1) {
+        throw std::runtime_error(
+            "multi-way joins are planned but not yet executable (Week 27)");
+    }
+    checkKeyCounts(root);
 }
 
 // walk down children[0] to the leaf scan's table name — used to read row
@@ -282,8 +295,7 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
         std::unordered_map<std::string, ColumnarTable> columnar_tables,
         const Catalog& catalog) {
-    int joins_seen = 0;
-    checkLowerable(logical.get(), joins_seen);
+    checkLowerable(logical.get());
 
     Lowering lowering{columnar_tables, {}, catalog};
     countScans(logical.get(), lowering.scan_uses);

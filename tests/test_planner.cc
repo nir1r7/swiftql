@@ -225,6 +225,21 @@ TEST(PlannerTest, ThreeWayJoinRefusedUntilWeek27) {
     }
 }
 
+// Same query as VecPlanBuilder.MultiWayAndMultiKeyReportsTheJoinCountFirst:
+// the two engines must agree on which reason they report.
+TEST(PlannerTest, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    try {
+        bindAndPlan("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                    "JOIN sj c ON b.grp = c.id AND b.val = c.val", catalog);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
+        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
+    }
+}
+
 TEST(PlannerTest, MultiKeyJoinRefusedUntilWeek27) {
     Catalog catalog("../tests/data/test_catalog.json");
     try {

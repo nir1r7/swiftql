@@ -742,6 +742,23 @@ TEST(VecPlanBuilder, MultiKeyJoinRefusedUntilWeek27) {
     }
 }
 
+// A query that is both multi-way and multi-key must give the SAME reason here
+// as on the Volcano path, which tests the join count first. Interleaving the two
+// checks in one preorder walk made this answer "multi-key" while `--storage row`
+// answered "multi-way" — same query, same refusal, two different explanations.
+TEST(VecPlanBuilder, MultiWayAndMultiKeyReportsTheJoinCountFirst) {
+    Catalog cat(CATALOG);
+    try {
+        buildVec("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+                 "JOIN sj c ON b.grp = c.id AND b.val = c.val", cat);
+        FAIL() << "expected a refusal";
+    } catch (const std::runtime_error& e) {
+        std::string err = e.what();
+        EXPECT_NE(err.find("multi-way joins"), std::string::npos) << err;
+        EXPECT_EQ(err.find("multi-key"), std::string::npos) << err;
+    }
+}
+
 // The refusal must not have narrowed what already worked.
 TEST(VecPlanBuilder, SingleKeySingleJoinStillLowers) {
     Catalog cat(CATALOG);
