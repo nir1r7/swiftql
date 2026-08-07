@@ -84,11 +84,20 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
 // THREE THINGS MAKE THIS HARDER THAN THE EXISTS CASE, and each is handled rather
 // than assumed:
 //
-//  1. THE JOIN IS LEFT, NOT INNER. SQL says a scalar subquery over zero rows is
-//     NULL (Week 31 shipped the typed-null Literal for exactly that); an inner
-//     join DROPS the outer row instead. Week 29's rules then follow and are all
-//     correct here: pushdown declines the null-supplying side, the build side is
-//     forced, and join enumeration declines the whole tree with
+//  1. THE JOIN IS LEFT, NOT INNER — AND THAT IS ONLY HALF THE ZERO-ROW RULE.
+//     A key with no matching body rows produces NO GROUP ROW AT ALL, so the join
+//     null-extends it. For SUM / AVG / MIN / MAX that IS the right value: those
+//     are NULL over an empty set (Week 31 shipped the typed-null Literal for
+//     exactly that), and an INNER join would instead DROP the outer row.
+//     **COUNT IS THE EXCEPTION AND THE LEFT JOIN ALONE GETS IT WRONG**: SQL says
+//     COUNT over zero rows is 0, so the outer predicate read NULL where it must
+//     read 0. That shipped as a silent wrong answer and was caught by the Week 34
+//     audit (F1) — `d.age > (SELECT COUNT(*) ... AND l.speed > 999)` returned 0
+//     rows against SQLite's 20. The substituted value therefore depends on the
+//     BODY'S AGGREGATE, not on the join: see the CASE wrapper at the substitution
+//     site. Week 29's rules then follow from LEFT and are all correct here:
+//     pushdown declines the null-supplying side, the build side is forced, and
+//     join enumeration declines the whole tree with
 //     `join-ordering=skipped (outer join)` — a real, reported plan-quality cost.
 //
 //  2. THE "MORE THAN ONE ROW" RULE DISAPPEARS. Week 31's deliberate divergence
