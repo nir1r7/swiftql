@@ -1,30 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 34 — F1 BLOCKER FIXED and pushed through c5b4567. Waiting on gate r1
-  (ab12a3af1f893a53d, launched 14:46) to report before starting gate r2 — never two gates at
-  once, they contend on build/. Gate r1's verdict is STALE either way: it measured the pre-fix
-  tree. If it has not reported by ~15:10, treat it as dead and launch gate r2 directly.
-  F1 reproduced first: COUNT body over a zero-row group returned 0 rows vs SQLite's 20.
-  Fixed by wrapping a COUNT body's ColumnRef in CASE WHEN ref IS NULL THEN 0 ELSE ref END —
-  COALESCE spelled in the dialect that exists — keyed on the FUNCTION so COUNT(DISTINCT) is
-  covered. The agent DECLINED the audit's offered minimum (refuse COUNT bodies) with a reason:
-  it would cost TPC-H a correlated shape for something the dialect can express. Cost stated at
-  the site (CASE has no vectorized kernel, so that predicate falls back to scalar evaluate()).
-  Oracle now pins EVERY aggregate kind over a zero-row group, including the NEGATIVE cases
-  (SUM/AVG/MIN/MAX -> NULL) so the fix cannot be over-applied, a mixed case (19 vs 20 pre-fix),
-  and an all-groups-present COUNT pinning the wrapper as a no-op.
-  F2 fixed with MUTANT PROOF: making the DERIVED lowering report the child's schema leaves both
-  old schema-only tests passing while 2 of 3 new ones fail.
-  Bonus real defect found and fixed: VecDerivedNode counted chunk->num_rows (buffer width)
-  instead of the surviving count, over-reporting --explain-analyze for any derived body with a
-  WHERE.
-  Swept: "a scalar subquery over zero rows is NULL" appeared in 3 places and is FALSE for
-  COUNT in all of them — corrected in subquery_decorrelation.h, README week 34 table, and
-  Limitations.
-  STILL UNAUDITED: the harness suite definitions in compare_against_sqlite.py.
+Current: week 34 — gate r1 RED, fix agent a4e5229d58781224a diagnosing (launched 15:22 UTC).
+  The gate self-aborted a first attempt when it detected concurrent edits mid-run, renamed that
+  output to week-34-round-1-ABORTED-concurrent-edits.log, and re-ran in a quiet window with
+  identical src fingerprints before and after. MY ERROR: I dispatched the F1 fix while that gate
+  was running, which is the exact sequencing rule I had already written down. Do not fix during
+  a gate.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
-Last gate: GREEN (week 33 round 4, closing) — unit 786/786, sqlite 1076, regression 318 all
+Last gate: RED (week 34 round 1) — build PASS, unit 800/800, regression 318 PASS, but sqlite
+  1250 passed / 4 failed: 2 queries x 2 modes, all "expected a rejection, got rows", both
+  correlated-scalar shapes (one NESTED inside a correlated IN body, one inside ARITHMETIC).
+  Week 34 added correlated scalar decorrelation, so these may now legitimately execute and the
+  suite entries may be stale — or a shape that should still be refused is returning wrong rows.
+  Fix agent must DIFF BOTH AGAINST SQLITE FIRST and decide per shape.
+  SERIAL until green: no audit alongside the fix agent.
+Previous: GREEN (week 33 round 4, closing) — unit 786/786, sqlite 1076, regression 318 all
   modes; staleness disproved. Week 33 took 4 gates (one RED) and 2 audits.
 Week 33 verdict: CHECKPOINT PARTIALLY MET. EXISTS/NOT EXISTS decorrelation works (Q4, Q21);
   correlated SCALAR (Q17, Q22's correlated half) is REFUSED — blocked on derived-table
