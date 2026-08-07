@@ -45,20 +45,81 @@ other 25 guards, and per-entry query-shape re-derivation. Both re-declined with
 reasons in the README rather than dropped — see the Week 35 section's closing
 note.
 
+### Next, for a successor — in this order, one commit each
+
+1. **Wire `run_tpch.py` into the `verify` skill as a fifth gate step.**
+   `.claude/skills/verify/SKILL.md` runs four gates (build, C++ tests,
+   `compare_against_sqlite.py`, the regression harness) and **none of them
+   mentions TPC-H**, so a GREEN gate today says nothing whatever about the 22
+   queries — which is Week 36's entire deliverable. The step to add is
+   `python3 python_tools/run_tpch.py --catalog data/tpch/sf0.01/catalog.json
+   --baseline docs/tpch-baseline.json`; `compare_baseline` already exits non-zero
+   when a query stops answering, becomes vacuous, or answers in fewer modes, and
+   prints `IMPROVED` with the `--write-baseline` instruction when the figure
+   rises. Two things to decide rather than assume: the gate needs
+   `data/tpch/sf0.01` to exist (it is gitignored — the step must generate it, or
+   skip loudly rather than silently), and a full run took ~25 minutes here, most
+   of it SQLite's q21 mutation, so a fast subset plus a full nightly may be the
+   right shape. State whichever you choose in the skill.
+2. **The two lesser round-1 audit findings**, both recorded in
+   `scratchpad/audits/week-35-round-1.md` and neither yet touched:
+   - `compare_against_sqlite.py:1874` compares floats as `abs(x-y) > tol`, so two
+     NaNs — or two same-signed infinities — compare **equal**, because
+     `nan > tol` is False. `normalize`'s `coerce` produces both, since
+     `float("nan")` parses. Grounded in the code; no TPC-H input demonstrated
+     reaching it.
+   - `random_diff.py:113-117` projects only `driver_id` and `team`, and only from
+     `rels[:3]`. `driver_id` is also the join key in every generated join, so
+     every projected `rN.driver_id` is equal across relations **by construction**
+     and a plan defect that emitted the wrong relation's copy would be invisible.
+     Only `team` discriminates, and relations 4-8 are never projected at all.
+     This bounds what the 40/40 result-preserving figure licenses.
+
 ### Measured this week
 
-TPC-H at SF=0.01, synthetic data (see `data/tpch/sf0.01/PROVENANCE.txt`):
+TPC-H at SF=0.01, synthetic data (see `data/tpch/sf0.01/PROVENANCE.txt`).
+**All figures below are from one full 22x4 run recorded in
+`docs/tpch-sf0.01-report.json`, with `docs/tpch-baseline.json` its summary.**
+Language is deliberate throughout: **matches SQLite over the same files**, never
+"correct" and never "TPC-H compliant" — the published answer set does not apply
+to this data.
 
-- **answered correctly: 20/22** — **5 in all four modes** (q1, q6, q12, q14, q19)
-  and **15 in the two vectorized modes only**. 34 of the 88 query x mode cells
-  are Volcano refusals pinned by message.
+- **matched SQLite: 20/22.** **Meaningfully answered: 17/22** — **4 in all four
+  modes** (q1, q6, q12, q14) and **13 in the two vectorized modes only** (q3,
+  q4, q5, q7, q8, q9, q10, q11, q13, q15, q16, q20, q22). 34 of the 88 query x
+  mode cells are Volcano refusals pinned by message.
+- **3 vacuous — matched while asserting nothing about the feature under test.**
+  Each was found by the mutation check (`tpch_queries.MUTATIONS`), not by
+  inspection: neuter the one predicate carrying the query's characteristic
+  feature and require the answer to change.
+  - **q2 INERT** (2 modes) — deleting the correlated `MIN(ps_supplycost)`
+    subquery leaves the answer byte-identical. Only one part survives
+    `p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'` on this data,
+    so the subquery selects what was already selected.
+  - **q18 EMPTY** (2 modes) — `SUM(l_quantity) > 300` is unreachable at SF=0.01.
+  - **q19 ALL_NULL** (4 modes) — no row matches any of the three OR arms, so the
+    comparison is a `SUM` over nothing against a `SUM` over nothing.
 - **2 not answered**, both refused BY NAME for documented reasons rather than
   failing: q17 (`a correlated scalar subquery is decorrelated only when its
   select list is a single aggregate` — the standard text is
   `0.2 * AVG(l_quantity)`), q21 (`only an equality between two columns can
-  become a join key` — a correlated inequality).
-- **1 vacuous pass named** (q18: `SUM(l_quantity) > 300` is unreachable at
-  SF=0.01, so both engines return zero rows and the match asserts nothing).
+  become a join key` — a correlated inequality). Both are UNPORTED in the two
+  vectorized modes and REFUSED_EXPECTED in the two Volcano ones, so they are
+  0-mode queries and Week 36's worklist.
+- **q16 is no longer among them.** The round-1 audit's blocker — its `NOT IN`
+  anti-join matched nothing, so the whole predicate could be deleted without
+  changing a byte — was fixed by seeding the phrase into the generator
+  (`f7c6cdb`). Re-measured here: 5 suppliers match the inner `LIKE`, deleting the
+  anti-join changes the answer, and SwiftQL still matches SQLite in both
+  vectorized modes.
+
+**Why the figure moved, since three different numbers are in the history.** The
+harness first reported **20/22** and that count is still right for "matched the
+oracle"; the round-1 audit corrected it to **18** by naming q16 alongside q18;
+the mutation check finds **17**, because it can see two vacuity shapes the audit
+could not spot by hand (q2's inert subquery and q19's all-NULL aggregate) while
+q16 is now genuinely discriminating. 17 is the honest figure and it is the one
+Week 36 should raise.
 - **Q22's provenance, read off a plan rather than argued**:
   `{'LogicalDerived': 2, 'LogicalAntiJoin': 2}` — the correlated half IS Week
   33's `NOT EXISTS` anti-join, the `custsale` half IS Week 34's derived table,
