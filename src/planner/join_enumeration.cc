@@ -108,12 +108,20 @@ bool containsOuterJoin(const LogicalPlanNode* node) {
 // positional-routing path for callers that skip the Binder) can never satisfy
 // keysBetween's placed-set test, so the key would vanish from the rebuilt tree:
 // a missing conjunct and therefore MORE rows if the join had a second key, or a
-// spurious "produced a cross product" throw if it did not. And, from Week 34
-// on, a SCAN THAT IS NOT A RANGE-TABLE ENTRY of the query being planned, because
-// it belongs to a subquery — at which point `slot >= countRelations()` stops
-// meaning "unbound key" and starts firing on legitimate plans. (Week 31 was
-// expected to make that live and did not: a materialized subquery's scans form
-// their own plan, with their own range table.)
+// spurious "produced a cross product" throw if it did not. And a SEMI/ANTI join,
+// whose join_slot is -1 because children[1] is a subquery BODY rather than a
+// relation of this block (Week 32).
+//
+// !! DERIVED TABLES DO NOT REACH HERE, which four weeks predicted they would.
+// Weeks 28-31 each recorded that "a scan that is not a range-table entry of the
+// query being planned" would start firing this guard on legitimate plans from
+// Week 34 on. What was actually wrong was countRelations, which counted SCANS
+// and so over-counted a derived body's — making `slot >= n` too PERMISSIVE, not
+// too strict. It counts the spine now, and a derived relation is an ordinary
+// range-table entry with an in-range slot that the search reorders like any
+// other. The prediction is recorded here rather than deleted because the FIX it
+// asked for (re-derive n against the binder range table) was the right one; only
+// its predicted symptom was wrong.
 //
 // DECLINE, do not throw. Volcano and the written-order vectorized path never
 // consult from_slot for placement, so a throw here is the one place the

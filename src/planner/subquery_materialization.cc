@@ -166,10 +166,15 @@ namespace {
 // finished before this pass begins; nothing here allocates one — `body` at
 // runOnce is a stack local, and cloneExpr shares the shared_ptr rather than
 // making a second statement. The first week that heap-allocates a
-// SelectStatement DURING planning — Week 34's derived tables are the candidate —
-// breaks it, and the fix is to hold the shared_ptr in the cache VALUE, which
-// pins the address for the pass's lifetime. Adding that pin now would be a field
-// no reachable input needs.
+// SelectStatement DURING planning breaks it, and the fix is to hold the
+// shared_ptr in the cache VALUE, which pins the address for the pass's lifetime.
+//
+// Week 34 was named here as the candidate and IS NOT ONE, checked rather than
+// assumed: a derived table's body is allocated by the parser like every other
+// statement (parseTableRef calls make_unique at parse time), and
+// LogicalPlanBuilder MOVES it rather than allocating a second. This pass also
+// runs before planning and never meets a TableRef at all. The invariant holds
+// unchanged, and the pin is still a field no reachable input needs.
 using ResultCache = std::unordered_map<const SelectStatement*, SubqueryResult>;
 
 const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
