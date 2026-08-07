@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **638 tests, 0 failures.**
+Expected: **713 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,16 +223,26 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **596 passed, 0 failed, 0 errors**: 124 queries × 4 modes (row/Volcano,
+Expected: **792 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
 `--no-optimize`), plus 12 rejections × the same 4 modes, plus the multi-way
 capability split — 13 multi-way queries × the 2 vectorized modes, diffed against
-SQLite, and the same 13 asserted to be refused × the 2 Volcano modes.
+SQLite, and the same 13 asserted to be refused × the 2 Volcano modes — plus
+Week 30's two subquery suites × the same 4 modes (13 forms that must *bind* and
+reach the Week 31 refusal, and 11 that must fail earlier for their own stated
+reason).
 
 The multi-way block is 6 Week 27 execution shapes plus 7 Week 28 join-ordering
 ones. Running the ordering queries in the `--no-optimize` vectorized mode as well
 is the point, not duplication: that mode keeps the **written** join order, so the
 pair is what makes this file able to catch a reordering that changes an answer.
+
+Week 30's block is a rejection suite for a different reason: nothing that week
+ships returns rows, so **reaching** the refusal is the assertion — lexing,
+parsing, nested-scope resolution, correlation detection and validation of the
+nested query all had to succeed to get there. The second suite exists so the
+refusal cannot become a catch-all that hides a real defect: a bad nested table, a
+bad nested column, a wrong arity or a disallowed position must all outrank it.
 
 > A query that runs in only some modes has to be listed separately, not dropped
 > from the harness and not run everywhere. Multi-way joins are the first such
@@ -282,7 +292,8 @@ FROM table
                                                      -- only (Week 27).
                                                      -- LEFT OUTER: Week 29
                                                      -- (all modes)
-[WHERE expr [AND expr ...]]
+[WHERE expr [AND expr ...]]                          -- subqueries: Week 30
+                                                     -- (bind only)
 [GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
 [ORDER BY expr [ASC|DESC], ...]                      -- expressions + aliases (Week 24)
@@ -346,6 +357,35 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 > the SIMD loop join — an inner equi-join with no unmatched path — is never
 > selected. `RIGHT`/`FULL` are out of scope; no TPC-H query in the documented
 > dialect needs them.
+
+> **Week 30 subqueries — parsing and binding only.** Three forms are in the
+> grammar: scalar `(SELECT ...)`, `[NOT] EXISTS (SELECT ...)` and
+> `x [NOT] IN (SELECT ...)`. `IN (subquery)` is a **different production** from
+> the constant list — `InExpr`'s design is a set hashed once at compile time,
+> which a subquery cannot be — and Week 32 lowers it to a semi-/anti-join.
+>
+> They are legal in `WHERE` and `HAVING` only. `SELECT`, `GROUP BY`, `ORDER BY`
+> and `JOIN ... ON` each refuse with their own message: no TPC-H query puts one
+> elsewhere, and allowing one in a select list would make `buildProjectSchema`
+> type it and `aggregateOutputName` name an output column after it. `FROM
+> (subquery)` is Week 34.
+>
+> **A subquery is the first nested scope in this engine.** `ColumnRef` carries a
+> `query_level` beside its `relation_slot`: the slot is a position in the range
+> table of the scope `query_level` blocks out, so an inner slot 1 and an outer
+> slot 1 are different relations and a slot read without its level compares two
+> numbering domains. Resolution walks innermost-first and then outward; an inner
+> block shadows an outer one (not an ambiguity — that check is per scope), and a
+> name that resolves outward marks every scope between it and the supplying block
+> correlated.
+>
+> Nothing executes. Every parse, bind and validate error a query is entitled to
+> fires first — including the nested query's own, which is validated against its
+> own `FROM` schema — and then one check at the end of `Validator::validate`
+> raises `subqueries are parsed and bound but not yet executable (Week 31)`. One
+> site, so the four modes agree by construction rather than by two guards that
+> can drift. A *plan-time* type error in the same query is masked by it, since
+> `inferExprType` runs after `Validator`; both emit the identical string.
 
 Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
 literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
@@ -572,6 +612,15 @@ Eighteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
 one is missed — no error, no crash, a wrong answer or a lost optimization
 somewhere far away. Adding a node type means visiting all of them.
 
+> **A node that CONTAINS a query changes the question at several of these.**
+> `SubqueryExpr` (Week 30) is the first, and the rule it established is: descend
+> into the parts written in **this** query block (the `IN` form's left-hand
+> operand), never into the body. The body is a different scope — different
+> schema, different range table, its own aggregate rule — and is handed to a
+> fresh `Validator::validateQuery` / `Binder::bindQuery` instead. Sites 2, 5, 6,
+> 7, 8 and 9 all turn on that distinction, and at three of them getting it
+> backwards is a wrong answer rather than a lost optimization.
+
 Ordered by how hard the failure is to find:
 
 | # | Site | On an unhandled subtype | What breaks |
@@ -583,7 +632,7 @@ Ordered by how hard the failure is to find:
 | 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
 | 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
 | 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, now THREE callers, never a private copy. The third (Week 29) is `pruningHintForPreservedSide`, which decides whether an outer join may hand its `WHERE` down to the preserved side's scan as a zone-map hint — and it is the one caller where an empty slot set is *dangerous* rather than merely lossy, because "mentions no relation" would read as "mentions nothing unpreserved". It therefore fails **closed**: empty means withhold. A new node type that this walker misses costs pushdown at the first two callers and would have silently reopened a null-supplying predicate's route to the wrong table's zone maps at the third. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, now THREE callers, never a private copy. The third (Week 29) is `pruningHintForPreservedSide`, which decides whether an outer join may hand its `WHERE` down to the preserved side's scan as a zone-map hint — and it is the one caller where an empty slot set is *dangerous* rather than merely lossy, because "mentions no relation" would read as "mentions nothing unpreserved". It therefore fails **closed**: empty means withhold. A new node type that this walker misses costs pushdown at the first two callers and would have silently reopened a null-supplying predicate's route to the wrong table's zone maps at the third. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one. **Week 30** corrected the justification in `predicate_pushdown.h`/`.cc`, which claimed "every other caller treats empty as the conservative answer" — false of `classifyJoinCondition`, where an empty set means the forward-reference loop never runs and the conjunct is ACCEPTED. This caller fails closed on its OWN account, not on a property of the others. A `SubqueryExpr` contributes its operand's slots plus `-1` when the Binder marked it correlated: the body's slots belong to another scope's range table, while a correlated ref genuinely does reference this one and cannot be named here |
 | 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps its own relation's slot (any `k >= 1`) below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
 | 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
@@ -593,7 +642,7 @@ Ordered by how hard the failure is to find:
 | 15 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
 | 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
 | 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
-| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType` |
+| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents |
 
 `ChunkPruner::shouldSkip` is not on the list: `collectSimplePredicates` returns
 immediately on anything that is not a `BinaryExpr`, so a new node contributes no
