@@ -1232,3 +1232,43 @@ landing.
   NDV lookup misses. Conservative and invariant-preserving — and the reason the
   rule's arithmetic is exercised only by hand-built nodes in
   `tests/test_cardinality.cc`.
+
+### Closing round (round 4 response)
+
+- **Rationale for `collectSlotTables` corrected.** The "latent, not live" verdict
+  stands; the reason recorded with it did not. The load-bearing reason is the
+  map, not the cost block — the only read is
+  `slot_tables.find(col.relation_slot)` over the child's `output_schema`, which
+  for a semi/anti join *is its left child's*, so nothing ever looks up `-1` and
+  the width is bit-identical either way. Corrected in
+  `src/planner/vectorized_plan_builder.cc`, `development.md` and the round-2
+  entry above. The old reason ("discarded before `setCostDecision`") holds only
+  via a build-order fact in `logical_plan.cc` and must not be inherited as
+  verified.
+- **MEDIUM-1 (r4) — the `Kind::IN` arm recurses outside `runOnce`'s cache.**
+  No code change: it is safe today on the `has_subquery` clear plus `planBody`'s
+  `use_count() > 1` refusal, and neither was named at the call site. Both are now
+  stated in `src/planner/subquery_materialization.cc`, together with the one
+  shape the first guarantee does **not** cover (an `IN` inside an `IN` body
+  leaves the flag set) and the guard to add if anything ever produces a second
+  visit. Guarding an unreachable state today would be speculative code.
+- **LOW-1 (r4) — the nested-subquery-in-`IN`-body oracle entries were
+  `COUNT(*)`-shaped.** Two row-set entries added to `WEEK32_SEMI_JOIN_VEC_ONLY`
+  that select `name` and `ORDER BY` it, so a defect preserving cardinality while
+  returning the wrong rows no longer diffs identically.
+- **LOW-2 (r4) — the NaN justification was wrong for the loader path.** "SQLite
+  stores NaN as NULL" covers a *computed* NaN only; `CSVLoader` accepts the text
+  `nan` via `std::stod` while SQLite imports the same cell as TEXT `'nan'`, which
+  is not NULL. Behaviour unchanged (no committed dataset holds such a cell, and
+  the real close is a columnar validity mask in Week 35); the rationale is
+  corrected in `key_encoding.h`, `vec_hash_join_node.cc` and both README rows.
+- **HUNCH (r4) — `refuseUnloweredIn` on an `IN` body's own clauses.** Read, not
+  tested: both call sites are inside `LogicalPlanBuilder::build`'s own body
+  (`logical_plan.cc`), so `planBody`'s re-entry gets the same treatment. Carried
+  into the Week 33 notes as an unpinned read rather than closed.
+- **Week 32 to Week 33 hand-off written** as a "Starting notes, from Week 32's
+  foundations" block in `README.md`: the triggered `ColumnId { level, slot }`
+  change as its own standalone commit, the three surfaces round 4 did not reach,
+  Volcano semi/anti parity as the way back to the four-mode oracle baseline, the
+  selection-vector path deferred to Week 37, and the lesson that a green oracle
+  cannot see a capability that a narrowed test stopped guarding.

@@ -1647,6 +1647,84 @@ re-derived.
 > that property. Week 34's derived tables are what break it for real, because a
 > derived table's columns *are* in scope above it.
 
+> **Starting notes, from Week 32's foundations.** The closing hand-off, written
+> after four audit rounds. It does not replace the starting note above; it makes
+> the deferrals and the unchecked surfaces nameable.
+> - **The `ColumnId { level, slot }` change is now triggered, and it is its own
+>   commit.** It was deferred *by decision* through Weeks 30–32, bound to a
+>   trigger rather than a date: the first week that lowers a correlated
+>   reference. Week 32 did **not** — `Validator::validate` still refuses
+>   `has_correlated_subquery` in Week 33's name, and every shape
+>   `lowerInSubqueries` (`src/planner/subquery_lowering.cc`) handles is
+>   uncorrelated by definition. Week 33 removes that refusal, so a `ColumnRef`
+>   with `query_level > 0` reaches a plan node for the first time and a bare
+>   `relation_slot` stops identifying a relation. Measured cost: **87
+>   non-comment mentions** of `relation_slot` / `from_slot` across six source
+>   layers (binder, validator, logical plan, pushdown, both plan builders,
+>   chunk pruning), plus **every test that hand-builds a `ColumnRef`**,
+>   `GroupByColumn` or `AggregateSpec`. Land it as a standalone mechanical
+>   change with the suite green on both sides of it, and **never fold it into a
+>   feature week** — a rename that large inside a semantics change makes every
+>   subsequent diff unreadable and hides exactly the class of regression the
+>   last bullet is about.
+> - **Three surfaces audit round 4 did not reach.** Named so Week 33 does not
+>   read the green gate as coverage of them. (1) `refuseUnloweredIn`'s call
+>   sites in `LogicalPlanBuilder::build` (`src/planner/logical_plan.cc`) — round
+>   4 left this as an explicit *hunch*: it did not confirm the tripwire runs on
+>   every entry to `build` rather than once at the top, which decides whether an
+>   `IN` nested in an `IN` body's `HAVING` gets its own diagnostic or dies at
+>   dispatch site 12 with an internal-defect message. The closing round read the
+>   two call sites and they are inside `build`'s own body, which is the
+>   reassuring reading — but that is a read, not a test, and no test pins it.
+>   Week 33 nests deeper than any week so far; pin it. (2) The **Volcano
+>   `HashJoinNode` refusal path** — `build_had_unmatchable_key_` exists only in
+>   `src/execution/vec_hash_join_node.{h,cc}`, which is consistent with
+>   `WEEK32_SEMI_JOIN_VOLCANO_REJECTED` but does not prove the refusal is
+>   *total*; a semi join reaching `src/execution/hash_join_node.cc` would find
+>   no NULL rule there at all. (3) **`setCostDecision`'s consumption of
+>   `rowWidth`** (`src/planner/vectorized_plan_builder.cc`) — never traced end to
+>   end. It is why half the `collectSlotTables` rationale was unconfirmed for
+>   three rounds; see the corrected reason in that file's comment and in
+>   `development.md` before trusting anything written about that block.
+> - **Volcano semi/anti parity restores the four-mode oracle baseline.** Week 32
+>   shipped option (b) — `IN (subquery)` is refused outright on the Volcano path
+>   (`WEEK32_SEMI_JOIN_VOLCANO_REJECTED` in
+>   `python_tools/compare_against_sqlite.py`), so every one of those queries is
+>   diffed in **two** modes rather than four, and the columnar/row × volcano
+>   coverage that every other feature carries does not exist for set membership.
+>   The refusal is the honest interim, **not the intended end state**: it makes
+>   the gap loud instead of silently answering differently per mode. Week 33
+>   decorrelates *into* these same operators, so it inherits the halved coverage
+>   for correlated `EXISTS` too. Closing it means `JoinSemantics` in
+>   `src/execution/hash_join_node.cc` plus the same NULL/unmatchable rule, and
+>   it is the cheapest available increase in confidence for the whole area.
+> - **The semi-join operator ships the ROW path, not the selection-vector
+>   path — deferred to Week 37.** `VecHashJoinNode`
+>   (`src/execution/vec_hash_join_node.cc`) assembles surviving probe rows into
+>   `output_buffer_` because a real join must merge two schemas. A semi-join
+>   merges nothing: its output schema **is** the probe schema, which makes it
+>   structurally a `VecFilterNode`, and the late-materialization-correct
+>   implementation emits a `SelectionVector` over the probe chunk and copies
+>   zero bytes. Week 32 knowingly took the row path for the smaller diff
+>   (`docs/week-32-plan.md`, "Late materialization" — the tradeoff was surfaced,
+>   not decided silently), forfeiting the design principle Phase 3 is built on
+>   for the one operator where it is free. Week 33 must **not** pay the copy
+>   twice by cloning this shape into decorrelation; Week 37 owns the second
+>   output mode and the `SelectionVector` cascading rules it needs.
+> - **The lesson worth carrying: a changed test is where a capability
+>   disappears.** Week 32 shipped a regression — a subquery nested inside an
+>   `IN` body died at dispatch site 12 with an internal-invariant message — past
+>   a **green 988-query oracle and 770 green unit tests**. Neither could see it,
+>   because the one test guarding that capability
+>   (`tests/test_subquery.cc`) had been narrowed, in this same week, to a
+>   flattened scalar-outer stand-in that no longer reached through
+>   `sq->subquery->where` to the nested node. The suite was green about a
+>   weaker claim. Week 33 changes more subquery tests than any week so far:
+>   treat **every test it edits or deletes** as a place a capability can
+>   silently vanish, and for each one name the assertion that left and where it
+>   went — the round-4 audit did exactly this for `NoLongerRefusesALargeInSet`
+>   and found nothing lost, which is the standard.
+
 ### Week 34 — Derived Tables + Distinct Aggregates
 
 - Bind and execute subqueries in `FROM`
