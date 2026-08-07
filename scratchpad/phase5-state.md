@@ -1,16 +1,19 @@
 # Phase 5 orchestrator state
-Current: week 33, TASKS 2-9 (agent aa6b3121eb7ae18de, launched 11:13 UTC) — correlation
-  proper. Task 1 (ColumnId migration) is CLOSED: gated GREEN on its own, 775/775 unit,
-  996 sqlite, 318 regression, 0 warnings. Representation change altered no behaviour.
-  ON RECLAIM: resume from ## Progress in docs/week-33-plan.md. Never restart the week.
-  !! OPEN GAP TO CLOSE LATER: no AUDITOR has read the ColumnId migration — only the gate
-  measured it. The week's audits must cover it, since it is in the week's diff. Do not let it
-  slip past on the grounds that it was "already verified"; a gate proves behaviour unchanged,
-  not that the representation is sound.
-  Task 2 must REPLACE both Week 30 tripwires, not delete them (ChunkPruner declines a
-  query_level>0 ref; buildAggregateSchema throws). Removing a tripwire without a replacement
-  is how a silent wrong answer ships.
-  NOT EXISTS + NULLs is the same trap NOT IN was in Week 32 — must be diffed against SQLite.
+Current: week 33, tasks 3-9 continuing (agent aa6b3121eb7ae18de). Task 1 CLOSED (gated GREEN
+  alone). Task 2 DONE — refusal removed and BOTH week 30 tripwires RESTATED with new
+  justifications, not deleted. Task 3 core done: src/planner/subquery_decorrelation.{h,cc};
+  correlated EXISTS/NOT EXISTS execute on the vectorized path.
+  !! THE MIGRATION ALREADY PAID: inferExprType indexed the schema with a bare slot and THREW,
+  naming itself. Pre-migration that lookup would have HIT a same-named column of the wrong
+  relation and returned its type — a silent wrong answer. Being recorded durably so nobody
+  "simplifies" ColumnId back to an int.
+  UNPINNED GAPS the agent named itself and is now closing: NOT EXISTS against a NULL-keyed body
+  is untested vs SQLite; the Volcano correlation refusal is not in any rejection suite.
+  Decorrelation validity conditions are explicit: whole top-level WHERE conjunct; every
+  correlated conjunct an equality between two plain ColumnRefs exactly one level apart; body
+  has no GROUP BY/HAVING/aggregate/LIMIT/DISTINCT; at least one key. Each failure refuses by
+  name at the site.
+  STILL OPEN: no auditor has read the ColumnId migration — the week's audits must cover it.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
