@@ -1,14 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32 — closing round DONE and pushed (3 commits). ONE THING LEFT: the final gate.
-  >> NEXT ACTION, for whoever wakes first after the ~10:26 reclaim: launch the week 32 closing
-  gate (verify skill, log to scratchpad/gates/week-32-round-4.log). It was deliberately NOT
-  started at 10:18 because a gate needs ~11 min and the reclaim was 8 min away — launching it
-  right after a reclaim gives it a full window instead of feeding it to the reaper.
-  If that gate is GREEN, week 32 is DONE (mark 32 done in Weeks done) and week 33 begins:
-  step 1 is the teach agent for Week 33 (correlated subqueries).
-  !! WEEK 33 TRIGGERS the ColumnId {level, slot} deferral — its own standalone change FIRST,
-  never folded into the feature week. 87 non-comment mentions / 6 source layers / every test
-  hand-building a ColumnRef. The Week 33 starting-notes block in README.md says so.
+Current: week 32 CLOSING GATE running (agent aebef1cdb45716bc4, launched 10:32 UTC right
+  after the 10:30 reclaim — the deferral worked as intended, it now has a full window).
+  All week 32 work is complete and pushed through 889b6cb. This gate is the last thing owed.
+  IF GREEN: mark week 32 done, then start week 33 with the teach step.
+  !! WEEK 33 IS CORRELATED SUBQUERIES, which TRIGGERS the ColumnId {level, slot} deferral.
+  It must be its OWN STANDALONE CHANGE FIRST, never folded into the feature week: 87
+  non-comment mentions / 6 source layers / every test hand-building a ColumnRef. The Week 33
+  starting-notes block in README.md records this, along with three unreached surfaces
+  (refuseUnloweredIn call sites, the Volcano HashJoinNode refusal path, setCostDecision's
+  rowWidth consumption), Volcano semi/anti parity, and the Week 37 selection-vector deferral.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
