@@ -2123,7 +2123,46 @@ One blocker, one low, three areas not reached.
   `sel`, `filter_applied` or data — a strictly weaker pass-through than either of
   those two, and not a chunk *producer*, so the reset rule does not apply.
 - **Not reached (3/3) — the harness suite definitions in
-  `compare_against_sqlite.py`: STILL UNAUDITED.** Carries into the next round.
+  `compare_against_sqlite.py`: PARTLY CLOSED by the gate.** The stale-rejection
+  question is now answered behaviourally for all nine rejection suites (see
+  below), and the correlated-scalar diffed suite is fully re-diffed against
+  SQLite. The *diffed* suites' completeness — whether each query still tests what
+  its comment claims — remains unaudited and carries forward.
+
+### Gate round 1 (RED) — cause and fix
+
+Four failures, all "expected a rejection, got rows", two queries x two modes.
+
+**Both queries verified LEGAL against real SQLite before any suite was touched**
+— exact set match, optimized and `--no-optimize`:
+
+| Shape | SQLite | SwiftQL | Discriminating variant |
+|---|---|---|---|
+| (a) `IN` body containing a correlated scalar | 20 | 20 | 19/19, and `NOT IN` 0/0 |
+| (b) correlated scalar under arithmetic (Q17) | 10000 | 10000 | 2084/2084, same on the left of the comparison and inside a subtraction |
+
+They are legal for **different** reasons, and (a)'s old comment is why it looked
+unsupported: it said *"nested two deep, the inner one correlated to the MIDDLE
+block"*. Re-read, the `IN` body references only its own relation `l`, so **the
+`IN` is uncorrelated** and the scalar is correlated *one* level, to the `IN`
+body's own block — two independent mechanisms in two separate blocks (Week 32's
+semi-join lowering, Week 34's scalar decorrelation inside the body's own
+`build()`), not a two-level correlation. (b) is Q17 itself.
+
+**The cause was mine, and the shape of it is the lesson.** An earlier commit
+claimed to have *moved* both; only the arrival landed. The removal edits silently
+no-oped and I verified the destination suite's length without re-checking the
+source — so "nothing leaves without arriving" was half-checked. A **textual**
+cross-check finds nothing here, because the copies I added were reworded with
+aliases and `ORDER BY`. The check that works is **behavioural**: run every
+rejection entry and assert it still errors. Done across all nine rejection
+suites — these two were the only stale entries and there are none left.
+
+**Also strengthened**, because the moved entries are weak oracles: (a) at its
+original coefficient returns *all 20* drivers and would pass against an engine
+that ignored the inner scalar entirely, so a 19-of-20 variant and the anti-join
+`NOT IN` form were added; (b) gained the scalar on the left of the comparison,
+inside a subtraction, and two correlated scalars in one predicate.
 
 ### Still open, handed to Week 35/36
 
