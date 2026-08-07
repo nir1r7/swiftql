@@ -467,6 +467,100 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
 }
 
 
+Schema derivedRelationSchema(Schema body_schema, const TableRef& ref) {
+    std::vector<ColumnDef> cols = body_schema.columns();
+
+    if (!ref.columnAliases().empty()) {
+        if (ref.columnAliases().size() != cols.size()) {
+            throw std::runtime_error(
+                "derived table '" + ref.alias() + "' has "
+                + std::to_string(cols.size()) + " columns but "
+                + std::to_string(ref.columnAliases().size())
+                + " column aliases were supplied");
+        }
+        for (size_t i = 0; i < cols.size(); ++i) cols[i].name = ref.columnAliases()[i];
+    }
+
+    for (auto& col : cols) {
+        col.relation_slot = 0;   // a leaf's own schema; see the header
+        // A body's HAVING/ORDER-BY-only aggregate is computed inside the body
+        // and is not a column of the RELATION. build()'s star expansion already
+        // drops them at the body's own project, so this cannot fire today — but
+        // stating it here is what makes "the derived relation's columns are
+        // exactly its select list" true by construction rather than by accident.
+        col.hidden = false;
+    }
+
+    for (size_t i = 0; i < cols.size(); ++i) {
+        for (size_t j = i + 1; j < cols.size(); ++j) {
+            if (cols[i].name != cols[j].name) continue;
+            throw std::runtime_error(
+                "derived table '" + ref.alias() + "': column '" + cols[i].name
+                + "' is produced twice; give one of them an alias");
+        }
+    }
+    return Schema(cols);
+}
+
+
+Schema blockOutputSchema(const SelectStatement& stmt, const Catalog& catalog) {
+    // 1. The spine, in written order: FROM then joins[i] at slot i+1. Same
+    //    stamping rule build() uses — a leaf's own columns keep slot 0 and only
+    //    the newly added side is stamped — so a name that appears on both sides
+    //    resolves by slot exactly as it will in the real plan.
+    auto relationSchemaFor = [&](const TableRef& ref) {
+        if (!ref.isDerived())
+            return buildScanSchema(stmt, catalog.getTable(
+                ref.tableName("blockOutputSchema relation")).schema);
+        // A derived table inside a derived table: recurse, then apply the same
+        // normalization buildRelation applies (rename, flatten to slot 0), so
+        // the two agree by construction rather than by inspection.
+        return derivedRelationSchema(blockOutputSchema(*ref.body(), catalog), ref);
+    };
+
+    // NAMED locals, not `for (col : relationSchemaFor(...).columns())`. That form
+    // ranges over a reference INTO a temporary Schema, and a range-for extends
+    // the lifetime only of the range-init expression's own top-level temporary —
+    // `.columns()` returns a reference, so the Schema dies before the first
+    // iteration. It read freed memory and surfaced as `basic_string::_M_create`
+    // from a garbage column name, on the first joining derived body tried.
+    const Schema from_schema = relationSchemaFor(stmt.from);
+    std::vector<ColumnDef> spine = from_schema.columns();
+    for (size_t i = 0; i < stmt.joins.size(); ++i) {
+        const Schema join_schema = relationSchemaFor(stmt.joins[i].relation);
+        for (ColumnDef col : join_schema.columns()) {
+            col.relation_slot = static_cast<int>(i) + 1;
+            spine.push_back(col);
+        }
+    }
+    Schema schema(spine);
+
+    // 2. Aggregate, when there is one. Same detection as build(): recursive,
+    //    because AVG(speed) * 2 aggregates without being an AggregateExpr.
+    bool has_aggs = false;
+    for (const auto& e : stmt.select_list) {
+        std::vector<const AggregateExpr*> found;
+        collectAggregates(e.get(), found);
+        if (!found.empty()) { has_aggs = true; break; }
+    }
+    if (!stmt.group_by.empty() || has_aggs) {
+        schema = buildAggregateSchema(stmt.group_by, extractAggregates(stmt), schema);
+    }
+
+    // 3. Project. SELECT * drops hidden aggregate columns, exactly as build()'s
+    //    star expansion does — a body's HAVING/ORDER-BY-only aggregate is not a
+    //    column of the derived RELATION.
+    if (stmt.select_star) {
+        std::vector<ColumnDef> star;
+        for (const auto& col : schema.columns()) {
+            if (!col.hidden) star.push_back(col);
+        }
+        return Schema(star);
+    }
+    return buildProjectSchema(stmt, schema);
+}
+
+
 std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
     std::vector<AggregateSpec> specs;
 
@@ -613,6 +707,11 @@ std::string LogicalScan::explain() const {
     return "LogicalScan [" + table_name + ", " + std::to_string(output_schema.columns().size()) + " columns]";
 }
 
+std::string LogicalDerived::explain() const {
+    return "LogicalDerived [" + alias + ", "
+         + std::to_string(output_schema.columns().size()) + " columns]";
+}
+
 
 // LogicalJoin — single-key output is byte-identical to the pre-Week-26 form,
 // so existing --explain assertions keep passing
@@ -727,6 +826,76 @@ std::string LogicalLimit::explain() const {
 
 
 // LogicalPlanBuilder
+namespace {
+
+// One relation of the block being planned. Week 34 — either a catalog scan or a
+// DERIVED TABLE, and the two must be built by one function because everything
+// above them (the merged schema, slot stamping, key routing) treats them alike.
+std::unique_ptr<LogicalPlanNode> buildRelation(TableRef& ref,
+                                               const SelectStatement& outer,
+                                               const Catalog& catalog) {
+    if (!ref.isDerived()) {
+        return std::make_unique<LogicalScan>(
+            ref.tableName("buildRelation scan"),
+            buildScanSchema(outer, catalog.getTable(
+                ref.tableName("buildRelation schema")).schema));
+    }
+
+    // The body is a query BLOCK: build() it exactly as a top-level statement.
+    // That is what makes its refs level 0 against its OWN range table and its
+    // Validator errors the ones the body is entitled to.
+    //
+    // Projection pushdown into the body is deliberately NOT attempted.
+    // buildScanSchema narrows a CATALOG schema by bare name over one flat
+    // schema; a derived relation's schema IS its body's select list, so
+    // narrowing it means rewriting that list — which changes the body's output
+    // schema and therefore the range entry the enclosing block was BOUND
+    // against. A real feature with a real wrong-answer failure mode, and not
+    // this week's; the cost is a stated one, in README Limitations, so it lands
+    // in Week 37's numbers as an expectation rather than a surprise.
+    // Computed BEFORE the body is moved out: this is the schema the BINDER
+    // resolved this block's references against.
+    Schema expected = derivedRelationSchema(blockOutputSchema(*ref.body(), catalog), ref);
+
+    // SelectStatement is move-only; build() takes it by value. The unique_ptr is
+    // released here so the TableRef stops owning a statement that has been
+    // emptied — a second buildRelation on the same ref would otherwise plan a
+    // husk, which is the shape Week 33's use_count() > 1 refusal guards for
+    // SubqueryExpr.
+    std::unique_ptr<SelectStatement> body = ref.takeBody();
+    auto body_plan = LogicalPlanBuilder::build(std::move(*body), catalog);
+    Schema normalized = derivedRelationSchema(body_plan->output_schema, ref);
+
+    // THE DRIFT CHECK. blockOutputSchema and build() are two different code
+    // paths, so this can GENUINELY FAIL — unlike the assertion Week 33 deleted,
+    // which compared a copy of an object with the object. If it fires, the two
+    // derivations have diverged, which is the two-paths failure sharing the
+    // helpers was meant to prevent, and every indexOf(name, slot) above this
+    // graft is resolving against a schema the Binder never saw. Loud beats a
+    // clean hit on the wrong column. It runs once per derived relation.
+    if (expected.size() != normalized.size()) {
+        throw std::runtime_error(
+            "internal: derived table '" + ref.alias() + "' was bound against a "
+            + std::to_string(expected.size()) + "-column schema but planned to "
+            + std::to_string(normalized.size())
+            + " columns (blockOutputSchema and LogicalPlanBuilder::build disagree)");
+    }
+    for (int i = 0; i < expected.size(); ++i) {
+        if (expected.column(i).name == normalized.column(i).name
+            && expected.column(i).type == normalized.column(i).type) continue;
+        throw std::runtime_error(
+            "internal: derived table '" + ref.alias() + "' column " + std::to_string(i)
+            + " was bound as '" + expected.column(i).name + "' but planned as '"
+            + normalized.column(i).name
+            + "' (blockOutputSchema and LogicalPlanBuilder::build disagree)");
+    }
+
+    return std::make_unique<LogicalDerived>(std::move(body_plan), ref.alias(),
+                                            std::move(normalized));
+}
+
+} // namespace
+
 std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt, const Catalog& catalog) {
     Validator::validate(stmt, catalog);
 
@@ -734,11 +903,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     // aggregate's group-key output columns (no-op without expression keys)
     substituteGroupKeyRefs(stmt);
 
-    // FROM scan, narrowed to only the columns the query actually needs
-    std::unique_ptr<LogicalPlanNode> node = std::make_unique<LogicalScan>(
-        stmt.from.tableName("LogicalPlanBuilder FROM scan"),
-        buildScanSchema(stmt, catalog.getTable(
-            stmt.from.tableName("LogicalPlanBuilder FROM schema")).schema));
+    // FROM relation: a scan narrowed to the columns the query needs, or — Week
+    // 34 — a whole derived subtree normalized into one relation of this block.
+    std::unique_ptr<LogicalPlanNode> node = buildRelation(stmt.from, stmt, catalog);
 
     // ON conjuncts that are not equi-join keys, cloned out of the statement's
     // join trees (which die with `stmt` at the end of this function) and folded
@@ -750,11 +917,12 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         const auto& jc = stmt.joins[i];
         const int join_slot = static_cast<int>(i) + 1;   // range-table position
 
-        const TableMetadata& join_meta = catalog.getTable(
-            jc.relation.tableName("LogicalPlanBuilder JOIN schema"));
-        auto join_scan = std::make_unique<LogicalScan>(
-            jc.relation.tableName("LogicalPlanBuilder JOIN scan"),
-            buildScanSchema(stmt, join_meta.schema));
+        // Week 34: the SAME helper as the FROM position. The merged-schema loop
+        // below re-stamps this side with join_slot whatever it is, so a derived
+        // join needs no new stamping code — which is the payoff of normalizing
+        // the derived subtree's own schema to slot 0.
+        auto join_scan = buildRelation(
+            const_cast<TableRef&>(jc.relation), stmt, catalog);
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
         // way to disambiguate a self-join's occurrences of the same table —

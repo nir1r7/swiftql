@@ -10,7 +10,7 @@
 #include <vector>
 
 enum class LogicalNodeType {
-    SCAN, JOIN, FILTER, AGGREGATE, PROJECT, SORT, DISTINCT, LIMIT
+    SCAN, DERIVED, JOIN, FILTER, AGGREGATE, PROJECT, SORT, DISTINCT, LIMIT
 };
 
 // aggregate specification for a single aggregate function
@@ -73,6 +73,37 @@ struct LogicalScan : LogicalPlanNode {
     std::string table_name;  // catalog name (binder normalized)
 
     LogicalScan(std::string table, Schema narrowed_schema) : LogicalPlanNode(LogicalNodeType::SCAN, std::move(narrowed_schema)), table_name(std::move(table)) {}
+    std::string explain() const override;
+};
+
+// Week 34 — a relation of this block that is a PLAN rather than a table.
+//
+// WHY THIS IS A NODE AND NOT A BARE GRAFT, which is the smaller diff and the
+// wrong one. Four walkers in this tree find "the relation" by descending
+// children[0] until they hit a SCAN — leafScanTable and isSingleRelation
+// (vectorized_plan_builder.cc), leafScanTableOf and countRelations
+// (join_enumeration.cc) — and every one of them then draws a conclusion the cost
+// model consumes. Walked THROUGH a derived subtree they return the BODY's base
+// table, so the derived relation's column widths are attributed to whatever
+// table its body happens to scan first, and countRelations inflates the range
+// table's size so JoinEnumeration's out-of-range test stops meaning what it
+// says. All four failures are silent. This node is the wall they stop at, which
+// is Week 27's stance for a join-shaped input restated: refuse to guess rather
+// than return a plausible wrong number.
+//
+// It also owns the alias for --explain, so a derived subtree is not an
+// unexplained plan fragment at the bottom of the spine.
+//
+// !! ITS OUTPUT SCHEMA STAMPS SLOT 0, like a leaf scan's own schema. The outer
+// slot is applied by the merged join schema. See derivedRelationSchema.
+struct LogicalDerived : LogicalPlanNode {
+    std::string alias;   // the enclosing block's ref name for this relation
+
+    LogicalDerived(std::unique_ptr<LogicalPlanNode> body, std::string alias, Schema schema)
+        : LogicalPlanNode(LogicalNodeType::DERIVED, std::move(schema)),
+          alias(std::move(alias)) {
+        children.push_back(std::move(body));
+    }
     std::string explain() const override;
 };
 
@@ -257,6 +288,49 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
 
 // schema of the project node's output based on the select list
 Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schema);
+
+// Week 34 — the output schema of a whole query BLOCK, without building its plan.
+//
+// The Binder needs a derived table's schema to put in its range-table entry, and
+// it needs it BEFORE LogicalPlanBuilder::build has run (build calls
+// Validator::validate, which resolves against the range table this schema is
+// for). Writing a second, private derivation in the Binder is the two-paths
+// drift Weeks 26/28/30 each had to undo, and it would be worse than usual here:
+// the two copies would have to agree on aggregateOutputName (which IS
+// exprToString, a byte-for-byte contract), on `hidden` columns and on SELECT *
+// expansion, and a disagreement is a silent wrong-relation lookup rather than an
+// error.
+//
+// So: one function, composed of the SAME helpers build() uses
+// (buildScanSchema / extractAggregates / buildAggregateSchema /
+// buildProjectSchema), and LogicalPlanBuilder::build ASSERTS at the graft that
+// the plan it actually produced has this schema. That assertion compares two
+// objects computed by different code paths, so it can genuinely fail — unlike
+// the dead one Week 33 deleted, which compared a copy of an object with the
+// object.
+//
+// Precondition: `stmt` is bound. Nested derived tables recurse.
+Schema blockOutputSchema(const SelectStatement& stmt, const Catalog& catalog);
+
+// Week 34 — turn a derived table's BODY schema into the schema of a RELATION of
+// the enclosing block. Two operations and one refusal, all of which must happen
+// identically wherever a derived relation's schema is computed, which is why
+// they are here and not open-coded at the Binder and the plan builder:
+//
+//  - the column-alias list (`AS d (a, b)`) RENAMES positionally; a length
+//    mismatch is an error;
+//  - every column is stamped relation_slot 0, exactly as a leaf scan's own
+//    schema is. THE OUTER SLOT IS NOT APPLIED HERE: it is applied by the merged
+//    join schema, by the same loop that stamps a base relation. A body that
+//    JOINS produces slots 0 AND 1 — the BODY's numbering — and grafting that
+//    unchanged would put two numbering domains inside one schema, which is the
+//    silent wrong-relation class ColumnId makes loud inside a block and which
+//    nothing checks across a range-table boundary. Keeping it 0 is also what
+//    PredicatePushdown's `restampSlots(c, 0)` before a push and ChunkPruner's
+//    `relation_slot < 1` scan-local test both already assume of a leaf.
+//  - two output columns of one name are REFUSED. A catalog table cannot have
+//    them; a derived table can, and then BOTH indexOf overloads are a coin flip.
+Schema derivedRelationSchema(Schema body_schema, const TableRef& ref);
 
 // schema of the aggregate node's output: group-by columns, then one column per aggregate
 Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,

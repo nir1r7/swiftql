@@ -2,6 +2,7 @@
 
 #include "parser/ast.h"
 #include "catalog/catalog.h"
+#include <memory>
 #include <vector>
 
 // resolves table aliases and qualified/unqualified column references to a stable relation identity (the catalog table name)
@@ -37,6 +38,13 @@ class Binder {
         // chunk pruning inside every subquery.
         struct Scope {
             std::vector<RangeEntry> range_table;
+            // Week 34. Stable storage for a DERIVED entry's schema. A catalog
+            // table's Schema outlives the query, so RangeEntry can hold a raw
+            // pointer at it; a derived table's is computed here and must be
+            // OWNED. unique_ptr, never vector<Schema>: a reallocation on the
+            // SECOND derived table in one block would dangle every earlier
+            // entry's pointer, and only then.
+            std::vector<std::unique_ptr<Schema>> owned_schemas;
             Scope* parent = nullptr;
             SelectStatement* stmt = nullptr;  // to set has_subquery
             bool correlated = false;          // some ref here resolved further out
@@ -58,4 +66,17 @@ class Binder {
         // the column's type lives in a range table `query_level` blocks out.
         // The Binder is the only layer with that chain, so the check lands here.
         static void checkCorrelatedAggregateArg(const AggregateExpr* agg, const Scope& scope);
+        // Week 34. The schema of one FROM/JOIN relation — a catalog table's, or
+        // a DERIVED TABLE's, in which case the body is bound here first.
+        //
+        // !! `parent`, not `&scope`. A derived table is NOT LATERAL: its body may
+        // not reference the enclosing query's own FROM items. Binding it against
+        // the block's PARENT makes sibling relations invisible by construction —
+        // the argument IS the scoping rule, there is no separate check for it —
+        // and a reference reaching further out still marks the body correlated,
+        // which is refused by name. SwiftQL has no dependent-join operator to run
+        // a lateral join on, which is the same reason Week 33 refuses rather than
+        // falling back.
+        static const Schema* relationSchema(TableRef& ref, Scope& scope,
+                                            const Catalog& catalog, Scope* parent);
 };

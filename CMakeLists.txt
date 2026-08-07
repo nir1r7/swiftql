@@ -44,6 +44,7 @@ add_library(swiftql_lib
     src/planner/subquery_decorrelation.cc
     src/planner/join_condition.cc
     src/planner/logical_plan.cc
+    src/execution/vec_derived_node.cc
     src/planner/cardinality_estimator.cc
     src/planner/predicate_pushdown.cc
     src/planner/join_enumeration.cc

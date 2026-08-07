@@ -1,5 +1,6 @@
 #include "binder.h"
 #include "constant_folding.h"
+#include "logical_plan.h"   // blockOutputSchema / derivedRelationSchema (Week 34)
 #include "parser/expr_utils.h"
 #include <stdexcept>
 
@@ -8,29 +9,17 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
 }
 
 bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* parent) {
-    // Week 34 INTERIM REFUSAL, deleted by Task 3 in the very next commit. The
-    // grammar accepts FROM (subquery) as of this commit and nothing below can
-    // yet build a range entry for one, so refuse here — before any consumer
-    // reads a name that is not there — rather than let TableRef::tableName throw
-    // an internal-defect message at whichever site happens to run first. Same
-    // stance Weeks 26 and 30 took for a shape that parses before it executes.
-    // NOT added to compare_against_sqlite.py: the harness pins the SHIPPED
-    // dialect, and this refusal does not survive the week.
-    if (stmt.from.isDerived())
-        throw std::runtime_error(
-            "FROM (subquery) is parsed but not yet executable (Week 34)");
-    for (const auto& j : stmt.joins) {
-        if (j.relation.isDerived())
-            throw std::runtime_error(
-                "FROM (subquery) is parsed but not yet executable (Week 34)");
-    }
-
     // table existence is Validator's error to raise (preserves its message)
-    // without a valid range table there is nothing safe to resolve here
-    if (!catalog.hasTable(stmt.from.tableName("Binder::bindQuery FROM existence")))
+    // without a valid range table there is nothing safe to resolve here.
+    // Week 34: NAMED relations only — a derived one has no name to check, and
+    // calling tableName() here would turn "this query uses a derived table"
+    // into an internal-defect throw.
+    if (!stmt.from.isDerived()
+        && !catalog.hasTable(stmt.from.tableName("Binder::bindQuery FROM existence")))
         return false;
     for (const auto& j : stmt.joins) {
-        if (!catalog.hasTable(j.relation.tableName("Binder::bindQuery JOIN existence")))
+        if (!j.relation.isDerived()
+            && !catalog.hasTable(j.relation.tableName("Binder::bindQuery JOIN existence")))
             return false;
     }
 
@@ -38,24 +27,36 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     scope.parent = parent;
     scope.stmt = &stmt;
 
-    const Schema& from_schema =
-        catalog.getTable(stmt.from.tableName("Binder::bindQuery FROM schema")).schema;
+    // Week 34: the schema comes from relationSchema, which for a derived table
+    // BINDS THE BODY FIRST — before this entry is pushed, so a body that
+    // (wrongly) resolved against this scope could not find a sibling relation
+    // even if the parent argument were wrong. Ordering is the second guard.
+    //
+    // table_name stays EMPTY for a derived entry, deliberately: it is the
+    // CANONICAL CATALOG NAME and there is none. Filling it with the alias would
+    // make the duplicate-alias diagnostic below read a derived entry as an
+    // unaliased base table and hand a user who wrote two aliases the "add
+    // aliases" advice.
+    const Schema* from_schema = relationSchema(stmt.from, scope, catalog, parent);
     scope.range_table.push_back({
         stmt.from.refName(),
-        stmt.from.tableName("Binder::bindQuery FROM entry"),
-        &from_schema
+        stmt.from.isDerived() ? std::string()
+                              : stmt.from.tableName("Binder::bindQuery FROM entry"),
+        from_schema
     });
+    if (stmt.from.isDerived()) stmt.has_derived_table = true;
 
     // One range-table entry per JOIN, in written order: joins[i] lands at slot
     // i+1. resolveColumnRef already loops over the range table by index, so
     // widening it here is the whole of the N-relation generalization.
-    for (const auto& j : stmt.joins) {
-        const Schema& join_schema =
-            catalog.getTable(j.relation.tableName("Binder::bindQuery JOIN schema")).schema;
+    for (auto& j : stmt.joins) {
+        const Schema* join_schema = relationSchema(j.relation, scope, catalog, parent);
+        if (j.relation.isDerived()) stmt.has_derived_table = true;
         scope.range_table.push_back({
             j.relation.refName(),
-            j.relation.tableName("Binder::bindQuery JOIN entry"),
-            &join_schema
+            j.relation.isDerived() ? std::string()
+                                   : j.relation.tableName("Binder::bindQuery JOIN entry"),
+            join_schema
         });
 
         // Two relations sharing a ref name are unresolvable — every qualified
@@ -179,6 +180,35 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     // 14) rather than descending into an already-folded body.
     foldConstants(stmt);
     return scope.correlated;
+}
+
+const Schema* Binder::relationSchema(TableRef& ref, Scope& scope,
+                                     const Catalog& catalog, Scope* parent) {
+    if (!ref.isDerived())
+        return &catalog.getTable(ref.tableName("Binder::relationSchema")).schema;
+
+    // NOT LATERAL. `parent`, never `&scope`: the body must not see this block's
+    // own FROM items. The argument IS the rule. A reference reaching FURTHER out
+    // (into a block enclosing this one) still resolves and marks the body
+    // correlated, and that is the shape refused below — SQL disallows it without
+    // LATERAL, and there is no dependent-join operator here to run it on.
+    const bool body_is_correlated = bindQuery(*ref.body(), catalog, parent);
+    if (body_is_correlated) {
+        throw std::runtime_error(
+            "derived table '" + ref.alias() + "': a subquery in FROM cannot "
+            "reference a column of an enclosing query (LATERAL is not supported)");
+    }
+
+    // ONE derivation, shared with LogicalPlanBuilder::build, which asserts at the
+    // graft that the plan it produced has exactly this schema. A private copy
+    // here would be the two-paths drift Weeks 26/28/30 each had to undo, and the
+    // two would have to agree on aggregateOutputName, hidden columns and SELECT *
+    // expansion — a disagreement being a silent wrong-relation lookup, not an
+    // error. derivedRelationSchema applies the column-alias rename, flattens the
+    // slots to 0 and refuses a duplicate output name.
+    Schema derived = derivedRelationSchema(blockOutputSchema(*ref.body(), catalog), ref);
+    scope.owned_schemas.push_back(std::make_unique<Schema>(std::move(derived)));
+    return scope.owned_schemas.back().get();
 }
 
 void Binder::markCorrelated(Scope& scope, int level) {

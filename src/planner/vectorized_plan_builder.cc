@@ -1,4 +1,5 @@
 #include "vectorized_plan_builder.h"
+#include "execution/vec_derived_node.h"
 #include "execution/vec_scan_node.h"
 #include "execution/vec_filter_node.h"
 #include "execution/vec_project_node.h"
@@ -42,11 +43,20 @@ void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int
 
 // walk down children[0] to the leaf scan's table name — used to read row
 // counts for the build-side decision before lowering moves the tables
-const std::string& leafScanTable(const LogicalPlanNode* node) {
+// Week 34: NULLABLE. A DERIVED relation has no catalog table, so there is no
+// per-column avg_width to look up and no TableStats to consult — and walking
+// THROUGH it returns the BODY's base table, attributing that table's widths to
+// the derived relation's columns. That is the identical defect Week 27 found in
+// rowWidth for a join subtree and closed by refusing to guess: the uniform proxy
+// and `build=join-subtree` beat a plausible wrong number, because this feeds the
+// decision Week 28's enumeration is built on.
+const std::string* leafScanTableOrNull(const LogicalPlanNode* node) {
     while (node->type != LogicalNodeType::SCAN) {
+        if (node->type == LogicalNodeType::DERIVED) return nullptr;
+        if (node->children.empty()) return nullptr;
         node = node->children[0].get();
     }
-    return static_cast<const LogicalScan*>(node)->table_name;
+    return &static_cast<const LogicalScan*>(node)->table_name;
 }
 
 // True when this join input is exactly one relation: a scan, possibly under
@@ -56,6 +66,13 @@ const std::string& leafScanTable(const LogicalPlanNode* node) {
 bool isSingleRelation(const LogicalPlanNode* node) {
     while (node->type != LogicalNodeType::SCAN) {
         if (node->type == LogicalNodeType::JOIN) return false;
+        // Week 34: a DERIVED relation IS one relation of this block — that is
+        // the whole point of the node — but it is not one a TableStats describes,
+        // and every caller of this predicate follows it with leafScanTable. So
+        // it answers false, which routes them to the no-statistics path rather
+        // than to the body's base table. Same stance as the row above.
+        if (node->type == LogicalNodeType::DERIVED) return false;
+        if (node->children.empty()) return false;
         node = node->children[0].get();
     }
     return true;
@@ -174,7 +191,12 @@ void collectSlotTables(const LogicalPlanNode* node,
     // dissolves that argument and would have made the -1 entry live. The map
     // argument above does not depend on it.
     if (join->semantics == JoinSemantics::STANDARD) {
-        out[join->join_slot] = leafScanTable(join->children[1].get());
+        // Week 34: a DERIVED children[1] names no catalog table, so the entry is
+        // SKIPPED rather than filled with the body's base table. rowWidth's
+        // slot_tables lookup then misses and falls back to 8 bytes/column, which
+        // is Week 27's refuse-to-guess rather than a plausible wrong width.
+        if (const std::string* t = leafScanTableOrNull(join->children[1].get()))
+            out[join->join_slot] = *t;
     }
     // The left side is walked either way: a semi join's output schema IS its
     // left child's, so every column this map is consulted for comes from there.
@@ -183,8 +205,10 @@ void collectSlotTables(const LogicalPlanNode* node,
         // A join always carries at least its own key columns per side, so the
         // merged schema cannot be empty — but read defensively: an empty schema
         // here would index out of bounds rather than lose a width.
-        if (join->output_schema.size() > 0)
-            out[join->output_schema.column(0).relation_slot] = leafScanTable(left);
+        if (join->output_schema.size() > 0) {
+            if (const std::string* t = leafScanTableOrNull(left))
+                out[join->output_schema.column(0).relation_slot] = *t;
+        }
         return;
     }
     collectSlotTables(left, out);
@@ -197,7 +221,9 @@ void collectSlotTables(const LogicalPlanNode* node,
 // that don't seed them) — the same proxy the pre-Gap-3 code always used.
 double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
     if (isSingleRelation(child)) {
-        const std::string& table = leafScanTable(child);
+        const std::string* table_p = leafScanTableOrNull(child);
+        if (!table_p) return child->output_schema.size() * 8.0;
+        const std::string& table = *table_p;
         if (!catalog.hasStats(table)) return child->output_schema.size() * 8.0;
         const TableStats& ts = catalog.getStats(table);
         double width = 0.0;
@@ -259,6 +285,24 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 scan->table_name, std::move(table), scan->output_schema, pruning_where);
         }
 
+        // Week 34 — a derived relation lowers to its BODY's operator tree and
+        // nothing else. There is deliberately NO physical derived operator: a
+        // derived table is a naming and slot-normalization artifact, not a
+        // computation. What does have to reach the physical side is the column
+        // RENAME from `AS d (a, b)`, because resolveColumnIndex (evaluator.cc)
+        // and every indexOf above this graft look the new names up.
+        case LogicalNodeType::DERIVED: {
+            auto* derived = static_cast<LogicalDerived*>(node);
+            auto child = lowerNode(derived->children[0].get(), nullptr);
+            if (derived->output_schema.size() != child->outputSchema().size()) {
+                throw std::runtime_error(
+                    "internal: derived relation '" + derived->alias
+                    + "' lowered to a child of a different width");
+            }
+            return std::make_unique<VecDerivedNode>(
+                std::move(child), derived->alias, derived->output_schema);
+        }
+
         case LogicalNodeType::JOIN: {
             auto* join = static_cast<LogicalJoin*>(node);
 
@@ -307,8 +351,16 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 from_w = rowWidth(join->children[0].get(), catalog);
                 join_w = rowWidth(join->children[1].get(), catalog);
             } else {
-                from_est = tables.at(leafScanTable(join->children[0].get())).num_rows;
-                join_est = tables.at(leafScanTable(join->children[1].get())).num_rows;
+                // Week 34: with a DERIVED input there is no loaded table to
+                // read a row count from. Fall back to the logical estimate (or
+                // to 1 when there is none, which is what --no-optimize leaves),
+                // rather than throwing out of a map lookup on a legal query.
+                const std::string* fp = leafScanTableOrNull(join->children[0].get());
+                const std::string* jp = leafScanTableOrNull(join->children[1].get());
+                from_est = fp ? tables.at(*fp).num_rows
+                              : std::max(1.0, join->children[0]->estimated_rows);
+                join_est = jp ? tables.at(*jp).num_rows
+                              : std::max(1.0, join->children[1]->estimated_rows);
             }
 
             // Pruning hint routes to the FROM side only — and only while that
@@ -500,8 +552,10 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 const LogicalPlanNode* build_side = join->children[from_builds ? 0 : 1].get();
                 std::ostringstream d;
                 d << std::fixed << std::setprecision(0)
-                  << "build=" << (isSingleRelation(build_side)
-                                      ? leafScanTable(build_side) : "join-subtree")
+                  << "build=" << (leafScanTableOrNull(build_side) && isSingleRelation(build_side)
+                                      ? *leafScanTableOrNull(build_side)
+                                      : (build_side->type == LogicalNodeType::DERIVED
+                                             ? "derived" : "join-subtree"))
                   << " cost=" << side_cost << " (alt=" << side_alt << ")";
                 if (int_keys && !outer) {
                     d << " algo=" << (use_simd ? "simd" : "hash")

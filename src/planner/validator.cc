@@ -1,4 +1,5 @@
 #include "validator.h"
+#include "logical_plan.h"   // blockOutputSchema / derivedRelationSchema (Week 34)
 #include "join_condition.h"
 #include <stdexcept>
 #include "parser/expr_utils.h"
@@ -160,13 +161,44 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 }
 
 void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalog){
-    // FROM table must exist
-    if (!catalog.hasTable(stmt.from.tableName("Validator FROM existence"))) {
-        throw std::runtime_error(
-            "Table not found: '" + stmt.from.tableName("Validator FROM message") + "'");
-    }
-    const Schema& schema =
-        catalog.getTable(stmt.from.tableName("Validator FROM schema")).schema;
+    // Week 34 — ONE range table for the whole function, built once, keyed
+    // exactly as the Binder's is (the alias when there is one, the table name
+    // otherwise). It replaces four inline recomputations of the same thing:
+    // the FROM schema, the SUM/AVG argument check's slot arithmetic, the
+    // `relations` vector for join conditions, and the GROUP BY existence check.
+    // Keeping them separate is what let Week 26's join keying and Week 30's
+    // SUM/AVG slot lookup each disagree with the Binder in its own way.
+    //
+    // A DERIVED entry's schema is computed by the SAME shared helpers the Binder
+    // and the plan builder use, and is OWNED here (the catalog owns the others).
+    std::vector<std::unique_ptr<Schema>> owned_schemas;
+    std::vector<std::pair<std::string, const Schema*>> relations;
+
+    auto addRelation = [&](const TableRef& ref, bool is_join) {
+        if (ref.isDerived()) {
+            // The body is a query block of its own: validate it in its own scope
+            // first, so a defect inside it reports against the body's relations
+            // rather than surfacing as a missing column of the derived table.
+            validateQuery(*ref.body(), catalog);
+            owned_schemas.push_back(std::make_unique<Schema>(
+                derivedRelationSchema(blockOutputSchema(*ref.body(), catalog), ref)));
+            relations.push_back({ref.refName(), owned_schemas.back().get()});
+            return;
+        }
+        const std::string& t = ref.tableName("Validator relation existence");
+        if (!catalog.hasTable(t)) {
+            throw std::runtime_error(
+                (is_join ? "Join table not found: '" : "Table not found: '") + t + "'");
+        }
+        relations.push_back({ref.refName(), &catalog.getTable(t).schema});
+    };
+
+    addRelation(stmt.from, /*is_join=*/false);
+    for (const auto& j : stmt.joins) addRelation(j.relation, /*is_join=*/true);
+
+    // The FROM relation's schema, under its historical name. Every use below is
+    // of relation 0, which is what `schema` always meant.
+    const Schema& schema = *relations[0].second;
 
     // SELECT list columns must exist (skip for SELECT *)
     if (!stmt.select_star) {
@@ -201,25 +233,30 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
 
             // pick the schema the argument resolves against: binder slot when
             // bound, table-name match for unbound qualified refs, FROM otherwise
+            //
+            // Week 34: resolved against the RANGE TABLE built above rather than
+            // against `stmt.joins[slot-1].join_table`. That index arithmetic is
+            // still right — slot k > 0 IS joins[k-1]'s relation — but its next
+            // step, catalog.getTable(name), has no answer for a derived
+            // relation. The range table answers uniformly for both, which is the
+            // same reason the CORRELATED half of this check lives in the Binder
+            // (Week 30 round 2): the layer that owns slot -> schema is the only
+            // one that can resolve it.
+            //
+            // The unqualified/table-name fallbacks now match on the REF NAME,
+            // which is what a qualified reference actually writes. Keying on the
+            // table name was already wrong for an aliased relation and worked
+            // only because the slot branch caught those first.
             const Schema* target = nullptr;
             const int col_slot = col->id.localSlot("SUM/AVG argument check");
-            if (col_slot > 0
-                && col_slot <= static_cast<int>(stmt.joins.size())) {
-                // slot k > 0 is joins[k-1]'s relation — the one arithmetic
-                // identity the whole multi-way generalization rests on
-                target = &catalog.getTable(
-                    stmt.joins[col_slot - 1].relation.tableName(
-                        "SUM/AVG argument check")).schema;
-            } else if (col_slot == 0 || col->table_name.empty()) {
-                target = &schema;
-            } else if (col->table_name == stmt.from.tableName("SUM/AVG argument check FROM")) {
+            if (col_slot >= 0 && col_slot < static_cast<int>(relations.size())) {
+                target = relations[col_slot].second;
+            } else if (col->table_name.empty()) {
                 target = &schema;
             } else {
-                for (const auto& j : stmt.joins) {
-                    const std::string& jt =
-                        j.relation.tableName("SUM/AVG argument check JOIN");
-                    if (col->table_name != jt) continue;
-                    target = &catalog.getTable(jt).schema;
+                for (const auto& r : relations) {
+                    if (col->table_name != r.first) continue;
+                    target = r.second;
                     break;
                 }
             }
@@ -232,23 +269,9 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         }
     }
 
-    // JOIN tables must exist (if present)
+    // JOIN conditions (existence was checked by addRelation above, in written
+    // order, so a missing join table still reports before any ON clause is read)
     if (!stmt.joins.empty()) {
-        // Keyed by the name a qualified reference can actually use — the alias
-        // when there is one, the table name otherwise — mirroring the Binder's
-        // range table. Keying by table name made every aliased `ON` reference
-        // fall through validateJoinCondition's "unknown qualifier" escape, so
-        // its column-existence check did nothing for exactly the shapes Week 26
-        // adds (a self-join cannot be written without aliases).
-        std::vector<std::pair<std::string, const Schema*>> relations{
-            {stmt.from.refName(), &schema}};
-        for (const auto& j : stmt.joins) {
-            const std::string& jt = j.relation.tableName("Validator JOIN existence");
-            if (!catalog.hasTable(jt)) {
-                throw std::runtime_error("Join table not found: '" + jt + "'");
-            }
-            relations.push_back({j.relation.refName(), &catalog.getTable(jt).schema});
-        }
         for (size_t i = 0; i < stmt.joins.size(); ++i) {
             if (!stmt.joins[i].condition) continue;
             // shape first (at least one equi-join key, no forward reference),
@@ -359,21 +382,19 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         bool found;
         if (!g.table_name.empty()) {
             // qualified but unbound (validator-only callers that skip the Binder)
-            found = (g.table_name == stmt.from.tableName("GROUP BY existence FROM")
-                     && schema.hasColumn(g.column_name));
-            for (const auto& j : stmt.joins) {
+            // Week 34: matched against the range table's REF names, which is
+            // what a qualified GROUP BY item actually writes, and which answers
+            // for a derived relation as well as a base one.
+            found = false;
+            for (const auto& r : relations) {
                 if (found) break;
-                const std::string& jt = j.relation.tableName("GROUP BY existence JOIN");
-                found = g.table_name == jt
-                     && catalog.getTable(jt).schema.hasColumn(g.column_name);
+                found = g.table_name == r.first && r.second->hasColumn(g.column_name);
             }
         } else {
-            found = schema.hasColumn(g.column_name);
-            for (const auto& j : stmt.joins) {
+            found = false;
+            for (const auto& r : relations) {
                 if (found) break;
-                found = catalog.getTable(
-                    j.relation.tableName("GROUP BY existence JOIN (unqualified)"))
-                        .schema.hasColumn(g.column_name);
+                found = r.second->hasColumn(g.column_name);
             }
         }
         if (!found) {
