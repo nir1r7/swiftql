@@ -1,20 +1,23 @@
 # Phase 5 orchestrator state
-Current: week 34 cleanup (a91a1c6f7778b58f5) still running. Week 35 TEACH IS DONE —
-  docs/week-35-plan.md committed, 8 tasks.
-  >> NEXT ACTION: when the week-34 cleanup reports, dispatch week 35 IMPLEMENTATION to agent
-  ace28f349cf48c3b7 (it wrote the plan). HELD deliberately: both rounds touch
-  python_tools/compare_against_sqlite.py, and two agents editing one file is how a fix gets
-  silently reverted. Do not start it early.
-  Week 35 plan highlights worth holding onto:
-  - Real hazards found before coding: CSVLoader::load eats line 1 unconditionally and splits on
-    ',' but .tbl has NO header and a TRAILING '|'; std::stod("1996-01-02") silently returns
-    1996.0 (a date parsed as a number, no error).
-  - An ABSOLUTE 1e-5 tolerance FAILS Q1 ON A CORRECT ANSWER (%.15g printing + summation order
-    ~= 0.03 absolute) — the comparison must be RELATIVE or it manufactures false failures.
-  - Mode-coverage honesty: the report never prints a bare "22/22". It prints answered-correctly
-    out of 22 SPLIT BY how many of the four modes each query matched, Volcano refusals on a
-    separate line and only when pinned by their expected message, and the two-mode/four-mode
-    census COMPUTED, not typed.
+Current: week 34 CLOSING GATE (a34a90e642f7d93b7, launched 16:12 UTC), serial. Cleanup
+  changed HARNESS AND TESTS ONLY, no engine code — so a failure means a suite entry or unit
+  test is wrong, not an engine regression.
+  >> NEXT ACTION after a GREEN gate: mark week 34 fully closed, then dispatch week 35
+  IMPLEMENTATION to agent ace28f349cf48c3b7 (it wrote docs/week-35-plan.md, 8 tasks).
+  Cleanup round results worth keeping:
+  - The two-key oracle entry had TWO reasons it could not discriminate; the audit named one,
+    and the AUDIT'S OWN SUGGESTED FIX would still not have worked (driver_id functionally
+    determines team). Now driver_id AND season at 0.99: both keys 623, one 553, other 533,
+    SwiftQL == sqlite3. MUTATION-TESTED: dropping keys after the first makes the new entry fail
+    (553 vs 623) while the old one still passes.
+  - A SYSTEMATIC harness weakness: 40 entries across four Volcano suites pinned only the shared
+    tail "not supported on the Volcano path", so none could say which of four guards fired. Now
+    per-guard; all 131 entries across twelve suites reach 26 distinct guards with no cross-guard
+    needle. Two hidden facts surfaced: one WEEK34_DERIVED_TABLE_VOLCANO_REJECTED entry never
+    reaches the derived-table guard (it joins twice), and three scalar entries reach the IN guard.
+  OWED, in week 35's starting notes, deferred with reason and NOT judged unnecessary: per-guard
+  mutation coverage (only 1 of 26 guards was mutated) and per-entry query-SHAPE re-derivation,
+  which a message-level pass structurally cannot see. Audit target 4 is UNRUN in both rounds.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
