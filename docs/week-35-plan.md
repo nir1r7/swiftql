@@ -43,7 +43,7 @@ written-down capability boundaries into an unqualified pass.
 | 1 — the gate step that cannot fail (`--baseline` + `--write-baseline` on one path) | **done** — the write moved after the comparison and is refused unless the run passed; proved on a synthetic regression |
 | 2 — q2's INERT is a parameter artifact | **done** — `SIZE` 15 -> 1 (172/250 combos discriminate); q2 is now DISCRIMINATING (7 rows -> 8) and still matches SQLite in both vectorized modes |
 | 3 — q19's ALL_NULL is a parameter artifact | **done** — BRANDs 12/23/34 -> 14/34/23; q19 is now DISCRIMINATING (56323.29 vs 8473.82) and matches SQLite in **all four** modes |
-| 4 — a narrowed `--queries` run prints a full-shaped PASS | pending |
+| 4 — a narrowed `--queries` run prints a full-shaped PASS | **done** — the verdict token becomes `PARTIAL-PASS`/`PARTIAL-FAIL`/`PARTIAL-NO-BASELINE` and the line names how many of the 22 did not run |
 | 5 — README records Q17 as supported; the spec's Q17 text is refused | pending |
 | 6 — q18's "unreachable" holds only at threshold 300 | pending |
 | after 2+3 — regenerate `docs/tpch-baseline.json` from a full run | pending |

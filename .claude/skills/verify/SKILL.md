@@ -76,6 +76,7 @@ oracle. Write **"matches SQLite"** — never "correct", never "TPC-H compliant".
 | `PASS` | No regression against `docs/tpch-baseline.json`. An `-- IMPROVED` suffix also passes: something newly answers, so refresh the baseline in the same commit as the improvement — a **second, separate run** with `--write-baseline docs/tpch-baseline.json` and *no* `--baseline`. The harness now writes the baseline only after the comparison and only when the run passed, so a regression can no longer be laundered into the file it was being gated against; a refresh run that also carries `--baseline` will simply refuse to write if anything failed. |
 | `FAIL` | **RED.** A wrong answer, an unexplained error, a broken mutation check, or a regression: a query that stopped answering, one that became vacuous, or one that answers in fewer modes than the baseline records. |
 | `NO-BASELINE` | `--baseline` was omitted. Not a pass — a run that cannot see a regression. Re-run it properly. |
+| `PARTIAL-*` | `--queries` narrowed the run, so the figure is a **subset**, not a measurement of TPC-H. Never quotable in a verdict block whatever the suffix says. The line names how many of the 22 did not run. |
 
 Never edit `docs/tpch-baseline.json` to make this gate pass. The baseline moves
 **up** with a real improvement and never down; a drop in the honest number is the
@@ -96,7 +97,10 @@ vacuous, so it needs its own baseline rather than being diffed against this one.
 Run it anyway on any planner, execution, storage, or TPC-H-query change — that is
 every change Phase 5 makes. While iterating on one query, narrow it with
 `--queries q9,q17` (the baseline comparison scopes itself to the queries that ran),
-but a verdict block may only report a **full 22-query run**.
+but a verdict block may only report a **full 22-query run**. That is no longer
+discipline alone: a narrowed run prints `PARTIAL-PASS` / `PARTIAL-FAIL` /
+`PARTIAL-NO-BASELINE` and says in the same line how many of the 22 did not run,
+so a partial figure cannot be quoted as a full one.
 
 ## Interpreting results
 

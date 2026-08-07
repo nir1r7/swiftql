@@ -542,6 +542,16 @@ def gate_line(summary, qids, ok, baseline_lines):
     baseline_lines is None when no baseline was compared -- said out loud,
     because an unchecked run cannot detect a regression and must not read as one
     that found none.
+
+    A NARROWED run says so in the verdict word itself. `--queries q1,q6,q12,q14`
+    used to print `PASS (4/4 meaningful vs SQLite: 4 in all four modes; 0
+    vacuous; 0 unported)` -- indistinguishable in SHAPE from a full run, a
+    stronger-reading claim than the true figure, and a genuine exit-0 PASS with
+    nothing in the line recording that 18 queries never ran. `SKILL.md` says a
+    verdict block may only report a full run, but that was discipline enforced
+    by nothing, and the same section tells the reader to narrow with --queries
+    while iterating. PARTIAL-* is carried in the verdict token so the words
+    travel with any quotation of the line, however it is excerpted.
     """
     modes = summary["modes"]
     split = {}
@@ -552,7 +562,11 @@ def gate_line(summary, qids, ok, baseline_lines):
         label = {4: "in all four modes", 2: "vectorized-only"}.get(n, f"in {n} modes")
         parts.append(f"{len(split[n])} {label}")
 
+    partial = set(qids) != set(QUERY_IDS)
     shape = (f"{len(summary['meaningful'])}/{len(qids)} meaningful vs SQLite"
+             + (f" of a {len(qids)}-QUERY SUBSET -- {len(QUERY_IDS) - len(qids)}"
+                f" of {len(QUERY_IDS)} NOT RUN, so this is NOT a full measurement"
+                if partial else "")
              + (f": {', '.join(parts)}" if parts else "")
              + f"; {len(summary['vacuous'])} vacuous"
              + f"; {len(summary['unported'])} unported")
@@ -575,8 +589,10 @@ def gate_line(summary, qids, ok, baseline_lines):
     # It says what it is. The verdict always agrees with the exit code.
     verdict = ("NO-BASELINE" if baseline_lines is None else
                ("PASS" if ok else "FAIL"))
+    if partial:
+        verdict = "PARTIAL-" + verdict
     line = f"tpch:       {verdict} ({shape})"
-    if verdict == "NO-BASELINE":
+    if verdict.endswith("NO-BASELINE"):
         line += " -- rerun with --baseline docs/tpch-baseline.json to gate it"
     if fails:
         line += " -- " + "; ".join(fails)
