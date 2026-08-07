@@ -426,10 +426,6 @@ WEEK31_SUBQUERY_QUERIES = [
     "SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed / 0 FROM laps LIMIT 1)",
     # an empty INNER RELATION on the EXISTS and IN paths
     "SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT * FROM laps WHERE speed > 99999)",
-    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
-    "(SELECT driver_id FROM laps WHERE speed > 99999)",
-    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
-    "(SELECT driver_id FROM laps WHERE speed > 99999)",
 
     # --- EXISTS / NOT EXISTS, both truth values ---
     "SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT * FROM laps WHERE speed > 340)",
@@ -437,25 +433,6 @@ WEEK31_SUBQUERY_QUERIES = [
     "SELECT COUNT(*) FROM drivers WHERE age > 30 AND NOT EXISTS "
     "(SELECT * FROM laps WHERE speed > 99999)",
 
-    # --- IN / NOT IN (Q16/Q18's shape) ---
-    "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps) ORDER BY name",
-    "SELECT name FROM drivers WHERE driver_id NOT IN "
-    "(SELECT driver_id FROM laps WHERE speed > 340) ORDER BY name",
-    # the IN operand reaches constant folding (dispatch site 14) and is then
-    # moved into the substituted InExpr
-    "SELECT COUNT(*) FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
-
-    # --- THREE-VALUED IN: a NULL in the materialized set ---
-    # A LEFT JOIN is the only way to get a NULL through the whole pipeline from
-    # catalog data (invariant 14), and these are the two rules that differ:
-    #   NOT IN over a set containing NULL is NEVER TRUE -> no rows;
-    #   IN over the same set keeps the non-null values.
-    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
-    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
-    " ON d.driver_id = l.driver_id AND l.speed > 99999)",
-    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
-    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
-    " ON d.driver_id = l.driver_id AND l.driver_id < 5)",
 
     # --- the walker (dispatch site 19) must reach a subquery inside a container ---
     "SELECT COUNT(*) FROM laps WHERE "
@@ -472,10 +449,6 @@ WEEK31_SUBQUERY_QUERIES = [
     # an unqualified name present in BOTH blocks resolves to the inner one
     "SELECT COUNT(*) FROM laps l WHERE EXISTS "
     "(SELECT * FROM drivers d WHERE team = 'Ferrari')",
-    # a subquery in a query that also uses a LEFT JOIN, so the Week 29 passes run
-    # on the same tree
-    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
-    "WHERE d.age IN (SELECT season FROM laps l2)",
     # a local expression group key inside the body must still satisfy its own
     # select item
     "SELECT COUNT(*) FROM laps l WHERE EXISTS "
@@ -490,6 +463,126 @@ WEEK31_SUBQUERY_QUERIES = [
 # the vectorized path only (Week 27). The nested query runs on the SAME engine as
 # the query containing it, so this is the pre-existing capability difference
 # rather than a new one — and asserting both halves is what keeps it deliberate.
+# Week 32 — SET-MEMBERSHIP LOWERING, diffed in the VECTORIZED modes only.
+#
+# An uncorrelated `IN (subquery)` is no longer materialized into a literal list:
+# it is lowered to a hash SEMI join (`NOT IN` to an ANTI join), which Volcano
+# cannot hold — Planner::plan builds exactly one HashJoinNode out of stmt.joins
+# and a semi-join is a second one. That refusal is pinned below; these are the
+# queries whose ANSWERS are compared, and they are compared in two modes rather
+# than four. Every one of them was diffed in four modes in Week 31, so the loss
+# is real and is recorded here rather than implied by an absence.
+WEEK32_SEMI_JOIN_VEC_ONLY = [
+    # --- the checkpoint query, and the one Week 31 could NOT answer at all ---
+    # 10000 distinct values, i.e. 1e8 Value comparisons under the old linear
+    # InExpr scan, which is why Week 31 capped it at 1024 and pinned the REFUSAL
+    # instead of the answer. The cap is gone because nothing is materialized, so
+    # the query MOVES here — a rejection entry deleted without a diff entry
+    # added would quietly reduce coverage exactly where it matters most.
+    "SELECT COUNT(*) FROM laps WHERE lap_id IN (SELECT lap_id FROM laps)",
+
+    # --- IN / NOT IN (Q16/Q18's shape) ---
+    "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps) ORDER BY name",
+    "SELECT name FROM drivers WHERE driver_id NOT IN "
+    "(SELECT driver_id FROM laps WHERE speed > 340) ORDER BY name",
+
+    # --- DUPLICATE BUILD KEYS: the single most valuable query in the week ---
+    # `team` has 20 rows over a handful of distinct values on the build side. An
+    # inner join with a projection on top would emit each outer row once PER
+    # match; a semi-join emits it once. The two answers differ by a factor of
+    # five, and only SQLite says which is right.
+    "SELECT COUNT(*) FROM laps WHERE team IN (SELECT team FROM drivers)",
+    "SELECT team, COUNT(*) FROM laps WHERE team IN (SELECT team FROM drivers) "
+    "GROUP BY team ORDER BY team",
+
+    # --- EMPTY BUILD SIDE, both polarities ---
+    #   x IN ()     is FALSE for every x       -> no rows
+    #   x NOT IN () is TRUE for every x        -> every row, NULL x included
+    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
+    "(SELECT driver_id FROM laps WHERE speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
+    "(SELECT driver_id FROM laps WHERE speed > 99999)",
+
+    # --- THREE-VALUED IN: a NULL on the BUILD side ---
+    # The sharpest correctness item in the week, and the one the shipped CSVs
+    # cannot express — ColumnarTable cannot hold a NULL, so a LEFT JOIN inside
+    # the body is how one is constructed (invariant 14). The rules differ:
+    #   NOT IN over a set containing a NULL is NEVER TRUE -> no rows at all,
+    #     which is why the build phase carries build_had_null_key_ out as a flag
+    #     and the ANTI probe short-circuits on it;
+    #   IN over the same set keeps the non-null matches, because a NULL simply
+    #     never matches.
+    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
+    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
+    " ON d.driver_id = l.driver_id AND l.speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
+    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
+    " ON d.driver_id = l.driver_id AND l.driver_id < 5)",
+
+    # --- a NULL on the PROBE side ---
+    # `NULL IN S` and `NULL NOT IN S` are both UNKNOWN for a non-empty S, and a
+    # WHERE keeps neither — but `NULL NOT IN ()` is TRUE, which is the case the
+    # empty-build branch is tested separately for.
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "AND l.speed > 99999 WHERE l.driver_id IN (SELECT driver_id FROM laps)",
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "AND l.speed > 99999 WHERE l.driver_id NOT IN (SELECT driver_id FROM laps)",
+
+    # --- the semi-join sits ABOVE a JOIN SPINE, so the operand's binder slot is
+    # a real slot rather than 0, and pushdown/enumeration both meet the node ---
+    "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "WHERE l.season IN (SELECT season FROM laps l2)",
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE d.age IN (SELECT season FROM laps l2)",
+
+    # --- other conjuncts survive in the WHERE filter and still push to the scan ---
+    "SELECT COUNT(*) FROM laps WHERE speed > 300 AND driver_id IN "
+    "(SELECT driver_id FROM drivers WHERE age > 30) AND season = 2024",
+    # two IN conjuncts -> two stacked semi-joins
+    "SELECT COUNT(*) FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
+    "AND season IN (SELECT season FROM laps l2 WHERE l2.speed > 340)",
+    # a GROUP BY inside the body: its keys are level 0 against the BODY's range
+    # table, so buildAggregateSchema's Week 30 tripwire must NOT fire even though
+    # the body is now planned by a nested builder call rather than as its own
+    # top-level statement (docs/week-32-plan.md 0)
+    "SELECT COUNT(*) FROM laps WHERE driver_id IN "
+    "(SELECT driver_id FROM drivers GROUP BY driver_id)",
+]
+
+WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path")
+    for query in WEEK32_SEMI_JOIN_VEC_ONLY
+]
+
+# Shapes the lowering cannot express. Each is legal SQL that SQLite answers, so
+# none can live in a diffed suite — the diffed suite cannot hold a query that
+# errors — and each is a stated row in README -> Syntax Deliberately Not
+# Supported. Refusing beats falling back to Week 31's materialization: two
+# productions that must agree on NULL semantics is the drift this codebase has
+# had to undo three times.
+#
+# Run in ALL FOUR modes: these refusals come from LogicalPlanBuilder and from
+# Planner::plan's own guard, so asserting all four is what proves the engines
+# agree on the boundary rather than assuming it.
+WEEK32_LOWERING_REFUSED = [
+    # A COMPUTED OPERAND. The grammar allows `additive [NOT] IN (select_stmt)`,
+    # so this parses — but JoinKey holds column NAMES, and there is no
+    # computed-key join in this engine. Diffed in four modes in Week 31.
+    ("SELECT COUNT(*) FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
+     "must be a column reference"),
+    # AN IN UNDER AN OR. A semi-join is a whole-conjunct construct; there is no
+    # disjunctive semi-join here. No TPC-H query writes one.
+    ("SELECT COUNT(*) FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
+     "OR speed > 340",
+     "whole top-level WHERE conjunct"),
+    # AN IN IN HAVING. The join would have to sit above LogicalAggregate. Legal,
+    # but no TPC-H query needs it (Q11's HAVING subquery is scalar), so lowering
+    # only WHERE is the minimum code that solves the problem.
+    ("SELECT team, COUNT(*) FROM laps GROUP BY team "
+     "HAVING COUNT(*) IN (SELECT driver_id FROM drivers)",
+     "whole top-level WHERE conjunct"),
+]
+
 WEEK31_SUBQUERY_VEC_ONLY = [
     "SELECT COUNT(*) FROM laps WHERE speed > "
     "(SELECT AVG(l.speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
@@ -514,11 +607,11 @@ WEEK31_MATERIALIZATION_REFUSED = [
     # SQLite's answer depends on a scan order this engine is free to change.
     ("SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed FROM laps)",
      "scalar subquery returned more than one row"),
-    # THE IN CAP. The most obvious IN subquery a user can write against the
-    # shipped dataset is over the cap, so the refusal must be asserted rather
-    # than assumed absent from the suite. Week 32's semi-join deletes this row.
-    ("SELECT COUNT(*) FROM laps WHERE lap_id IN (SELECT lap_id FROM laps)",
-     "above the materialization limit of 1024"),
+    # THE IN CAP entry lived here until Week 32 and was MOVED, not deleted:
+    # `lap_id IN (SELECT lap_id FROM laps)` is answerable now that nothing is
+    # materialized, so it is diffed against SQLite in WEEK32_SEMI_JOIN_VEC_ONLY
+    # above. Deleting it outright would have removed the one query that best
+    # demonstrates the week's checkpoint at the moment it finally has an answer.
 ]
 
 # Correlated subqueries are Week 33: their value depends on the outer row, so
@@ -1234,6 +1327,32 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
+
+    # Week 32 — set-membership lowering. Diffed in the two vectorized modes,
+    # refused (by message) in the two Volcano ones. Same split, same reason, as
+    # MULTIWAY_QUERIES / MULTIWAY_VOLCANO_REJECTED: the capability difference is
+    # real, so BOTH halves are asserted and the boundary cannot drift silently.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK32_SEMI_JOIN_VEC_ONLY,
+            f"Week 32 semi/anti-join subqueries — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK32_SEMI_JOIN_VOLCANO_REJECTED,
+            f"Week 32 semi/anti-join subqueries refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK32_LOWERING_REFUSED,
+            f"Week 32 shapes lowering cannot express — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
 
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
     total_failed = f1 + f2 + f3 + f4 + m_failed + r_failed
