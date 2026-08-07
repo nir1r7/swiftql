@@ -61,6 +61,15 @@ struct Args {
     bool storage_stats = false;  // print columnar byte sizes and exit
     std::string storage = "row"; // default to row
     std::string execution = "volcano";
+    // Week 35: "aligned" (the default, unchanged) or "tsv". The aligned printer
+    // pads to data-derived widths, which is unambiguous only while no value and
+    // no COLUMN NAME contains two consecutive spaces and no value is empty.
+    // TPC-H breaks all three: aggregateOutputName IS exprToString, which renders
+    // a BinaryExpr as "(a * (1 - b))" -- spaces inside a single column name --
+    // so a header split on whitespace shreds one column into seven and every row
+    // is then silently dropped by the harness's field-count check. TSV removes
+    // the ambiguity instead of teaching the parser to guess.
+    std::string format = "aligned";
 };
 
 Args parseArgs(int argc, char* argv[]) {
@@ -76,7 +85,12 @@ Args parseArgs(int argc, char* argv[]) {
         else if (flag == "--no-cache") args.no_cache = true;
         else if (flag == "--no-optimize") args.no_optimize = true;
         else if (flag == "--storage-stats") args.storage_stats = true;
+        else if (flag == "--format" && i+1 < argc) args.format = argv[++i];
         else std::cerr << "Unknown argument: " << flag << "\n";
+    }
+    if (args.format != "aligned" && args.format != "tsv") {
+        throw std::runtime_error("--format must be 'aligned' or 'tsv', got '"
+                                 + args.format + "'");
     }
     return args;
 }
@@ -146,7 +160,43 @@ SubqueryResult runVolcanoToRows(SelectStatement stmt, const Catalog& catalog,
     return out;
 }
 
-void printResults(const std::vector<Row>& rows, const Schema& schema) {
+// Week 35 — machine-readable output for the harnesses.
+//
+// The aligned printer below is for humans and stays the default. It is
+// ambiguous to parse in exactly three ways TPC-H hits and the F1 suite never
+// did: a COLUMN NAME containing spaces (aggregateOutputName IS exprToString,
+// so `SUM(l_extendedprice * (1 - l_discount))` is ONE column whose name has
+// six spaces in it), an EMPTY string value (which renders as pure padding and
+// merges with its neighbour's gap), and a value containing two consecutive
+// spaces. All three make a field-count check fail, and a harness that drops the
+// mismatched row silently reports an empty result for a correct answer.
+//
+// A separator no value can contain removes the ambiguity at the source. A tab
+// is that separator here: no TPC-H column contains one, and Value::toString
+// never emits one. A NULL prints as the same "NULL" token the aligned printer
+// uses, because normalize()'s NULL canonicalization is keyed on it.
+void printResultsTsv(const std::vector<Row>& rows, const Schema& schema) {
+    const auto& cols = schema.columns();
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) std::cout << '\t';
+        std::cout << cols[i].name;
+    }
+    std::cout << "\n";
+    for (const auto& row : rows) {
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (i) std::cout << '\t';
+            std::cout << row[i].toString();
+        }
+        std::cout << "\n";
+    }
+    // An explicit terminator. Without it a zero-row result is one header line,
+    // which a reader cannot distinguish from a truncated or failed run — the
+    // same conflation parse_swiftql_output has today, where a genuine empty
+    // result and a mis-parsed header both come back as [].
+    std::cout << "(" << rows.size() << " rows)\n";
+}
+
+void printResultsAligned(const std::vector<Row>& rows, const Schema& schema) {
     const auto& cols = schema.columns();
     int ncols = static_cast<int>(cols.size());
 
@@ -178,6 +228,15 @@ void printResults(const std::vector<Row>& rows, const Schema& schema) {
         }
         std::cout << "\n";
     }
+}
+
+// One dispatch point, so every existing printResults call site keeps working
+// and none of them has to know which format is active.
+static std::string g_output_format = "aligned";
+
+void printResults(const std::vector<Row>& rows, const Schema& schema) {
+    if (g_output_format == "tsv") printResultsTsv(rows, schema);
+    else                          printResultsAligned(rows, schema);
 }
 
 struct NodeLine {
@@ -315,7 +374,17 @@ void printAligned(const std::vector<NodeLine>& lines) {
 
 // main
 int main(int argc, char* argv[]) {
-    Args args = parseArgs(argc, argv);
+    Args args;
+    try {
+        args = parseArgs(argc, argv);
+    } catch (const std::exception& e) {
+        // parseArgs validates --format, and it runs BEFORE the main try block,
+        // so its throw needs its own handler or an unknown format terminates
+        // instead of reporting.
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+    g_output_format = args.format;
 
     if (args.catalog_path.empty() || args.queries.empty()) {
         std::cerr << "Usage: swiftql --catalog <path> --query \"<sql>\" [--query \"<sql>\" ...]\n";
