@@ -7,6 +7,7 @@
 #include "parser/expr_utils.h"
 #include "catalog/catalog.h"
 #include "common/schema.h"
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -377,6 +378,47 @@ TEST(SubqueryMaterialization, CollectQueryTablesFindsNestedAndDeduplicates) {
     ASSERT_EQ(tables.size(), 2u) << "laps must appear once despite the self-join";
     EXPECT_EQ(tables[0], "laps");
     EXPECT_EQ(tables[1], "drivers");
+}
+
+// ===== the one slot the walkers used to miss =====
+
+// GroupByColumn::expr carries an arbitrary expression (alias substitution from
+// the select list puts one there, binder.cc), and it is the one statement
+// expression neither walker reached: the table collector missed its nested
+// table, and the substitution walk left the node in place for inferExprType to
+// throw on. Unreachable through the parser today only because the Validator
+// refuses a subquery in the select list — which is a rule in ANOTHER FILE, and
+// not depending silently on one is exactly why forEachStatementExpr walks the
+// clauses the position rule already forbids. Constructed here the way alias
+// substitution would build it, since no legal SQL text produces it.
+TEST(SubqueryMaterialization, AGroupKeyExpressionIsWalkedLikeEveryOtherStatementExpr) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(age) FROM drivers) "
+                         "GROUP BY team", cat);
+    auto* bin = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(bin, nullptr);
+    ASSERT_EQ(stmt.group_by.size(), 1u);
+
+    // Move the bound subquery out of the WHERE and into the group key, so the
+    // ONLY subquery in the statement is the one under test.
+    stmt.group_by[0].expr = std::shared_ptr<Expr>(std::move(bin->right));
+    stmt.where.reset();
+
+    std::vector<std::string> tables;
+    collectQueryTables(stmt, tables);
+    EXPECT_NE(std::find(tables.begin(), tables.end(), "drivers"), tables.end())
+        << "main.cc loads exactly what this returns; a missed table is an "
+           "out_of_range from table_rows.at(), not a diagnostic";
+
+    int runs = 0;
+    materializeSubqueries(stmt, canned({oneCol("AVG(age)", TypeId::DOUBLE),
+                                        {Row{Value(31.5)}}}, &runs));
+    EXPECT_EQ(runs, 1);
+    const Literal* lit = asLiteral(stmt.group_by[0].expr.get());
+    ASSERT_NE(lit, nullptr) << "the group key still holds a SubqueryExpr, which "
+                               "survives into planning for site 12 to throw on";
+    EXPECT_DOUBLE_EQ(lit->value.asDouble(), 31.5);
+    EXPECT_FALSE(stmt.has_subquery);
 }
 
 // ===== the refusal that replaced the blanket one =====

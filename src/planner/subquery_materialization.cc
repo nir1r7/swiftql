@@ -1,6 +1,7 @@
 #include "planner/subquery_materialization.h"
 
 #include "planner/constant_folding.h"
+#include "parser/expr_utils.h"        // cloneExpr — bridges the GROUP BY shared_ptr
 #include "execution/key_encoding.h"   // keyFieldText — exact value identity
 
 #include <algorithm>
@@ -84,10 +85,15 @@ void forEachSubqueryConst(const Expr* expr,
 
 namespace {
 
-// Every expression a statement owns. Position is WHERE/HAVING only
-// (validateExpr's allow_subqueries flag enforces it), but walking the rest costs
-// four lines and stops this pass depending silently on a rule enforced in
-// another file.
+// Every expression a statement owns in a unique_ptr SLOT. Position is
+// WHERE/HAVING only (validateExpr's allow_subqueries flag enforces it), but
+// walking the rest costs four lines and stops this pass depending silently on a
+// rule enforced in another file.
+//
+// GROUP BY is the one clause missing here, and only because its expression is a
+// shared_ptr (GroupByColumn must stay copyable) rather than a slot this walk can
+// replace through. It is walked by walkGroupKeys below, so the defence has no
+// hole — see the comment there.
 template <typename Fn>
 void forEachStatementExpr(SelectStatement& stmt, Fn&& fn) {
     fn(stmt.where);
@@ -114,6 +120,7 @@ void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& o
     };
     forEachSubqueryConst(stmt.where.get(), descend);
     forEachSubqueryConst(stmt.having.get(), descend);
+    for (const auto& g : stmt.group_by)    forEachSubqueryConst(g.expr.get(), descend);
     for (const auto& e : stmt.select_list) forEachSubqueryConst(e.get(), descend);
     for (const auto& i : stmt.order_by)    forEachSubqueryConst(i.expr.get(), descend);
     for (const auto& j : stmt.joins)       forEachSubqueryConst(j.condition.get(), descend);
@@ -297,6 +304,28 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     forEachStatementExpr(stmt, [&](std::unique_ptr<Expr>& e) {
         forEachSubquery(e, visit);
     });
+
+    // GROUP BY, which forEachStatementExpr cannot reach: GroupByColumn::expr is
+    // a shared_ptr, and site 19 replaces a node THROUGH ITS SLOT, which needs a
+    // unique_ptr. An expression only lands there by alias substitution from the
+    // select list (binder.cc), and the Validator refuses a subquery in the
+    // select list — so this is unreachable today. It is walked anyway because
+    // the alternative is this pass depending SILENTLY on a rule enforced in
+    // another file, which is the one thing forEachStatementExpr's comment says
+    // it exists to avoid; the day that rule relaxes, a group key holding a
+    // SubqueryExpr would otherwise survive into planning.
+    //
+    // Cloning is what bridges the two ownership shapes, and costs nothing on any
+    // real query: only a key that actually contains a subquery is cloned.
+    for (auto& g : stmt.group_by) {
+        bool has_subquery = false;
+        forEachSubqueryConst(g.expr.get(), [&](const SubqueryExpr&) { has_subquery = true; });
+        if (!has_subquery) continue;
+
+        std::unique_ptr<Expr> slot = cloneExpr(g.expr.get());
+        forEachSubquery(slot, visit);
+        g.expr = std::shared_ptr<Expr>(std::move(slot));
+    }
 
     // The flag means "a SubqueryExpr is still in this tree", and none is. This
     // is what returns projection pushdown to a subquery query: buildScanSchema
