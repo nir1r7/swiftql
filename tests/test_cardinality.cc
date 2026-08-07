@@ -593,3 +593,110 @@ TEST(Cardinality, LeftmostLeafContextTakesTheMergedSchemaSlot) {
     // and the key lookup that produced the estimate still hit: 1000*20/20
     EXPECT_DOUBLE_EQ(join->estimated_rows, 1000.0);
 }
+
+// ===== Week 32: the semi/anti rule =====
+
+// Hand-built, for the reason LeftmostLeafContextTakesTheMergedSchemaSlot is:
+// the lowering pass wraps the body in a LogicalProject whose StatsContext is
+// empty, so no query this engine can write reaches the branch with a right-side
+// NDV in hand. The rule falls back to frac = 1.0 there — conservative and
+// invariant-preserving, but it means the arithmetic below is exercised by
+// nothing else in the suite.
+static std::unique_ptr<LogicalJoin> semiJoinOverLapsAndDrivers(JoinSemantics sem) {
+    auto left = std::make_unique<LogicalScan>(
+        "laps", Schema({ColumnDef{"driver_id", TypeId::INT, 0, false}}));
+    auto right = std::make_unique<LogicalScan>(
+        "drivers", Schema({ColumnDef{"driver_id", TypeId::INT, 0, false}}));
+    // !! output_schema IS the left child's, NOT a merged schema. That is the
+    // containment keeping the body's slot numbering out of the outer plan, and
+    // it is what makes `rows <= left` a statement about the same relation.
+    Schema out = left->output_schema;
+    std::vector<JoinKey> keys{JoinKey{"driver_id", "driver_id", 0}};
+    // join_slot -1: children[1] is not a relation of this block's range table.
+    auto join = std::make_unique<LogicalJoin>(std::move(left), std::move(right),
+                                              std::move(keys), -1, std::move(out));
+    join->semantics = sem;
+    return join;
+}
+
+// drivers with 20 rows but only 10 distinct driver_ids. The gap between the
+// right side's ROW COUNT and its NDV is what separates the semi rule from the
+// product form: with rows == NDV (seedDriversStats) the two agree numerically
+// and the test would pass against the wrong rule.
+static void seedDriversStatsWithDuplicateKeys(Catalog& cat) {
+    TableStats ts;
+    ts.row_count = 20;
+    ColumnStats driver_id;
+    driver_id.min_val = Value(int64_t(1));
+    driver_id.max_val = Value(int64_t(10));
+    driver_id.distinct_count = 10;
+    driver_id.null_count = 0;
+    ts.columns.emplace("driver_id", driver_id);
+    cat.setStats("drivers", std::move(ts));
+}
+
+// The two NDVs are read SEPARATELY, not max()'d: the semi rule needs the ratio,
+// so a shared lookup collapsing them to one number cannot express it. The right
+// side contributes ONLY its NDV — never its row count, which is exactly why the
+// product form is the wrong shape and is overwritten rather than adjusted.
+//
+// laps.driver_id NDV 50, drivers.driver_id NDV 10 over 20 rows:
+//   semi    = 1000 * min(1, 10/50) = 200
+//   product = 1000 * 20 / max(50,10) = 400   <- what joinCardinality returns
+TEST(Cardinality, SemiJoinIsALeftSideSelectivityFromTheNdvRatio) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat, /*driver_id_ndv=*/50);
+    seedDriversStatsWithDuplicateKeys(cat);
+    auto join = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    CardinalityEstimator::estimateSubtree(*join, cat);
+    EXPECT_DOUBLE_EQ(join->estimated_rows, 200.0);
+    EXPECT_NE(join->estimated_rows, 400.0);   // the product form, pinned by name
+    EXPECT_LE(join->estimated_rows, join->children[0]->estimated_rows);
+}
+
+// Semi + anti = the left side exactly. The two are complements by construction
+// (R ▷ S is R − (R ⋉ S)), so any drift between them is a rule that stopped
+// being a partition of the left input.
+TEST(Cardinality, SemiAndAntiEstimatesPartitionTheLeftSide) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat, /*driver_id_ndv=*/50);
+    seedDriversStats(cat);
+    auto semi = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    auto anti = semiJoinOverLapsAndDrivers(JoinSemantics::ANTI);
+    CardinalityEstimator::estimateSubtree(*semi, cat);
+    CardinalityEstimator::estimateSubtree(*anti, cat);
+    EXPECT_DOUBLE_EQ(anti->estimated_rows, 600.0);
+    EXPECT_DOUBLE_EQ(semi->estimated_rows + anti->estimated_rows,
+                     semi->children[0]->estimated_rows);
+}
+
+// The clamp is not decoration. With more distinct values on the right than the
+// left, the ratio exceeds 1 and an unclamped rule would estimate MORE rows than
+// the left input holds — for an operator that can only ever emit a subset of
+// it. The anti side is where that shows up as a negative row count.
+TEST(Cardinality, SemiJoinClampsAtTheLeftRowCountAndAntiNeverGoesNegative) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat, /*driver_id_ndv=*/5);   // right NDV 20 > left NDV 5
+    seedDriversStats(cat);
+    auto semi = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    auto anti = semiJoinOverLapsAndDrivers(JoinSemantics::ANTI);
+    CardinalityEstimator::estimateSubtree(*semi, cat);
+    CardinalityEstimator::estimateSubtree(*anti, cat);
+    EXPECT_DOUBLE_EQ(semi->estimated_rows, 1000.0);   // min(1.0, 20/5) == 1.0
+    EXPECT_DOUBLE_EQ(anti->estimated_rows, 0.0);
+    EXPECT_GE(anti->estimated_rows, 0.0);
+}
+
+// A semi/anti join carries no ON residual — the lowering pass builds none — and
+// the estimator asserts that rather than quietly handling a case that cannot
+// occur. An assertion that never fires is only worth keeping if something
+// proves it fires when violated.
+TEST(Cardinality, SemiJoinWithAnOnResidualIsAnInternalError) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto join = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    auto lit = std::make_unique<Literal>(Value(int64_t(1)));
+    join->on_residual = std::move(lit);
+    EXPECT_THROW(CardinalityEstimator::estimateSubtree(*join, cat), std::runtime_error);
+}
