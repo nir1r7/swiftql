@@ -257,10 +257,44 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     // constant, and a plan node cannot be produced from an AST rewrite — see
     // subquery_lowering.h for the routing and for why keeping both productions
     // for one shape was rejected.
-    bool in_survives = false;
+    bool node_survives = false;
     auto visit = [&](std::unique_ptr<Expr>& slot) {
         auto* sq = dynamic_cast<SubqueryExpr*>(slot.get());
         if (!sq) return;
+        // Week 33 — a CORRELATED node survives this pass, for the same reason a
+        // Kind::IN node does and one stronger: it has no value to substitute.
+        // Its body names a column of the ENCLOSING row, so "run it once and
+        // replace it with a constant" is not an optimisation of it — it is a
+        // different query. Running it here executed the body with the outer ref
+        // resolved by bare name against the BODY's own schema
+        // (`l.driver_id = d.driver_id` became `laps.driver_id = laps.driver_id`,
+        // a tautology), folded the whole predicate to the literal 1 or 0, and
+        // returned a plausible wrong answer for every correlated query in the
+        // engine — while making lowerExistsSubqueries unreachable from the CLI,
+        // because the SubqueryExpr it decorrelates had already been consumed.
+        //
+        // The header's precondition "no correlated subquery anywhere in stmt"
+        // was true only while Validator::validate refused one. Week 33 deleted
+        // that refusal, and this pass — which the header says TRUSTS the
+        // Validator rather than re-checking — kept trusting a rule that no
+        // longer existed. The trust is now placed where it can be honoured: the
+        // routing decision is made HERE, off the Binder's own `correlated` flag,
+        // not off a rule enforced in another file.
+        //
+        // What happens to the survivor is the planner's business:
+        // lowerExistsSubqueries decorrelates a Kind::EXISTS one into a semi/anti
+        // join, and refuseUnloweredCorrelated refuses every other shape by name.
+        // Both are loud; neither substitutes a value.
+        if (sq->correlated) {
+            // The BODY is still this pass's business, exactly as for IN: an
+            // uncorrelated subquery nested inside a correlated body is Week 31's
+            // and must still be materialized before the body is planned. Same
+            // caveats as the IN arm below — not moved, not limit-capped, not
+            // cached.
+            materializeSubqueries(*sq->subquery, run);
+            node_survives = true;
+            return;
+        }
         if (sq->kind == SubqueryExpr::Kind::IN) {
             // The NODE survives, but its BODY is still this pass's business:
             // `x IN (SELECT k FROM t WHERE c > (SELECT AVG(c) FROM t))` is legal
@@ -293,7 +327,7 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
             // "the materialization walker missed a subtype" message — an
             // internal-defect report for a perfectly ordinary query.
             materializeSubqueries(*sq->subquery, run);
-            in_survives = true;
+            node_survives = true;
             return;
         }
         const SubqueryResult& res = runOnce(sq, run, cache);
@@ -338,7 +372,7 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     // widens to the full schema for as long as the flag is set (Week 30), which
     // Week 30's own hand-forward note predicted would otherwise show up as a
     // surprise in this week's first benchmark.
-    stmt.has_subquery = in_survives;
+    stmt.has_subquery = node_survives;
 
     // A substituted constant can sit under arithmetic — `> (SELECT ...) * 2` —
     // and three fast paths pattern-match on ColumnRef op Literal. Folding

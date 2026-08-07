@@ -435,13 +435,53 @@ TEST(SubqueryMaterialization, CorrelationPropagatesToTheOutermostStatement) {
     EXPECT_FALSE(top->correlated)
         << "the top node is NOT correlated — which is why the flag has to propagate";
 
-    try {
-        Validator::validate(stmt, cat);
-        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("correlated subqueries are not yet executable (Week 33)"),
-                  std::string::npos) << e.what();
-    }
+    // Week 33 DELETED the Validator refusal this test used to pin, so the
+    // assertion is replaced rather than removed: the flag still has to
+    // propagate, and what now consumes it is materializeSubqueries, which must
+    // LEAVE a correlated node alone instead of running its body once and
+    // substituting a constant.
+    EXPECT_NO_THROW(Validator::validate(stmt, cat));
+
+    int calls = 0;
+    materializeSubqueries(stmt, canned({oneCol("AVG(l2.speed)", TypeId::DOUBLE),
+                                        {Row{Value(300.0)}}}, &calls));
+    EXPECT_EQ(calls, 0)
+        << "a correlated body must never be RUN here: its rows depend on which "
+           "outer row selected them, so there is no single value to substitute";
+    EXPECT_TRUE(stmt.has_subquery)
+        << "the flag means 'a SubqueryExpr is still in this tree', and two are";
+
+    const SubqueryExpr* in_node = dynamic_cast<const SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(in_node, nullptr);
+    ASSERT_NE(in_node->subquery, nullptr);
+    const auto* body_pred = dynamic_cast<const BinaryExpr*>(in_node->subquery->where.get());
+    ASSERT_NE(body_pred, nullptr);
+    EXPECT_NE(dynamic_cast<const SubqueryExpr*>(body_pred->right.get()), nullptr)
+        << "the correlated scalar must survive the pass; before the fix it was "
+           "replaced by Literal(300.0) computed from a body whose l.team was "
+           "resolved by bare name against the body's own schema";
+}
+
+// The direct form of the same defect, and the one that made the whole of Week
+// 33's decorrelation unreachable from the CLI: a correlated EXISTS was consumed
+// by materialization before lowerExistsSubqueries could ever see it.
+TEST(SubqueryMaterialization, ACorrelatedExistsSurvivesForDecorrelation) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT name FROM drivers d WHERE EXISTS "
+                         "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)", cat);
+    const SubqueryExpr* sq = dynamic_cast<const SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+    ASSERT_TRUE(sq->correlated);
+
+    int calls = 0;
+    materializeSubqueries(stmt, canned({oneCol("x", TypeId::INT),
+                                        {Row{Value(int64_t(1))}}}, &calls));
+    EXPECT_EQ(calls, 0) << "the body must not be run for a value";
+    EXPECT_TRUE(stmt.has_subquery);
+    EXPECT_NE(dynamic_cast<const SubqueryExpr*>(stmt.where.get()), nullptr)
+        << "before the fix this was Literal(1): the body ran with d.driver_id "
+           "resolved by bare name against laps, making the predicate the "
+           "tautology laps.driver_id = laps.driver_id";
 }
 
 TEST(SubqueryMaterialization, AnUncorrelatedQueryNoLongerCarriesTheFlag) {
