@@ -568,6 +568,16 @@ WEEK32_SEMI_JOIN_VEC_ONLY = [
     # tests/test_subquery.cc.
     "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
     "(SELECT driver_id FROM laps WHERE speed > (SELECT AVG(speed) FROM laps))",
+    # ...and the same shape as a ROW SET rather than a scalar. COUNT(*) alone
+    # compares one number, so any defect that preserves cardinality while
+    # returning the WRONG drivers — a nested threshold off by one, or the semi
+    # join matching on the wrong column — diffs identically against SQLite.
+    # Naming the rows and ordering them closes that at no cost.
+    "SELECT name FROM drivers WHERE driver_id IN "
+    "(SELECT driver_id FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)) "
+    "ORDER BY name",
+    "SELECT name FROM drivers WHERE driver_id IN "
+    "(SELECT driver_id FROM drivers WHERE age > 30) ORDER BY name",
 ]
 
 WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [

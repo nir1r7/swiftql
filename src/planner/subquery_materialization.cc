@@ -270,6 +270,24 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
             // moved, NOT limit-capped and NOT cached, because it is planned by
             // the semi-join's build side rather than run for a value.
             //
+            // NOT CACHED IS NOT FREE — name what makes it safe, because neither
+            // guarantee lives in this file. cloneExpr shares the body's
+            // shared_ptr rather than deep-copying it, so two SubqueryExpr nodes
+            // over ONE body is a state the engine already reaches (BETWEEN
+            // clones its left operand). This arm recurses unconditionally,
+            // outside the statement-keyed ResultCache the non-IN path uses, so
+            // a body reached twice is walked twice. It is harmless only because
+            // (a) a walked body normally has has_subquery cleared on the first
+            // pass, so the second call returns at the top, and (b) any body that
+            // is genuinely shared is refused outright by planBody's
+            // use_count() > 1 check in subquery_lowering.cc.
+            //
+            // (a) does NOT hold for every body: an IN nested inside an IN body
+            // leaves the body's has_subquery TRUE, so a second visit would
+            // re-walk it. Nothing produces a second visit today; if anything
+            // ever does, guard this call on cache.count(sq->subquery.get())
+            // rather than re-deriving the argument.
+            //
             // Without this, the body's own SCALAR node reaches
             // LogicalPlanBuilder and inferExprType (dispatch site 12) throws its
             // "the materialization walker missed a subtype" message — an

@@ -83,8 +83,17 @@ inline std::string keyFieldText(const Value& v) {
 // the encoding compares text: two NaNs serialize identically and would land in
 // one bucket, while `Value::operator==` on the same pair is false — so the join
 // would match a pair that the identical predicate in a WHERE clause rejects.
-// SQLite never has the case at all (it stores NaN as NULL), so dropping agrees
-// with it too.
+// The "SQLite agrees" half of this is narrower than it was first written, and
+// the difference is worth keeping straight. It holds for a COMPUTED NaN: SQLite
+// makes `0.0/0.0` NULL and stores a bound NaN as NULL, so both engines return
+// nothing and the agreement is real. It does NOT hold for a NaN that arrives
+// through the loader — CSVLoader parses a DOUBLE field with std::stod, which
+// accepts the text `nan`, while SQLite importing the same cell leaves it as the
+// TEXT value 'nan' under REAL affinity, which is not NULL. There
+// `3.0 NOT IN (1.0, 'nan')` is TRUE for SQLite and drops here. No committed
+// dataset holds such a cell, so this is a divergence in the RATIONALE, not a
+// live wrong answer; the drop is still what the encoding requires (see above),
+// but do not defend it with an agreement that only covers computed NaNs.
 inline bool isUnmatchableKey(const Value& v) {
     if (v.isNull()) return true;
     return v.type() == TypeId::DOUBLE && std::isnan(v.asDouble());

@@ -112,9 +112,14 @@ void VecHashJoinNode::open() {
                 // is only justified for the NULL half — a NaN in S is a value
                 // that simply never compares equal, so `3.0 NOT IN {1.0, NaN}`
                 // is relationally TRUE while this branch drops it. Deliberately
-                // not special-cased: key_encoding.h records that SQLite converts
-                // NaN to NULL on storage, so the oracle agrees with this
-                // engine's answer and there is no reachable divergence to fix.
+                // not special-cased — but not for the reason first given here.
+                // "SQLite converts NaN to NULL on storage" covers a COMPUTED
+                // NaN only; a `nan` cell in a CSV is imported by SQLite as the
+                // TEXT 'nan', which is not NULL, and there SQLite answers TRUE
+                // where this drops. See key_encoding.h. It stays uncorrected
+                // because no committed dataset holds such a cell and the real
+                // close is a columnar validity mask (README, Week 35), not
+                // because the two engines agree everywhere.
                 build_had_unmatchable_key_ = true;
                 continue;
             }
