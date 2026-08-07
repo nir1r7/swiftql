@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "planner/vectorized_plan_builder.h"
+#include "planner/subquery_materialization.h"
 #include "planner/logical_plan.h"
 #include "planner/predicate_pushdown.h"
 #include "planner/cardinality_estimator.h"
@@ -26,15 +27,20 @@ static const char* CATALOG = "../tests/data/test_catalog.json";
 // once by name; VectorizedPlanBuilder copies internally for the extra scan).
 static std::unordered_map<std::string, ColumnarTable> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
+    // Week 34: through collectQueryTables (subquery_materialization.h), the one
+    // walker main.cc itself uses. Reading stmt.from/joins directly missed every
+    // NESTED table from Week 31 on, and as of Week 34 it cannot even be spelled —
+    // a DERIVED relation has no catalog name and tableName() throws on it. This
+    // is a widening of what the helper loads, never a narrowing: it is a superset
+    // of what the two-clause walk found.
     std::unordered_map<std::string, ColumnarTable> tables;
-    const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
-    tables.emplace(stmt.from.tableName("test loader"),
-                   CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
-    for (const auto& j : stmt.joins) {
-        if (tables.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
-        const auto& jm = cat.getTable(j.relation.tableName("test loader"));
-        tables.emplace(j.relation.tableName("test loader"),
-                       CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
+    std::vector<std::string> names;
+    collectQueryTables(stmt, names);
+    for (const auto& name : names) {
+        if (tables.count(name)) continue;   // self-join: load once
+        const auto& m = cat.getTable(name);
+        tables.emplace(name, CSVToColumnar::convert(
+            CSVLoader::load(m.filepath, m.schema), m.schema));
     }
     return tables;
 }
@@ -1267,4 +1273,77 @@ TEST(VecPlanBuilder, TwoInConjunctsLowerToTwoStackedSemiJoins) {
     ASSERT_NE(inner, nullptr) << outer->children()[0]->explain();
     // both keep the probe schema, so stacking them changes no column
     EXPECT_EQ(outer->outputSchema().size(), inner->outputSchema().size());
+}
+
+// ---------------------------------------------------------------------------
+// Week 34 — the derived-table COLUMN ALIAS LIST, at EXECUTION level.
+//
+// These two tests are the feature's ENTIRE possible coverage, and the reason is
+// worth stating rather than assuming: SQLite does not parse `AS d (a, b)` at all
+// (`near "(": syntax error`), so compare_against_sqlite.py can hold such a query
+// in NEITHER direction — it is not diffable, and it is not refusable either,
+// because SwiftQL accepts it. That is the mirror image of the blind spot Week 30
+// named. When the oracle cannot reach a feature, the C++ tests have to reach all
+// of it.
+//
+// Audit round 1, F2: the two tests that shipped asserted only
+// LogicalDerived::output_schema's column NAMES. The comment justifying the
+// feature says the rename "has to survive into the plan schema, because
+// resolveColumnIndex and every indexOf above the graft look the new names up" —
+// and neither test reached resolveColumnIndex, a physical plan, or a row. The
+// half that can silently regress into a WRONG-COLUMN READ was the half nothing
+// pinned. These reach rows.
+// ---------------------------------------------------------------------------
+
+TEST(DerivedTableAliasList, RenamedColumnsCarryTheOriginalColumnsValues) {
+    Catalog cat(CATALOG);
+    // `a` must be `team` and `b` must be `speed` — POSITIONALLY. A rename that
+    // resolved by name, or that swapped the pair, still produces a two-column
+    // schema named (a, b) and passes a schema-only assertion.
+    auto plan = buildVec(
+        "SELECT d.a, d.b FROM (SELECT team, speed FROM laps) AS d (a, b)", cat);
+    auto rows = drainVec(*plan);
+    ASSERT_FALSE(rows.empty());
+
+    // The same values, read without the alias list, as the reference.
+    auto ref_plan = buildVec("SELECT team, speed FROM laps", cat);
+    auto ref = drainVec(*ref_plan);
+    ASSERT_EQ(rows.size(), ref.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        ASSERT_EQ(rows[i].size(), 2u);
+        EXPECT_EQ(rows[i][0].toString(), ref[i][0].toString()) << "row " << i << " col a";
+        EXPECT_EQ(rows[i][1].toString(), ref[i][1].toString()) << "row " << i << " col b";
+    }
+}
+
+// The other half, and the one that can regress silently: the PRE-RENAME name
+// must stop resolving. If it still resolved, `d.team` would read a column the
+// derived relation does not expose — a wrong-column read with no error, which is
+// exactly the class the slot-0 normalization exists to prevent. A schema-only
+// test cannot see this at all, because the schema is right either way.
+TEST(DerivedTableAliasList, ThePreRenameNameNoLongerResolves) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildVec(
+        "SELECT d.team FROM (SELECT team, speed FROM laps) AS d (a, b)", cat),
+        std::runtime_error);
+    // Unqualified, too: the bare name must not fall through to the body's
+    // pre-rename schema by any path.
+    EXPECT_THROW(buildVec(
+        "SELECT team FROM (SELECT team, speed FROM laps) AS d (a, b)", cat),
+        std::runtime_error);
+}
+
+// SELECT * over an aliased derived relation expands to the NEW names, and to
+// exactly the derived relation's columns. Execution-level, so it also pins that
+// the physical schema the printer reads carries the rename.
+TEST(DerivedTableAliasList, SelectStarExpandsToTheRenamedColumns) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec("SELECT * FROM (SELECT team, speed FROM laps) AS d (a, b)", cat);
+    const Schema& out = plan->outputSchema();
+    ASSERT_EQ(out.size(), 2);
+    EXPECT_EQ(out.column(0).name, "a");
+    EXPECT_EQ(out.column(1).name, "b");
+    auto rows = drainVec(*plan);
+    ASSERT_FALSE(rows.empty());
+    EXPECT_EQ(rows[0].size(), 2u);
 }
