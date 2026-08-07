@@ -156,6 +156,21 @@ bool foldNode(std::unique_ptr<Expr>& expr) {
         foldNode(sub->length);   // nullptr-safe
         return false;
     }
+    // Week 30 — DISPATCH SITE 14, and the one place the rule a query-bearing
+    // node established was not applied: fold the parts written in THIS block
+    // (the IN form's operand), never the body — that statement was folded by
+    // its own bindQuery, and folding it twice would only be harmless by
+    // accident. Declining the node itself is right, as for every Week 25 node.
+    //
+    // Not merely tidiness: Week 32 lowers `x IN (subquery)` to a semi-join whose
+    // probe key IS this operand, and three fast paths (ChunkPruner,
+    // scanColumn's typed loop, selectivity()) pattern-match on the
+    // `ColumnRef op Literal` shape folding restores, so
+    // `WHERE season + 4 IN (SELECT ...)` would arrive unfolded.
+    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr.get())) {
+        foldNode(sq->operand);   // nullptr-safe for SCALAR / EXISTS
+        return false;
+    }
 
     return false;   // ColumnRef, IntervalLiteral, or a subtype with no folding rule
 }

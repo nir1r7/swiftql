@@ -26,8 +26,16 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         // not one of this block's relations. It is not nothing either — a
         // correlated conjunct cannot be routed to one relation of this block —
         // so contribute -1, this walker's existing "unresolved, be
-        // conservative" value. Reached only through the SubqueryExpr branch
-        // below; a top-level ref always has query_level 0.
+        // conservative" value.
+        //
+        // A TOP-LEVEL ref reaches this with query_level > 0, and that is why the
+        // branch is here rather than only inside the SubqueryExpr case below:
+        // classifyJoinCondition calls this walker directly on a NESTED query's
+        // ON conjuncts (via Validator::validateQuery), where a correlated ref is
+        // an ordinary top-level ref of that expression. An earlier revision of
+        // this comment claimed otherwise — the same class of
+        // false-justification-that-stops-anyone-checking that this file's header
+        // was corrected for four lines below.
         out.insert(cr->query_level > 0 ? -1 : cr->relation_slot);
         return;
     }
