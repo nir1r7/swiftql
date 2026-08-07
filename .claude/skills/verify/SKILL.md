@@ -50,7 +50,7 @@ line in the verdict block and cannot be omitted by accident.
 `GATE tpch: ...` on purpose — copy it, never retype a count:
 
 ```
-tpch:       PASS (19/22 meaningful vs SQLite: 5 in all four modes, 14 vectorized-only; 1 vacuous; 2 unported)
+tpch:       PASS (20/22 meaningful vs SQLite: 5 in all four modes, 15 vectorized-only; 1 vacuous; 1 unported)
 ```
 
 - **meaningful** — matched SQLite *and* survived the mutation check (neutering

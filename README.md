@@ -1988,9 +1988,11 @@ None of the first four ever invoke the TPC-H harness, so until this step existed
 a verifier could report the tree green while TPC-H was broken or had regressed —
 the gate simply never looked, which is exactly the false certainty this week's
 harness was built to remove. It is the fifth line of the verdict block and it
-reports the shape rather than a count: the harness's own last line is
+reports the shape rather than a count: the harness's own last line is copied
+verbatim, and **at the close of Week 35** it read
 `GATE tpch: PASS (19/22 meaningful vs SQLite: 5 in all four modes, 14
-vectorized-only; 1 vacuous; 2 unported)`, copied verbatim. A run narrowed with
+vectorized-only; 1 vacuous; 2 unported)` (Week 36 moved it — see that section
+and `.claude/skills/verify/SKILL.md` for the current line). A run narrowed with
 `--queries` says `PARTIAL-PASS` and names how many of the 22 did not run, so a
 subset figure cannot be quoted as a full measurement. A query that stops
 answering, becomes vacuous, or answers in fewer modes than
@@ -2078,7 +2080,41 @@ is "matches SQLite" and never "correct", is in `.claude/skills/verify/SKILL.md`.
 - Close query-specific parser, execution, and optimizer correctness gaps
 - Document supported scale and memory limits
 
-**Checkpoint:** Supported TPC-H queries match reference results within numeric tolerance.
+**Checkpoint:** Supported TPC-H queries match reference results within numeric tolerance. ✅
+
+Read "reference results" as **SQLite over the same `.tbl` files**, never the
+published TPC-H answer set — `dbgen` was unavailable and `PROVENANCE.txt` says
+the published answers do not apply to this data. The figure moved and it moved by
+making the engine do more, not by softening a query:
+
+```
+Week 35   GATE tpch: PASS (19/22 meaningful vs SQLite: 5 in all four modes,
+                           14 vectorized-only; 1 vacuous; 2 unported)
+Week 36   GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes,
+                           15 vectorized-only; 1 vacuous; 1 unported)
+```
+
+The full report — the mode split on every count, the Volcano breakdown, the six
+inherited divergences with a verdict each, and which queries were hand-verified —
+is in [docs/week-36-plan.md](docs/week-36-plan.md).
+
+| Shipped | Why it was required |
+|---|---|
+| **A correlated scalar body may wrap its aggregate in CONSTANT arithmetic**, and the wrapper is lifted **out** of the body rather than pushed through it | Week 34 required the body's select-list item to *be* the aggregate and so refused **TPC-H Q17's own text**, `(SELECT 0.2 * AVG(l_quantity) ...)`, while the semantically identical constant-outside form decorrelated and matched SQLite — the engine could answer the query but not read it. Lifting is not a stylistic choice: it is what keeps the `COUNT` zero-row rule correct. The substitution site wraps a `COUNT` reference in `CASE WHEN ref IS NULL THEN 0 ELSE ref END`, and lifting puts that `CASE` at the **aggregate's own position**, so `1 + COUNT(*)` over an empty correlation group reads 1. Pushing the wrapper into the body would substitute 0 for the *whole* wrapper and answer 0 — the Week 34 audit's F1 defect one level further in. Verified by **plan equality**: after the rewrite the spec's text and the constant-outside text produce byte-identical `--explain` output, which proves the lift built the tree already diffed against SQLite rather than a new one that agrees on one dataset |
+| **The refusal NARROWED rather than vanished, and the sweep landed in the same commit** | Week 33 shipped three silent wrong answers from code trusting a refusal that had been changed. A non-aggregate body, two aggregates under one wrapper, and a non-constant wrapper are each still refused **by name**; a wrapper naming a *body* column is reported earlier by the Validator's grouped-reference check, which is the better diagnostic, so it is pinned there instead. Eight sites were rewritten and seven were **checked and found still true** — both lists are recorded, because a sweep that reports only its hits is not evidence it was thorough. Two mutants confirm the new needles bite: with the whitelist disabled the `CASE`-wrapper query *returns rows* |
+| **q21's requirement established and DECLINED IN THE OPEN** | q21 is not blocked by a missing key — both its bodies have one. It pairs a valid correlated equality with an **inequality** (`l2.l_suppkey != l1.l_suppkey`), which would have to ride as an `ON` **residual** on the semi/anti join. Four facts size that: the semi/anti build side keeps *keys only* (`build_keys_`, a set) where a residual needs the build **rows**; `passes()` evaluates against `output_schema_`, which for semi/anti **is** the probe schema and must stay so; the body is projected to its key columns only (round 1 H-1/H-2/M-3), so residual columns must be *appended*; and q21's residual compares two columns of the **same name** from two aliases of one table — the H-1 wrong-relation class, which resolves silently. Declined because the operator is **shared** — q4, q16, q18, q20 and q22 probe through it, ten cells against q21's two. The message now names what it would take, and `WEEK36_CORRELATED_RESIDUAL_REFUSED` pins the shape in both polarities |
+| **The Volcano parity expectation was WRONG, and the measurement replaced it** | Of 34 Volcano refusal cells: multi-way joins **14**, derived tables **12**, `IN` subqueries **4**, correlated **4**. Semi/anti parity therefore addresses 8 of 34, and six of those eight need a *second* join `Planner::plan` cannot express — only q4's **2 cells** are reachable, at the price of a second decorrelation production on a path with no logical layer. Corrected in `planner.cc` and Limitations rather than left to mislead a third week |
+| **`rows_equal` compared a NaN as equal to ANYTHING** | IEEE 754 makes every comparison against NaN False, so `abs(nan - 5.0) > tol` is False, the mismatch branch was unreachable, and `rows_equal([[nan]], [[5.0]])` returned `True`. A NaN anywhere in a SwiftQL answer was invisible to the oracle — a defect that hides defects. Non-finite values are now judged before the tolerance test, with seven cases asserted at the top of every run. The inherited note called it "nan/inf compare equal"; measuring it is what showed the hole was bigger |
+| **The randomized differ projected the JOIN KEY** | `generate_query` projected `driver_id` and `team` from `rels[:3]`. `driver_id` is the join key, so `r1.driver_id` and `r4.driver_id` are equal **by construction** and projecting them cannot distinguish which relation a column came from — exactly the defect class the generator exists to find. And five relations of an eight-relation shape were never named at all. Every relation now contributes non-key, per-row-varying columns. Demonstrated rather than asserted: swapping `r0` → `r3` in a 4-relation projection changes the answer under the new pool and is invisible under the old. Cost recorded: the 40-shape batch goes from 61 s to 102 s |
+| **Scale and memory measured, and the finding is not the obvious one** | `--storage columnar` peaks **higher** than `--storage row` (83 MB vs 64 MB at sf0.01; 782 MB vs 594 MB at sf0.1) despite `ratio=0.43`, because `main.cc` clears `table_rows` only after **every** table has been converted: peak is the row image *plus* the columnar image, not the columnar size. sf0.1 is named as the largest scale exercised and no SF1 number is extrapolated |
+
+> **q18 stays vacuous, deliberately.** Its `SUM(l_quantity) > 300` is unreachable
+> on this data (the maximum per-order sum is 295.0). 290 would discriminate — and
+> **300 is already the lowest of the spec's three Q18 quantities**, so lowering it
+> would invent a value the spec does not contain. That would raise the figure by
+> weakening what the query tests, which is the one thing the harness exists to
+> prevent. The contrast with q2 and q19, whose parameters *were* re-chosen from
+> within the spec's own value domains, is what shows where the line is.
 
 ### Week 37 — TPC-H Benchmarks + Final Documentation
 

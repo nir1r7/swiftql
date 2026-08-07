@@ -1392,6 +1392,22 @@ deliberately.
 - README's dialect row now carries the requirement, so the next reader inherits
   the four facts above rather than re-deriving them.
 
+**Measured, from the full 22×4 `--fingerprint-all` run:**
+
+```
+GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes, 15
+                 vectorized-only; 1 vacuous; 1 unported) -- IMPROVED,
+                 refresh the baseline (--write-baseline)
+BASELINE docs/tpch-baseline.json: OK
+  IMPROVED: ['q17'] newly meaningful
+  IMPROVED: q17 answers in 2 modes, was 0
+```
+
+q21's cell now records the sharpened message:
+`UNPORTED (correlated subquery: only an equality between two columns can become
+a join key (a correlated inequality has no equi-join to lower to; it would have
+to ride as an ON residual on the semi/anti join, ...))`.
+
 **Next concrete step:** read the finished `run_tpch.py` gate line, refresh
 `docs/tpch-baseline.json` with `--write-baseline` in a commit carrying the
 per-query deltas, and re-run to confirm the gate is green against the new
