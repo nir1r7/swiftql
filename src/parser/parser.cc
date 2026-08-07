@@ -125,22 +125,7 @@ SelectStatement Parser::parseSelect(){
     }
 
     expect(TokenType::FROM, "FROM");
-    stmt.from_table = expect(TokenType::IDENTIFIER, "table name").value;
-
-    // optional table alias (e.g. FROM laps l / FROM laps AS l);
-    // an explicit AS makes the alias mandatory
-    if (match(TokenType::AS)) {
-        stmt.from_alias = expect(TokenType::IDENTIFIER, "table alias after AS").value;
-    } else if (check(TokenType::IDENTIFIER) &&
-        !check(TokenType::JOIN) &&
-        !check(TokenType::WHERE) &&
-        !check(TokenType::GROUP) &&
-        !check(TokenType::ORDER) &&
-        !check(TokenType::LIMIT) &&
-        !check(TokenType::HAVING) &&
-        !check(TokenType::END_OF_FILE)) {
-        stmt.from_alias = consume().value;
-    }
+    stmt.from = parseTableRef();
 
     // Explicit joins, in written order. `while`, not `if`: joins[i] attaches
     // relation slot i+1 (Week 26). Before this, a second JOIN fell through to
@@ -166,14 +151,11 @@ SelectStatement Parser::parseSelect(){
             consume();                 // the JOIN token
         }
 
-        join.join_table = expect(TokenType::IDENTIFIER, "join table name").value;
-
-        // optional join table alias (i.e, JOIN drivers d / JOIN drivers AS d)
-        if (match(TokenType::AS)) {
-            join.alias = expect(TokenType::IDENTIFIER, "table alias after AS").value;
-        } else if (check(TokenType::IDENTIFIER)) {
-            join.alias = consume().value;
-        }
+        // Week 34: the SAME helper as the FROM position. The two alias rules
+        // were already identical bar the keyword exclusion list, and letting
+        // them drift is how Week 26's `relations` keying bug and Week 29's `jc`
+        // bug both happened.
+        join.relation = parseTableRef();
 
         expect(TokenType::ON, "ON");
         join.condition = parseExpr();
@@ -680,4 +662,71 @@ std::vector<GroupByColumn> Parser::parseColumnList(){
         cols.push_back(parseOne());
     }
     return cols;
+}
+// One relation in FROM or JOIN. Week 34 added the derived-table production; the
+// name-and-alias rules below are Week 26's, moved here verbatim so the FROM and
+// JOIN positions cannot drift.
+//
+//   table_ref -> IDENT [[AS] IDENT]
+//              | LPAREN select_stmt RPAREN [AS] IDENT [ LPAREN ident_list RPAREN ]
+//
+// No lookahead ambiguity, unlike Week 30's scalar subquery in `primary`: FROM
+// has no parenthesised-expression production to be confused with, so an LPAREN
+// here can only open a derived table.
+TableRef Parser::parseTableRef() {
+    if (check(TokenType::LPAREN)) {
+        consume();
+        auto body = std::make_unique<SelectStatement>(parseSelect());
+        expect(TokenType::RPAREN, ") to close the derived table");
+
+        match(TokenType::AS);   // optional noise word, as in SQL
+
+        // MANDATORY, and it is a SYNTAX fact rather than a binder one:
+        // Binder::RangeEntry is keyed on the ref name, so an unaliased derived
+        // entry is unreferenceable and two of them collide on the empty string.
+        if (!check(TokenType::IDENTIFIER)) {
+            throw ParseError("a subquery in FROM requires an alias "
+                             "(FROM (SELECT ...) AS name)", current_);
+        }
+        std::string alias = consume().value;
+
+        // AS d (a, b) — a positional RENAME of the derived relation's output
+        // columns, not a projection. Arity is checked in the Binder, which is
+        // the only place both the list and the body's schema are in hand.
+        std::vector<std::string> column_aliases;
+        if (match(TokenType::LPAREN)) {
+            do {
+                column_aliases.push_back(
+                    expect(TokenType::IDENTIFIER, "column alias").value);
+            } while (match(TokenType::COMMA));
+            expect(TokenType::RPAREN, ") to close the column alias list");
+        }
+        return TableRef::derived(std::move(body), std::move(alias),
+                                 std::move(column_aliases));
+    }
+
+    std::string table = expect(TokenType::IDENTIFIER, "table name").value;
+
+    // optional table alias (e.g. FROM laps l / FROM laps AS l);
+    // an explicit AS makes the alias mandatory.
+    //
+    // The keyword exclusion list guards the FROM position, where the next token
+    // after a bare identifier can legally be a clause keyword. It is harmless in
+    // the JOIN position (JOIN / ON / WHERE / ... are all their own TokenTypes,
+    // so check(IDENTIFIER) is already false for them) — which is what lets one
+    // helper serve both.
+    std::string alias;
+    if (match(TokenType::AS)) {
+        alias = expect(TokenType::IDENTIFIER, "table alias after AS").value;
+    } else if (check(TokenType::IDENTIFIER) &&
+        !check(TokenType::JOIN) &&
+        !check(TokenType::WHERE) &&
+        !check(TokenType::GROUP) &&
+        !check(TokenType::ORDER) &&
+        !check(TokenType::LIMIT) &&
+        !check(TokenType::HAVING) &&
+        !check(TokenType::END_OF_FILE)) {
+        alias = consume().value;
+    }
+    return TableRef::named(std::move(table), std::move(alias));
 }

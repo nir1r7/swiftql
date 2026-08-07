@@ -82,7 +82,7 @@ TEST(LexerTest, Peek) {
 TEST(ParserTest, SimpleSelect) {
     Parser p("SELECT team FROM laps");
     auto stmt = p.parse();
-    EXPECT_EQ(stmt.from_table, "laps");
+    EXPECT_EQ(stmt.from.tableName("test"), "laps");
     EXPECT_EQ(stmt.select_list.size(), 1);
     EXPECT_FALSE(stmt.distinct);
 }
@@ -145,7 +145,7 @@ TEST(ParserTest, Join) {
     Parser p("SELECT team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id");
     auto stmt = p.parse();
     ASSERT_EQ(stmt.joins.size(), 1u);
-    EXPECT_EQ(stmt.joins[0].join_table, "drivers");
+    EXPECT_EQ(stmt.joins[0].relation.tableName("test"), "drivers");
 }
 
 // Week 26: the join clause is a Kleene star, not an option. Before this a
@@ -155,9 +155,9 @@ TEST(ParserTest, MultipleJoinClauses) {
     Parser p("SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id");
     auto stmt = p.parse();
     ASSERT_EQ(stmt.joins.size(), 2u);
-    EXPECT_EQ(stmt.joins[0].join_table, "sj");
-    EXPECT_EQ(stmt.joins[0].alias, "b");
-    EXPECT_EQ(stmt.joins[1].alias, "c");
+    EXPECT_EQ(stmt.joins[0].relation.tableName("test"), "sj");
+    EXPECT_EQ(stmt.joins[0].relation.alias(), "b");
+    EXPECT_EQ(stmt.joins[1].relation.alias(), "c");
     ASSERT_NE(stmt.joins[1].condition, nullptr);
 }
 
@@ -179,7 +179,7 @@ TEST(ParserTest, LeftJoinIsAnOuterJoin) {
     Parser p("SELECT team FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id");
     auto stmt = p.parse();
     ASSERT_EQ(stmt.joins.size(), 1u);
-    EXPECT_EQ(stmt.joins[0].join_table, "laps");
+    EXPECT_EQ(stmt.joins[0].relation.tableName("test"), "laps");
     EXPECT_EQ(stmt.joins[0].type, JoinType::LEFT);
 }
 
@@ -187,7 +187,7 @@ TEST(ParserTest, LeftOuterJoinIsTheSameJoin) {
     Parser p("SELECT team FROM drivers d LEFT OUTER JOIN laps l ON d.driver_id = l.driver_id");
     auto stmt = p.parse();
     ASSERT_EQ(stmt.joins.size(), 1u);
-    EXPECT_EQ(stmt.joins[0].alias, "l");
+    EXPECT_EQ(stmt.joins[0].relation.alias(), "l");
     EXPECT_EQ(stmt.joins[0].type, JoinType::LEFT);
 }
 
@@ -205,7 +205,7 @@ TEST(ParserTest, InnerAndOuterJoinsMixInOneStatement) {
 TEST(ParserTest, LeftIsNotReadAsATableAlias) {
     Parser p("SELECT drivers.team FROM drivers LEFT JOIN laps ON drivers.driver_id = laps.driver_id");
     auto stmt = p.parse();
-    EXPECT_TRUE(stmt.from_alias.empty());
+    EXPECT_TRUE(stmt.from.alias().empty());
     ASSERT_EQ(stmt.joins.size(), 1u);
 }
 
@@ -230,9 +230,9 @@ TEST(ParserTest, BadQueryThrows) {
 TEST(ParserTest, TableAliasWithAsKeyword) {
     Parser p("SELECT l.team FROM laps AS l JOIN drivers AS d ON l.driver_id = d.driver_id");
     auto stmt = p.parse();
-    EXPECT_EQ(stmt.from_alias, "l");
+    EXPECT_EQ(stmt.from.alias(), "l");
     ASSERT_EQ(stmt.joins.size(), 1u);
-    EXPECT_EQ(stmt.joins[0].alias, "d");
+    EXPECT_EQ(stmt.joins[0].relation.alias(), "d");
 }
 
 TEST(ParserTest, AsWithoutAliasIsSyntaxError) {
@@ -696,7 +696,7 @@ TEST(ParserTest, ScalarSubqueryParsesAsAPrimary) {
     EXPECT_FALSE(sq->negated);
     EXPECT_EQ(sq->operand, nullptr) << "only IN carries a left-hand operand";
     ASSERT_NE(sq->subquery, nullptr);
-    EXPECT_EQ(sq->subquery->from_table, "laps");
+    EXPECT_EQ(sq->subquery->from.tableName("test"), "laps");
 
     // ...and composes with arithmetic, which is the whole reason for the level
     Parser q("SELECT team FROM laps WHERE speed > 0.2 * (SELECT AVG(speed) FROM laps)");

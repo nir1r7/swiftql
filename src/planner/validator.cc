@@ -161,11 +161,12 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
 void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalog){
     // FROM table must exist
-    if (!catalog.hasTable(stmt.from_table)) {
+    if (!catalog.hasTable(stmt.from.tableName("Validator FROM existence"))) {
         throw std::runtime_error(
-            "Table not found: '" + stmt.from_table + "'");
+            "Table not found: '" + stmt.from.tableName("Validator FROM message") + "'");
     }
-    const Schema& schema = catalog.getTable(stmt.from_table).schema;
+    const Schema& schema =
+        catalog.getTable(stmt.from.tableName("Validator FROM schema")).schema;
 
     // SELECT list columns must exist (skip for SELECT *)
     if (!stmt.select_star) {
@@ -206,15 +207,19 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
                 && col_slot <= static_cast<int>(stmt.joins.size())) {
                 // slot k > 0 is joins[k-1]'s relation — the one arithmetic
                 // identity the whole multi-way generalization rests on
-                target = &catalog.getTable(stmt.joins[col_slot - 1].join_table).schema;
+                target = &catalog.getTable(
+                    stmt.joins[col_slot - 1].relation.tableName(
+                        "SUM/AVG argument check")).schema;
             } else if (col_slot == 0 || col->table_name.empty()) {
                 target = &schema;
-            } else if (col->table_name == stmt.from_table) {
+            } else if (col->table_name == stmt.from.tableName("SUM/AVG argument check FROM")) {
                 target = &schema;
             } else {
                 for (const auto& j : stmt.joins) {
-                    if (col->table_name != j.join_table) continue;
-                    target = &catalog.getTable(j.join_table).schema;
+                    const std::string& jt =
+                        j.relation.tableName("SUM/AVG argument check JOIN");
+                    if (col->table_name != jt) continue;
+                    target = &catalog.getTable(jt).schema;
                     break;
                 }
             }
@@ -236,14 +241,13 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         // its column-existence check did nothing for exactly the shapes Week 26
         // adds (a self-join cannot be written without aliases).
         std::vector<std::pair<std::string, const Schema*>> relations{
-            {stmt.from_alias.empty() ? stmt.from_table : stmt.from_alias, &schema}};
+            {stmt.from.refName(), &schema}};
         for (const auto& j : stmt.joins) {
-            if (!catalog.hasTable(j.join_table)) {
-                throw std::runtime_error(
-                    "Join table not found: '" + j.join_table + "'");
+            const std::string& jt = j.relation.tableName("Validator JOIN existence");
+            if (!catalog.hasTable(jt)) {
+                throw std::runtime_error("Join table not found: '" + jt + "'");
             }
-            relations.push_back({j.alias.empty() ? j.join_table : j.alias,
-                                 &catalog.getTable(j.join_table).schema});
+            relations.push_back({j.relation.refName(), &catalog.getTable(jt).schema});
         }
         for (size_t i = 0; i < stmt.joins.size(); ++i) {
             if (!stmt.joins[i].condition) continue;
@@ -355,17 +359,21 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         bool found;
         if (!g.table_name.empty()) {
             // qualified but unbound (validator-only callers that skip the Binder)
-            found = (g.table_name == stmt.from_table && schema.hasColumn(g.column_name));
+            found = (g.table_name == stmt.from.tableName("GROUP BY existence FROM")
+                     && schema.hasColumn(g.column_name));
             for (const auto& j : stmt.joins) {
                 if (found) break;
-                found = g.table_name == j.join_table
-                     && catalog.getTable(j.join_table).schema.hasColumn(g.column_name);
+                const std::string& jt = j.relation.tableName("GROUP BY existence JOIN");
+                found = g.table_name == jt
+                     && catalog.getTable(jt).schema.hasColumn(g.column_name);
             }
         } else {
             found = schema.hasColumn(g.column_name);
             for (const auto& j : stmt.joins) {
                 if (found) break;
-                found = catalog.getTable(j.join_table).schema.hasColumn(g.column_name);
+                found = catalog.getTable(
+                    j.relation.tableName("GROUP BY existence JOIN (unqualified)"))
+                        .schema.hasColumn(g.column_name);
             }
         }
         if (!found) {

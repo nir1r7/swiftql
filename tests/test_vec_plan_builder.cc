@@ -27,13 +27,13 @@ static const char* CATALOG = "../tests/data/test_catalog.json";
 static std::unordered_map<std::string, ColumnarTable> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
     std::unordered_map<std::string, ColumnarTable> tables;
-    const auto& fm = cat.getTable(stmt.from_table);
-    tables.emplace(stmt.from_table,
+    const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
+    tables.emplace(stmt.from.tableName("test loader"),
                    CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
     for (const auto& j : stmt.joins) {
-        if (tables.count(j.join_table)) continue;   // self-join: load once
-        const auto& jm = cat.getTable(j.join_table);
-        tables.emplace(j.join_table,
+        if (tables.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.relation.tableName("test loader"));
+        tables.emplace(j.relation.tableName("test loader"),
                        CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
     }
     return tables;
@@ -84,12 +84,12 @@ static std::vector<Row> runVolcanoRow(const std::string& sql, const Catalog& cat
     Binder::bind(stmt, cat);
 
     std::unordered_map<std::string, std::vector<Row>> table_rows;
-    const auto& fm = cat.getTable(stmt.from_table);
-    table_rows[stmt.from_table] = CSVLoader::load(fm.filepath, fm.schema);
+    const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
+    table_rows[stmt.from.tableName("test loader")] = CSVLoader::load(fm.filepath, fm.schema);
     for (const auto& j : stmt.joins) {
-        if (table_rows.count(j.join_table)) continue;   // self-join: load once
-        const auto& jm = cat.getTable(j.join_table);
-        table_rows[j.join_table] = CSVLoader::load(jm.filepath, jm.schema);
+        if (table_rows.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.relation.tableName("test loader"));
+        table_rows[j.relation.tableName("test loader")] = CSVLoader::load(jm.filepath, jm.schema);
     }
     auto plan = Planner::plan(std::move(stmt), cat, std::move(table_rows));
     std::vector<Row> out;

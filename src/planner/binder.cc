@@ -8,21 +8,41 @@ void Binder::bind(SelectStatement& stmt, const Catalog& catalog) {
 }
 
 bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* parent) {
+    // Week 34 INTERIM REFUSAL, deleted by Task 3 in the very next commit. The
+    // grammar accepts FROM (subquery) as of this commit and nothing below can
+    // yet build a range entry for one, so refuse here — before any consumer
+    // reads a name that is not there — rather than let TableRef::tableName throw
+    // an internal-defect message at whichever site happens to run first. Same
+    // stance Weeks 26 and 30 took for a shape that parses before it executes.
+    // NOT added to compare_against_sqlite.py: the harness pins the SHIPPED
+    // dialect, and this refusal does not survive the week.
+    if (stmt.from.isDerived())
+        throw std::runtime_error(
+            "FROM (subquery) is parsed but not yet executable (Week 34)");
+    for (const auto& j : stmt.joins) {
+        if (j.relation.isDerived())
+            throw std::runtime_error(
+                "FROM (subquery) is parsed but not yet executable (Week 34)");
+    }
+
     // table existence is Validator's error to raise (preserves its message)
     // without a valid range table there is nothing safe to resolve here
-    if (!catalog.hasTable(stmt.from_table)) return false;
+    if (!catalog.hasTable(stmt.from.tableName("Binder::bindQuery FROM existence")))
+        return false;
     for (const auto& j : stmt.joins) {
-        if (!catalog.hasTable(j.join_table)) return false;
+        if (!catalog.hasTable(j.relation.tableName("Binder::bindQuery JOIN existence")))
+            return false;
     }
 
     Scope scope;
     scope.parent = parent;
     scope.stmt = &stmt;
 
-    const Schema& from_schema = catalog.getTable(stmt.from_table).schema;
+    const Schema& from_schema =
+        catalog.getTable(stmt.from.tableName("Binder::bindQuery FROM schema")).schema;
     scope.range_table.push_back({
-        stmt.from_alias.empty() ? stmt.from_table : stmt.from_alias,
-        stmt.from_table,
+        stmt.from.refName(),
+        stmt.from.tableName("Binder::bindQuery FROM entry"),
         &from_schema
     });
 
@@ -30,10 +50,11 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     // i+1. resolveColumnRef already loops over the range table by index, so
     // widening it here is the whole of the N-relation generalization.
     for (const auto& j : stmt.joins) {
-        const Schema& join_schema = catalog.getTable(j.join_table).schema;
+        const Schema& join_schema =
+            catalog.getTable(j.relation.tableName("Binder::bindQuery JOIN schema")).schema;
         scope.range_table.push_back({
-            j.alias.empty() ? j.join_table : j.alias,
-            j.join_table,
+            j.relation.refName(),
+            j.relation.tableName("Binder::bindQuery JOIN entry"),
             &join_schema
         });
 

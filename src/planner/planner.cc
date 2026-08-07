@@ -79,6 +79,36 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         }
     }
 
+    // Week 34 — DERIVED TABLES. Third refusal in this block, same shape and same
+    // reason as the two above: this function builds its scan directly from a
+    // catalog table name and exactly one HashJoinNode out of stmt.joins, so
+    // there is no plan shape here that can hold a relation which is itself a
+    // PLAN, and this path does not run LogicalPlanBuilder, where the graft
+    // happens. A capability difference, so it lives here and not in the shared
+    // Validator (Week 26's rule).
+    //
+    // !! WHAT IT COSTS, extending the paragraph above rather than restating it:
+    // every derived-table query joins the IN-subquery and correlated ones in
+    // being diffed against SQLite in the two VECTORIZED modes only, with the
+    // refusal pinned by message in the two Volcano ones. That is now three
+    // families of query the four-mode oracle does not cover, and the count is
+    // stated in README Limitations so the week it tips is visible.
+    {
+        bool derived = stmt.from.isDerived();
+        for (const auto& j : stmt.joins) derived = derived || j.relation.isDerived();
+        if (derived) {
+            throw std::runtime_error(
+                "derived tables (FROM (subquery)) are not supported on the "
+                "Volcano path; use --execution vectorized");
+        }
+    }
+
+    // Every read below is of a NAMED relation, which the refusal above is what
+    // guarantees. Named once so the dependency is local rather than restated at
+    // sixteen sites — the discipline the `jc` clause pointer established after
+    // Week 29 found `preserved_slots{0}` coupled to a refusal 110 lines away.
+    const std::string& from_table = stmt.from.tableName("Planner::plan FROM");
+
     // expression GROUP BY keys: rewrite post-aggregate references, mirroring
     // LogicalPlanBuilder::build (no-op without expression keys)
     substituteGroupKeyRefs(stmt);
@@ -129,7 +159,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         }
     }
 
-    const TableMetadata& meta = catalog.getTable(stmt.from_table);
+    const TableMetadata& meta = catalog.getTable(from_table);
 
     // narrowed scan schema via the shared logical-layer helper — this also
     // fixes SELECT * + JOIN under columnar storage, which previously narrowed
@@ -137,20 +167,20 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     Schema scan_schema = buildScanSchema(stmt, meta.schema);
 
     // capture before std::move transfers ownership into SeqScanNode
-    int from_row_count = columnar_tables.count(stmt.from_table) > 0 ? columnar_tables.at(stmt.from_table).num_rows : (int)table_rows.at(stmt.from_table).size();
+    int from_row_count = columnar_tables.count(from_table) > 0 ? columnar_tables.at(from_table).num_rows : (int)table_rows.at(from_table).size();
 
     // Self-join: both scans read the same catalog table, keyed once in the
     // map. The FROM scan below moves that data out, so preserve a copy for the
     // JOIN scan. (A copy — not shared ownership — keeps this a minimal change;
     // it costs one extra table copy, acceptable at this project's scale.)
-    bool self_join = jc && jc->join_table == stmt.from_table;
+    bool self_join = jc && jc->relation.tableName("Planner::plan JOIN") == from_table;
     std::optional<ColumnarTable> self_join_columnar;
     std::optional<std::vector<Row>> self_join_rows;
     if (self_join) {
-        if (columnar_tables.count(stmt.from_table) > 0)
-            self_join_columnar = columnar_tables.at(stmt.from_table);
+        if (columnar_tables.count(from_table) > 0)
+            self_join_columnar = columnar_tables.at(from_table);
         else
-            self_join_rows = table_rows.at(stmt.from_table);
+            self_join_rows = table_rows.at(from_table);
     }
 
     // build seqScan (bottom of tree) using narrowed schema
@@ -185,37 +215,37 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         stmt.where.get(), outer ? JoinType::LEFT : JoinType::INNER, preserved_slots);
 
     std::unique_ptr<PlanNode> node;
-    if (columnar_tables.count(stmt.from_table) > 0) {
-        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, prune_hint);
+    if (columnar_tables.count(from_table) > 0) {
+        node = std::make_unique<SeqScanNode>(from_table, std::move(columnar_tables.at(from_table)), scan_schema, prune_hint);
     } else {
-        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(table_rows.at(stmt.from_table)), meta.schema);
+        node = std::make_unique<SeqScanNode>(from_table, std::move(table_rows.at(from_table)), meta.schema);
     }
 
     // hash join (exactly one, guarded above)
     if (jc){
         const auto& join_clause = *jc;
-        const TableMetadata& join_meta = catalog.getTable(join_clause.join_table);
+        const TableMetadata& join_meta = catalog.getTable(join_clause.relation.tableName("Planner::plan JOIN"));
 
         Schema right_scan_schema = buildScanSchema(stmt, join_meta.schema);
 
         // capture before std::move transfers ownership into SeqScanNode
         int join_row_count = self_join
             ? from_row_count
-            : (columnar_tables.count(join_clause.join_table) > 0
-                ? columnar_tables.at(join_clause.join_table).num_rows
-                : (int)table_rows.at(join_clause.join_table).size());
+            : (columnar_tables.count(join_clause.relation.tableName("Planner::plan JOIN")) > 0
+                ? columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN")).num_rows
+                : (int)table_rows.at(join_clause.relation.tableName("Planner::plan JOIN")).size());
 
         std::unique_ptr<PlanNode> right;
         if (self_join) {
             // read from the copy preserved before the FROM scan moved the data
             if (self_join_columnar.has_value())
-                right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(*self_join_columnar), right_scan_schema, nullptr);
+                right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(*self_join_columnar), right_scan_schema, nullptr);
             else
-                right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(*self_join_rows), join_meta.schema);
-        } else if (columnar_tables.count(join_clause.join_table) > 0) {
-            right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(columnar_tables.at(join_clause.join_table)), right_scan_schema, nullptr);
+                right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(*self_join_rows), join_meta.schema);
+        } else if (columnar_tables.count(join_clause.relation.tableName("Planner::plan JOIN")) > 0) {
+            right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN"))), right_scan_schema, nullptr);
         } else {
-            right = std::make_unique<SeqScanNode>(join_clause.join_table, std::move(table_rows.at(join_clause.join_table)), join_meta.schema);
+            right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(table_rows.at(join_clause.relation.tableName("Planner::plan JOIN"))), join_meta.schema);
         }
 
         // Keys were routed by binder-assigned slot above — the only way to

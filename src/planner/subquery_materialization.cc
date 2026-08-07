@@ -112,8 +112,21 @@ void addTable(std::vector<std::string>& out, const std::string& name) {
 void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& out) {
     // A self-join names one table twice and main.cc keys its loaded data by
     // table name, so dedupe here rather than at every caller.
-    addTable(out, stmt.from_table);
-    for (const auto& j : stmt.joins) addTable(out, j.join_table);
+    // Week 34: a DERIVED relation names no catalog table of its own; the tables
+    // its body scans are collected by recursing into the body, exactly as this
+    // walker already does for a SubqueryExpr. Skipping it here rather than
+    // calling tableName() is the difference between "there is nothing to add"
+    // and an internal-defect throw on a legitimate query.
+    if (!stmt.from.isDerived())
+        addTable(out, stmt.from.tableName("collectQueryTables FROM"));
+    else
+        collectQueryTables(*stmt.from.body(), out);
+    for (const auto& j : stmt.joins) {
+        if (!j.relation.isDerived())
+            addTable(out, j.relation.tableName("collectQueryTables JOIN"));
+        else
+            collectQueryTables(*j.relation.body(), out);
+    }
 
     auto descend = [&out](const SubqueryExpr& sq) {
         if (sq.subquery) collectQueryTables(*sq.subquery, out);

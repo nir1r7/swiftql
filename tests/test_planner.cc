@@ -110,12 +110,12 @@ static std::unique_ptr<PlanNode> bindAndPlan(const std::string& sql, const Catal
     Binder::bind(stmt, catalog);
 
     std::unordered_map<std::string, std::vector<Row>> table_rows;
-    const auto& meta = catalog.getTable(stmt.from_table);
-    table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
+    const auto& meta = catalog.getTable(stmt.from.tableName("test loader"));
+    table_rows[stmt.from.tableName("test loader")] = CSVLoader::load(meta.filepath, meta.schema);
     for (const auto& j : stmt.joins) {
-        if (table_rows.count(j.join_table)) continue;   // self-join: load once
-        const auto& jmeta = catalog.getTable(j.join_table);
-        table_rows[j.join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
+        if (table_rows.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
+        const auto& jmeta = catalog.getTable(j.relation.tableName("test loader"));
+        table_rows[j.relation.tableName("test loader")] = CSVLoader::load(jmeta.filepath, jmeta.schema);
     }
     return Planner::plan(std::move(stmt), catalog, std::move(table_rows));
 }

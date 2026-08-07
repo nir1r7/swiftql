@@ -97,13 +97,13 @@ static void seedDriversStats(Catalog& cat) {
 static std::unordered_map<std::string, ColumnarTable> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
     std::unordered_map<std::string, ColumnarTable> tables;
-    const auto& fm = cat.getTable(stmt.from_table);
-    tables.emplace(stmt.from_table,
+    const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
+    tables.emplace(stmt.from.tableName("test loader"),
                    CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
     for (const auto& j : stmt.joins) {
-        if (tables.count(j.join_table)) continue;   // self-join: load once
-        const auto& jm = cat.getTable(j.join_table);
-        tables.emplace(j.join_table,
+        if (tables.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
+        const auto& jm = cat.getTable(j.relation.tableName("test loader"));
+        tables.emplace(j.relation.tableName("test loader"),
                        CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
     }
     return tables;

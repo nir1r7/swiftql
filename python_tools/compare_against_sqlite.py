@@ -908,27 +908,34 @@ WEEK33_CORRELATED_BINDS = [
 # implement it, so Volcano stays the correctness baseline (invariant 6) instead
 # of refusing. This is the one Week 34 deliverable that RESTORES coverage rather
 # than narrowing it, which is why it does not get a *_VEC_ONLY twin.
+# EVERY COLUMN IS ALIASED, and that is a harness constraint rather than style:
+# parse_swiftql_output() reads the aligned printer's header line with
+# `lines[0].split()`, so a column NAME containing a space becomes two headers and
+# the whole result fails to parse. `COUNT(DISTINCT driver_id)` is the first
+# output name in the engine's history to contain a space at the TOP level of a
+# select item, so this constraint had never bitten. Aliasing also makes both
+# engines name the column identically, which normalize() keys rows on.
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
-    "SELECT team, COUNT(DISTINCT driver_id) FROM laps GROUP BY team ORDER BY team",
+    "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
     # THE DEDUPE TEST. extractAggregates dedupes specs by aggregateOutputName,
     # which IS exprToString, so an exprToString that forgot DISTINCT collapses
     # these two select items into ONE spec and one output column that both read.
     # Without this query that bug is invisible: every other query here still
     # returns the right single number.
-    "SELECT COUNT(driver_id), COUNT(DISTINCT driver_id) FROM laps",
+    "SELECT COUNT(driver_id) AS a, COUNT(DISTINCT driver_id) AS b FROM laps",
     # THE KEY-ENCODING TEST, and the reason it is a DOUBLE expression. Week 27
     # measured `sector_1 + sector_2` at 3245 distinct values against 2526
     # distinct %.15g texts over this dataset, so a distinct set keyed on
     # Value::toString() is off by 719 here and by nothing anywhere else.
-    "SELECT COUNT(DISTINCT sector_1 + sector_2) FROM laps",
+    "SELECT COUNT(DISTINCT sector_1 + sector_2) AS d FROM laps",
     # global, and empty-input: COUNT(DISTINCT x) over zero rows is 0, not NULL
-    "SELECT COUNT(DISTINCT team) FROM laps",
-    "SELECT COUNT(DISTINCT team) FROM laps WHERE season = 1900",
+    "SELECT COUNT(DISTINCT team) AS d FROM laps",
+    "SELECT COUNT(DISTINCT team) AS d FROM laps WHERE season = 1900",
     # NULLs are excluded (x / 0 is NULL in this dialect), while COUNT(*) is not
-    "SELECT COUNT(*), COUNT(DISTINCT round / (season - season)) FROM laps",
+    "SELECT COUNT(*) AS a, COUNT(DISTINCT round / (season - season)) AS b FROM laps",
     # grouped, with the distinct column also grouped on — the degenerate case
-    "SELECT team, COUNT(DISTINCT team) FROM laps GROUP BY team ORDER BY team",
+    "SELECT team, COUNT(DISTINCT team) AS d FROM laps GROUP BY team ORDER BY team",
 ]
 
 # Refused in all four modes: these are LANGUAGE refusals, not capability ones,

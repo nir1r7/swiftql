@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
 // base expression node
 struct Expr {
@@ -236,6 +237,82 @@ struct GroupByColumn {
     std::shared_ptr<Expr> expr;
 };
 
+// Week 34 — a relation in FROM / JOIN. Either a catalog table name or a DERIVED
+// TABLE: a whole nested query block that behaves as one relation of this block's
+// range table.
+//
+// !! table_name IS PRIVATE, and it is the same discipline ColumnId (Week 33)
+// applies to a relation slot, for the same measured reason. Encoding "derived"
+// as an empty string would leave `catalog.getTable(stmt.from_table)` compiling
+// everywhere it does today and reporting `Table not found: ''` on a query with
+// no table-name error in it. Reading the name costs a NAMED call that states the
+// caller believes this is a catalog table, and the throw is what stops that
+// belief being wrong silently. That is the Week 26 move as well: std::optional
+// was the type-level encoding of "at most one join", and making it a vector
+// turned 14 silent sites into compile errors.
+//
+// OWNERSHIP is unique_ptr, NOT the shared_ptr SubqueryExpr uses, and the
+// asymmetry is deliberate: SubqueryExpr shares because cloneExpr (dispatch site
+// 11) must copy any Expr and a deep statement copy has silent omissions. A
+// TableRef is not an Expr and nothing clones it, so sharing would import Week
+// 33's use_count() > 1 problem for no benefit.
+struct SelectStatement;
+class TableRef {
+    public:
+        TableRef() = default;
+
+        static TableRef named(std::string table, std::string alias = "") {
+            TableRef r;
+            r.table_name_ = std::move(table);
+            r.alias_ = std::move(alias);
+            return r;
+        }
+        // The alias is REQUIRED for a derived table and the parser enforces it:
+        // Binder::RangeEntry is keyed on the ref name, so an unnamed derived
+        // entry is unreferenceable and two of them collide on the empty string.
+        static TableRef derived(std::unique_ptr<SelectStatement> body,
+                                std::string alias,
+                                std::vector<std::string> column_aliases = {});
+
+        bool isDerived() const { return subquery_ != nullptr; }
+
+        // THE NARROWING POINT. Call this — there is no other way to obtain the
+        // string — anywhere the value is about to be used as a catalog table
+        // name. `site` names the caller so a planner defect points at itself.
+        const std::string& tableName(const char* site) const {
+            if (subquery_)
+                throw std::runtime_error(
+                    std::string("internal: ") + site + " read a derived table "
+                    "reference ('" + alias_ + "') as a catalog table name");
+            return table_name_;
+        }
+
+        // The name a qualified reference uses, and the Binder's RangeEntry key:
+        // the alias when there is one, the table name otherwise. Hoisted here
+        // because binder.cc and validator.cc each computed it inline, and the
+        // two must not drift (Week 26's `relations` keying bug was exactly that).
+        const std::string& refName() const {
+            return alias_.empty() ? table_name_ : alias_;
+        }
+        const std::string& alias() const { return alias_; }
+
+        // Non-const access for the Binder and the logical planner, which bind
+        // and then MOVE the body. Nothing else should need it.
+        SelectStatement* body() const { return subquery_.get(); }
+        std::unique_ptr<SelectStatement> takeBody() { return std::move(subquery_); }
+
+        // AS d (a, b) — a positional RENAME of the derived relation's output
+        // columns, not a projection. Empty when absent; a named table never
+        // carries one, because the grammar does not offer it there.
+        const std::vector<std::string>& columnAliases() const { return column_aliases_; }
+
+    private:
+        std::string table_name_;                      // empty when derived
+        std::string alias_;
+        std::vector<std::string> column_aliases_;
+        std::unique_ptr<SelectStatement> subquery_;   // non-null == derived
+};
+
 // the full parsed query
 struct SelectStatement {
     bool distinct = false;
@@ -243,13 +320,14 @@ struct SelectStatement {
 
     std::vector<std::unique_ptr<Expr>> select_list;
 
-    std::string from_table;
-    std::string from_alias; // empty if FROM table has no alias
+    // Week 34: was `std::string from_table` + `std::string from_alias`. A
+    // relation is no longer always a NAME.
+    TableRef from;
 
     // optional JOINs
     struct JoinClause {
-        std::string join_table;
-        std::string alias; // empty if JOIN table has no alias
+        // Week 34: was `std::string join_table` + `std::string alias`.
+        TableRef relation;
         std::unique_ptr<Expr> condition; // the ON expression
         // Week 29. LAST field, so positional brace-inits that predate it stay
         // valid — the same discipline AggregateSpec::argument and
@@ -311,4 +389,24 @@ struct SelectStatement {
     // itself. Three wrong answers this week came from code that kept trusting
     // the refusal after it was gone, so do not restate it as a guarantee.
     bool has_correlated_subquery = false;
+
+    // Week 34. Set by the Binder when THIS block's FROM or JOIN list holds a
+    // derived table. DELIBERATELY NOT has_subquery: that flag means "a
+    // SubqueryExpr is still in this tree" and drives buildScanSchema's
+    // conservative widening and Planner::plan's refusal scan, so reusing it
+    // would silently turn projection pushdown off for every derived-table query
+    // and give the wrong Volcano refusal message. Not propagated upward: a
+    // derived table is a relation of the block it appears in, and every consumer
+    // asks about its own block.
+    bool has_derived_table = false;
 };
+
+inline TableRef TableRef::derived(std::unique_ptr<SelectStatement> body,
+                                  std::string alias,
+                                  std::vector<std::string> column_aliases) {
+    TableRef r;
+    r.alias_ = std::move(alias);
+    r.column_aliases_ = std::move(column_aliases);
+    r.subquery_ = std::move(body);
+    return r;
+}

@@ -38,13 +38,13 @@ static std::vector<Row> runVolcano(const std::string& sql, const Catalog& cat) {
     Binder::bind(stmt, cat);
 
     std::unordered_map<std::string, std::vector<Row>> table_rows;
-    const auto& fm = cat.getTable(stmt.from_table);
-    table_rows[stmt.from_table] = CSVLoader::load(fm.filepath, fm.schema);
+    const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
+    table_rows[stmt.from.tableName("test loader")] = CSVLoader::load(fm.filepath, fm.schema);
     for (const auto& j : stmt.joins) {
         // self-join keys by name; load once is enough (planner copies internally)
-        if (table_rows.count(j.join_table)) continue;
-        const auto& jm = cat.getTable(j.join_table);
-        table_rows[j.join_table] = CSVLoader::load(jm.filepath, jm.schema);
+        if (table_rows.count(j.relation.tableName("test loader"))) continue;
+        const auto& jm = cat.getTable(j.relation.tableName("test loader"));
+        table_rows[j.relation.tableName("test loader")] = CSVLoader::load(jm.filepath, jm.schema);
     }
     auto plan = Planner::plan(std::move(stmt), cat, std::move(table_rows));
     std::vector<Row> out;

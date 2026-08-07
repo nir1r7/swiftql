@@ -29,6 +29,8 @@ class Parser {
 
         // grammar rule methods
         SelectStatement parseSelect();
+        // Week 34: one relation in FROM or JOIN — a table name or a derived table.
+        TableRef parseTableRef();
         std::unique_ptr<Expr> parseExpr();
         std::unique_ptr<Expr> parseOrExpr();
         std::unique_ptr<Expr> parseAndExpr();

@@ -736,8 +736,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
 
     // FROM scan, narrowed to only the columns the query actually needs
     std::unique_ptr<LogicalPlanNode> node = std::make_unique<LogicalScan>(
-        stmt.from_table,
-        buildScanSchema(stmt, catalog.getTable(stmt.from_table).schema));
+        stmt.from.tableName("LogicalPlanBuilder FROM scan"),
+        buildScanSchema(stmt, catalog.getTable(
+            stmt.from.tableName("LogicalPlanBuilder FROM schema")).schema));
 
     // ON conjuncts that are not equi-join keys, cloned out of the statement's
     // join trees (which die with `stmt` at the end of this function) and folded
@@ -749,9 +750,10 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         const auto& jc = stmt.joins[i];
         const int join_slot = static_cast<int>(i) + 1;   // range-table position
 
-        const TableMetadata& join_meta = catalog.getTable(jc.join_table);
+        const TableMetadata& join_meta = catalog.getTable(
+            jc.relation.tableName("LogicalPlanBuilder JOIN schema"));
         auto join_scan = std::make_unique<LogicalScan>(
-            jc.join_table,
+            jc.relation.tableName("LogicalPlanBuilder JOIN scan"),
             buildScanSchema(stmt, join_meta.schema));
 
         // classifyJoinCondition routes keys by binder-assigned slot — the only
