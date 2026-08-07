@@ -50,7 +50,15 @@ namespace {
         // grouping is not an optimization and has no correct fallback.)
         const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
         const auto* lit = dynamic_cast<const Literal*>(bin->right.get());
-        if (col && lit && col->query_level == 0 && col->relation_slot < 1){
+        // Week 31 adds the second decline, for the same reason as the first. A
+        // NULL literal became possible when a materialized scalar subquery
+        // returned zero rows: `speed > NULL` is UNKNOWN for every row, so no
+        // zone map can say anything about it. canSkipChunk would in fact return
+        // false for every chunk — Value's comparisons are three-valued — but
+        // that is an accident of the comparison operators, not a stated rule,
+        // and this file's whole subject is not resting on accidents.
+        if (col && lit && !lit->value.isNull()
+            && col->query_level == 0 && col->relation_slot < 1){
             out.emplace_back(col->column_name, bin->op, lit->value);
         }
     }

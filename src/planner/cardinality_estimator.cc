@@ -155,6 +155,18 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     if (!col || !lit)
         return (op == "=") ? FALLBACK_EQ_SELECTIVITY : FALLBACK_SELECTIVITY;
 
+    // Week 31. A NULL literal became possible for the first time: a materialized
+    // scalar subquery that returned zero rows (or one NULL row) substitutes one.
+    // Every comparison against NULL is UNKNOWN, so the predicate matches nothing
+    // — 0.0 is the exact answer, not a fallback, and it is the same conclusion
+    // the eq branch below already draws for a literal outside [min,max].
+    //
+    // It is also a correctness guard, not only an accuracy one: both branches
+    // below call lit->value.type(), which THROWS on a null Value, so before this
+    // the optimized vectorized path died with "Cannot get type of null Value" on
+    // a query --no-optimize answered correctly.
+    if (lit->value.isNull()) return 0.0;
+
     const ColumnStatsEntry* e = ctx.findForRef(col->column_name, col->relation_slot);
 
     if (op == "=" || op == "!=") {
