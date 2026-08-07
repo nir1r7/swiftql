@@ -1,10 +1,23 @@
 # Phase 5 orchestrator state
-Current: week 34 — gate r1 RED, fix agent a4e5229d58781224a diagnosing (launched 15:22 UTC).
-  The gate self-aborted a first attempt when it detected concurrent edits mid-run, renamed that
-  output to week-34-round-1-ABORTED-concurrent-edits.log, and re-ran in a quiet window with
-  identical src fingerprints before and after. MY ERROR: I dispatched the F1 fix while that gate
-  was running, which is the exact sequencing rule I had already written down. Do not fix during
-  a gate.
+Current: week 34, gate r2 running (a543c4adbef8ed41f, launched 15:32 UTC). SERIAL — no audit
+  alongside it until a gate is green.
+  Both RED shapes were confirmed LEGAL vs SQLite with exact set matches at DISCRIMINATING
+  coefficients (20/20 and 19/19; 10000/10000 and 2084/2084), optimized and --no-optimize.
+  (a) turned out NOT to be a two-level correlation at all — its own comment was wrong: the IN
+  body references only its own alias, so the IN is UNCORRELATED and the scalar sits one level
+  deep inside it. Two independent mechanisms in two blocks, not nested correlation.
+  ROOT CAUSE: an earlier commit claimed to MOVE both entries; only the arrival landed, the
+  removal edits silently no-oped, and the destination suite's length was checked without
+  re-checking the source. "Nothing leaves without arriving" failed in the opposite direction.
+  !! HARNESS LESSON WORTH KEEPING: a TEXTUAL cross-check cannot catch this, because moved
+  copies get reworded with aliases and ORDER BY. The check that works is BEHAVIOURAL — run
+  every rejection entry and assert it still errors. That sweep was run across all nine
+  rejection suites; these two were the only stale entries and none remain.
+  The moved queries were also STRENGTHENED, because they were weak oracles: (a) returns all 20
+  rows and would pass an engine that ignored the inner scalar entirely, so a 19-of-20 variant
+  and the NOT IN anti-join form were added; (b) gained the scalar on the left of the
+  comparison, inside a subtraction, and two correlated scalars in one predicate.
+  STILL UNAUDITED: whether each DIFFED suite query still tests what its comment claims.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
