@@ -1618,3 +1618,420 @@ rather than leaving a reader to wonder whether it was missed.
 - `--explain` renders `COUNT(DISTINCT driver_id)` in the aggregate node's string.
 
 ---
+
+## Task 8 — The two inherited capability boundaries
+
+### Why it matters
+
+Week 33's *Handed to Week 34* list has four items. Two of them are decisions this
+week must **make**, not inherit: the correct-but-slower fallback, and Volcano
+semi/anti parity. The other two (`WEEK33_CORRELATED_EXPECT` being a prefix rather
+than a message, and the remaining `buildScanSchema` narrowing) belong to Task 9
+and Task 3 respectively.
+
+A decision here means one of two things, and only two: **build it**, or
+**re-decline it explicitly, in writing, with what changed since the last
+decline**. Silently carrying a hand-off forward is the failure this project
+already refuses by convention — Week 33 recorded its own miss as a miss rather
+than absorbing it, and that is the standard.
+
+### Conceptual explanation
+
+**(a) The correct-but-slower fallback.** The README's Week 33 bullet asked for
+"a correct fallback for unsupported patterns"; what shipped was a **refusal**,
+named as one. The argument for refusing, restated:
+
+> A real fallback means a dependent-join operator (re-execute the body per outer
+> row), which this engine has never had, and a second execution production that
+> must agree with the first on `NOT EXISTS`'s NULL semantics is the two-paths
+> drift Weeks 26/28/30 each had to undo.
+
+Nothing in Week 34 changes that argument. A dependent join is a new physical
+operator on both engines, with its own NULL rule, its own cardinality rule and its
+own `--explain` surface, arriving in the same week that removes the schema
+containment two prior weeks were built on. **Recommendation: re-decline, and make
+the re-decline informative** by recording what actually changed:
+
+- Shapes that were refused in Week 33 and now **execute**: the correlated scalar
+  aggregate body (Task 6). The refusal set shrank; say by how much.
+- Shapes that remain refused, and why each is a *language* limit rather than an
+  engine one where that is true: a correlated inequality (`JoinKey` holds column
+  names), a computed key side, a reference more than one block out, a correlated
+  `IN`, an `EXISTS` that is not a whole top-level conjunct.
+- The one honest cost: SQLite answers all of these, so each is a **divergence**
+  and belongs in the dialect table with a pinned message.
+
+**(b) Volcano semi/anti parity.** Week 33 stated the shape precisely:
+
+> It is two halves and only one is cheap: `JoinSemantics` in
+> `src/execution/hash_join_node.cc` (small), plus a Volcano plan shape that can
+> hold a *second* join, since `Planner::plan` builds exactly one `HashJoinNode`
+> out of `stmt.joins` (not small, and its guards have undocumented couplings).
+
+Week 33's Task 7 then **corrected the pointer**, and the correction matters: the
+Volcano hash join lives in `src/planner/plan_nodes.h`, **not** in a
+`src/execution/hash_join_node.cc`, and it has no `JoinSemantics` parameter at
+all — so a semi/anti join is not representable there. The refusal is total
+*structurally*; the `Planner::plan` refusals exist to give a named message, not
+to close a hole.
+
+That makes the "cheap half" cheaper than advertised and the expensive half
+unchanged: `Planner::plan` still builds exactly one join from `stmt.joins`, and
+its `preserved_slots`, its single `jc` clause pointer and its `joins.size() > 1`
+refusal are coupled across 110 lines — Week 29's audit found `preserved_slots{0}`
+was correct *only* because of that refusal.
+
+**Week 34 makes this worse, and that is the news to record.** Derived tables add a
+**third** Volcano capability refusal (Task 4, Step 5), on top of `IN` (Week 32)
+and correlated (Week 33). The set of queries diffed in two modes rather than four
+grows again. **Recommendation: re-decline for this week, and quantify it** — count
+the queries in `WEEK32_SEMI_JOIN_VEC_ONLY` + `WEEK33_DECORRELATED_VEC_ONLY` +
+the new Week 34 vec-only suites, and put the number in the README's Limitations.
+A number is falsifiable; "some queries" is not.
+
+The counter-argument deserves stating because it may win in Week 37: Volcano is
+the correctness baseline (invariant 6), and the four-mode oracle is *the* reason
+the vectorized operators are trusted. Every week that adds a vectorized-only
+feature spends baseline coverage. At some point the balance tips and rebuilding
+`Planner::plan` around the logical layer is cheaper than the accumulated blind
+spot. Week 34 is not that week — it is already removing a containment — but the
+number should be in the README so that the week where it tips is visible.
+
+### Implementation guidance
+
+There is no code in this task. There are four artifacts:
+
+1. **A dialect-table row per surviving refusal**, in `README.md` →
+   *Syntax Deliberately Not Supported*, in the established three-column shape
+   (*Not supported* / *Rejected with* / *Why*). Week 34 adds at least: a derived
+   table on the Volcano path; an unaliased derived table; a `LATERAL` derived
+   table; a derived table producing two columns of one name; a column-alias-list
+   arity mismatch; a non-aggregate correlated scalar body; `DISTINCT` on an
+   aggregate other than `COUNT`.
+2. **A Limitations bullet** stating the four-mode coverage cost with a count.
+3. **An update to Week 33's *Handed to Week 34* list**, in
+   `docs/week-33-plan.md`, marking each of the four items done or re-declined.
+   Do this in `docs/week-33-plan.md` itself, not only here: a reader following the
+   hand-off from that file must not have to know Week 34's plan exists.
+4. **The re-decline, written where the code is**, not only in a doc. The
+   `Planner::plan` refusal block already carries "what this costs, stated rather
+   than discovered later"; extend it rather than adding a fourth parallel comment.
+
+### Verification
+
+- Every refusal that survives the week has: a dialect-table row, a
+  rejection-suite entry with the message pinned, and a comment at the throw site.
+  Three places, and the harness one is not optional — `compare_against_sqlite.py`
+  cannot diff a query that errors, which is the blind spot Week 30 established the
+  rejection-suite pattern for.
+- Week 33's hand-off list is fully dispositioned; no item is silently carried.
+- The vec-only query count in Limitations matches
+  `grep -c` over the suites. A number that has to be recomputed by hand is a
+  number that will be wrong by Week 36.
+
+---
+
+## Task 9 — Harness and tests
+
+### Why it matters
+
+Two rules from prior weeks, both learned expensively, both directly applicable:
+
+**The harness blind spot.** `compare_against_sqlite.py` diffs *rows*; it cannot
+hold a query that **errors**. So every newly refused shape needs a rejection-suite
+entry that pins the message, or it is untested — this is why
+`WEEK31_MATERIALIZATION_REFUSED`, `WEEK32_LOWERING_REFUSED` and
+`WEEK33_CORRELATED_BINDS` exist. Week 34 adds seven or more refusals (Task 8).
+
+**Week 32's lesson, quoted because it is the standard this task is held to:**
+
+> A subquery nested inside an `IN` body died at dispatch site 12 with an
+> internal-invariant message — past a **green 988-query oracle and 770 green unit
+> tests**. Neither could see it, because the one test guarding that capability had
+> been **narrowed, in that same week**, to a flattened stand-in that no longer
+> reached through `sq->subquery->where` to the nested node. The suite was green
+> about a weaker claim.
+
+Week 34 changes `TableRef` — which touches **every test that hand-builds a
+`SelectStatement`**. That is the largest mechanical test edit since Week 33's
+`ColumnId`, and mechanical edits are exactly where a capability vanishes.
+
+### Conceptual explanation
+
+Three categories of harness work, and they are not interchangeable.
+
+**Diffed suites** — queries that return rows, compared against SQLite. The mode
+matrix is per-feature:
+
+| Feature | Modes | Why |
+|---|---|---|
+| `COUNT(DISTINCT)` | **all four** | Both aggregate nodes implement it; this is the one Week 34 deliverable that does not narrow coverage |
+| Derived tables | two vectorized | `Planner::plan` cannot hold a relation that is a plan (Task 4, Step 5) |
+| Correlated scalar (Q17) | two vectorized | Inherits the Week 33 boundary, unchanged |
+
+**Rejection suites** — the message pinned, in the modes where the refusal fires.
+A capability refusal (Volcano) fires in two modes and the query is *diffed* in the
+other two; a language refusal (unaliased derived table) fires in all four.
+
+**Unit tests** — for what the oracle structurally cannot see: the LATERAL refusal
+firing by the *right* message rather than by column-not-found; the drift assertion
+in Task 4 firing when `blockOutputSchema` is broken; `join-ordering=skipped
+(derived relation)` appearing on the `--explain` line.
+
+### Code snippets
+
+```python
+# python_tools/compare_against_sqlite.py
+#
+# Week 34. Diffed in the two VECTORIZED modes only: Planner::plan builds exactly
+# one HashJoinNode out of stmt.joins and has no plan shape that can hold a
+# relation which is a PLAN, so derived tables are refused there. The refusal is
+# pinned by message in the two Volcano modes below -- this suite cannot hold a
+# query that errors, which is the whole reason the paired suite exists.
+WEEK34_DERIVED_TABLE_VEC_ONLY = [
+    # the plain shape
+    "SELECT d.team FROM (SELECT team FROM laps) AS d",
+    # Q15's shape: a derived table JOINED to a base relation, with an aggregate
+    # body -- the case the slot-0 normalization exists for
+    "SELECT dr.name, d.s FROM (SELECT driver_id, AVG(speed) AS s FROM laps "
+    "GROUP BY driver_id) AS d JOIN drivers dr ON d.driver_id = dr.driver_id "
+    "ORDER BY dr.name",
+    # Q13's shape: column alias list, and a body that JOINS -- so the body's own
+    # output schema carries slots 0 AND 1 before normalization
+    "SELECT c.n, COUNT(*) FROM (SELECT dr.name, COUNT(l.lap_id) FROM drivers dr "
+    "LEFT JOIN laps l ON dr.driver_id = l.driver_id GROUP BY dr.name) AS c (n, k) "
+    "GROUP BY c.n ORDER BY c.n",
+    # a derived table INSIDE a subquery body -- two nesting mechanisms at once,
+    # which is the shape Week 32 shipped a regression in and no suite could see
+    "SELECT team FROM laps WHERE speed > (SELECT AVG(x.s) FROM "
+    "(SELECT AVG(speed) AS s FROM laps GROUP BY team) AS x)",
+]
+
+WEEK34_DERIVED_TABLE_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path")
+    for query in WEEK34_DERIVED_TABLE_VEC_ONLY
+]
+
+# All FOUR modes: both aggregate nodes implement it. The second query is the one
+# that catches an exprToString that forgot DISTINCT -- extractAggregates dedupes
+# specs by aggregateOutputName, so without the five characters these two select
+# items collapse into ONE column and both read it.
+WEEK34_DISTINCT_AGG_QUERIES = [
+    "SELECT team, COUNT(DISTINCT driver_id) FROM laps GROUP BY team ORDER BY team",
+    "SELECT COUNT(driver_id), COUNT(DISTINCT driver_id) FROM laps",
+    # the Week 27 repro shape: %.15g collapsed 3245 distinct doubles into 2526
+    # texts, in all four modes, visible only to this oracle
+    "SELECT COUNT(DISTINCT sector_1 + sector_2) FROM laps",
+    "SELECT COUNT(DISTINCT team) FROM laps WHERE season = 1900",   # empty -> 0
+]
+
+# Refused in ALL four modes: these are LANGUAGE refusals, not capability ones.
+WEEK34_REFUSED = [
+    ("SELECT * FROM (SELECT team FROM laps)",                  "requires an alias"),
+    ("SELECT * FROM laps l JOIN (SELECT team FROM drivers d WHERE d.team = l.team) "
+     "AS x ON x.team = l.team",                                "LATERAL is not supported"),
+    ("SELECT * FROM (SELECT l.team, d.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id) AS x",                     "is produced twice"),
+    ("SELECT * FROM (SELECT team FROM laps) AS d (a, b)",      "column aliases were supplied"),
+    ("SELECT COUNT(DISTINCT *) FROM laps",                     "DISTINCT"),
+    ("SELECT SUM(DISTINCT speed) FROM laps",                   "DISTINCT"),
+]
+```
+
+### Implementation guidance
+
+**The changed-test discipline, made concrete.** Week 34 will edit at least
+`tests/test_parser.cc`, `test_binder.cc`, `test_planner.cc`, `test_logical_plan.cc`,
+`test_vec_plan_builder.cc`, `test_join_enumeration.cc`, `test_predicate_pushdown.cc`,
+`test_execution.cc`, `test_vectorized.cc` and `test_subquery.cc` — most of them
+only because `stmt.from_table = "laps"` becomes `stmt.from = TableRef{"laps"}`.
+
+For **every test this week edits or deletes**, name the assertion that left and
+where it went. Week 33's round-4 audit did exactly this for
+`NoLongerRefusesALargeInSet` and found nothing lost; that is the standard, and it
+takes minutes. Write the translation rules down so a reviewer can check them
+mechanically, exactly as Week 33 did for the `ColumnId` migration:
+
+```
+stmt.from_table = "laps";                  ->  stmt.from = TableRef{"laps"};
+stmt.from_table = "laps"; from_alias = "l" ->  stmt.from = TableRef{"laps", nullptr, "l"};
+stmt.joins.push_back({"drivers", "d", ...}) ->  ... TableRef{"drivers", nullptr, "d"} ...
+```
+
+No assertion may be weakened. A test that needed more than a translation was
+asserting something about the *old encoding*; say what, in the commit message.
+
+**Two harness traps Week 35's note already documents, and they bite here.**
+
+- A query with **no `ORDER BY` must be sorted before diffing**. A derived table
+  changes physical emission order legitimately, and that is not a result
+  difference. Several of the suite queries above carry an explicit `ORDER BY` for
+  this reason; the rest must go through the sorted comparison.
+- `normalize()` keys rows by column **name**. `SELECT *` over a derived table
+  whose column names came from a column-alias list is fine; `SELECT *` over a
+  derived table joining two relations that share a column name is not — and Task 3
+  refuses that shape, which is one more reason the refusal is right.
+
+**Unit tests the oracle cannot replace** — write these, they are the ones that
+pin decisions rather than results:
+
+- `BinderTest.DerivedTableCannotSeeTheEnclosingBlocksRelations` — asserts the
+  **LATERAL message**. This is what pins the `parent` argument in Task 3; a
+  refactor that changes it would otherwise leave a green suite.
+- `LogicalPlanTest.DerivedRelationColumnsAreStampedSlotZero` — reads the
+  `LogicalDerived`'s `output_schema` directly. The normalization is the week's
+  central invariant and nothing else asserts it directly.
+- `LogicalPlanTest.GraftAssertionFiresWhenBlockOutputSchemaDrifts` — the Task 4
+  drift check, exercised. An assertion never seen to fail is the one Week 33
+  deleted for being unfailable.
+- `JoinEnumerationTest.ReportsTheDeclineForADerivedRelation` — asserts the
+  `join-ordering=skipped (derived relation)` string, not just that the order is
+  unchanged.
+- `ExecutionTest` / `VectorizedTest` pairs for `COUNT(DISTINCT)` over a DOUBLE
+  column, asserting the two engines agree — the four-mode oracle covers this too,
+  but the operator-level test is what localizes a failure to an engine.
+
+### Verification — the week's success criteria
+
+The week is done when all of these hold, and not before:
+
+1. **Build clean**, no new warnings.
+2. **Unit suite green**, with a written account of every changed test.
+3. **`compare_against_sqlite.py` green in all four modes**, including the new
+   diffed and rejection suites.
+4. `WEEK33_CORRELATED_BINDS` has **shrunk**, and every shape that left it arrived
+   in a diffed suite. Nothing leaves a rejection suite without arriving somewhere.
+5. **Optimized ≡ `--no-optimize`** on every new query, in both vectorized modes.
+   That equivalence is what a wrong `n` in `hasSlotOutsideRangeTable` breaks, and
+   it is the fourth mode's whole reason to exist.
+6. Every pre-existing query's `--explain` output is **byte-identical**.
+7. Task 1's sweep checklist is fully ticked, each with a finding rather than a
+   "checked".
+
+---
+
+## Task 10 — The closing sweep
+
+### Why it matters
+
+Task 1 built the worklist. This is where it is discharged, and it is a task rather
+than a chore because of the measured history: **Week 33 shipped three silent wrong
+answers from stale guarantees, two of them in header comments, and a sweep
+afterwards found seven more.** The comments were not decoration; they were the
+preconditions later code was written against.
+
+Week 34 is worse-exposed than Week 33 was, because Week 33 *removed* a refusal
+while Week 34 removes an **invariant that two weeks were built on**. Anything that
+reasoned "a body column is never in scope above the join" reasoned from something
+that is now conditional.
+
+### Conceptual explanation
+
+The discipline, stated as a rule you can check someone against:
+
+> Every citation is rewritten to state **what is now true and why**, never that it
+> was reviewed. "Checked in Week 34" is not a finding and reads to the next week
+> exactly like the stale text did.
+
+And the specific trap this project has hit three times: a comment that is *still
+true* but for a **different reason** than it says. `buildAggregateSchema`'s
+tripwire is the live example — it stays armed and unreached after Task 6, but its
+Week 33 reason ("decorrelation refuses a `GROUP BY` body") becomes false, and the
+new reason (the body's group keys are level 0 against the body's own range table)
+is a different sentence. Leaving the old reason is the shape that produced two of
+Week 33's three wrong answers.
+
+### Implementation guidance
+
+Discharge in this order, because each layer's truth depends on the one below.
+
+**1. Code comments and headers** — Task 1's list. The highest-risk five:
+
+- `src/planner/logical_plan.h`, the `LogicalJoin::semantics` invariant block. It
+  is still true *for `SEMI`/`ANTI`*. What must change is the surrounding claim
+  that it is "the whole containment for the two-range-table problem this node
+  introduces" — it is now **one of two** containments, the other being Task 4's
+  slot-0 normalization. Name both, and point at each other.
+- `src/planner/subquery_decorrelation.h`, condition 3. "A body with an aggregate
+  cannot be decorrelated" is now true of `lowerExistsSubqueries` and false of
+  `lowerCorrelatedScalars`. Two guards, two headers, each true of its own.
+- `src/planner/join_enumeration.cc`, the `hasSlotOutsideRangeTable` block, which
+  predicts this week by name. Replace the prediction with what happened: `n` is
+  now the range-table size passed from the builder, and the decline is reported.
+- `src/storage/chunk_pruner.h`, the scan-local justification. Still correct;
+  re-derive it under derived relations (a derived relation is not a `LogicalScan`,
+  so it receives no hint) and say *that*, rather than "unchanged".
+- `src/planner/plan_nodes.h` — the Volcano `HashJoinNode`. Week 33 found the
+  README and Week 32's hand-off both pointed at a nonexistent
+  `src/execution/hash_join_node.cc`. If any citation of that path survives
+  anywhere, this is the week to kill it.
+
+**2. `development.md`.** Two edits, and the second is the one that carries value
+forward:
+
+- Rewrite the sentence "**Week 34's derived tables break this containment for
+  real**" into a record of *how* it was broken and *what replaced it*.
+- Add the **Week 34 consumers** table (Task 5, step 3). Every row states
+  level-aware / safe-by-domain / guarded **with its reason**. A missing row is
+  worse than a wrong one.
+
+**3. `README.md`.** Six places:
+
+- The subquery bullet in *In Scope* — `FROM (subquery)` no longer says "is Week 34".
+- The dialect table — remove the "FROM (subquery) is Week 34" pointers from the
+  two rows that carry them, add Task 8's new rows.
+- *Limitations* — the derived-table Volcano bullet with the counted cost, the
+  `COUNT(DISTINCT)` memory bullet, and an update to the correlated-subquery bullet
+  (correlated scalars over an aggregate body now execute).
+- The **Week 34 section** — a *Shipped / Why it was required* table in the shape
+  every prior Phase 5 week uses, plus the checkpoint mark. If any part of the
+  checkpoint is not met, record it as a **miss**, as Week 33 did, not as a
+  qualified success.
+- Week 33's checkpoint line, which says the correlated-scalar family is a miss —
+  it stays as the record of Week 33, but should point forward to where it closed.
+- The 37-week plan table row for Week 34.
+
+**4. `docs/week-33-plan.md` → *Handed to Week 34*.** All four items dispositioned
+(Task 8).
+
+**5. Re-run Task 1's five greps.** Every new hit is this week's own code and is
+accounted for.
+
+### Verification
+
+- Task 1's checklist has no unticked entries, and every entry's resolution names a
+  fact rather than an activity.
+- `grep -rn "Week 34" src/ tests/ python_tools/` returns only *records* of what
+  Week 34 did — no surviving promises. Any remaining forward pointer names Week 35
+  or later.
+- `grep -rn "hash_join_node.cc" .` returns nothing outside historical plan
+  documents.
+- A reader who opens `logical_plan.h` cold can state, from the comments alone, why
+  a derived relation's columns are safe above the join and why a semi-join's body
+  columns are not in scope. If they cannot, the sweep is not finished.
+
+---
+
+## Progress
+
+*(Fill in as the week proceeds. Task 1's sweep checklist lives here, and every
+task's outcome — including anything cut or re-declined — is recorded here rather
+than left to be inferred from the diff.)*
+
+- [ ] Task 1 — refusal inventory and sweep checklist
+- [ ] Task 2 — `TableRef` (own commit, derived form still refused)
+- [ ] Task 3 — Binder: derived range-table entries
+- [ ] Task 4 — `LogicalPlanBuilder`: graft and normalize
+- [ ] Task 5 — the three synthetic-slot consumers, slot-table sweep
+- [ ] Task 6 — Q17 / correlated scalar decorrelation
+- [ ] Task 7 — `COUNT(DISTINCT ...)`
+- [ ] Task 8 — capability boundaries: fallback, Volcano parity
+- [ ] Task 9 — harness and tests
+- [ ] Task 10 — closing sweep
+
+**If the week runs short**, cut in this order and say so out loud: Task 6 first
+(cut to a refusal, never to a partial implementation — a wrong Q17 costs more than
+a refused one, which is Week 33's own judgement), then Task 8's quantification.
+**Do not cut Tasks 1, 5 or 10.** They are what stop the week's removals from
+becoming next week's silent wrong answers, and they are the only tasks whose
+absence is invisible in a green suite.
