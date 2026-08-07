@@ -74,6 +74,17 @@ struct LogicalScan : LogicalPlanNode {
     std::string explain() const override;
 };
 
+// Week 32 — set-membership lowering. Kept OFF JoinType (parser/ast.h) on
+// purpose: JoinType is the *syntactic* per-clause kind a user writes on a JOIN
+// clause, and SEMI/ANTI are never written — they are lowering artifacts. Adding
+// them there would make `stmt.joins[i].join_type == SEMI` representable and
+// unreachable, and grow a dead case in every parser and validator switch.
+enum class JoinSemantics {
+    STANDARD,  // ordinary equi-join; join_type says INNER or LEFT
+    SEMI,      // emit each children[0] row AT MOST ONCE, when a match exists
+    ANTI       // emit each children[0] row when NO match exists
+};
+
 // equi-join, INNER by default. keys[k].from_col resolves against children[0]'s schema,
 // keys[k].join_col against children[1]'s. Multi-key since Week 26 (TPC-H Q9).
 // join_slot is the binder relation slot of children[1] — it stamps the merged
@@ -82,6 +93,13 @@ struct LogicalScan : LogicalPlanNode {
 // that shape).
 struct LogicalJoin : LogicalPlanNode {
     std::vector<JoinKey> keys;
+    // Binder relation slot of children[1]. Week 32: -1 when semantics !=
+    // STANDARD, and -1 there means "children[1] is not a relation of this
+    // block's range table" — there is no slot that names a subquery body. Every
+    // reader of join_slot must therefore either decline on semantics !=
+    // STANDARD or be provably unreachable for such a node (PredicatePushdown
+    // declines; JoinEnumeration declines; the lowerings read it only in the
+    // STANDARD branch). That is a development.md slot-table row, not a comment.
     int join_slot;
     // Week 28: set by JoinEnumeration on the TOP join of an enumerated tree, and
     // nowhere else. Empty for every single-join plan, every --no-optimize plan
@@ -107,6 +125,26 @@ struct LogicalJoin : LogicalPlanNode {
     // against THIS node's merged output_schema, and is MOVED into the physical
     // operator at lowering (like LogicalFilter::predicate).
     std::unique_ptr<Expr> on_residual;
+
+    // Week 32 — set-membership lowering (subquery_lowering.h). Set AFTER
+    // construction, like order_decision and join_type, so the five-argument
+    // constructor and every hand-built test tree are byte-identical.
+    //
+    // !! INVARIANT, and the whole containment for the two-range-table problem
+    // this node introduces (development.md -> Relation slots and query levels):
+    // when semantics != STANDARD, output_schema IS children[0]->output_schema,
+    // NOT a merged schema. children[1] is the plan of a subquery BODY, whose
+    // relation slots are numbered against the BODY's range table — a second
+    // numbering domain at the same query level. Nothing from children[1] is ever
+    // in scope above this node, so the two domains never meet. A merged schema
+    // here would put a body column at a body slot into scope, and every
+    // indexOf(name, slot) above would be a coin flip — the silent
+    // wrong-relation class buildAggregateSchema's tripwire exists for.
+    //
+    // join_type stays INNER for both: an outer semi-join is not a shape this
+    // engine can produce, and the two fields are read independently. join_slot
+    // is -1 — see below.
+    JoinSemantics semantics = JoinSemantics::STANDARD;
 
     LogicalJoin(std::unique_ptr<LogicalPlanNode> from_child, std::unique_ptr<LogicalPlanNode> join_child, std::vector<JoinKey> keys, int join_slot, Schema merged) : LogicalPlanNode(LogicalNodeType::JOIN, std::move(merged)), keys(std::move(keys)), join_slot(join_slot) {
         children.push_back(std::move(from_child));

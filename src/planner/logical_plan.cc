@@ -579,7 +579,14 @@ std::string LogicalJoin::explain() const {
     // of them byte-identical and is unmissable in a plan dump. It also keeps the
     // substring "Join", which python_tools/test_new_queries.py greps for when it
     // sums the rows a plan's joins materialize.
-    std::string s = (join_type == JoinType::LEFT ? "LogicalLeftJoin [" : "LogicalJoin [");
+    // Week 32: same argument as Week 29's — the node NAME carries the kind, so
+    // every pre-existing plan string stays byte-identical, the substring "Join"
+    // survives for test_new_queries.py's join-row accounting, and a semi-join is
+    // unmissable in a plan dump.
+    std::string s = "LogicalJoin [";
+    if (semantics == JoinSemantics::SEMI)      s = "LogicalSemiJoin [";
+    else if (semantics == JoinSemantics::ANTI) s = "LogicalAntiJoin [";
+    else if (join_type == JoinType::LEFT)      s = "LogicalLeftJoin [";
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i) s += " AND ";
         const Schema& left = children[0]->output_schema;
