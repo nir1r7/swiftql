@@ -334,6 +334,13 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 >   `order=` line — a decision was available and was refused, which is worth
 >   saying, but no order was chosen.
 >
+> A fourth consequence is quieter: the predicate a join hands its preserved side
+> as a **zone-map pruning hint** is now the place the null-supplying side's
+> conjuncts live, so an outer join withholds it unless every relation it mentions
+> is preserved. One rule (`pruningHintForPreservedSide`, `predicate_pushdown.h`)
+> for both hint routes — `VectorizedPlanBuilder`'s JOIN case and `Planner::plan`'s
+> FROM scan — because a second copy is how the two engines drift apart.
+>
 > The build side is forced rather than costed: the preserved side must be the
 > probe input (`build=<table> ... (outer: the preserved side must probe)`), and
 > the SIMD loop join — an inner equi-join with no unmatched path — is never
@@ -576,7 +583,7 @@ Ordered by how hard the failure is to find:
 | 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
 | 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
 | 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, two callers, never a private copy. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, now THREE callers, never a private copy. The third (Week 29) is `pruningHintForPreservedSide`, which decides whether an outer join may hand its `WHERE` down to the preserved side's scan as a zone-map hint — and it is the one caller where an empty slot set is *dangerous* rather than merely lossy, because "mentions no relation" would read as "mentions nothing unpreserved". It therefore fails **closed**: empty means withhold. A new node type that this walker misses costs pushdown at the first two callers and would have silently reopened a null-supplying predicate's route to the wrong table's zone maps at the third. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one |
 | 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps its own relation's slot (any `k >= 1`) below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
 | 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
