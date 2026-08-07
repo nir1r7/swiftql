@@ -1,17 +1,18 @@
 # Phase 5 orchestrator state
-Current: week 32, round 1, step 2 CONTINUED — successor agent a7a1981ecb00dab7a launched
-  08:35 UTC. The interruption protocol WORKED: the first agent shipped §1-§9 as pushed layered
-  commits and left a full "## Progress" handoff at the end of docs/week-32-plan.md before the
-  ~08:26 reclaim. Remaining per that handoff: C++ unit tests, README dialect rows, the
-  development.md slot-table rows, and the --explain-analyze est= invariant check.
-  ON ANY FURTHER RECLAIM: re-read that Progress section and launch another successor. Never
-  restart week 32, never re-run teach.
+Current: week 32, round 1, steps 3+4 IN PARALLEL (gate + audit), launched 08:45 UTC, both
+  budgeted to land before the ~09:26 reclaim.
+  Week 32 implementation is COMPLETE and pushed, across two agents via the handoff protocol
+  (the first was killed at ~08:26; the successor finished from the "## Progress" section).
+  Unit tests now 768. The successor found the predecessor's NULL tests asserted against data
+  with NO NULLS — `makeScan` builds a ColumnarTable that silently turns Value::null() into 0.
+  Rewritten through NullableSourceNode. Audit r1 is told to check every NULL test/oracle entry
+  in the week for that same defect.
+  Week 32 shipped: 1024 IN cap REMOVED; IN(subquery) is VECTORIZED-ONLY (Volcano refuses by
+  name, so those queries diff in 2 modes not 4); four lowering refusals (IN under OR, IN in
+  HAVING, computed operand, shared body statement).
+  STILL OPEN as stated Week 33+ items: Volcano semi/anti parity (restores the 4-mode
+  baseline), and the selection-vector path for the semi-join operator (deferred to Week 37).
   Week 32 does NOT lower a correlated reference, so ColumnId defers to Week 33.
-  The 1024 IN cap is GONE (MAX_MATERIALIZED_IN_VALUES removed).
-  Volcano REFUSES IN-subqueries by name (vectorized-only this week) — so these queries are
-  diffed in 2 modes, not 4. Restoring the 4-mode baseline is a stated Week 33+ item.
-  NOTE: JoinEnumeration's decline went live NOW, contradicting a Week 31 note that predicted
-  Week 34 — the successor is correcting that stale note.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
