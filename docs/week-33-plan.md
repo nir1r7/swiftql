@@ -383,3 +383,329 @@ is never behind the code.
 
 Commit alone, with the before/after counts in the message. `git log --stat`
 should show a commit that touches 20-odd files and changes no test assertion.
+
+---
+
+## Task 2 — Remove the refusal; replace both Week 30 tripwires
+
+### Why it matters
+
+The refusal is one `if` at the end of `Validator::validate`, and its placement is
+load-bearing in a way that is easy to destroy while deleting it. Week 30 put it
+there so that **every parse, bind and validate error a query is entitled to fires
+first** — a bad nested table, a bad nested column, an ungrouped reference, a
+wrong arity, a disallowed position. And it is **one** check, so the four modes
+agree *by construction* rather than by copies of a guard that can drift, which is
+what Week 29 spent an audit round undoing.
+
+Deleting it arms two tripwires that have been in the tree, unreached, since
+Week 30:
+
+- `collectSimplePredicates` (`src/storage/chunk_pruner.h`) **declines** any ref
+  with `query_level > 0`.
+- `buildAggregateSchema` (`src/planner/logical_plan.cc`) **throws** on a
+  `GroupByColumn` with `query_level > 0`.
+
+They differ **on purpose**, and the difference is the design principle to
+preserve. Pruning is an *optimization*: contributing nothing is
+correct-and-slower, so declining is the right answer forever. Grouping is
+*semantics*, and its failure mode is `indexOf("team", 0)` scoring a clean hit on
+the **wrong relation** — no local fallback can repair that, so it must be loud.
+
+The README's instruction is explicit: **replace them with real behaviour, do not
+delete them.**
+
+### Conceptual explanation
+
+After Task 3's decorrelation, a correlated reference should not survive into a
+scan predicate or a group key at all — the rewrite converts it into a join key
+against an ordinary column of the *outer* relation. So the honest "real
+behaviour" for both sites is:
+
+- **`ChunkPruner`:** keep declining. A `level > 0` ref reaching here means either
+  a shape decorrelation did not handle (Task 5's fallback path) or a defect;
+  either way, contributing no pruning hint is safe. What changes is the
+  *comment*: it currently says "unreachable today", and after Task 3 it is
+  reachable for the fallback shapes. Restate the reason as the one that is
+  actually load-bearing — *a correlated ref names a relation this scan is not
+  scanning, so it can prune nothing here* — rather than "the validator refuses
+  it".
+- **`buildAggregateSchema`:** the throw stays, and it stays a *planner-defect*
+  message, because after decorrelation a group key that is still correlated means
+  the rewrite left one behind. This is the single guard for the whole
+  `GroupByColumn` consumer set (`HashAggregateNode`, `VecHashAggregateNode`,
+  `CardinalityEstimator`), all three of which run on a plan whose schema was
+  built here — if it throws, they never see the key.
+
+The subtlety Task 1 buys you: after the migration, both of these are expressed as
+`id.isLocal()` / `id.localSlot(...)`, so the tripwires are no longer *ad hoc
+`if`s a reader can mistake for defensive noise — they are the two places the
+type's narrowing is deliberately not taken.
+
+### Code snippets
+
+```cpp
+// src/planner/validator.cc — what replaces the refusal.
+//
+// NOT a second refusal somewhere else, and NOT one per engine. Week 30's
+// placement is the asset: one check, at the end of validate(), which both
+// Planner::plan and LogicalPlanBuilder::build reach first. Task 5's fallback
+// refusal goes in ONE place too, for the same reason (see Task 5).
+//
+// The check is simply gone. What must NOT happen here:
+//   - moving it into LogicalPlanBuilder "because that is where lowering is";
+//     Planner::plan then accepts a query the vectorized path refuses, which is
+//     the four-mode drift Week 29's audit rounds were about;
+//   - keeping a narrowed version ("correlated scalar subqueries are not yet
+//     executable") — that belongs at the decorrelation site, which knows WHICH
+//     shape it declined and can say so.
+```
+
+```cpp
+// src/storage/chunk_pruner.h — the tripwire, restated rather than deleted.
+//
+// Week 33: this is now REACHABLE. Decorrelation (subquery_decorrelation.cc)
+// rewrites the correlated shapes TPC-H needs into join keys, so a level > 0 ref
+// should not arrive here — but the Task 5 fallback shapes are refused rather
+// than rewritten, and a defect in the rewrite would arrive here too.
+//
+// Still a DECLINE, and now for the reason that survives the refusal's removal:
+// a correlated ref names a relation this scan is not scanning, so it can supply
+// no pruning hint about this table's zone maps. Contributing nothing is
+// correct-and-slower; matching by NAME against the scanned table's zone maps
+// (which is what the code below does) would prune the WRONG relation's chunks
+// silently, on the --no-optimize path where the collectSlots/soleSlot
+// containment never applies.
+if (col && lit && !lit->value.isNull()
+    && col->id.isLocal() && col->id.slot < 1) {
+    out.emplace_back(col->column_name, bin->op, lit->value);
+}
+```
+
+### Implementation guidance
+
+1. Do this **after** Task 1 is committed and green, and **before** Task 3's
+   rewrite exists — with the refusal gone and no decorrelation yet, a correlated
+   query will fail *somewhere*, and where it fails is diagnostic information you
+   want to see once, deliberately. Run each query in
+   `WEEK33_CORRELATED_BINDS` (`python_tools/compare_against_sqlite.py`, seven
+   shapes) and write down the message each produces. That list is Task 3's and
+   Task 5's worklist.
+2. Expect `inferExprType` and `evaluate` (dispatch sites 12 and 13) to throw
+   their Week-31 messages for a surviving `SubqueryExpr`. Week 30's note is
+   explicit that both sites must close **in the same commit that lowers one** —
+   so they close in Task 3/4, not here. Leaving them throwing between Task 2 and
+   Task 3 is fine and is why Tasks 2-4 may share one commit if the intermediate
+   state is not independently verifiable; Task 1 is the one that must stand alone.
+3. Update `development.md` → *Relation slots and query levels*: the
+   "reachable / behind the refusal" split is now obsolete. Rewrite the heading of
+   the second half as what it actually becomes — *reachable, guarded by
+   `ColumnId`'s narrowing* — and re-check every row in it. This is the audit the
+   README warns is worth more than the green gate.
+
+### Verification
+
+- Every query in `WEEK33_CORRELATED_BINDS` produces a message that names the
+  shape it declined, not `correlated subqueries are not yet executable`.
+- `grep -rn "not yet executable (Week 33)" src/ python_tools/` returns nothing.
+- A unit test for each tripwire, asserting the *new* behaviour directly rather
+  than via a query: a `ColumnRef` at `ColumnId::outer(1,0)` contributes no
+  simple predicate; a `GroupByColumn` at `ColumnId::outer(1,0)` makes
+  `buildAggregateSchema` throw. Both are cheap and both outlive the week.
+
+---
+
+## Task 3 — Decorrelate `EXISTS` / `NOT EXISTS` into the Week 32 semi/anti join
+
+### Why it matters
+
+This is the week's actual deliverable and the TPC-H unlock: Q4 and Q21 are
+correlated `EXISTS` / `NOT EXISTS`. **The operator already exists.** Week 32
+built `JoinSemantics::{SEMI, ANTI}`, `VecHashJoinNode`'s set-probe, and
+`lowerInSubqueries` — the whole lowering site, refusal set and schema invariant.
+Week 33 should need **no new operator**: only the rewrite that produces the join
+keys.
+
+That is the single most important scoping fact of the week. If you find yourself
+writing an operator, stop and re-read `src/planner/subquery_lowering.cc` — the
+work is a sibling of `lowerInSubqueries`, roughly its length, at the same call
+site in `LogicalPlanBuilder::build`.
+
+### Conceptual explanation
+
+A correlated `EXISTS` is a **dependent join**: for each outer row, run the body
+with that row's values substituted. Decorrelation turns it into an ordinary join
+by *promoting the correlation predicate into the join condition*.
+
+```
+WHERE EXISTS (SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 340)
+```
+
+The body's `WHERE` splits into two classes of conjunct:
+
+- **local** — every ref is `level 0` against the body's own range table
+  (`l.speed > 340`). These stay inside the body's plan, as an ordinary
+  `LogicalFilter` under the join's right child.
+- **correlated equality** — an `=` whose one side is `level 0` in the body and
+  whose other side is `level 1` (`l.driver_id = d.driver_id`). These become
+  `JoinKey`s: `join_col` from the body side, `from_col`/`from_slot` from the
+  outer side, whose `ColumnId` is level 1 in the body and therefore **level 0 in
+  the outer block** — one `outward()` call, which is exactly why that method
+  exists on `ColumnId`.
+
+The result is `LogicalJoin{semantics = SEMI}` (or `ANTI` for `NOT EXISTS`) with
+the outer spine as `children[0]` and the body's plan as `children[1]` — the
+identical node shape `lowerInSubqueries` already builds. The correlation is gone:
+the body plan contains no `level > 0` ref, because every one of them left as a
+join key.
+
+**Three invariants the rewrite must preserve, all inherited from Week 32:**
+
+1. **`output_schema` IS the left child's**, not a merged schema. Week 32 asserts
+   this in code rather than leaving it as an observation, and the assertion is
+   what keeps the body's slot numbering out of the outer plan. One plan already
+   holds two range tables; the containment is that nothing from the body is ever
+   in scope above the join. Week 34's derived tables break this for real —
+   Week 33 must not.
+2. **`join_slot = -1`.** `children[1]` is not a relation of this block's range
+   table, so there is no slot to name it by, and every reader of `join_slot`
+   declines on `semantics != STANDARD`.
+3. **A whole-conjunct construct.** `lowerInSubqueries` extracts only top-level
+   `WHERE` conjuncts, and for the same reason: `EXISTS(...) OR x > 5` has no
+   disjunctive semi-join to lower to. Correlated `EXISTS` inherits that
+   restriction verbatim — and inherits the refusal that goes with it (Task 5).
+
+**What `JoinKey` can and cannot express.** It holds column **names** and an
+`int from_slot`. So a correlated conjunct qualifies as a key only when both sides
+are plain `ColumnRef`s under `=`. `l.speed > d.age` is a correlated *inequality*
+— a real dependent join with no equi-join lowering in this engine, and there is
+no cross-product operator to run it on. That is Task 5's territory, and it is the
+same boundary the dialect already documents for `JOIN ... ON`.
+
+### Code snippets
+
+A new `src/planner/subquery_decorrelation.{h,cc}`, sibling to
+`subquery_lowering.{h,cc}` — a separate file because the routing question ("is
+this shape decorrelatable?") is different from Week 32's ("is this `IN` in a
+lowerable position?"), and because Week 32's header documents *its* preconditions
+as "no correlated subquery anywhere", which stops being true this week and must
+be restated rather than silently invalidated.
+
+```cpp
+// Splits a correlated body's WHERE into (join keys, residual local conjuncts).
+// Returns false when the body is not decorrelatable by this rewrite, leaving
+// `keys` and `local` untouched — the caller then refuses (Task 5) rather than
+// falling back to a second production, which is the two-paths problem Weeks
+// 26/28/30 each had to undo.
+bool splitCorrelation(const Expr* body_where,
+                      std::vector<JoinKey>& keys,
+                      std::vector<std::unique_ptr<Expr>>& local);
+```
+
+```cpp
+// The classification, per top-level conjunct of the body's WHERE.
+// splitConjuncts() (predicate_pushdown) already does the AND flattening — reuse
+// it; a private walker here would be a nineteenth silent dispatch site, which is
+// exactly what Week 30 refused to add for the ORDER BY position rule.
+for (auto& c : body_conjuncts) {
+    auto* bin = dynamic_cast<BinaryExpr*>(c.get());
+    if (!bin || bin->op != "=") { local.push_back(std::move(c)); continue; }
+
+    auto* l = dynamic_cast<ColumnRef*>(bin->left.get());
+    auto* r = dynamic_cast<ColumnRef*>(bin->right.get());
+    if (!l || !r) { /* not both plain refs -> stays local, or refuse if it
+                       mentions an outer ref at all (see below) */ }
+
+    // Exactly one side must be level 1 (the outer block) and the other level 0
+    // (this body). Anything else is not this rewrite's shape:
+    //   - both level 0  -> an ordinary local predicate, keep it local;
+    //   - both level 1  -> a predicate on the OUTER row alone; correct but not a
+    //                      join key. It belongs in the OUTER WHERE, and hoisting
+    //                      it is a separate decision — refuse for now (Task 5);
+    //   - level >= 2    -> correlated past the immediately enclosing block
+    //                      (Q20's shape). Refuse; see the note in Task 5.
+    const bool l_outer = !l->id.isLocal(), r_outer = !r->id.isLocal();
+    if (l_outer == r_outer) { /* both or neither: not a key */ }
+
+    const ColumnRef* body  = l_outer ? r : l;
+    const ColumnRef* outer = l_outer ? l : r;
+    if (outer->id.level != 1) { /* refuse: level >= 2 */ }
+
+    // from_slot is a slot in the OUTER range table. `outer->id` is level 1 in
+    // THIS block; one step outward makes it level 0 there, and localSlot() then
+    // narrows it at a named point instead of by an unremarked assignment.
+    keys.push_back(JoinKey{outer->column_name,
+                           body->column_name,
+                           outer->id.outward().localSlot("splitCorrelation")});
+}
+```
+
+Grafting it, alongside Week 32's call in `LogicalPlanBuilder::build`
+(`src/planner/logical_plan.cc`, near line 778):
+
+```cpp
+// Same site, same conjunct vector, same ordering discipline as Week 32:
+// AFTER the FROM/JOIN spine exists and BEFORE the WHERE LogicalFilter is built.
+InLoweringResult in_lowered  = lowerInSubqueries(std::move(node), conjuncts, catalog);
+ExLoweringResult ex_lowered  = lowerExistsSubqueries(std::move(in_lowered.plan),
+                                                     conjuncts, catalog);
+// ...then refuseUnloweredIn / refuseUnloweredExists on what is left.
+```
+
+### Implementation guidance
+
+1. **Read `src/planner/subquery_lowering.cc` end to end first.** It is 110 lines
+   and it answers, in code, every structural question this task has: where the
+   body is planned (`LogicalPlanBuilder::build`, recursively), how ownership of
+   the shared `SelectStatement` is handled (moved out, with a `use_count() > 1`
+   refusal because `cloneExpr` shares), where the schema invariant is asserted,
+   and what `join_slot = -1` means.
+2. **Reuse `planBody`'s ownership shape verbatim,** including the
+   `use_count() > 1` refusal. A shared body statement is one statement with two
+   parents; only one of them can be lowered from it, and the second would plan an
+   emptied statement. This is not a hypothetical — `(SELECT ...) BETWEEN a AND b`
+   produces the shape through `cloneExpr`.
+3. **Plan the body *after* stripping the correlated conjuncts, not before.** If
+   the body's `WHERE` still contains `l.driver_id = d.driver_id` when
+   `LogicalPlanBuilder::build` runs on it, that ref reaches `validateExpr`,
+   `collectSlots`, `buildScanSchema` and the pruning hint inside a block where it
+   is meaningless. Strip first, plan second — this is the single most likely
+   source of a confusing failure in this task.
+4. **An `EXISTS` body's select list is irrelevant** and must stay so. Q4 and Q21
+   both write `SELECT *`, and the README records that `EXISTS` deliberately has
+   no arity rule. The semi-join probes keys only; nothing from the body is
+   projected. Do not "helpfully" narrow the body's projection to the key column —
+   `buildScanSchema` already handles narrowing, and a special case here would be
+   a second production.
+5. **An *uncorrelated* `EXISTS` stays materialized.** Week 32's header says so
+   explicitly: its value does not depend on the outer row, so a semi-join would
+   turn a foldable constant into a pipeline breaker. Route on the node's
+   `correlated` flag, which the Binder derives from the stamps (and which
+   survives repeated walks since Week 30 round 1).
+6. **`ANTI` and NULLs.** `NOT EXISTS` is an anti-join and — unlike `NOT IN` —
+   has **no** NULL subtlety: `EXISTS` is a pure existence test, never UNKNOWN.
+   Do not copy `NOT IN`'s NULL rule into it. Week 32's `build_had_unmatchable_key_`
+   machinery in `vec_hash_join_node.cc` exists for `NOT IN`; confirm by reading
+   whether the anti path consults it unconditionally, because if it does, a
+   correlated `NOT EXISTS` over a body with a NULL key would wrongly return zero
+   rows. **This is a specific thing to test, not to assume.**
+7. **Cardinality.** Week 29's starting note, pointed at from Week 32's, is
+   binding: a semi/anti join needs its **own** rule, never a reuse of the outer
+   join's, and a non-multiplicative rule lives at the stamping site and never
+   inside `joinCardinality` or the join search's optimal substructure goes with
+   it. If Week 32 already added one, decorrelated joins get it for free — verify
+   that, do not re-derive it.
+
+### Verification
+
+- The three `EXISTS`/`NOT EXISTS` shapes in `WEEK33_CORRELATED_BINDS` move out of
+  the rejection suite and into a **diffed** suite against SQLite. That move is
+  the checkpoint.
+- `--explain` on each: the plan shows `SEMI`/`ANTI` with the correlated column
+  as a join key, and the join's `output_schema` is the left child's. Week 32's
+  in-code assertion already enforces the second half; make sure your new node
+  goes through it (share the helper rather than re-asserting inline).
+- `--no-optimize` and optimized produce identical rows (`optimizer-diff` skill).
+- A correlated `NOT EXISTS` whose body's key column contains a NULL returns the
+  same rows as SQLite. This is item 6 above, and it is the one place a
+  copy-paste from `NOT IN` produces a wrong answer that looks plausible.
