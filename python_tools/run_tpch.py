@@ -283,11 +283,16 @@ def mutation_check(conn, qid):
     if mutant is None:
         return MUTATION_BROKEN, label, "SQLite could not run the mutant"
 
-    # Positional, not normalize()'d: this compares one SQLite answer against
-    # another, so column names and types are identical by construction and any
-    # difference at all -- a row, a value, a count -- is the discrimination we
-    # are asking about.
-    same = ([tuple(r.values()) for r in base] == [tuple(r.values()) for r in mutant])
+    # Not normalize()'d: this compares one SQLite answer against another, so
+    # column names and types are identical by construction and any difference in
+    # CONTENT -- a row, a value, a count -- is the discrimination we are asking
+    # about. Compared as a MULTISET rather than positionally, because a mutation
+    # that only reshuffles tied rows under a partial ORDER BY changes nothing
+    # about the answer, and calling that DISCRIMINATING inflates the headline
+    # figure -- the exact direction of error this check exists to remove.
+    # key=repr, not the natural order: a column can hold None beside a str.
+    same = (sorted((tuple(r.values()) for r in base), key=repr) ==
+            sorted((tuple(r.values()) for r in mutant), key=repr))
     if same:
         return INERT, label, VACUITY_REASON[INERT]
     return DISCRIMINATING, label, f"{len(base)} rows -> {len(mutant)}"
