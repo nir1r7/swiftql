@@ -490,6 +490,17 @@ std::unique_ptr<Node> compileNode(const Expr* expr, const Schema& schema) {
         // The grammar has no NULL literal (NULL appears only in IS NULL), and a
         // null Value has no type() to broadcast. Decline rather than invent one:
         // Value::type() throws on null, and compile() must not throw.
+        //
+        // Week 31 made this branch REACHABLE for the first time: a materialized
+        // scalar subquery that returned zero rows (or one NULL row) substitutes
+        // a null Literal. Declining cascades — the enclosing predicate compiles
+        // to nullptr and the whole conjunct falls back to evaluate() per row,
+        // which is the correct-but-slow path CASE already uses. That is why no
+        // kernel has to learn about null constants, and it costs little in
+        // practice: the comparison is UNKNOWN for every row, so the query it
+        // guards returns nothing anyway. The node still carries the type
+        // (Literal::null_type) for inferExprType; broadcasting a constant
+        // validity mask is not worth a kernel until a query needs it.
         if (lit->value.isNull()) return nullptr;
         auto n = std::make_unique<Node>();
         n->kind = Node::Kind::CONSTANT;
