@@ -378,10 +378,13 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
         //
         // THROW, not decline: grouping is not an optimization and a correlated
         // key has no correct local fallback — its value comes from the outer
-        // row, which needs the correlation machinery Week 33 builds. Unreachable
-        // today (Validator refuses a subquery before either planner builds a
-        // schema), so this is the shape of a planner bug and says so, like the
-        // dead tripwire in join_enumeration.cc.
+        // row. Week 33: the Validator refusal that made this unreachable is
+        // gone, and it STAYS A THROW. Decorrelation promotes every correlated
+        // reference into a join key before the body is planned, and a body with
+        // a GROUP BY is refused outright (subquery_decorrelation.cc), so a
+        // correlated group key arriving here means the rewrite left one behind
+        // — a planner defect, which is what it says. It remains the single
+        // guard for the whole GroupByColumn consumer set.
         //
         // This is the single guard for the whole GroupByColumn consumer set:
         // HashAggregateNode, VecHashAggregateNode and CardinalityEstimator all

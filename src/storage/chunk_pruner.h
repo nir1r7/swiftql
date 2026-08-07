@@ -37,7 +37,15 @@ namespace {
         // scan. Silently skipped chunks, no error: invariant 12's subject and
         // the worst failure mode in this file.
         //
-        // Unreachable today (execution runs after Validator refuses a subquery),
+        // Week 33: REACHABLE. The refusal is gone and a correlated ref now
+        // reaches a plan. Still a DECLINE, and now for the reason that survives
+        // the refusal's removal rather than depending on it: a correlated ref
+        // names a relation this scan is not scanning, so it can supply no hint
+        // about THIS table's zone maps. Pruning is an optimization, so
+        // contributing nothing is correct-and-slower; matching by name below
+        // would prune the wrong relation's chunks silently.
+        //
+        // Was unreachable (execution ran after Validator refused a subquery),
         // and NOT protected by the collectSlots/soleSlot `-1` containment that
         // covers restampSlots: vectorized_plan_builder hands the whole un-pushed
         // WHERE to the FROM-side scan as a hint, so on `--no-optimize` a

@@ -49,9 +49,20 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         // (validateExpr's allow_subqueries flag), so those two trees are the
         // whole search space.
         bool has_in = false;
+        // Week 33. A CORRELATED subquery decorrelates into the same semi/anti
+        // join, and this path does not run LogicalPlanBuilder, where the rewrite
+        // grafts the body's subtree — so it is the same capability difference
+        // with the same containment, and it is refused here rather than in the
+        // shared Validator (Week 26's rule). What it costs is stated rather than
+        // hidden: every correlated query is diffed against SQLite in the two
+        // VECTORIZED modes only, with the refusal pinned by message in the two
+        // Volcano ones. Closing it means JoinSemantics in hash_join_node.cc —
+        // Task 6 of docs/week-33-plan.md, and the honest end state.
+        bool has_correlated = false;
         auto scan = [&](const Expr* e) {
             forEachSubqueryConst(e, [&](const SubqueryExpr& sq) {
                 if (sq.kind == SubqueryExpr::Kind::IN) has_in = true;
+                if (sq.correlated) has_correlated = true;
             });
         };
         scan(stmt.where.get());
@@ -60,6 +71,11 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             throw std::runtime_error(
                 "IN subqueries are lowered to a semi-join and are not supported "
                 "on the Volcano path; use --execution vectorized");
+        }
+        if (has_correlated) {
+            throw std::runtime_error(
+                "correlated subqueries are decorrelated to a semi-join and are "
+                "not supported on the Volcano path; use --execution vectorized");
         }
     }
 

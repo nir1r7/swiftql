@@ -1138,18 +1138,46 @@ removed or weakened.
       `LogicalPlanBuilder::build` beside Week 32's `lowerInSubqueries`. Landed
       FIRST, with the refusal still armed, so the tree stays coherent: the code
       is compiled and unreachable until Task 2 flips the refusal.
-- [ ] Task 2: remove `Validator::validate`'s `has_correlated_subquery` refusal;
-      restate both Week 30 tripwires.
+- [x] Task 2: refusal removed; both Week 30 tripwires RESTATED, not deleted
+      (`chunk_pruner.h` still declines, now for a reason that survives the
+      refusal's removal; `buildAggregateSchema` still throws, now because
+      decorrelation refuses a GROUP BY body so a correlated key here means the
+      rewrite left one behind). Volcano refusal added in `Planner::plan` beside
+      Week 32's identical one for `IN`.
 - [ ] Task 5: Volcano refusal (capability difference -> `Planner::plan`), README
       dialect rows, rejection-suite entries.
 - [ ] Tasks 4, 6, 7, 8, 9.
 
-**Next concrete step:** Task 2 — delete the refusal in `src/planner/validator.cc`
-(~line 150), restate `chunk_pruner.h`'s decline and `buildAggregateSchema`'s
-throw for a world where they are reachable, and add the Volcano refusal in
-`Planner::plan` (that path runs no `LogicalPlanBuilder`, so it cannot
-decorrelate). Then run every query in `WEEK33_CORRELATED_BINDS` and split it
-into diffed vs rejected.
+**IN PROGRESS — the one live defect, and it is the good kind.** A correlated
+`EXISTS` now reaches decorrelation and dies with:
+
+```
+Error: internal: inferExprType read a correlated column reference as a local
+relation slot (query level 1)
+```
+
+That is `ColumnId`'s narrowing doing exactly what Task 1 built it for: a
+correlated ref reaching a consumer that assumed a local slot, named at the
+site, loud instead of a silent hit on the wrong relation. Before Task 1 this
+would have been wrong rows.
+
+**Next concrete step:** find which `inferExprType` call sees the correlated ref.
+It is *not* the body (its correlated conjuncts are stripped before
+`LogicalPlanBuilder::build` runs on it) and *not* the outer `WHERE` (the
+`EXISTS` conjunct is extracted). The likely candidates, in order: (1)
+`Validator::validate` / `validateQuery` recursing into the subquery statement
+and typing its `WHERE` **before** decorrelation strips it — validation runs
+first, so the correlated equality is still in the body there; (2)
+`buildScanSchema` / the pruning hint walking the un-stripped body; (3)
+`materializeSubqueries`' walker typing a correlated node. Reproduce with
+`--explain` on the first query in `WEEK33_CORRELATED_BINDS`, then decide
+whether `inferExprType` should return the *outer* type for a `level > 0` ref
+(it can: the Binder verified it against the supplying scope) or whether the
+caller must skip it — the same "trust what a lower layer established" move
+`validateExpr` (site 4) and `validateJoinCondition` (site 18) already make.
+
+Then: Task 5's rejection-suite entries and README dialect rows, Task 4, and
+Tasks 6-9.
 
 **Task 1 is code-complete.** `grep -rn "query_level" src/ tests/` returns only
 comments; `grep -rn "relation_slot" src/ tests/` returns only `ColumnDef` and

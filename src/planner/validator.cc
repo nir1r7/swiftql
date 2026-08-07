@@ -145,10 +145,17 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // ref is level 0 against that statement's own range table. Either way every
     // consumer below still sees level-0 refs from ONE range table, which is why
     // both of Week 30's tripwires stay armed and unreached.
-    if (stmt.has_correlated_subquery) {
-        throw std::runtime_error(
-            "correlated subqueries are not yet executable (Week 33)");
-    }
+    // Week 33 REMOVED the refusal that stood here. A correlated subquery is now
+    // decorrelated into the Week 32 semi/anti join
+    // (planner/subquery_decorrelation.h), and the shapes that rewrite cannot
+    // express are refused AT THAT SITE, by name, so the message says which shape
+    // it declined instead of naming a week.
+    //
+    // Nothing replaces it here on purpose. Week 30's placement rule still holds
+    // for what remains: a DIALECT rule belongs in this one check that both
+    // planner entry points reach, and a CAPABILITY difference belongs at the
+    // engine that lacks it (Planner::plan) — which is where the Volcano refusal
+    // for a decorrelated join lives, beside Week 32's identical one for IN.
 }
 
 void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalog){
