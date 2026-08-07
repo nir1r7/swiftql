@@ -2,6 +2,7 @@
 #include "parser/ast.h"
 #include <algorithm>
 
+#include <stdexcept>
 const ColumnStatsEntry* StatsContext::findExact(const std::string& name, int slot) const {
     if (slot < 0) return nullptr;
     for (const auto& e : entries)
@@ -399,6 +400,52 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // substructure would be gone — the same reason the ≥1-row floor moved
             // out in Week 28. JoinEnumeration declines outer-join trees entirely,
             // so the search never meets either; both facts have to stay true.
+            // Week 32 — SEMI/ANTI, AT THE STAMP and never inside
+            // joinCardinality: both rules are NON-MULTIPLICATIVE (a clamp
+            // against l_rows, and a subtraction), so a subset's estimate would
+            // depend on the path that reached it and the DP's optimal
+            // substructure would be gone. Identical argument to the >=1-row
+            // floor (Week 28) and the outer-join max() below (Week 29).
+            // JoinEnumeration also declines these trees — hasSlotOutsideRangeTable
+            // fires on join_slot == -1 — and both facts must hold INDEPENDENTLY.
+            //
+            // Semi-join selectivity is a property of the LEFT side: the fraction
+            // of left rows whose key value also occurs on the right. The right
+            // side contributes only its NDV, never its row count, which is
+            // exactly why the product form joinCardinality computed above is the
+            // wrong shape here and is overwritten rather than adjusted.
+            if (join.semantics != JoinSemantics::STANDARD) {
+                if (join.on_residual) {
+                    throw std::runtime_error(
+                        "internal: a semi/anti join carries no ON residual");
+                }
+                double frac = 1.0;
+                if (!join.keys.empty()) {
+                    // The SAME lookups joinCardinality makes — slot-exact on the
+                    // left (the merged context can hold one name at several
+                    // slots), bare-name on the right (a body plan is one
+                    // relation) — but read SEPARATELY rather than max()'d,
+                    // because the semi rule needs the ratio. `have_ndv` stays
+                    // tracked apart from the value: an NDV of 1 is a usable
+                    // statistic, a rule this codebase has corrected twice.
+                    const ColumnStatsEntry* lk =
+                        out.findForRef(join.keys[0].from_col, join.keys[0].from_slot);
+                    const ColumnStatsEntry* rk = right.find(join.keys[0].join_col, -1);
+                    const bool have_l = lk && lk->stats->distinct_count > 0;
+                    const bool have_r = rk && rk->stats->distinct_count > 0;
+                    if (have_l && have_r) {
+                        frac = std::min(1.0,
+                            static_cast<double>(rk->stats->distinct_count)
+                          / static_cast<double>(lk->stats->distinct_count));
+                    }
+                }
+                double semi = l_rows * frac;
+                rows = (join.semantics == JoinSemantics::SEMI) ? semi : (l_rows - semi);
+                rows = std::max(0.0, std::min(rows, l_rows));   // never exceeds the left side
+                node.estimated_rows = rows;
+                return out;
+            }
+
             if (join.join_type == JoinType::LEFT) {
                 if (join.on_residual) {
                     rows *= selectivity(join.on_residual.get(), out);

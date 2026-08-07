@@ -265,7 +265,17 @@ std::unique_ptr<LogicalPlanNode> distribute(std::unique_ptr<LogicalPlanNode> nod
         //
         // Written as `== INNER` rather than `!= LEFT` so a future RIGHT/FULL join
         // is refused by default rather than pushed through by omission.
-        auto it = join->join_type == JoinType::INNER
+        //
+        // Week 32: a SEMI/ANTI join is declined for a STRONGER reason than an
+        // outer join's. children[1] is a subquery BODY, not a relation of this
+        // block's range table — join_slot is -1 to say so — and none of its
+        // columns is in this node's output schema at all, so a conjunct pushed
+        // there is unresolvable rather than merely mis-scoped. The recursion
+        // into children[0] stays unconditional and is what keeps a WHERE
+        // conjunct pushing to the spine's scans exactly as it did before the
+        // semi-join was interposed between the filter and the spine.
+        auto it = (join->join_type == JoinType::INNER
+                   && join->semantics == JoinSemantics::STANDARD)
                       ? by_slot.find(join->join_slot) : by_slot.end();
         if (it != by_slot.end()) {
             // Below the join these execute against the standalone scan, whose
