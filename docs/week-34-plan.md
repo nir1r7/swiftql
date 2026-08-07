@@ -2034,15 +2034,35 @@ from the diff. A successor agent resumes from this section.)*
       range table; `Planner::plan` refuses derived tables (third Volcano refusal).
 - [ ] Task 3 — Binder: derived range-table entries
 - [ ] Task 4 — `LogicalPlanBuilder`: graft and normalize
-- [ ] Task 5 — the three synthetic-slot consumers, slot-table sweep
-- [ ] Task 6 — Q17 / correlated scalar decorrelation
+- [x] Task 5 — the three synthetic-slot consumers. **One of the three did not
+      break the way three prior weeks predicted**, and that is the week's main
+      finding: `hasSlotOutsideRangeTable` does NOT fire for a derived relation.
+      What was wrong was `countRelations`, which counted SCANS and so over-counted
+      a derived body's; with it counting the spine, a derived relation is an
+      ordinary in-range range-table entry and the search reorders it (`method=dp`,
+      optimized ≡ `--no-optimize`, verified). No reported decline was added — a
+      decline string that cannot fire is Week 33's dead-assertion failure.
+      Consumer 2 (`Validator`'s `stmt.joins[slot-1]`) closed by rebuilding
+      `validateQuery` around one range table. Consumer 3 (`indexOf(name, slot)`)
+      closed by Task 4's normalization plus the duplicate-output-name refusal.
+      **What IS newly live:** a derived relation has no `TableStats`, so
+      `joinCardinality`'s non-multiplicative `max(l, r)` branch — and therefore
+      Week 28's `method=written-floor` path, which had never executed — is
+      reachable from the CLI for the first time.
+- [x] Task 6 — Q17 landed. `lowerCorrelatedScalars`, a third sibling at the same
+      site; reuses `splitCorrelation` verbatim; builds a `LogicalDerived` (the same
+      node, not a special case); the join is **LEFT** for the zero-row NULL rule.
+      A non-aggregate body is refused. A separate guard, not a widened
+      `requireDecorrelatableBody`.
 - [x] Task 7 — `COUNT(DISTINCT ...)` — landed. Both engines; keyed through
       `key_encoding.h`; `DISTINCT` reaches `exprToString`/`exprKey`/`cloneExpr`;
       `DISTINCT` on the other four aggregates and `COUNT(DISTINCT *)` refused at
       the parser. Harness: `WEEK34_DISTINCT_AGG_QUERIES` (all four modes) and
       `WEEK34_DISTINCT_AGG_REFUSED`.
 - [ ] Task 8 — capability boundaries: fallback, Volcano parity
-- [ ] Task 9 — harness and tests
+- [~] Task 9 — harness suites landed for all three families (derived tables,
+      correlated scalars, `COUNT(DISTINCT)`), diffed and rejected. C++ unit tests
+      for the decisions the oracle cannot see are still to write.
 - [ ] Task 10 — closing sweep
 
 **If the week runs short**, cut in this order and say so out loud: Task 6 first
