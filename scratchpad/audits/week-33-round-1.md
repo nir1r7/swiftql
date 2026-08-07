@@ -4,7 +4,9 @@ Range: `889b6cb..ecee221`, branch `claude/phase5-week26-qomtkb`.
 Targets: ColumnId migration, decorrelation correctness, NOT EXISTS semantics,
 Week 30 tripwires, stale rationales.
 
-Status: IN PROGRESS (appending as confirmed).
+Status: COMPLETE for targets 1-5 (see "Not reached").
+
+Tally: 2 CRITICAL, 2 HIGH, 5 MEDIUM, 1 LOW.
 
 ---
 
@@ -278,4 +280,203 @@ with H-1) keep the key resolvable against the body's scan schema.
 
 ---
 
-(more to come)
+## M-4 (MEDIUM, false assurance) — the "containment assertion" cannot fail, and is presented as replacing an audit round
+
+`src/planner/subquery_decorrelation.cc:141-158`
+
+```cpp
+Schema left_schema = spine->output_schema;          // copy of the left schema
+auto join = std::make_unique<LogicalJoin>(
+    std::move(spine), std::move(body_plan), std::move(keys), -1, left_schema);
+...
+const auto& jc = join->output_schema.columns();       // == left_schema
+const auto& lc = join->children[0]->output_schema.columns();  // == the same
+```
+
+`left_schema` is copied from `spine->output_schema` on line 141 and passed as the
+join's `output_schema`; `children[0]` is that same spine, whose schema the
+`unique_ptr` move does not touch. `LogicalJoin`'s constructor only stores the
+schema. So `jc` and `lc` are a copy of one object and the object — the loop can
+never observe a difference and the throw is dead code.
+
+The comment calls it "the same single check `subquery_lowering.cc` makes in place
+of an audit round". That check (`subquery_lowering.cc:70-88`) is tautological for
+the identical reason, so Week 32's assurance was also empty and Week 33 has now
+inherited and restated it.
+
+A check that would actually bind: assert after construction that
+`join->output_schema` is not a merged schema — e.g. that its size is strictly
+less than `children[0]->size() + children[1]->size()` — or move the guarantee
+into `LogicalJoin` itself (derive `output_schema` from `children[0]` whenever
+`semantics != STANDARD` rather than accepting it as a parameter).
+
+---
+
+## M-5 (MEDIUM, doc contradicts code) — dispatch site 12's justification still cites the Validator refusal Week 33 deleted
+
+`src/planner/logical_plan.cc:256-262`
+
+```
+// Every subquery is replaced by a constant before planning
+// (materializeSubqueries ...), and a correlated one is refused by the Validator.
+// Reaching this therefore means the materialization walker (dispatch site 19)
+// missed an Expr subtype, or the pass was not run at all.
+```
+
+`validator.cc:148-158` is where that refusal *was*; Week 33 removed it and
+recorded the removal. The site-12 comment was not updated, so its "reaching this
+means a walker bug" conclusion no longer follows: a correlated subquery in the
+SELECT list or ORDER BY now reaches this throw as a matter of ordinary,
+supported-looking SQL.
+
+Concretely, `refuseUnloweredCorrelated` is called on exactly two clauses —
+`logical_plan.cc:824` (WHERE) and `:859` (HAVING). The SELECT list and ORDER BY
+have no such call, so
+
+```sql
+SELECT d.name, EXISTS (SELECT * FROM laps l WHERE l.driver_id = d.driver_id)
+FROM drivers d;
+```
+
+dies with `internal: a subquery reached type inference without being
+materialized (materializeSubqueries must run before planning)` — an internal
+message blaming the wrong pass, which is the exact diagnostic failure
+`subquery_decorrelation.h:63-67` says the tripwire exists to prevent. Add the two
+missing `refuseUnloweredCorrelated` calls (and correct the comment).
+
+---
+
+## M-6 (MEDIUM, internal error on legal SQL) — a correlated ref in the EXISTS body's SELECT list throws from `buildProjectSchema`
+
+`src/planner/logical_plan.cc:330-332`
+
+```cpp
+int idx = col->id.isResolved()
+    ? table_schema.indexOf(col->column_name, col->id.localSlot("buildProjectSchema"))
+    : -1;
+```
+
+The guard is `isResolved()`, not `isLocal()`. A correlated ref is resolved
+(level 1, slot >= 0), so `localSlot()` throws.
+
+```sql
+SELECT * FROM drivers d
+WHERE EXISTS (SELECT d.name FROM laps l WHERE l.speed = d.speed);
+```
+
+is legal SQL that SQLite accepts, and it produces
+`internal: buildProjectSchema read a correlated column reference as a local
+relation slot (query level 1)`. This is the migration working exactly as designed
+— it converted a silent mis-resolution into a loud one — but the site was left
+unhandled, so a legal query reports a planner defect.
+
+Same unguarded shape at `logical_plan.cc:97-99` (`specArgType`),
+`plan_nodes.cc:230,257` and `vec_hash_aggregate_node.cc:46,62`. Those four are
+currently unreachable because `requireDecorrelatableBody`
+(`subquery_decorrelation.cc:21-32`) refuses an aggregate or GROUP BY in the body,
+so no `AggregateSpec`/`GroupByColumn` can carry a correlated id — worth recording
+as the reason, since it is the only thing holding them.
+
+By contrast the sites guarded with `isLocal()` before `localSlot()`
+(`validator.cc:198/203`, `validator.cc:573/585`, `chunk_pruner.h:69-70`,
+`join_condition.cc:88-91`, `cardinality_estimator.cc:34-35,54-55,173-177,497-499`,
+`predicate_pushdown.cc:50`) are all correct.
+
+---
+
+## M-7 (MEDIUM, false rationale — this project's named failure mode) — Task 8's "it turned out to be MOOT" argument is not true, and contradicts a comment written the same week
+
+`src/planner/predicate_pushdown.cc:39-49`
+
+> decorrelation extracts the correlated conjunct from stmt.where BEFORE the
+> LogicalFilter is built, and the body is planned only after its correlated
+> conjuncts have become join keys — **so no correlated ref survives into any
+> predicate this walker runs over.** Shapes decorrelation refuses throw instead
+> of arriving. ... restampSlots' body branch stays unreachable by the same
+> argument rather than by the one Week 30 wrote down.
+
+C-2 is a counterexample: a correlated ref in the body's `JOIN ... ON` becomes an
+inner-join residual, is folded into the body's WHERE at `logical_plan.cc:796-799`
+*after* `splitCorrelation` has run, and is then walked by `collectSlots` from
+`PredicatePushdown`. It neither becomes a join key nor throws.
+
+`src/storage/chunk_pruner.h:40-47`, written in the same week, asserts the
+opposite and is the one that is right:
+
+> Week 33: **REACHABLE.** The refusal is gone and a correlated ref now reaches a
+> plan.
+
+Two comments in the same commit range give opposite answers to the same question.
+
+The *conclusion* about `restampSlots` happens to survive, but by a different
+mechanism than the one recorded: `soleSlot` (`predicate_pushdown.cc:149-154`)
+returns -1 whenever the slot set contains -1, so a conjunct holding a correlated
+ref is never pushed and `restampSlots` is never called on it. That matters
+because `restampSlots` (`:162-163`) does `cr->id = ColumnId::local(slot)` — it
+would silently overwrite a correlated id's level with 0, the exact collapse
+`ColumnId` exists to prevent. The containment should be recorded as "soleSlot
+rejects any conjunct containing -1", which is checkable, rather than "no
+correlated ref survives", which is false.
+
+---
+
+## L-8 (LOW, misleading refusal) — an unresolved ref is diagnosed as a correlation error
+
+`src/planner/subquery_decorrelation.cc:51-70`
+
+`collectSlots` maps both a correlated ref *and* an unresolved one to -1
+(`predicate_pushdown.cc:50`, since `ColumnId::unresolved()` is `(0, -1)` and
+`localSlot()` returns -1 for it). A body conjunct containing an unresolved ref
+therefore enters the correlated branch, where `l_outer == r_outer` is true (an
+unresolved id reports `isLocal() == true`) and the refusal reads "a correlated
+equality must compare one column of the subquery with one of the enclosing
+query" — about a conjunct that has no correlation at all. The code comment at
+lines 48-50 anticipates the routing but not the message. Loud, so not a
+correctness issue; the message names the wrong cause.
+
+---
+
+## Note on the three types deliberately NOT migrated
+
+`ColumnDef::relation_slot`, `Schema::indexOf(name, slot)` and
+`ColumnStatsEntry::relation_slot` are correctly left as bare ints — each is
+scoped to a single query block's schema or stats context and has no level to
+lose. Verified: every caller of `indexOf(name, slot)` and `findForRef` in the
+diff passes a `localSlot()` result or an `isLocal()`-guarded value.
+
+**A fourth bare int was overlooked: `JoinKey::from_slot`.** Its header
+(`join_condition.h:22-27`) states the invariant is enforced by
+`classifyJoinCondition` refusing to key a `query_level > 0` ref. Week 33 adds a
+second `JoinKey` producer — `splitCorrelation`
+(`subquery_decorrelation.cc:81-83`) — which the header does not mention. That
+producer is itself correct (`outward().localSlot(...)` moves the ref into the
+outer block before narrowing), but `JoinKey` has no field for the *body*-side
+slot at all, and that omission is the root cause of H-1 and H-2.
+
+---
+
+## Targets covered
+
+1. ColumnId migration — covered (M-6, M-7, note above). Slot is genuinely
+   unreachable as a bare int: no `operator int`, no public member, and the only
+   two `slotInOwnScope` callers (`binder.cc:184`, `expr_utils.h:128`) are the two
+   justified ones and both are correct.
+2. Decorrelation correctness — covered (C-2, H-1, H-2, M-3). Conditions 1/3/4 are
+   enforced as stated; condition 2 is enforced for the body's WHERE only (C-2).
+3. NOT EXISTS semantics — covered (C-1), by code trace. **NOT verified against a
+   live SQLite** (gate owns the build directory; no build or test run was made).
+4. Week 30 tripwires — covered. `buildAggregateSchema`'s throw
+   (`logical_plan.cc:415-421`) remains unreachable, held by
+   `requireDecorrelatableBody` refusing GROUP BY. `ChunkPruner`'s decline
+   (`chunk_pruner.h:66-71`) is now genuinely reachable via C-2 and declines
+   correctly (`isLocal()` short-circuits before `localSlot()`).
+5. Stale rationales — covered (M-5, M-7, M-4, and the `JoinKey` note).
+
+## Not reached
+
+- `docs/week-33-plan.md` `## Progress` and the README Week 33 section were not
+  read against the code; deviations recorded there are unverified.
+- `python_tools/compare_against_sqlite.py` (+113 lines) and the test diffs
+  (`tests/test_common.cc`, `test_binder.cc`, `test_logical_plan.cc`) were not
+  audited.
+- No SQLite oracle run (build directory is held by the gate).
