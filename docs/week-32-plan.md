@@ -1036,38 +1036,83 @@ layer and every one is pushed to `claude/phase5-week26-qomtkb`.
   single-relation `FROM`. It is what restores the four-mode baseline for the
   feature; the refusal is the honest interim, not the intended end state.
 
+### Done in the second run (continuation)
+
+- **§10 — the C++ unit tests.** All of §10's table is now covered.
+  - `tests/test_vectorized.cc` — the predecessor's in-flight edit, completed.
+    Duplicate build key emits the probe row once (the test the operator exists
+    for), the anti complement, an empty build side in both polarities, and the
+    three NULL rows of §8's table. **Two of those tests failed as written** and
+    the operator was not the reason: they used `makeScan`, which builds a
+    `ColumnarTable` and cannot express a NULL, so `Value::null()` came back out
+    as a plain `0` and the NULL rule was asserted against data holding no NULL.
+    They now go through `NullableSourceNode`, and a comment at the helper says
+    why, because this is the trap the whole section exists to catch.
+  - `tests/test_join_enumeration.cc` — the slot-outside-the-range-table decline
+    fires on a three-scan semi-join query, and the test asserts **which** decline
+    fired (silent, no `order_decision`) rather than only that the order did not
+    change: the outer-join decline is reported, so a weaker test would pass on
+    either and would not notice the two swapping.
+  - `tests/test_cardinality.cc` — hand-built SEMI/ANTI nodes with known NDVs.
+    The right side is seeded with **20 rows over 10 distinct keys on purpose**:
+    with rows == NDV the semi rule and `joinCardinality`'s product form agree
+    numerically and the test would pass against the wrong rule. Semi 200 vs
+    product 400, both pinned; semi + anti = left; the clamp at `left_rows` with
+    the anti side never going negative; the `on_residual` assertion throws.
+  - `tests/test_vec_plan_builder.cc` — the forced build side, written with a
+    **big body and a small spine** so a cost-based choice would put them the
+    other way round; no `cost=` / `build=` annotation; two `IN` conjuncts give
+    two stacked joins. The body arrives wrapped in its own `VecProject`, so the
+    table-name assertion recurses — which is the week's shape, not an
+    inconvenience.
+  - `tests/test_subquery.cc` already carried the lowering-shape tests and the
+    `output_schema == children[0]->output_schema` / `join_slot == -1` invariant
+    (commit `5079b00`), so `tests/test_logical_plan.cc` needed nothing.
+  - Full unit suite: **768 tests, all passing.**
+- **§4's verification — the `--explain-analyze` invariant, now checked across
+  the suite** rather than spot-checked: all 13 `WEEK32_SEMI_JOIN_VEC_ONLY`
+  queries × both storage modes, `est=` never exceeds the semi-join's left
+  child's `rows_out`. Zero violations.
+- **§9/§10 — `README.md`.** The dialect rows and the corrected Week 31
+  hand-forward note landed in `aff022b`. What was still stale and is now fixed:
+  the **Limitations** section still described *every* uncorrelated subquery as
+  materializing and still claimed the 1024-distinct-value cap. It now names the
+  two productions and which shape picks which. Added the **Week 33 starting
+  note** (the `ColumnId` trigger fires there and before the feature work; both
+  Week 30 tripwires still armed; decorrelation needs no new operator; the
+  Volcano refusal is the thing to reconsider) and a **Week 37 starting note**
+  (the selection-vector deferral, with the shape of the measurement that decides
+  whether to convert, plus the projection-pushdown and `frac = 1.0` effects that
+  would otherwise read as regressions in the plots).
+
 ### Not done — the next concrete steps, in order
 
-1. **C++ unit tests (§10's table).** None were added. Highest value first:
-   `tests/test_vectorized.cc` — SEMI/ANTI per-row semantics, the duplicate-build-key
-   case, empty build side, build-side NULL, probe-side NULL;
-   `tests/test_logical_plan.cc` — `output_schema == children[0]->output_schema`
-   and `join_slot == -1`; `tests/test_subquery.cc` — one join per top-level `IN`
-   conjunct, two conjuncts give two stacked joins, `EXISTS` still materializes,
-   and the four refusals; `tests/test_cardinality.cc` — semi + anti = left, the
-   clamp; `tests/test_join_enumeration.cc` — the decline fires and it is the
-   slot-outside-the-range-table one; `tests/test_vec_plan_builder.cc` — forced
-   side, illegal combinations throw.
-2. **Run the `verify` gate.** Build + C++ tests + `compare_against_sqlite.py` +
-   the regression harness in all modes. Not yet run against the new suites.
-3. **`README.md` dialect table.** The `MAX_MATERIALIZED_IN_VALUES` row must be
-   **removed** (the cap no longer exists) and four rows added: `IN` under an
-   `OR`, `IN` in `HAVING`, a computed `IN` operand, and `IN (subquery)` being
-   vectorized-only. Also add the Week 33 starting note.
-4. **`development.md` → *Relation slots and query levels*.** Add rows for the
-   consumers this week touched, each of which reads a slot on a plan that now
-   holds two range tables: the SEMI/ANTI branch of `CardinalityEstimator`
-   (reads `JoinKey::from_slot`, level 0 in the OUTER block), `lowerInSubqueries`
-   (reads `SubqueryExpr::operand`'s `relation_slot`, outer block), the
-   `VectorizedPlanBuilder` SEMI/ANTI lowering (`leftKeyIndices` against the probe
-   schema, `rightKeyIndices` against the BODY's), `JoinEnumeration`'s
-   now-live decline, and `PredicatePushdown`'s decline on `join_slot == -1`.
-   Also record that the `ColumnId { level, slot }` trigger now points at **Week
-   33**, in §0's words, and correct Week 31's hand-forward note about
-   `JoinEnumeration`'s decline going live in Week 34.
-5. **`--explain-analyze` invariant check (§4's verification).** Confirm the
-   semi-join's `est=` never exceeds its left child's `rows_out` across the suite.
-   Spot-checked on one query only. Note that the body plan's `StatsContext` is
-   emptied by its `LogicalProject`, so `have_r` is false and the estimate
-   currently falls back to `frac = 1.0` — conservative and invariant-preserving,
-   but the rule is not actually exercised on a real query yet.
+1. **Run the `verify` gate.** Build + `compare_against_sqlite.py` + the
+   regression harness in all modes. The **C++ unit tests are green (768)** and
+   the `--explain-analyze` invariant is checked, but the four-mode SQLite diff
+   and the regression harness have not been run against the new suites. This is
+   the only remaining gate on the week.
+2. **§7's option (a)** — semi/anti in Volcano's `HashJoinNode` for a
+   single-relation `FROM`. Still the honest end state; the refusal shipped is
+   the interim. Until it lands, every `IN`-subquery query is diffed in two modes
+   rather than four, which is a real reduction in the oracle's power on exactly
+   the feature the week added. `HashJoinNode` is the semantic reference, so
+   implement it there and check the vectorized operator against it.
+3. **§6's selection-vector path.** Deferred to Week 37 by §6's own allowance and
+   now recorded as a Week 37 starting note. Do not ship both paths.
+
+### Measurements worth carrying forward
+
+- `SELECT COUNT(*) FROM laps WHERE lap_id IN (SELECT lap_id FROM laps)` —
+  the checkpoint query, and the one Week 31 could not answer at all (10 000
+  distinct values against a 1024 cap; ~1e8 `Value` comparisons under the linear
+  `InExpr` scan). It now answers in ~124 ms end to end, of which the semi-join
+  is ~104 ms (84%). That 104 ms is the **row-copy path**: every one of the
+  10 000 probe rows survives and is copied into `output_buffer_`, which is
+  exactly the worst case for the deferral in §6 and the number Week 37 should
+  measure against.
+- The semi/anti estimate falls back to `frac = 1.0` on every real query, because
+  the body plan's `LogicalProject` empties its `StatsContext` and the right-side
+  NDV lookup misses. Conservative and invariant-preserving — and the reason the
+  rule's arithmetic is exercised only by hand-built nodes in
+  `tests/test_cardinality.cc`.
