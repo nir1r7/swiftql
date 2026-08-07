@@ -1,14 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32, round 3 — gate (a709747643e42ab57) + audit r4 (afebfb2d912098f44) launched
-  09:57 UTC. Audit r4 scope is ONLY the latest fix round, audited AS NEW CODE.
-  Fix round 2 actioned all 8 findings from audits r2+r3 across 4 pushed commits, none rejected.
-  The HIGH regression is fixed: visit's Kind::IN arm now recurses via materializeSubqueries,
-  with a test asserting the REAL nested shape (confirmed failing pre-fix) plus an oracle entry,
-  so a Week 31 capability cannot silently regress again.
-  Honest note from that round: for the latent collectSlotTables medium, A stated no behavioural
-  test can fail pre-fix and said so in the commit rather than faking one. r4 is verifying the
-  "latent not live" reasoning against the code.
-  AFTER: if r4 is clean and gate r3 is GREEN, close week 32 and advance to week 33.
+Current: week 32 — audit r4 DONE and self-committed: 0 blocker, 0 high, 1 medium, 2 low,
+  1 hunch. NO regression in the fix round; the IN-body recursion is idempotent, terminating,
+  and covers all three nestings; the deleted test lost no assertion.
+  ACT ON: the collectSlotTables "latent" verdict HOLDS BUT FOR A DIFFERENT REASON than the
+  commit records — a wrong recorded rationale reads as verified to a later week, so correct it.
+  Audit r4 did NOT reach: refuseUnloweredIn's call sites in LogicalPlanBuilder::build (left as
+  a hunch), the Volcano HashJoinNode refusal path, setCostDecision's use of rowWidth.
+  WAITING on gate r3 (a709747643e42ab57) — do not dispatch a fix while it runs.
+  THEN: one short closing round (medium + the wrong-reason correction + carry lows and the
+  unreached surface into Week 33's starting notes), a final gate, then close week 32.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
