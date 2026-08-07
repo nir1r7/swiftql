@@ -8,6 +8,168 @@ Status: IN PROGRESS (appending as confirmed).
 
 ---
 
+## C-1 (CRITICAL, silent wrong answer — whole result set lost) — `NOT EXISTS` DOES get Week 32's `NOT IN` unmatchable-key rule; the header's central claim is enforced by nothing
+
+`src/planner/subquery_decorrelation.h:49-53` states:
+
+> NOT EXISTS AND NULL. Unlike NOT IN, an anti-join IS exactly NOT EXISTS: EXISTS
+> is a pure existence test that is never UNKNOWN, so a NULL join key simply fails
+> to match and the outer row survives — which is what SQL says. Week 32's
+> unmatchable-key machinery exists for NOT IN's three-valued rule and must NOT be
+> applied here.
+
+The reasoning is right. **Nothing implements it.** `subquery_decorrelation.cc:145`
+sets `join->semantics = sq->negated ? JoinSemantics::ANTI : JoinSemantics::SEMI`
+— the *same* `JoinSemantics::ANTI` Week 32 used for `NOT IN`. `VecHashJoinNode`
+has no way to tell the two apart, and its ANTI path applies the NOT IN rule
+unconditionally.
+
+### C-1a — a single NULL in the body's key column empties the entire result
+
+`src/execution/vec_hash_join_node.cc:223-227`
+
+```cpp
+if (semantics_ == JoinSemantics::ANTI && build_had_unmatchable_key_) {
+    ...
+    continue;   // pull the next probe chunk; this one contributes nothing
+}
+```
+
+`build_had_unmatchable_key_` is set at line 123 whenever ANY build row has a NULL
+(or NaN) key member. For `NOT IN` that is correct. For `NOT EXISTS` it is not.
+
+```sql
+SELECT d.name FROM drivers d
+WHERE NOT EXISTS (SELECT * FROM laps l WHERE l.driver_id = d.driver_id);
+```
+
+If one row of `laps` has `driver_id` NULL, `build_had_unmatchable_key_` is true
+and **every probe chunk is skipped: the query returns ZERO rows.**
+
+SQLite: `l.driver_id = d.driver_id` is UNKNOWN for that lap, so it selects
+nothing and is simply invisible; every driver with no matching lap is still
+returned. Result: SwiftQL returns {} where SQLite returns a non-empty set.
+
+### C-1b — a NULL correlated (probe) key drops the outer row instead of keeping it
+
+`src/execution/vec_hash_join_node.cc:242-250`
+
+```cpp
+if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) {
+    if (semantics_ == JoinSemantics::ANTI && build_keys_.empty()
+        && !build_had_unmatchable_key_) { ...emit... }
+    continue;
+}
+```
+
+A NULL probe key is emitted **only when the build side is empty**. That is `NOT
+IN`'s rule (`NULL NOT IN S` is UNKNOWN unless S is empty). For `NOT EXISTS` the
+correct answer is: the correlated equality is UNKNOWN for every body row, so the
+body yields no rows, `EXISTS` is FALSE, `NOT EXISTS` is **TRUE**, and the outer
+row must be emitted regardless of whether the body is empty.
+
+```sql
+SELECT d.name FROM drivers d
+WHERE NOT EXISTS (SELECT * FROM laps l WHERE l.driver_id = d.driver_id);
+```
+with one `drivers` row whose `driver_id` is NULL and a non-empty `laps`:
+SQLite emits that driver; SwiftQL drops it.
+
+### Reachability under invariant 14 (CSV cannot express NULLs)
+
+C-1b is reachable with ordinary CSV data via Week 29's LEFT OUTER JOIN, which
+null-extends the probe side:
+
+```sql
+SELECT * FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id
+WHERE NOT EXISTS (SELECT * FROM laps l2 WHERE l2.lap_id = l.lap_id);
+```
+
+A driver with no laps gets `l.lap_id` = NULL, which becomes the NULL probe key.
+`laps` is non-empty, so the row is dropped; SQLite keeps it. No NULL needs to be
+stored anywhere. C-1a needs a NULL in the body's key column (a LEFT JOIN inside
+the body, or a nullable column once storage supports one).
+
+### Why no gate caught it
+
+The Week 33 harness work (`396afdd`, "diff decorrelated EXISTS") diffs against
+SQLite, but the outer spines it exercises are plain scans over NULL-free CSV, so
+neither NULL path is entered. The header's paragraph is doing the work a test
+should be doing.
+
+### Fix
+
+`JoinSemantics::ANTI` must be split — the operator needs to know whether it is
+serving `NOT IN` (three-valued) or `NOT EXISTS` (two-valued). Either a fourth
+enumerator (`ANTI_EXISTS`) or a `bool three_valued_` on `VecHashJoinNode`. Both
+guards above must then be conditioned on it. Until then, decorrelating a
+`NOT EXISTS` should be refused rather than lowered to the `NOT IN` operator.
+
+---
+
+## C-2 (CRITICAL, silent wrong answer) — a correlated ref in the body's `JOIN ... ON` is never extracted and never refused; it resolves by bare name against the BODY's schema
+
+`src/planner/subquery_decorrelation.cc:120-135` splits **only `body.where`**.
+The body's ON clauses are untouched, and the body's ON residuals are folded into
+the body's WHERE *later*, inside `LogicalPlanBuilder::build`
+(`logical_plan.cc:796-799`) — after `splitCorrelation` has already run and
+cleared `body.where`.
+
+Trace for:
+
+```sql
+SELECT * FROM drivers d
+WHERE EXISTS (SELECT * FROM laps l JOIN drivers d2 ON l.driver_id = d2.driver_id
+                                                  AND d2.team = d.team
+              WHERE l.speed = d.speed);
+```
+
+1. `splitCorrelation` sees only `l.speed = d.speed` -> `JoinKey{speed, speed, 0}`;
+   `body.where` becomes null (`subquery_decorrelation.cc:86`).
+2. `LogicalPlanBuilder::build(body)`: `classifyJoinCondition`
+   (`join_condition.cc:88-91`) sees `d2.team = d.team`, finds `d.team` is not
+   local, and **routes it to `out.residuals`** — Week 30's guard, working as
+   designed.
+3. `logical_plan.cc:756` folds inner-join residuals into `on_residuals`;
+   `logical_plan.cc:796-799` makes them the body's `stmt.where`.
+4. `logical_plan.cc:824` `refuseUnloweredCorrelated` only looks for a surviving
+   `SubqueryExpr` (`subquery_decorrelation.cc:172-174`). A correlated
+   **ColumnRef** is not a subquery, so it passes.
+5. `logical_plan.cc:831` `inferExprType`. The Week 33 branch
+   (`logical_plan.cc:126-131`) deliberately routes a correlated ref straight to
+   the bare-name fallback: `schema.indexOf("team")` over the body's merged
+   `[laps..., drivers...]` schema hits **`laps.team`**. No throw.
+6. `PredicatePushdown`: `collectSlots` gives `{1, -1}`, `soleSlot` gives -1, so
+   the conjunct is not pushed — it stays as a `LogicalFilter` over the body join.
+7. Execution: `evaluator.cc:72-80` `resolveColumnIndex` — `col.id.isLocal()` is
+   false, so the slot branch is skipped entirely and it returns
+   `schema.indexOf("team")` = `laps.team`.
+
+The body therefore filters `d2.team = laps.team` instead of
+`d2.team = <outer drivers>.team`. Wrong rows, no error. `laps` and `drivers`
+both have a `team` column in `catalog.json`, so this is buildable today.
+
+This is precisely the collapse `ColumnId` was built to make impossible, and it
+survives because the two *newly added* fallbacks — `inferExprType` and
+`resolveColumnIndex` — both branch on `isLocal()` and then silently resolve the
+correlated ref by bare name rather than throwing. `localSlot()` is never reached,
+so the type's guarantee never engages.
+
+Note the interaction with the Task 8 claim at `predicate_pushdown.cc:39-49`,
+which asserts "no correlated ref survives into any predicate this walker runs
+over". Step 6 above is a correlated ref in a predicate `collectSlots` runs over.
+That rationale is false as written (see M-7).
+
+### Fix
+
+Either extract correlated conjuncts from the body's ON clauses as well (they are
+already isolated as residuals by `classifyJoinCondition`), or — minimum code —
+make `refuseUnloweredCorrelated` also refuse a surviving correlated `ColumnRef`,
+and have `inferExprType`/`resolveColumnIndex` throw on a non-local ref instead of
+falling back to bare name.
+
+---
+
 ## H-1 (HIGH, silent wrong answer) — `rightKeyIndices` resolves the body key by BARE NAME, and its stated "children[1] is exactly one relation" justification is now false
 
 `src/planner/vectorized_plan_builder.cc:92-108`
