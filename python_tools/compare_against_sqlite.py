@@ -580,8 +580,36 @@ WEEK32_SEMI_JOIN_VEC_ONLY = [
     "(SELECT driver_id FROM drivers WHERE age > 30) ORDER BY name",
 ]
 
+# The four Volcano CAPABILITY refusals, each named by the guard that raises it.
+#
+# Every Volcano rejection suite used to pin the shared tail, "not supported on
+# the Volcano path". Four structurally different guards in Planner::plan end with
+# that phrase, so the needle could not say WHICH one fired: a suite asserting the
+# IN refusal passed unchanged when the multi-way guard caught the query first,
+# and would keep passing if the IN guard were deleted outright. That is the same
+# "passes regardless of whether the feature works" class as the two-key oracle
+# entry above, and it covered 40 entries.
+#
+# It was not hypothetical. Pinning the specific message showed one entry of
+# WEEK34_DERIVED_TABLE_VOLCANO_REJECTED never reaches the derived-table guard at
+# all (its outer query joins twice, so multi-way fires first) and three of
+# WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED reach the IN guard rather than the
+# correlated one. Both are correct behaviour and both were invisible.
+#
+# The ORDER these fire in is planner.cc's, top to bottom: multi-way, then IN,
+# then correlated, then derived. Where a suite's entries split across guards, the
+# split below is written as that ordering rule, not as a list of indices, so an
+# entry added later is classified rather than mislabelled.
+VOLCANO_MULTIWAY   = "multi-way joins are not supported on the Volcano path"
+VOLCANO_IN         = ("IN subqueries are lowered to a semi-join and are not "
+                      "supported on the Volcano path")
+VOLCANO_CORRELATED = ("correlated subqueries are decorrelated to a semi-join and "
+                      "are not supported on the Volcano path")
+VOLCANO_DERIVED    = ("derived tables (FROM (subquery)) are not supported on the "
+                      "Volcano path")
+
 WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path")
+    (query, VOLCANO_IN)
     for query in WEEK32_SEMI_JOIN_VEC_ONLY
 ]
 
@@ -637,13 +665,18 @@ WEEK32_LOWERING_REFUSED = [
     # disjunctive semi-join here. No TPC-H query writes one.
     ("SELECT COUNT(*) FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
      "OR speed > 340",
-     "whole top-level WHERE conjunct"),
+     "whole top-level WHERE conjunct (found one in a non-top-level position)"),
     # AN IN IN HAVING. The join would have to sit above LogicalAggregate. Legal,
     # but no TPC-H query needs it (Q11's HAVING subquery is scalar), so lowering
     # only WHERE is the minimum code that solves the problem.
+    # The PARENTHETICAL is part of the needle, here and above. Without it the two
+    # entries pin one string that both diagnostics satisfy, so a HAVING subquery
+    # collapsing into the generic non-top-level branch (or the reverse) is
+    # invisible — the same "cannot say which guard fired" defect as the Volcano
+    # needles above, at the one place it survives inside a single guard.
     ("SELECT team, COUNT(*) FROM laps GROUP BY team "
      "HAVING COUNT(*) IN (SELECT driver_id FROM drivers)",
-     "whole top-level WHERE conjunct"),
+     "whole top-level WHERE conjunct (found one in HAVING)"),
 ]
 
 # The Volcano half of the same three queries. Derived from the list above rather
@@ -654,7 +687,7 @@ WEEK32_LOWERING_REFUSED = [
 # later week gives Volcano a semi-join, these entries start failing, which is the
 # signal to move each query to whichever refusal then applies.
 WEEK32_LOWERING_REFUSED_VOLCANO = [
-    (query, "not supported on the Volcano path")
+    (query, VOLCANO_IN)
     for query, _ in WEEK32_LOWERING_REFUSED
 ]
 
@@ -663,8 +696,12 @@ WEEK31_SUBQUERY_VEC_ONLY = [
     "(SELECT AVG(l.speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
     " JOIN drivers d2 ON d.driver_id = d2.driver_id)",
 ]
+# VOLCANO_MULTIWAY, not VOLCANO_IN: the refusal these entries reach is the
+# multi-way one, raised on the SUBQUERY BODY's three relations, which is what the
+# comment above and the MULTIWAY_VOLCANO_REJECTED parallel already claim. The
+# generic needle could not show that, and so could not show it if it changed.
 WEEK31_SUBQUERY_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path") for query in WEEK31_SUBQUERY_VEC_ONLY
+    (query, VOLCANO_MULTIWAY) for query in WEEK31_SUBQUERY_VEC_ONLY
 ]
 
 # The two queries where materialization DIVERGES FROM SQLITE. Both are legal SQL
@@ -803,7 +840,7 @@ WEEK33_DECORRELATED_VEC_ONLY = [
 # drift silently: the diffed oracle cannot hold a query that errors, so without
 # this nothing tests that Volcano REFUSES rather than quietly answering.
 WEEK33_DECORRELATED_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path")
+    (query, VOLCANO_CORRELATED)
     for query in WEEK33_DECORRELATED_VEC_ONLY
 ]
 
@@ -851,8 +888,11 @@ WEEK33_CORRELATED_IN_SHAPES = [
 ]
 WEEK33_CORRELATED_NESTED_VEC = [
     (q, "correlated subquer") for q in WEEK33_CORRELATED_IN_SHAPES]
+# VOLCANO_IN, not VOLCANO_CORRELATED: the correlation is INSIDE an IN body, and
+# planner.cc checks has_in before has_correlated. Pinning it is what makes that
+# ordering an assertion rather than an accident.
 WEEK33_CORRELATED_NESTED_VOLCANO = [
-    (q, "not supported on the Volcano path") for q in WEEK33_CORRELATED_IN_SHAPES]
+    (q, VOLCANO_IN) for q in WEEK33_CORRELATED_IN_SHAPES]
 
 WEEK33_CORRELATED_BINDS = [
     # MOVED to WEEK34_CORRELATED_SCALAR_VEC_ONLY. This is Q17 exactly — a
@@ -987,8 +1027,13 @@ WEEK34_DERIVED_TABLE_VEC_ONLY = [
     "ORDER BY a, b",
 ]
 
+# One entry here joins TWICE in its outer query, so planner.cc's multi-way guard
+# fires before it ever reaches the derived-table one — correct, and completely
+# hidden by the generic needle. The split is written as the guard-ordering rule
+# rather than as an index, so a query added later is classified, not mislabelled.
 WEEK34_DERIVED_TABLE_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path")
+    (query,
+     VOLCANO_MULTIWAY if query.upper().count(" JOIN ") > 1 else VOLCANO_DERIVED)
     for query in WEEK34_DERIVED_TABLE_VEC_ONLY
 ]
 
@@ -1178,8 +1223,11 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id)) ORDER BY nm",
 ]
 
+# Three entries wrap their correlated scalar in an IN, and has_in is tested
+# before has_correlated, so those reach the IN guard. Same ordering rule as
+# WEEK33_CORRELATED_NESTED_VOLCANO, written the same way for the same reason.
 WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path")
+    (query, VOLCANO_IN if " IN (" in query else VOLCANO_CORRELATED)
     for query in WEEK34_CORRELATED_SCALAR_VEC_ONLY
 ]
 
@@ -1576,7 +1624,7 @@ MULTIWAY_QUERIES = WEEK27_MULTIWAY_QUERIES + WEEK28_JOIN_ORDER_QUERIES \
     + WEEK29_MULTIWAY_OUTER_QUERIES
 
 MULTIWAY_VOLCANO_REJECTED = [
-    (query, "not supported on the Volcano path") for query in MULTIWAY_QUERIES
+    (query, VOLCANO_MULTIWAY) for query in MULTIWAY_QUERIES
 ]
 
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
