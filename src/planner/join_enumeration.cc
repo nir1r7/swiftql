@@ -30,16 +30,50 @@ struct Edge {
     int slot_b; std::string col_b;
 };
 
-// walk down children[0] to the leaf scan's table name
-const std::string& leafScanTableOf(const LogicalPlanNode* node) {
-    while (node->type != LogicalNodeType::SCAN) node = node->children[0].get();
-    return static_cast<const LogicalScan*>(node)->table_name;
+// walk down children[0] to the leaf scan's table name.
+//
+// Week 34: NULLABLE, for the same reason vectorized_plan_builder.cc's twin is.
+// A DERIVED relation has no catalog table and no TableStats, and walking through
+// it returns the BODY's base table — so leafRowWidth would charge one table's
+// per-column avg_width for another relation's columns, which is the attribution
+// error Week 27 refused to make and which feeds the DP's cost directly.
+const std::string* leafScanTableOfOrNull(const LogicalPlanNode* node) {
+    while (node->type != LogicalNodeType::SCAN) {
+        if (node->type == LogicalNodeType::DERIVED) return nullptr;
+        if (node->children.empty()) return nullptr;
+        node = node->children[0].get();
+    }
+    return &static_cast<const LogicalScan*>(node)->table_name;
 }
 
-// Number of relations under a node, counted by its scans. Used only to size the
-// range table before decomposing.
+// Number of RELATIONS of the block being planned — which is the size of its
+// range table, and therefore the domain every join_slot and from_slot indexes.
+//
+// !! Week 34 corrected what this counts, and the correction is the one Weeks 28
+// and 29 both wrote down in advance. It counted SCANS, recursively through every
+// child, which equalled the range-table size only while every scan in the tree
+// belonged to this block. Two constructs broke that, and in OPPOSITE directions:
+//   - a DERIVED relation is ONE relation of this block whose body may hold any
+//     number of scans, so counting scans OVER-counted and `slot >= n` stopped
+//     meaning "outside the range table" — too permissive, letting through a tree
+//     the pass cannot decompose;
+//   - a SEMI/ANTI join's children[1] is a subquery BODY, not a relation of this
+//     block at all, so its scans were counted as if they were.
+// Counting the SPINE instead answers the question the callers actually ask.
 int countRelations(const LogicalPlanNode* node) {
     if (node->type == LogicalNodeType::SCAN) return 1;
+    // A derived relation is one relation of this block. Its body's scans are
+    // relations of the BODY's range table, which this number does not describe.
+    if (node->type == LogicalNodeType::DERIVED) return 1;
+    if (node->type == LogicalNodeType::JOIN) {
+        const auto* join = static_cast<const LogicalJoin*>(node);
+        // children[1] of a semi/anti join is a body, not a range-table entry —
+        // the same fact join_slot == -1 records. Count the left spine only.
+        if (join->semantics != JoinSemantics::STANDARD)
+            return countRelations(join->children[0].get());
+        return countRelations(join->children[0].get())
+             + countRelations(join->children[1].get());
+    }
     int n = 0;
     for (const auto& child : node->children) n += countRelations(child.get());
     return n;
@@ -102,7 +136,9 @@ bool hasSlotOutsideRangeTable(const LogicalPlanNode* node, int n) {
 // a single-relation input: real per-column avg_width, 8 bytes per column where
 // statistics are absent.
 double leafRowWidth(const LogicalPlanNode* leaf, const Catalog& catalog) {
-    const std::string& table = leafScanTableOf(leaf);
+    const std::string* table_p = leafScanTableOfOrNull(leaf);
+    if (!table_p) return leaf->output_schema.size() * 8.0;   // Week 34: derived
+    const std::string& table = *table_p;
     if (!catalog.hasStats(table)) return leaf->output_schema.size() * 8.0;
     const TableStats& ts = catalog.getStats(table);
     double width = 0.0;
@@ -391,7 +427,31 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
             "join-ordering=skipped (outer join)";
         return node;
     }
-    // Week 30 — also BEFORE decompose(), and silent. See the function.
+    // Week 30 — also BEFORE decompose(), and still SILENT. See the function.
+    //
+    // !! WEEK 34 EXPECTED TO MAKE THIS FIRE FOR DERIVED TABLES AND IT DOES NOT,
+    // which is worth recording because three prior weeks predicted otherwise
+    // (Weeks 28, 29 and 30 all wrote the prediction down, and the README's Week
+    // 34 notes name it as one of the three consumers that break silently). What
+    // was actually wrong was `countRelations`, which counted SCANS and so
+    // over-counted a derived body's — fix that and a derived relation is an
+    // ordinary range-table entry with an in-range slot: `decompose` takes it as
+    // a leaf, `rebuild` re-merges its schema, and the search reorders it like
+    // any other relation. A reported decline was therefore NOT added: Week 30's
+    // condition for earning one is "a supported query pays a real plan-quality
+    // cost", and no query pays one here. A decline string that cannot fire is
+    // the dead-assertion failure Week 33 recorded — it reads as a guarantee and
+    // stops anyone looking.
+    //
+    // WHAT IS REAL, AND IS NEW: a derived relation has no TableStats, so
+    // `joinCardinality`'s no-statistics branch `max(l, r)` — which is NOT
+    // multiplicative — now runs on a query the CLI can type. A subset containing
+    // one therefore has an order-dependent row count and the DP's optimal
+    // substructure does not hold for it. The containment is unchanged and is the
+    // written-order bound in reorder() below, exactly as Week 28 specified; this
+    // is simply the first time that bound is load-bearing outside a fixture.
+    // Week 28 also recorded that `method=written-floor` had never executed. It
+    // is reachable from the CLI now.
     if (hasSlotOutsideRangeTable(node.get(), n)) return node;
 
     std::vector<std::unique_ptr<LogicalPlanNode>> leaves(n);
@@ -404,7 +464,12 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
             "internal: join enumeration found no relation at range-table slot "
             + std::to_string(r));
         rels[r].slot = r;
-        rels[r].table = leafScanTableOf(leaves[r].get());
+        // Week 34: a DERIVED leaf names no catalog table. The empty string is
+        // the honest answer and every consumer of `table` already tolerates a
+        // name the catalog does not hold (hasStats returns false and the cost
+        // falls back to the uniform proxy), which is Week 27's stance again.
+        const std::string* leaf_table = leafScanTableOfOrNull(leaves[r].get());
+        rels[r].table = leaf_table ? *leaf_table : std::string();
         // Estimate each leaf in isolation, through the same function the final
         // whole-tree pass uses, so a leaf costed here and the same leaf stamped
         // later cannot disagree. Post-pushdown a leaf carries its own filters, so
