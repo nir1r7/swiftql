@@ -1290,7 +1290,7 @@ Success criteria for the week, in the form the gate reports them:
 | 5 — inherited divergences | **DONE** | 5a closed as a decision + asserted; 5b declared with the reason; 5c/5d declared |
 | 6 — small items owed | **DONE** | 6a NaN hole fixed + asserted; 6b projection widened + demonstrated; 6c `--time` and `--fingerprint-all` exercised; 6d recorded honestly |
 | 7 — scale + memory | **DONE** | in README Limitations, with the columnar-peaks-higher finding |
-| 8 — re-baseline + report + gate | IN PROGRESS | report written; full `--fingerprint-all` run under way, baseline refresh pending its result |
+| 8 — re-baseline + report + gate | **DONE** | three full runs: measure, `--write-baseline`, confirm |
 
 ### Task 2 sweep report — checked, not only hit
 
@@ -1408,10 +1408,22 @@ q21's cell now records the sharpened message:
 a join key (a correlated inequality has no equi-join to lower to; it would have
 to ride as an ON residual on the semi/anti join, ...))`.
 
-**Next concrete step:** read the finished `run_tpch.py` gate line, refresh
-`docs/tpch-baseline.json` with `--write-baseline` in a commit carrying the
-per-query deltas, and re-run to confirm the gate is green against the new
-baseline.
+**Baseline refreshed and confirmed.** Three full runs, in this order and for
+this reason: (1) measure with `--fingerprint-all` against the OLD baseline — PASS
+with `IMPROVED: ['q17'] newly meaningful`; (2) `--baseline X --write-baseline X`,
+which the harness makes safe by comparing *before* writing and refusing to write
+from a failing run; (3) confirm against the new baseline —
+`BASELINE docs/tpch-baseline.json: OK` with **no** IMPROVED line, which is what
+"the record now matches the tree" looks like.
+
+The recorded delta is one line: `q17` 0 modes → 2, moving out of `unported` and
+into `meaningful`. `mismatched`, `mutation_broken` and `unexplained` stay empty.
+
+**Not done this week, stated so the next reader does not have to infer it:**
+Q21's residual semi/anti join (Task 3b, declined with its requirement recorded
+above) and the `ON` STRING-vs-numeric type check (Task 5b, declared as a live
+divergence with its containment named). Both are the two items a following week
+inherits from Week 36.
 
 ---
 
