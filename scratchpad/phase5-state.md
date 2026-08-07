@@ -1,18 +1,12 @@
 # Phase 5 orchestrator state
-Current: week 32 CLOSING GATE running (agent aebef1cdb45716bc4, launched 10:32 UTC right
-  after the 10:30 reclaim — the deferral worked as intended, it now has a full window).
-  All week 32 work is complete and pushed through 889b6cb. This gate is the last thing owed.
-  IF GREEN: mark week 32 done, then start week 33 with the teach step.
-  !! WEEK 33 IS CORRELATED SUBQUERIES, which TRIGGERS the ColumnId {level, slot} deferral.
-  It must be its OWN STANDALONE CHANGE FIRST, never folded into the feature week: 87
-  non-comment mentions / 6 source layers / every test hand-building a ColumnRef. The Week 33
-  starting-notes block in README.md records this, along with three unreached surfaces
-  (refuseUnloweredIn call sites, the Volcano HashJoinNode refusal path, setCostDecision's
-  rowWidth consumption), Volcano semi/anti parity, and the Week 37 selection-vector deferral.
+Current: week 33, round 1, step 1 (teach) — launching ~10:44 UTC.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
-Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
-Last gate: GREEN (week 32 round 3) — build 0 warnings, unit 770/770, sqlite 988, regression 318 all modes
+Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
+Last gate: GREEN (week 32 round 4, closing) — 0 warnings, unit 770/770, sqlite 996, regression 318 all modes
+Week 32 verdict: checkpoint met. 4 gates / 4 audits; 1 blocker, 1 high, 6 medium, 8 low.
+  The HIGH was a REGRESSION a green 988-query oracle could not see, because the test guarding
+  that capability had been narrowed to a scalar stand-in.
 Week 31 verdict: checkpoint met. 2 gates / 2 audits; round 2 audit was CLEAN (0/0/0/0).
 
 
