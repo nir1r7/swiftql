@@ -1969,3 +1969,33 @@ all. The week that removes the containment is the week the change pays for
 itself, and the table is what makes it reviewable then. Recommend deferring to
 whichever of Week 31/32/34 first lowers a correlated reference; do not fold it
 into a feature week.
+
+---
+
+## Round 3 — auditing the enumeration itself
+
+Zero blockers. The round's first question was whether the round-2 slot-consumer
+table is **complete**, and the answer was no: the two most dangerous consumers in
+the tree were in neither half of it.
+
+| # | Finding | Fix |
+|---|---|---|
+| M1 | `collectSimplePredicates` / `ChunkPruner::shouldSkip` (`chunk_pruner.h`) tests `relation_slot < 1` on a WHERE-clause `ColumnRef` and then matches **by name** against the scanned table's zone maps. A correlated `(level 1, slot 0)` reads as scan-local, so with a shared column name the wrong relation's zone maps prune the scan — chunks skipped silently. Not protected by the `collectSlots`/`soleSlot` `-1` argument: on `--no-optimize` the whole un-pushed `WHERE` reaches the scan as a hint without pushdown seeing it | **Declines** a `query_level > 0` ref. A pruning hint is an optimization, so contributing nothing is correct-and-slower — the file's own "decline and fall back" pattern. Plus the table row |
+| M2 | Every `GroupByColumn` consumer — `buildAggregateSchema`, `HashAggregateNode`, `VecHashAggregateNode`, `CardinalityEstimator` — reads `g.relation_slot` bare, though `GroupByColumn` is the struct round 1 *gave* a level to. Quieter than a miss: `indexOf("team", 0)` against a subquery's `drivers` child schema is a clean HIT on the wrong relation, so neither the bare-name fallback nor the `idx < 0` throw fires | **Throws** at `buildAggregateSchema`. Grouping is not an optimization and a correlated key has no correct local fallback, so it must be loud. One guard covers all four: the other three run on a plan whose schema was built there |
+| m1 | The round-2 `exprKey` level prefix is not prefix-free — level 1 / slot 23 and level 12 / slot 3 both render `^123#team`, the same collision one order of magnitude out. Both halves are legal SwiftQL | One `:` separator |
+| m2 | Table hygiene: `restampSlots` was listed as reachable before the refusal (its only caller runs on a built plan), and the ORDER BY bare-column existence check — a correct level consumer — was not listed at all | Moved and added. Over-inclusion sends a reader's effort at the wrong row; omission of a correct entry is a hole in the audit trail |
+| m3 | The moved `SUM`/`AVG` check runs during binding, so it outranks `Validator`'s aggregate-position rule for correlated arguments only | Documented at the call site and in Week 31's notes. Both spellings are refused; only the wording differs, and moving the check back re-opens what it closed |
+
+**What this round changes about the method, not the code.** Rounds 1 and 2 fixed
+sites; round 2 produced the table so the fix would stop being per-site; round 3
+shows the table is itself an artifact that can be incomplete, and that an omission
+is worse than an error — `ChunkPruner` was absent while being named elsewhere in
+the same file answering the *dispatch-site* question, which a reader takes as
+clearance. The preamble now says so, and the dispatch-checklist sentence that
+caused it now points at the slot table.
+
+Five appearances of one class in one week is the argument for the structural
+change, and the decision is recorded in the README's Week 30 starting notes as a
+decision rather than a suggestion: `ColumnId { level, slot }` is deferred to
+whichever of Weeks 31/32/34 first lowers a correlated reference, as its own
+standalone change, never folded into a feature week.

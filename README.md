@@ -1293,12 +1293,28 @@ stopped exactly there); and the `SUM`/`AVG` argument type check indexed
 order of the *inner* query's own joins. That check moved to the Binder, the only
 layer holding the scope chain, rather than being skipped.
 
-The lesson is bigger than the three fixes, so it is written down rather than
+Round 3 audited the enumeration itself, and found the answer to *"is the list
+complete?"* was no — twice, at the two most dangerous consumers in the tree.
+`collectSimplePredicates` (`chunk_pruner.h`) tests `relation_slot < 1` and then
+matches **by name** against the scanned table's zone maps, so a correlated
+`(level 1, slot 0)` read as scan-local would prune another relation's chunks —
+silently, and on the `--no-optimize` path, where the `collectSlots`/`soleSlot`
+containment never applies. And every `GroupByColumn` consumer ignores the level
+the struct was *given* in round 1: for `GROUP BY l.team` inside a subquery over
+`drivers`, `indexOf("team", 0)` is a clean **hit on the wrong relation**, so
+neither the bare-name fallback nor the `idx < 0` throw fires. Both now carry a
+guard — pruning declines, grouping throws — and both have rows in the table.
+A missing row is worse than a wrong one, because the next week reads the table as
+already-checked; `ChunkPruner` was absent from it while being mentioned elsewhere
+in the same file answering a different question, which reads as
+considered-and-dismissed.
+
+The lesson is bigger than the five fixes, so it is written down rather than
 learned again: **adding a field to `ColumnRef` is not the work — finding every
 reader of the field it qualifies is.** `development.md` now carries a
 [slot-consumer table](development.md#relation-slots-and-query-levels) classifying
-every reader of `relation_slot` / `from_slot` as level-aware, level-agnostic-but-
-contained, or wrong, and stating what makes each contained one safe. Week 32's
+every reader of `relation_slot` / `from_slot` as level-aware, guarded, or
+contained-by-the-refusal, and stating what makes each one safe. Week 32's
 semi-/anti-joins and Week 34's derived tables are the weeks that remove those
 containments; the table is what makes that reviewable. The structural fix —
 making the level part of the *type*, so a bare slot cannot be passed where a
@@ -1383,7 +1399,54 @@ correlated ref can actually reach the second group.
 >   scope at the call site. Failing that, state the dependency on the refusal in
 >   the comment, in the shape the `jc` fix used.
 
-> **Starting notes, from Week 30's foundations.**
+> **Starting notes, from Week 30's foundations.** Week 31 lifts the refusal that
+> makes half of this week safe, so the first four notes are its blockers in
+> waiting rather than advice.
+> - **THE SLOT-CONSUMER ENUMERATION IS THE CONTAINMENT.** Read
+>   [development.md → Relation slots and query levels](development.md#relation-slots-and-query-levels)
+>   *before* deleting `Validator::validate`'s `has_subquery` refusal, not after.
+>   `relation_slot` is a position in the range table of the scope
+>   `ColumnRef::query_level` blocks out; a consumer that reads the slot without
+>   the level compares two numbering domains, and the failure is always silent.
+>   That collapse was found **five times in one week across three audit rounds** —
+>   `validateJoinCondition`, `classifyJoinCondition`, `GroupByColumn`'s round
+>   trip, `exprKey`, the `SUM`/`AVG` argument check — and twice more only when the
+>   enumeration itself was audited for completeness. Every consumer in the second
+>   half of that table is safe **only** because the refusal exists. Add a row when
+>   you add a consumer; a missing row is worse than a wrong one, because the next
+>   week reads it as already-checked.
+> - **The `ColumnId { level, slot }` structural change is deferred by decision,
+>   not oversight.** Making the level part of the *type*, so a bare `int` cannot
+>   be passed where a qualified reference is required, turns every one of those
+>   five findings into a compile error. It is to be done as **its own standalone
+>   change** in whichever of Weeks 31/32/34 first lowers a correlated reference —
+>   **never folded into a feature week**. Measured cost: 87 non-comment mentions
+>   of `relation_slot`/`from_slot` across six source layers, plus every test that
+>   hand-builds a `ColumnRef` / `GroupByColumn` / `AggregateSpec`. Until then the
+>   containment rests on the enumeration in `development.md` → *Relation slots
+>   and query levels*.
+> - **Two consumers carry a guard of their own, and both guards are tripwires
+>   that Week 31 will be the first to arm.** `collectSimplePredicates`
+>   (`src/storage/chunk_pruner.h`) **declines** a `query_level > 0` ref: it tested
+>   `relation_slot < 1` and then matched by NAME against the scanned table's zone
+>   maps, so a correlated `(level 1, slot 0)` read as scan-local and pruned the
+>   wrong relation's chunks — silently, and on the `--no-optimize` path, where the
+>   whole un-pushed `WHERE` reaches the scan as a hint and the
+>   `collectSlots`/`soleSlot` `-1` containment never applies. `buildAggregateSchema`
+>   (`src/planner/logical_plan.cc`) **throws**, because `indexOf("team", 0)`
+>   against a subquery's `drivers` child schema is a clean HIT on the wrong
+>   relation, not a miss — neither the bare-name fallback nor the `idx < 0` throw
+>   fires. Pruning is an optimization so declining is correct; grouping is not, so
+>   it must be loud. When Week 31 makes either reachable, replace the tripwire
+>   with real behaviour — do not delete it.
+> - **`GroupByColumn` carries a level and every one of its consumers ignores it**
+>   — `buildAggregateSchema`, `HashAggregateNode` (`plan_nodes.cc`),
+>   `VecHashAggregateNode` (`vec_hash_aggregate_node.cc`) and
+>   `CardinalityEstimator`. Three of them have a bare-name fallback, so a wrong
+>   slot does not surface as a miss. The single guard above covers all four today
+>   only because the other three run on a plan whose schema was built there.
+>   `AggregateSpec` has the identical exposure and no field at all; its
+>   containment is stated at `logical_plan.h`.
 > - **A shared subquery statement is one statement with two parents.**
 >   `cloneExpr` shares the `shared_ptr` rather than deep-copying, because
 >   `SelectStatement` is move-only. Binding is safe — but only since round 1,
@@ -1427,6 +1490,13 @@ correlated ref can actually reach the second group.
 >   identical string, so the user sees the same message either way; what a future
 >   week must not do is add a second refusal site per engine to close the gap,
 >   which is how the two paths drift.
+> - **The moved `SUM`/`AVG` type check runs during BINDING, so it outranks every
+>   `Validator` rule** — including the one forbidding an aggregate in `WHERE`. An
+>   illegal-position aggregate with a *correlated STRING* argument is therefore
+>   diagnosed by type where the same aggregate with a local or numeric argument is
+>   diagnosed by position. Both are refused; only the wording differs. It lives in
+>   the Binder because that is the only layer holding the scope chain, so moving
+>   it back to `Validator` re-opens the wrong-relation lookup it closed.
 
 ### Week 31 — Scalar + Uncorrelated Subqueries
 
