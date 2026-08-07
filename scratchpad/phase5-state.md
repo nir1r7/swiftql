@@ -1,19 +1,19 @@
 # Phase 5 orchestrator state
-Current: week 33, tasks 3-9 continuing (agent aa6b3121eb7ae18de). Task 1 CLOSED (gated GREEN
-  alone). Task 2 DONE — refusal removed and BOTH week 30 tripwires RESTATED with new
-  justifications, not deleted. Task 3 core done: src/planner/subquery_decorrelation.{h,cc};
-  correlated EXISTS/NOT EXISTS execute on the vectorized path.
-  !! THE MIGRATION ALREADY PAID: inferExprType indexed the schema with a bare slot and THREW,
-  naming itself. Pre-migration that lookup would have HIT a same-named column of the wrong
-  relation and returned its type — a silent wrong answer. Being recorded durably so nobody
-  "simplifies" ColumnId back to an int.
-  UNPINNED GAPS the agent named itself and is now closing: NOT EXISTS against a NULL-keyed body
-  is untested vs SQLite; the Volcano correlation refusal is not in any rejection suite.
-  Decorrelation validity conditions are explicit: whole top-level WHERE conjunct; every
-  correlated conjunct an equality between two plain ColumnRefs exactly one level apart; body
-  has no GROUP BY/HAVING/aggregate/LIMIT/DISTINCT; at least one key. Each failure refuses by
-  name at the site.
-  STILL OPEN: no auditor has read the ColumnId migration — the week's audits must cover it.
+Current: week 33 — TASK 4 (correlated scalar, the Q17/Q22 shape) sent back as REQUIRED.
+  Week 33's checkpoint is "Required correlated TPC-H queries execute correctly", and Q17/Q22
+  are correlated SCALAR subqueries, so the checkpoint is NOT met without Task 4. It was about
+  to be deferred to Week 34 — do not let that stand. Week 34 is derived tables + distinct
+  aggregates, and TPC-H is only measured at Week 36.
+  DONE: tasks 1 (gated green alone), 2, 3, 5, 9. Both self-named gaps closed: NOT EXISTS over
+  a nullable key asserted vs SQLite in BOTH directions; Volcano refusal pinned in
+  WEEK33_DECORRELATED_VOLCANO_REJECTED.
+  ACCEPTED DEVIATION, to be recorded as such: the README's week-33 bullet "retain a correct
+  fallback for unsupported patterns" ships as a REFUSAL, not a fallback. Reason accepted — a
+  real fallback needs a dependent-join operator this engine has never had, and a second
+  execution production risks the two-path drift weeks 26/28/30 each had to undo. Must be
+  written up as a bullet consciously NOT met, in the README and week 34's notes.
+  REMAINING: task 4, then 7 + 8, then 6 (Volcano parity, fine to stay a stated gap).
+  STILL OPEN: no auditor has read the ColumnId migration.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
