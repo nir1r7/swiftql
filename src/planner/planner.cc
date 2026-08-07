@@ -44,11 +44,22 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // different queries (a left row whose only candidate fails the residual is
     // null-extended, not deleted), so an outer join's residuals stay on the join
     // and become part of its match test.
-    const bool outer = !stmt.joins.empty() && stmt.joins[0].type == JoinType::LEFT;
+    //
+    // ONE clause pointer, used by every decision below — the residual split here,
+    // the scans, the swap, and the operator. `stmt.joins[0]` read at each of those
+    // sites would be correct only because of the `joins.size() > 1` throw at the
+    // top of this function, an undocumented coupling across 110 lines: relax that
+    // refusal and `FROM a JOIN b ON k1 LEFT JOIN c ON k2` would decide `outer`
+    // from the wrong clause and build an inner join over a/b. Naming the clause
+    // once makes the dependency local, and the assertion below the swap makes the
+    // remaining one loud.
+    const SelectStatement::JoinClause* jc =
+        stmt.joins.empty() ? nullptr : &stmt.joins.front();
+    const bool outer = jc && jc->type == JoinType::LEFT;
     std::vector<JoinKey> join_keys;
     std::unique_ptr<Expr> on_residual;
-    if (!stmt.joins.empty()) {
-        JoinCondition on = classifyJoinCondition(stmt.joins[0].condition.get(), 1);
+    if (jc) {
+        JoinCondition on = classifyJoinCondition(jc->condition.get(), 1);
         join_keys = std::move(on.keys);
         if (outer) {
             std::vector<std::unique_ptr<Expr>> parts;
@@ -76,7 +87,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // map. The FROM scan below moves that data out, so preserve a copy for the
     // JOIN scan. (A copy — not shared ownership — keeps this a minimal change;
     // it costs one extra table copy, acceptable at this project's scale.)
-    bool self_join = !stmt.joins.empty() && stmt.joins[0].join_table == stmt.from_table;
+    bool self_join = jc && jc->join_table == stmt.from_table;
     std::optional<ColumnarTable> self_join_columnar;
     std::optional<std::vector<Row>> self_join_rows;
     if (self_join) {
@@ -95,8 +106,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     }
 
     // hash join (exactly one, guarded above)
-    if (!stmt.joins.empty()){
-        const auto& join_clause = stmt.joins[0];
+    if (jc){
+        const auto& join_clause = *jc;
         const TableMetadata& join_meta = catalog.getTable(join_clause.join_table);
 
         Schema right_scan_schema = buildScanSchema(stmt, join_meta.schema);
@@ -151,6 +162,15 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         // matched flag per build row and an end-of-probe drain. The side is
         // forced, not costed.
         bool swap = !outer && from_row_count < join_row_count;
+        // The preserved side must be the probe input, and the residual is moved
+        // into the operator only on the unswapped branch — so a swapped outer
+        // join would not merely be the wrong algorithm, it would DROP the ON
+        // residual silently. The operator's own constructor refuses the
+        // combination too; this one names the reason at the place that decides it.
+        if (outer && swap) {
+            throw std::runtime_error(
+                "internal: a left outer join must not swap its build side");
+        }
         if (swap) {
             node = std::make_unique<HashJoinNode>(std::move(right), std::move(node), join_cols, from_cols, merged_schema, /*swapped=*/true);
         } else {
