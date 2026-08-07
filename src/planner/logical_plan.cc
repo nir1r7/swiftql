@@ -1004,7 +1004,24 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // before inferExprType walks it below.
         ExistsLoweringResult decorrelated =
             lowerExistsSubqueries(std::move(lowered.plan), conjuncts, catalog);
-        node = std::move(decorrelated.plan);
+        // Week 34 — correlated SCALAR subqueries (Q17), at the same site and for
+        // the same two reasons: the join's probe input must be the whole
+        // FROM/JOIN spine so the correlated operand's binder slot resolves in the
+        // domain leftKeyIndices() uses, and the node must leave the predicate
+        // before inferExprType walks it below.
+        //
+        // AFTER the other two, deliberately. A scalar node is not a whole
+        // conjunct, so this pass walks INTO each conjunct; running it first would
+        // have it descend into an IN or EXISTS operand that the earlier passes
+        // are about to remove wholesale.
+        //
+        // range_table_size is 1 + joins.size(): the slot this pass hands its
+        // derived relation is one past the last relation the Binder issued, and
+        // JoinEnumeration's out-of-range test must be able to explain it.
+        ScalarLoweringResult scalars = lowerCorrelatedScalars(
+            std::move(decorrelated.plan), conjuncts,
+            static_cast<int>(stmt.joins.size()) + 1, catalog);
+        node = std::move(scalars.plan);
         stmt.where = conjoinAll(std::move(conjuncts));
         // Anything left holding an IN node is a shape lowering cannot express —
         // an IN under an OR, most of all. Refuse by name here rather than let

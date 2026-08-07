@@ -1002,6 +1002,67 @@ WEEK34_DERIVED_REFUSED = [
      "LATERAL is not supported"),
 ]
 
+# Week 34 — CORRELATED SCALAR subqueries, the Q17 shape. Week 33 recorded their
+# absence as a checkpoint MISS and handed them here; a decorrelated scalar
+# subquery is a derived table with an implicit join, so they run on the machinery
+# the suites above exercise. Vectorized only, inheriting Week 33's boundary
+# unchanged (Planner::plan runs no LogicalPlanBuilder, where the rewrite grafts).
+WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
+    # Q17's shape exactly: a correlated AVG compared against an outer column
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > 1.02 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    # the same, regrouped above the join, so the merged schema is read by a
+    # GROUP BY and not only by the WHERE
+    "SELECT l.team AS t, COUNT(*) AS n FROM laps l WHERE l.speed > 1.05 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) "
+    "GROUP BY l.team ORDER BY t",
+    # TWO correlation keys, and MAX rather than AVG
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > (SELECT MAX(l2.speed) FROM laps l2 "
+    "WHERE l2.driver_id = l.driver_id AND l2.team = l.team)",
+    # THE ZERO-ROW CASE, and the reason the join is LEFT rather than INNER. The
+    # body's filter leaves many correlation keys with no group at all; SQL says
+    # the scalar subquery is NULL there, so the comparison is UNKNOWN and the row
+    # is excluded — but it must be EXCLUDED BY THE PREDICATE, not DROPPED BY THE
+    # JOIN. An inner join gives the same answer here and a different one below.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > (SELECT MAX(l2.speed) FROM laps l2 "
+    "WHERE l2.driver_id = l.driver_id AND l2.season = 2024)",
+    # every group empty: the answer is 0, not an error and not the whole table
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > (SELECT MAX(l2.speed) FROM laps l2 "
+    "WHERE l2.driver_id = l.driver_id AND l2.season = 1900)",
+    # !! THE QUERY THAT DISTINGUISHES LEFT FROM INNER. Under an inner join the
+    # rows with no matching group would be deleted before the OR could rescue
+    # them, so this returns FEWER rows than SQLite. It is the only shape here that
+    # can see the difference, and it is also the shape that shows a correlated
+    # SCALAR may sit under an OR at all: unlike EXISTS and IN, the rewrite
+    # preserves the outer row set exactly, so any expression position in WHERE is
+    # sound.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.season = 2024 OR l.speed > "
+    "(SELECT MAX(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.season = 2024)",
+]
+
+WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path")
+    for query in WEEK34_CORRELATED_SCALAR_VEC_ONLY
+]
+
+# The scalar shapes decorrelation declines, in all four modes. A NON-AGGREGATE
+# body is the important one: after the rewrite the GROUP BY makes one row per key
+# by construction, so Week 31's runtime `scalar subquery returned more than one
+# row` check has nowhere to live — a query SQL calls an error would return an
+# arbitrary row. SQLite answers all of these, so each is a divergence.
+WEEK34_CORRELATED_SCALAR_REFUSED = [
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)",
+     "single aggregate"),
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team LIMIT 1)",
+     "LIMIT cannot be decorrelated"),
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.speed > l.speed)",
+     "only an equality between two columns can become a join key"),
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -1679,6 +1740,8 @@ def main():
                              "Week 34 DISTINCT aggregate refusals"),
                             (WEEK34_DERIVED_REFUSED,
                              "Week 34 derived-table refusals"),
+                            (WEEK34_CORRELATED_SCALAR_REFUSED,
+                             "Week 34 correlated-scalar refusals"),
                             (WEEK31_MATERIALIZATION_REFUSED,
                              "Week 31 materialization divergences from SQLite"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
@@ -1732,6 +1795,23 @@ def main():
         mp, mf, me = run_rejection_suite(
             WEEK34_DERIVED_TABLE_VOLCANO_REJECTED,
             f"Week 34 derived tables refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+
+    # Week 34 — correlated scalar subqueries (Q17). Week 33's checkpoint miss,
+    # closed. Same split, same reason.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK34_CORRELATED_SCALAR_VEC_ONLY,
+            f"Week 34 correlated scalar subqueries — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED,
+            f"Week 34 correlated scalar subqueries refused — {label}", extra_args=extra)
         m_passed += mp
         m_failed += mf
         m_errors += me

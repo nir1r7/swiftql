@@ -60,6 +60,62 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
                                            std::vector<std::unique_ptr<Expr>>& conjuncts,
                                            const Catalog& catalog);
 
+// Week 34 — CORRELATED SCALAR subqueries (the Q17 shape), decorrelated onto the
+// derived-table machinery this week built.
+//
+//   WHERE l.speed > 0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)
+//     ->  outer  LEFT JOIN  (SELECT team, AVG(speed) FROM laps l2 GROUP BY team)
+//                ON team = team,  the SubqueryExpr replaced by a ColumnRef
+//
+// A DECORRELATED SCALAR SUBQUERY IS A DERIVED TABLE WITH AN IMPLICIT JOIN. That
+// sentence is why this is Week 34's and not Week 33's: the join is STANDARD, so
+// its output_schema is MERGED and the aggregate's column is in scope above it,
+// which is exactly the containment Week 32 established and Week 33 preserved.
+// The right child here is built as a LogicalDerived — literally the same node
+// FROM (subquery) produces — so the four descend-to-SCAN walkers, the range-table
+// size and every development.md row need ONE argument rather than two.
+//
+// THREE THINGS MAKE THIS HARDER THAN THE EXISTS CASE, and each is handled rather
+// than assumed:
+//
+//  1. THE JOIN IS LEFT, NOT INNER. SQL says a scalar subquery over zero rows is
+//     NULL (Week 31 shipped the typed-null Literal for exactly that); an inner
+//     join DROPS the outer row instead. Week 29's rules then follow and are all
+//     correct here: pushdown declines the null-supplying side, the build side is
+//     forced, and join enumeration declines the whole tree with
+//     `join-ordering=skipped (outer join)` — a real, reported plan-quality cost.
+//
+//  2. THE "MORE THAN ONE ROW" RULE DISAPPEARS. Week 31's deliberate divergence
+//     (`scalar subquery returned more than one row`) is a RUNTIME CARDINALITY
+//     check, and after the rewrite there is no per-outer-row result to count: the
+//     GROUP BY makes exactly one row per key BY CONSTRUCTION. That is sound for
+//     an AGGREGATE body and is the point. For a non-aggregate body the check
+//     would vanish silently and a query SQL calls an error would return an
+//     arbitrary row — so a non-aggregate body is REFUSED by name.
+//
+//  3. THE NODE IS NOT A WHOLE CONJUNCT. Q17 writes `l.speed > 0.2 * (SELECT ...)`,
+//     so unlike EXISTS and IN the node sits arbitrarily deep inside a conjunct and
+//     must be REPLACED IN PLACE while the join is grafted onto the spine.
+//     forEachSubquery (dispatch site 19) is the maintained walker for that; a
+//     private one here would be a twentieth silent dispatch site.
+//
+// !! requireDecorrelatableBody (the EXISTS guard) IS NOT REUSED, and must not be
+// widened with a flag. Its condition 3 states "the body has NO GROUP BY /
+// HAVING / aggregate / LIMIT / DISTINCT" — and this lowering REQUIRES an
+// aggregate and ADDS a GROUP BY. One function whose header states a rule it no
+// longer enforces for half its callers is the exact shape that produced three
+// silent wrong answers in Week 33 and seven stale preconditions after it. Two
+// guards, two headers, each true of its own caller.
+struct ScalarLoweringResult {
+    std::unique_ptr<LogicalPlanNode> plan;
+    int lowered = 0;
+};
+
+ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spine,
+                                            std::vector<std::unique_ptr<Expr>>& conjuncts,
+                                            int range_table_size,
+                                            const Catalog& catalog);
+
 // Throws the stated refusal if any CORRELATED SubqueryExpr survives anywhere in
 // `expr`. The same tripwire shape refuseUnloweredIn uses, and for the same
 // reason: without it the node reaches inferExprType (dispatch site 12) and dies

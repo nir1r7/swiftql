@@ -1,5 +1,5 @@
 #include "planner/subquery_decorrelation.h"
-#include "planner/subquery_materialization.h"   // forEachSubqueryConst
+#include "planner/subquery_materialization.h"   // forEachSubquery{,Const}
 #include "planner/predicate_pushdown.h"       // collectSlots (dispatch site 8)
 #include "parser/expr_utils.h"
 #include <unordered_set>
@@ -160,7 +160,155 @@ void refuseSurvivingCorrelatedRefs(const SelectStatement& body) {
     check(body.where.get(), "WHERE");
 }
 
+// Week 34 — the SCALAR guard. Deliberately NOT requireDecorrelatableBody with a
+// flag: that function's stated condition is "no GROUP BY / HAVING / aggregate /
+// LIMIT / DISTINCT", and this rewrite REQUIRES an aggregate and ADDS a GROUP BY.
+// Widening it would leave one header stating a rule it no longer enforces for
+// half its callers, which is the shape that produced three silent wrong answers
+// in Week 33.
+void requireDecorrelatableScalarBody(const SelectStatement& body) {
+    if (body.limit)    refuse("a scalar body with LIMIT cannot be decorrelated");
+    if (body.distinct) refuse("a scalar body with DISTINCT cannot be decorrelated");
+    if (body.having)   refuse("a scalar body with HAVING cannot be decorrelated");
+    if (!body.group_by.empty())
+        refuse("a scalar body with its own GROUP BY cannot be decorrelated "
+               "(the rewrite supplies the grouping)");
+    if (body.select_star || body.select_list.size() != 1)
+        refuse("a correlated scalar subquery must select exactly one expression");
+
+    // THE LOAD-BEARING ONE, and the reason it is not merely a scope reduction.
+    // Without an aggregate, GROUP BY does not guarantee one row per key, and
+    // Week 31's runtime `scalar subquery returned more than one row` check has
+    // nowhere to live after the rewrite -- a query SQL calls an error would
+    // return an arbitrary row instead. Refusing keeps that divergence honest.
+    std::vector<const AggregateExpr*> found;
+    collectAggregates(body.select_list[0].get(), found);
+    if (found.size() != 1 || found[0] != body.select_list[0].get())
+        refuse("a correlated scalar subquery is decorrelated only when its select "
+               "list is a single aggregate (a non-aggregate body has no "
+               "one-row-per-key guarantee, so 'returned more than one row' could "
+               "not be checked)");
+}
+
 } // namespace
+
+ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spine,
+                                            std::vector<std::unique_ptr<Expr>>& conjuncts,
+                                            int range_table_size,
+                                            const Catalog& catalog) {
+    ScalarLoweringResult out;
+
+    for (auto& conjunct : conjuncts) {
+        // UNLIKE EXISTS AND IN, the node is not the conjunct: Q17 writes
+        // `l.speed > 0.2 * (SELECT ...)`. forEachSubquery (dispatch site 19) is
+        // the maintained walker that reaches every SubqueryExpr through its
+        // owning slot, which is what lets the node be REPLACED in place.
+        forEachSubquery(conjunct, [&](std::unique_ptr<Expr>& slot) {
+            auto* sq = static_cast<SubqueryExpr*>(slot.get());
+            if (sq->kind != SubqueryExpr::Kind::SCALAR || !sq->correlated) return;
+
+            // Same ownership shape planBody() and lowerExistsSubqueries use:
+            // cloneExpr SHARES the shared_ptr, so two SubqueryExpr nodes can name
+            // one statement and only one of them can be lowered from it -- the
+            // second would plan an emptied statement. `(SELECT ...) BETWEEN a AND
+            // b` is legal syntax and produces exactly that shape.
+            if (sq->subquery.use_count() > 1)
+                refuse("a subquery body shared by two expressions is not supported "
+                       "by decorrelation");
+
+            SelectStatement body = std::move(*sq->subquery);
+            requireDecorrelatableScalarBody(body);
+
+            std::vector<std::unique_ptr<Expr>> body_conjuncts;
+            splitConjuncts(std::move(body.where), body_conjuncts);
+
+            // REUSED VERBATIM from Week 33: it already produces
+            // JoinKey{outer_col, body_col, outer_slot} plus the body-side refs,
+            // and it already refuses a correlated inequality, a computed side and
+            // a reference more than one level out.
+            std::vector<JoinKey> keys;
+            std::vector<std::unique_ptr<Expr>> body_key_refs;
+            std::vector<std::unique_ptr<Expr>> local;
+            splitCorrelation(body_conjuncts, keys, body_key_refs, local);
+            if (keys.empty())
+                refuse("no equality links the scalar subquery to the enclosing "
+                       "query, so there is no group key to decorrelate on");
+
+            body.where = conjoinAll(std::move(local));
+            refuseSurvivingCorrelatedRefs(body);
+
+            // GROUP BY the correlation keys, SELECT them and then the aggregate.
+            // The group keys must come FIRST and in key order: buildAggregateSchema
+            // emits group columns then aggregates, which makes the right-side key
+            // indices positional 0..k-1 -- the same shape Week 33's body projection
+            // produced and Week 32's IN lowering had by taking body column 0.
+            auto agg_expr = std::move(body.select_list[0]);
+            const std::string agg_name = aggregateOutputName(
+                static_cast<const AggregateExpr*>(agg_expr.get()));
+            body.select_list.clear();
+            for (auto& ref : body_key_refs) {
+                auto* cr = static_cast<ColumnRef*>(ref.get());
+                body.group_by.push_back(
+                    GroupByColumn{cr->table_name, cr->column_name, cr->id, nullptr});
+                body.select_list.push_back(cloneExpr(ref.get()));
+            }
+            body.select_list.push_back(std::move(agg_expr));
+
+            auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
+
+            // THE SAME NODE FROM (subquery) produces, and the same normalization:
+            // every column stamped slot 0, the outer slot applied by the merged
+            // schema below. Not a special case -- if it were, the four
+            // descend-to-SCAN walkers, the range-table size and every
+            // development.md row would need a second argument and the two would
+            // drift.
+            const std::string alias = "$scalar" + std::to_string(out.lowered);
+            TableRef synthetic = TableRef::named("", alias);
+            Schema normalized =
+                derivedRelationSchema(body_plan->output_schema, synthetic);
+            auto derived = std::make_unique<LogicalDerived>(
+                std::move(body_plan), alias, normalized);
+
+            // MERGED schema: the aggregate's column IS in scope above this join,
+            // because the outer predicate reads it. That is the containment
+            // Week 32 established and this week replaced with the slot-0
+            // normalization plus a real range-table slot.
+            const int derived_slot = range_table_size + out.lowered;
+            std::vector<ColumnDef> merged = spine->output_schema.columns();
+            for (ColumnDef col : normalized.columns()) {
+                col.relation_slot = derived_slot;
+                merged.push_back(col);
+            }
+
+            auto join = std::make_unique<LogicalJoin>(
+                std::move(spine), std::move(derived), std::move(keys),
+                derived_slot, Schema(merged));
+            // LEFT, not INNER, and this is the whole zero-row rule: an outer row
+            // whose key matches no group must survive NULL-EXTENDED, which is
+            // what SQL says a scalar subquery over zero rows evaluates to. An
+            // inner join would silently DELETE that row. Week 29's three
+            // consequences follow and are correct here: pushdown declines the
+            // null-supplying side, the build side is forced, and enumeration
+            // declines the tree and REPORTS it.
+            join->join_type = JoinType::LEFT;
+            spine = std::move(join);
+
+            // Replace the node in place with a reference to the aggregate's
+            // output column, stamped with the DERIVED RELATION'S SLOT. A bare-name
+            // ColumnRef would resolve -- against whichever relation holds that
+            // name first, which is the silent wrong-relation class this week's
+            // normalization exists to prevent.
+            auto ref = std::make_unique<ColumnRef>();
+            ref->column_name = agg_name;
+            ref->id = ColumnId::local(derived_slot);
+            slot = std::move(ref);
+            ++out.lowered;
+        });
+    }
+
+    out.plan = std::move(spine);
+    return out;
+}
 
 ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spine,
                                            std::vector<std::unique_ptr<Expr>>& conjuncts,
