@@ -206,6 +206,11 @@ void VecHashAggregateNode::consumeAll() {
 
                 Accumulator::SpecAccum& sa = acc.per_spec[i];
                 sa.non_null_count++;
+                if (spec.distinct) {
+                    std::string dk;
+                    appendGroupKeyField(dk, val);
+                    sa.distinct_keys.insert(std::move(dk));
+                }
 
                 if (spec.function == "SUM" || spec.function == "AVG") {
                     sa.sum += toDouble(val);
@@ -250,7 +255,12 @@ void VecHashAggregateNode::materializeResults() {
             const AggregateSpec& spec = specs_[i];
             const Accumulator::SpecAccum& sa = acc.per_spec[i];
             if (spec.function == "COUNT") {
-                int64_t n = spec.is_star ? acc.count : sa.non_null_count;
+                // Same three-way rule as HashAggregateNode (plan_nodes.cc):
+                // COUNT(*) counts rows, COUNT(x) non-NULL values,
+                // COUNT(DISTINCT x) distinct non-NULL values.
+                int64_t n = spec.is_star  ? acc.count
+                          : spec.distinct ? static_cast<int64_t>(sa.distinct_keys.size())
+                                          : sa.non_null_count;
                 row.push_back(Value(n));
             }
             else if (spec.function == "SUM") {

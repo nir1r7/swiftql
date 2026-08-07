@@ -35,6 +35,13 @@ struct AggregateSpec {
     std::string output_name;
     // true = referenced only in HAVING/ORDER BY: computed but never projected
     bool hidden = false;
+    // Week 34 — COUNT(DISTINCT x). The one aggregate in this engine whose
+    // per-group state is not O(1): both HashAggregateNode and
+    // VecHashAggregateNode keep a set of serialized values per group per spec.
+    // Copied straight off AggregateExpr::distinct, and part of output_name via
+    // aggregateOutputName, which is what keeps COUNT(x) and COUNT(DISTINCT x)
+    // from deduping into one spec.
+    bool distinct = false;
     // general argument expression (e.g. SUM(speed * (1 - x))). Non-owning:
     // points into the statement's AST, whose subtrees move into plan nodes of
     // the same tree — moving a unique_ptr never relocates the Expr (same

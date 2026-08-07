@@ -903,6 +903,50 @@ WEEK33_CORRELATED_BINDS = [
 # reason. Without them the Week 31 refusal becomes a catch-all that hides a real
 # defect behind a temporary one — the discipline that placed Week 26's multi-key
 # refusal past the plan-time type checks.
+# Week 34 — COUNT(DISTINCT x). Diffed in ALL FOUR modes, unlike everything else
+# this week: both HashAggregateNode (plan_nodes.cc) and VecHashAggregateNode
+# implement it, so Volcano stays the correctness baseline (invariant 6) instead
+# of refusing. This is the one Week 34 deliverable that RESTORES coverage rather
+# than narrowing it, which is why it does not get a *_VEC_ONLY twin.
+WEEK34_DISTINCT_AGG_QUERIES = [
+    # the plain grouped shape (TPC-H Q16)
+    "SELECT team, COUNT(DISTINCT driver_id) FROM laps GROUP BY team ORDER BY team",
+    # THE DEDUPE TEST. extractAggregates dedupes specs by aggregateOutputName,
+    # which IS exprToString, so an exprToString that forgot DISTINCT collapses
+    # these two select items into ONE spec and one output column that both read.
+    # Without this query that bug is invisible: every other query here still
+    # returns the right single number.
+    "SELECT COUNT(driver_id), COUNT(DISTINCT driver_id) FROM laps",
+    # THE KEY-ENCODING TEST, and the reason it is a DOUBLE expression. Week 27
+    # measured `sector_1 + sector_2` at 3245 distinct values against 2526
+    # distinct %.15g texts over this dataset, so a distinct set keyed on
+    # Value::toString() is off by 719 here and by nothing anywhere else.
+    "SELECT COUNT(DISTINCT sector_1 + sector_2) FROM laps",
+    # global, and empty-input: COUNT(DISTINCT x) over zero rows is 0, not NULL
+    "SELECT COUNT(DISTINCT team) FROM laps",
+    "SELECT COUNT(DISTINCT team) FROM laps WHERE season = 1900",
+    # NULLs are excluded (x / 0 is NULL in this dialect), while COUNT(*) is not
+    "SELECT COUNT(*), COUNT(DISTINCT round / (season - season)) FROM laps",
+    # grouped, with the distinct column also grouped on — the degenerate case
+    "SELECT team, COUNT(DISTINCT team) FROM laps GROUP BY team ORDER BY team",
+]
+
+# Refused in all four modes: these are LANGUAGE refusals, not capability ones,
+# so they fire identically on every path. The diffed oracle cannot hold a query
+# that errors, which is why the message is pinned here instead.
+WEEK34_DISTINCT_AGG_REFUSED = [
+    ("SELECT COUNT(DISTINCT *) FROM laps",
+     "COUNT(DISTINCT *) is not supported"),
+    ("SELECT SUM(DISTINCT speed) FROM laps",
+     "DISTINCT is supported inside COUNT only"),
+    ("SELECT AVG(DISTINCT speed) FROM laps",
+     "DISTINCT is supported inside COUNT only"),
+    # MIN(DISTINCT x) is a legal SQL no-op. Refused rather than silently
+    # accepted, because accepting it invites the reader to believe SUM/AVG work.
+    ("SELECT MIN(DISTINCT speed) FROM laps",
+     "DISTINCT is supported inside COUNT only"),
+]
+
 WEEK30_REJECTED_QUERIES = [
     # position: WHERE and HAVING only. All three are refused by the fail-closed
     # allow_subqueries flag rather than by enumerating what is allowed
@@ -1253,7 +1297,8 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
   + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES \
   + WEEK27_KEY_ENCODING_QUERIES + WEEK29_OUTER_JOIN_QUERIES \
-  + WEEK30_ALIAS_REBIND_QUERIES + WEEK31_SUBQUERY_QUERIES
+  + WEEK30_ALIAS_REBIND_QUERIES + WEEK31_SUBQUERY_QUERIES \
+  + WEEK34_DISTINCT_AGG_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -1536,6 +1581,8 @@ def main():
         r_errors += re_
     for label, extra in modes:
         for suite, name in ((week33_binds, "Week 33 correlated subqueries refused"),
+                            (WEEK34_DISTINCT_AGG_REFUSED,
+                             "Week 34 DISTINCT aggregate refusals"),
                             (WEEK31_MATERIALIZATION_REFUSED,
                              "Week 31 materialization divergences from SQLite"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):

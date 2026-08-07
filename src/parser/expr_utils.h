@@ -32,7 +32,11 @@ inline std::string exprToString(const Expr* expr) {
     }
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         std::string arg = agg->is_star ? "*" : exprToString(agg->argument.get());
-        return agg->function_name + "(" + arg + ")";
+        // Week 34: DISTINCT is part of the OUTPUT COLUMN NAME, not decoration.
+        // aggregateOutputName is this function, and extractAggregates dedupes
+        // specs by that name, so omitting it collapses
+        // `SELECT COUNT(x), COUNT(DISTINCT x)` into one spec and one column.
+        return agg->function_name + "(" + (agg->distinct ? "DISTINCT " : "") + arg + ")";
     }
     if (auto* in = dynamic_cast<const InExpr*>(expr)) {
         std::string s = exprToString(in->operand.get()) + (in->negated ? " NOT IN (" : " IN (");
@@ -155,7 +159,11 @@ inline std::string exprKey(const Expr* expr) {
     }
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         std::string arg = agg->is_star ? "*" : exprKey(agg->argument.get());
-        return agg->function_name + "(" + arg + ")";
+        // Week 34: `distinct` is part of the IDENTITY, exactly as InExpr's
+        // `negated` is. Without it substituteInto would rewrite COUNT(DISTINCT x)
+        // as a reference to a COUNT(x) group key, and checkGroupedRefs would
+        // accept one for the other.
+        return agg->function_name + "(" + (agg->distinct ? "DISTINCT " : "") + arg + ")";
     }
     if (auto* in = dynamic_cast<const InExpr*>(expr)) {
         // `negated` and the value TYPES are part of the identity: x IN (1) and
@@ -354,6 +362,13 @@ inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
         a->function_name = agg->function_name;
         a->argument = cloneExpr(agg->argument.get());
         a->is_star = agg->is_star;
+        // Week 34. Part of the node's MEANING, so it survives a clone for the
+        // same reason Literal::null_type does (Week 31): BETWEEN clones its left
+        // operand before binding and the GROUP BY / ORDER BY alias substitution
+        // clones a bound select item, so a dropped flag is reachable — and it
+        // would make the clone disagree with the original about its own output
+        // column name.
+        a->distinct = agg->distinct;
         out = std::move(a);
     } else if (auto* in = dynamic_cast<const InExpr*>(expr)) {
         auto n = std::make_unique<InExpr>();

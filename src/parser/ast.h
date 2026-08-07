@@ -78,6 +78,22 @@ struct AggregateExpr : Expr {
     std::string function_name;    // "AVG", "COUNT", "SUM", "MIN", "MAX"
     std::unique_ptr<Expr> argument; // nullptr when is_star = true
     bool is_star;
+    // Week 34 — COUNT(DISTINCT x). LAST field, so positional brace-inits that
+    // predate it stay valid: the discipline AggregateSpec::argument,
+    // GroupByColumn::expr and JoinClause::type all follow.
+    //
+    // COUNT only. SUM/AVG(DISTINCT) are legal SQL and no TPC-H query in the
+    // documented dialect needs them; MIN/MAX(DISTINCT) are no-ops that would
+    // invite a reader to believe the others work. The parser refuses the other
+    // four by name — see the dialect table.
+    //
+    // !! IT MUST REACH exprToString(). aggregateOutputName IS exprToString, and
+    // extractAggregates DEDUPES SPECS BY THAT NAME, so rendering this node as
+    // COUNT(x) collapses `SELECT COUNT(x), COUNT(DISTINCT x)` into ONE spec and
+    // one output column that both select items then read. Five missing
+    // characters, a wrong answer in a single query, no error. cloneExpr and
+    // exprKey carry it for the same reason Literal::null_type is carried.
+    bool distinct = false;
 };
 
 // x IN (v1, v2, ...) / x NOT IN (...) over a constant value list.

@@ -474,6 +474,7 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
         AggregateSpec spec;
         spec.function = agg->function_name;
         spec.is_star = agg->is_star;
+        spec.distinct = agg->distinct;   // Week 34; also encoded in output_name
         spec.output_name = aggregateOutputName(agg);
         spec.hidden = hidden;
         if (!agg->is_star && agg->argument) {

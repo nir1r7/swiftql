@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 
 
@@ -16,6 +17,15 @@ namespace {
         double sum = 0.0;
         Value min_val;
         Value max_val;
+        // Week 34 — COUNT(DISTINCT x). Populated ONLY for a distinct spec, so
+        // every other aggregate keeps its O(1) state and pays one empty set.
+        // Keyed through appendGroupKeyField (key_encoding.h), NEVER
+        // Value::toString(): %.15g is lossy and collapsed 3245 distinct doubles
+        // into 2526 texts in Week 27, in all four modes, visible only to the
+        // SQLite oracle. Six serializers already share that contract; this is
+        // the seventh, and the NULL marker is unused here because SQL says
+        // COUNT(DISTINCT x) ignores NULLs and the caller skips them first.
+        std::unordered_set<std::string> distinct_keys;
     };
 
     // Shared with every other key serializer — see key_encoding.h for the two
@@ -273,6 +283,11 @@ void HashAggregateNode::open() {
                 // skip NULLs (except COUNT(*))
                 if (!val.isNull()) {
                     acc.non_null_count++;
+                    if (spec.distinct) {
+                        std::string dk;
+                        appendGroupKeyField(dk, val);
+                        acc.distinct_keys.insert(std::move(dk));
+                    }
                     if (spec.function == "SUM" || spec.function == "AVG") {
                         acc.sum += toDouble(val);
                     }
@@ -310,7 +325,12 @@ void HashAggregateNode::open() {
             const AggAccumulator& acc = group_accs[i];
 
             if (spec.function == "COUNT") {
-                int64_t n = spec.is_star ? acc.count : acc.non_null_count;
+                // COUNT(*) counts rows, COUNT(x) counts non-NULL values, and
+                // COUNT(DISTINCT x) counts distinct non-NULL values. All three
+                // are 0 over empty input, which a default accumulator gives.
+                int64_t n = spec.is_star  ? acc.count
+                          : spec.distinct ? static_cast<int64_t>(acc.distinct_keys.size())
+                                          : acc.non_null_count;
                 result_row.push_back(Value(n));
             } else if (spec.function == "SUM") {
                 result_row.push_back(acc.non_null_count > 0 ? Value(acc.sum) : Value::null());

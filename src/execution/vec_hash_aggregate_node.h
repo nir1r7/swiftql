@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class VecHashAggregateNode : public VecPlanNode {
@@ -31,6 +32,14 @@ class VecHashAggregateNode : public VecPlanNode {
                 double sum = 0.0;
                 Value min_val;
                 Value max_val;
+                // Week 34 — COUNT(DISTINCT x). Populated only for a distinct
+                // spec. Keyed through appendGroupKeyField (key_encoding.h) and
+                // never Value::toString(): %.15g is lossy and collapsed 3245
+                // distinct doubles into 2526 texts in Week 27, in all four
+                // modes. The Volcano HashAggregateNode holds the identical
+                // field and runs the identical rule — this feature is one of the
+                // few Week 34 ships on ALL FOUR modes, so the two must agree.
+                std::unordered_set<std::string> distinct_keys;
             };
             std::vector<SpecAccum> per_spec; // one entry per specs_ element
         };

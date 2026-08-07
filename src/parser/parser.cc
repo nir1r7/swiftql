@@ -594,6 +594,26 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
         // uppercase function name for consistency
         for (char& c : node->function_name) c = std::toupper(c);
 
+        // Week 34 — COUNT(DISTINCT x). DISTINCT is already a TokenType (SELECT
+        // DISTINCT), so nothing lexes differently. Refused for the other four
+        // functions BY NAME rather than silently accepted-and-ignored: an
+        // ignored DISTINCT is a wrong answer that looks like a supported query.
+        if (check(TokenType::DISTINCT)) {
+            consume();
+            if (node->function_name != "COUNT") {
+                throw ParseError("DISTINCT is supported inside COUNT only, not "
+                                 + node->function_name, func);
+            }
+            if (check(TokenType::STAR)) {
+                // COUNT(DISTINCT *) is not SQL: DISTINCT applies to a value
+                // list, and `*` is not an expression here (is_star is a flag on
+                // this node, not a Literal).
+                throw ParseError("COUNT(DISTINCT *) is not supported; "
+                                 "use COUNT(*) or COUNT(DISTINCT column)", func);
+            }
+            node->distinct = true;
+        }
+
         if (check(TokenType::STAR)) {
             consume();
             node->is_star = true;
