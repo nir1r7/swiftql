@@ -1,35 +1,19 @@
 # Phase 5 orchestrator state
-Current: week 34 CLOSING GATE (a34a90e642f7d93b7, launched 16:12 UTC), serial. Cleanup
-  changed HARNESS AND TESTS ONLY, no engine code — so a failure means a suite entry or unit
-  test is wrong, not an engine regression.
-  >> NEXT ACTION after a GREEN gate: mark week 34 fully closed, then dispatch week 35
-  IMPLEMENTATION to agent ace28f349cf48c3b7 (it wrote docs/week-35-plan.md, 8 tasks).
-  Cleanup round results worth keeping:
-  - The two-key oracle entry had TWO reasons it could not discriminate; the audit named one,
-    and the AUDIT'S OWN SUGGESTED FIX would still not have worked (driver_id functionally
-    determines team). Now driver_id AND season at 0.99: both keys 623, one 553, other 533,
-    SwiftQL == sqlite3. MUTATION-TESTED: dropping keys after the first makes the new entry fail
-    (553 vs 623) while the old one still passes.
-  - A SYSTEMATIC harness weakness: 40 entries across four Volcano suites pinned only the shared
-    tail "not supported on the Volcano path", so none could say which of four guards fired. Now
-    per-guard; all 131 entries across twelve suites reach 26 distinct guards with no cross-guard
-    needle. Two hidden facts surfaced: one WEEK34_DERIVED_TABLE_VOLCANO_REJECTED entry never
-    reaches the derived-table guard (it joins twice), and three scalar entries reach the IN guard.
-  OWED, in week 35's starting notes, deferred with reason and NOT judged unnecessary: per-guard
-  mutation coverage (only 1 of 26 guards was mutated) and per-entry query-SHAPE re-derivation,
-  which a message-level pass structurally cannot see. Audit target 4 is UNRUN in both rounds.
+Current: week 35, implementation dispatching ~16:26 UTC to agent ace28f349cf48c3b7
+  (it wrote docs/week-35-plan.md, 8 tasks). Week 34 is CLOSED — 3 gates (1 red), 2 audits,
+  1 cleanup; checkpoint met including Q17.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
-Last gate: GREEN (week 34 round 2) — build PASS, unit 800/800, sqlite 1270 checks across 64
-  suites, regression 318 all modes; staleness disproved and the measured surface fingerprinted
-  identical at start and end.
+Last gate: GREEN (week 34 round 3, closing) — build PASS, unit 800/800, sqlite 1270,
+  regression 318 all modes; binaries genuinely relinked, staleness disproved.
 Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
   2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
   and one stale-rejection pair, both fixed.
-NOTE ON MY OWN BEHAVIOUR: my state-file commits land mid-gate. Harmless (scratchpad only, and
-  the verifier fingerprints src/tests/python_tools to prove it), but prefer to journal before
-  launching a gate or after it reports.
+RULE FOR MYSELF: NEVER commit the state file while a gate is running. Two verifiers in a row
+  had to disclose a mid-run HEAD move and prove it was outside the measurement surface. It is
+  harmless (scratchpad only) but it costs them work and weakens the verdict's provenance.
+  Journal BEFORE launching a gate or AFTER it reports.
 Previous: GREEN (week 33 round 4, closing) — unit 786/786, sqlite 1076, regression 318 all
   modes; staleness disproved. Week 33 took 4 gates (one RED) and 2 audits.
 Week 33 verdict: CHECKPOINT PARTIALLY MET. EXISTS/NOT EXISTS decorrelation works (Q4, Q21);
