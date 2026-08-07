@@ -1,18 +1,20 @@
 # Phase 5 orchestrator state
-Current: week 34 cleanup (a91a1c6f7778b58f5, 15:53 UTC) running alongside week 35 teach
-  (ace28f349cf48c3b7). Different files; if a push is rejected, pull --rebase, never force.
-  Audit r2: 0 blockers, 1 medium, 2 low. Q17 verified vs SQLite across all 22 suite entries and
-  every aggregate kind — the week-33 handover is genuinely delivered.
-  MEDIUM is the class worth remembering: compare_against_sqlite.py:1042, the ONLY
-  two-correlation-key oracle entry, returns n=0 whether one key or both are used — it cannot
-  detect a lost join key. A query that passes regardless of whether the feature works.
-  OWED, not approved: per-entry discriminating-power re-derivation for the WEEK 26-32 rejection
-  suites (wiring checked, content not) — a sampled pass this round, remainder to week 35 notes.
-  Audit target 4 ("anything else risky") never ran as its own pass; recorded as unrun.
-!! GIT IDENTITY: env vars GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL override git config, so every
-  commit must be prefixed with the four overrides to be attributed to the bot. Verified working
-  (be6dbe2). ~300 existing commits carry the owner's identity; NOT rewriting — raised with the
-  user, awaiting their preference.
+Current: week 34 cleanup (a91a1c6f7778b58f5) still running. Week 35 TEACH IS DONE —
+  docs/week-35-plan.md committed, 8 tasks.
+  >> NEXT ACTION: when the week-34 cleanup reports, dispatch week 35 IMPLEMENTATION to agent
+  ace28f349cf48c3b7 (it wrote the plan). HELD deliberately: both rounds touch
+  python_tools/compare_against_sqlite.py, and two agents editing one file is how a fix gets
+  silently reverted. Do not start it early.
+  Week 35 plan highlights worth holding onto:
+  - Real hazards found before coding: CSVLoader::load eats line 1 unconditionally and splits on
+    ',' but .tbl has NO header and a TRAILING '|'; std::stod("1996-01-02") silently returns
+    1996.0 (a date parsed as a number, no error).
+  - An ABSOLUTE 1e-5 tolerance FAILS Q1 ON A CORRECT ANSWER (%.15g printing + summation order
+    ~= 0.03 absolute) — the comparison must be RELATIVE or it manufactures false failures.
+  - Mode-coverage honesty: the report never prints a bare "22/22". It prints answered-correctly
+    out of 22 SPLIT BY how many of the four modes each query matched, Volcano refusals on a
+    separate line and only when pinned by their expected message, and the two-mode/four-mode
+    census COMPUTED, not typed.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
