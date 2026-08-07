@@ -2014,11 +2014,11 @@ accounted for.
 
 ## Progress
 
-*(Fill in as the week proceeds. Task 1's sweep checklist lives here, and every
-task's outcome — including anything cut or re-declined — is recorded here rather
-than left to be inferred from the diff.)*
+*(Task 1's sweep checklist lives here, and every task's outcome — including
+anything cut or re-declined — is recorded here rather than left to be inferred
+from the diff. A successor agent resumes from this section.)*
 
-- [ ] Task 1 — refusal inventory and sweep checklist
+- [x] Task 1 — refusal inventory and sweep checklist (below)
 - [ ] Task 2 — `TableRef` (own commit, derived form still refused)
 - [ ] Task 3 — Binder: derived range-table entries
 - [ ] Task 4 — `LogicalPlanBuilder`: graft and normalize
@@ -2035,3 +2035,92 @@ a refused one, which is Week 33's own judgement), then Task 8's quantification.
 **Do not cut Tasks 1, 5 or 10.** They are what stop the week's removals from
 becoming next week's silent wrong answers, and they are the only tasks whose
 absence is invisible in a green suite.
+
+### Task 1 — the sweep checklist (built BEFORE any refusal was removed)
+
+Produced by the five greps in Task 1, run against the tree at commit `fe17f40`
+(Week 33's close), before a line of Week 34 code existed. Each entry is ticked in
+Task 10 with **what is now true**, never with "checked".
+
+**A. Forward promises coming due — `grep -rn "Week 34"`**
+
+- [ ] `src/parser/ast.h:155` — "FROM is Week 34". The week arrived.
+- [ ] `src/planner/join_enumeration.cc:77` — "from Week 34 on, a SCAN THAT IS NOT
+      A RANGE-TABLE ENTRY … `slot >= countRelations()` stops meaning 'unbound
+      key' and starts firing on legitimate plans." **Now live.** Task 5.
+- [ ] `src/planner/join_enumeration.h:67,71` — same prediction, second spelling.
+- [ ] `src/planner/subquery_materialization.cc:156` — "a SelectStatement DURING
+      planning — Week 34's derived tables are the candidate".
+- [ ] `src/planner/vectorized_plan_builder.cc:300` — "no STANDARD join is ever
+      built above a semi join … Week 34's derived tables are that week."
+      **Task 6 builds exactly that**, so this build-order fact dies.
+- [ ] `python_tools/compare_against_sqlite.py:702` — per-shape correlated
+      expectations "Week 34's to add when the shapes stop moving". Task 9.
+- [ ] `development.md:378` — "`FROM (subquery)` is Week 34".
+- [ ] `development.md:650` — "re-check every 'contained' row … Week 34's derived
+      tables". Task 5.
+- [ ] `development.md:778` — "**Week 34's derived tables break this containment
+      for real**". Must become a record of *how*, plus what replaced it.
+- [ ] `development.md:786` — `CardinalityEstimator` SEMI/ANTI row: "Week 34's
+      derived tables are what would have made it a wrong estimate."
+- [ ] `development.md:788` — `hasSlotOutsideRangeTable` row.
+
+**B. The Week 32 containment, in every spelling**
+
+- [ ] `src/planner/logical_plan.h:145-158` — the `LogicalJoin::semantics`
+      invariant block: "the whole containment for the two-range-table problem
+      this node introduces". Still true *for SEMI/ANTI*; no longer *whole*.
+- [ ] `src/planner/subquery_lowering.cc` — the schema-equality assertion and the
+      comment that calls it "what keeps the two domains from meeting".
+- [ ] `src/planner/subquery_decorrelation.cc:243-281` — the same claim, restated
+      at the `LogicalJoin` construction, plus the record of the deleted dead
+      assertion. Task 6 adds a STANDARD join beside it.
+- [ ] `development.md:753,781` — the "one plan, two range tables" section header
+      and its lead paragraph.
+
+**C. Refusals this week removes or narrows**
+
+- [ ] `Validator` — no `FROM (subquery)` refusal exists today (the shape is a
+      *parse* error), so the removal is at the grammar. Any comment saying "FROM
+      is not supported" is in class A.
+- [ ] `src/planner/subquery_decorrelation.h` conditions 1–4, and
+      `requireDecorrelatableBody`'s condition 3 in the `.cc` — "a body with an
+      aggregate cannot be decorrelated" stops being universally true in Task 6.
+      **Highest-risk stale precondition of the week.**
+- [ ] `src/planner/planner.cc` — the Volcano refusal block (IN, correlated).
+      Task 4 adds a third; the "what this costs" paragraph must be extended, not
+      duplicated.
+- [ ] `README.md` dialect table rows citing `FROM (subquery)` as Week 34: the
+      subquery-position row and the In-Scope subquery bullet.
+
+**D. Binder-slot readers — the `ColumnId` worklist**
+
+Not enumerated by hand: Task 5 lets the compiler produce it. The prose rows in
+`development.md`'s two tables plus the *Week 32 consumers* table are the audit
+trail to update, and every `localSlot("site")` string is the greppable index.
+
+- [ ] Every `development.md` slot-table row carries a Week 34 verdict **with a
+      reason** (level-aware / safe-by-domain / guarded).
+- [ ] New section: *Week 34 consumers (a range-table entry that is a plan)*.
+
+**E. Walkers that find "the relation" by descending to a `SCAN` — the live ones**
+
+These are not stale prose; they are silent defects the moment a derived relation
+exists, and every one of them feeds the cost model.
+
+- [ ] `leafScanTable` (`vectorized_plan_builder.cc:46`) — returns the **body's
+      base table** for a derived leaf; attributes its widths to the derived
+      relation's columns. Week 27's `rowWidth` fix is the precedent.
+- [ ] `isSingleRelation` (`vectorized_plan_builder.cc:57`) — returns `true` for a
+      non-joining derived body, so `collectSlotTables` stamps the wrong table at
+      a real slot.
+- [ ] `leafScanTableOf` (`join_enumeration.cc:35`) — same wrong name, feeding
+      `leafRowWidth` and therefore the DP's cost.
+- [ ] `countRelations` (`join_enumeration.cc:42`) — counts scans **inside** the
+      body, so `n` over-counts and `hasSlotOutsideRangeTable` becomes too
+      permissive. Fix: `n` is the range-table size, passed from the builder.
+- [ ] `predicate_pushdown.cc:227` (`scan_child->type != SCAN`) and `:373` — read
+      both; confirm a derived child is handled or provably not reached.
+- [ ] `cardinality_estimator.cc:310` and `vectorized_plan_builder.cc:251` — the
+      two `case LogicalNodeType::SCAN:` dispatches. A new enum value makes these
+      compile errors only if the switch has no `default:`.
