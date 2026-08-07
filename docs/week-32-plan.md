@@ -975,3 +975,99 @@ before assertions. A green build is not a passing week; the four-mode diff is.
   schema is its left child's. Week 34's derived tables break that containment for real, because a
   derived table's columns *are* in scope above it.
 
+
+---
+
+## Progress
+
+Status at the end of the first implementation run. Commits are split by pipeline
+layer and every one is pushed to `claude/phase5-week26-qomtkb`.
+
+### Done
+
+- **§1 — `LogicalJoin` gains SEMI/ANTI.** `JoinSemantics` enum in
+  `src/planner/logical_plan.h`, set after construction; `join_slot == -1` with the
+  contract stated on the field; `explain()` prints `LogicalSemiJoin` /
+  `LogicalAntiJoin` by node name, so every pre-existing plan string is unchanged.
+- **§2/§3 — the lowering pass.** New `src/planner/subquery_lowering.{h,cc}`,
+  called from `LogicalPlanBuilder::build` between the spine and the `WHERE`
+  filter. `materializeSubqueries` skips `Kind::IN` and keeps `has_subquery` set
+  while one survives. `EXISTS` / scalar routing is unchanged.
+  `splitConjuncts` moved from `predicate_pushdown.cc`'s anonymous namespace to
+  `parser/expr_utils.h` so both passes share one notion of "a conjunct".
+  **Refused, each with a stated message:** an `IN` under an `OR` (not a whole
+  top-level conjunct), an `IN` in `HAVING`, a computed operand, and a body
+  statement shared by two `SubqueryExpr` nodes.
+- **§4 — cardinality.** SEMI/ANTI rule at the stamp in
+  `CardinalityEstimator::estimateNode`'s JOIN case, never inside
+  `joinCardinality`. Asserts a semi/anti join carries no `on_residual`.
+  `JoinEnumeration` declines independently: `hasSlotOutsideRangeTable` already
+  fires on `join_slot == -1`, so Week 30's silent decline is now live — **this
+  contradicts Week 31's hand-forward note, which predicted Week 34.**
+- **§5 — physical planning.** `VectorizedPlanBuilder` forces the side
+  (`swapped=false`, spine probes, body builds), calls no `setCostDecision`.
+- **§6/§8 — vectorized execution.** `VecHashJoinNode` takes a trailing defaulted
+  `semantics` parameter, builds a hash **set** (`build_keys_`), emits each probe
+  row once, and carries `build_had_null_key_` out of the build phase so an ANTI
+  probe short-circuits to no output. Constructor throws on every illegal
+  combination. Explain prints `VecSemiHashJoin` / `VecAntiHashJoin`.
+- **§7 — Volcano.** Option (b), not the plan's recommended (a): `Planner::plan`
+  refuses an `IN` subquery by name (`"IN subqueries are lowered to a semi-join
+  and are not supported on the Volcano path; use --execution vectorized"`). The
+  cost is stated at the site — these queries are now diffed in two modes, not
+  four — and pinned in the harness's Volcano rejection suite.
+- **§9 — the 1024 cap is gone.** `MAX_MATERIALIZED_IN_VALUES` removed outright,
+  along with `distinctNonNull` and the whole `Kind::IN` materialization branch
+  (which now throws an internal message, deliberately, since it is unreachable).
+- **§10 (partial) — the oracle.** `python_tools/compare_against_sqlite.py` has
+  `WEEK32_SEMI_JOIN_VEC_ONLY` (diffed, two modes),
+  `WEEK32_SEMI_JOIN_VOLCANO_REJECTED` and `WEEK32_LOWERING_REFUSED` (four modes).
+  The cap query **moved** into the diffed suite. Duplicate build keys, a NULL on
+  the build side, a NULL on the probe side and an empty build side are all
+  covered.
+
+### Deferred, with the reason
+
+- **§6's selection-vector path.** The row path shipped: `output_buffer_` holds a
+  copy of each surviving probe row. Correct, but it forfeits late
+  materialization for an operator that is structurally a filter. **This is a
+  Week 37 starting note**, exactly as §6 allows — do not ship both paths.
+- **§7's option (a)**, semi/anti in Volcano's `HashJoinNode` for a
+  single-relation `FROM`. It is what restores the four-mode baseline for the
+  feature; the refusal is the honest interim, not the intended end state.
+
+### Not done — the next concrete steps, in order
+
+1. **C++ unit tests (§10's table).** None were added. Highest value first:
+   `tests/test_vectorized.cc` — SEMI/ANTI per-row semantics, the duplicate-build-key
+   case, empty build side, build-side NULL, probe-side NULL;
+   `tests/test_logical_plan.cc` — `output_schema == children[0]->output_schema`
+   and `join_slot == -1`; `tests/test_subquery.cc` — one join per top-level `IN`
+   conjunct, two conjuncts give two stacked joins, `EXISTS` still materializes,
+   and the four refusals; `tests/test_cardinality.cc` — semi + anti = left, the
+   clamp; `tests/test_join_enumeration.cc` — the decline fires and it is the
+   slot-outside-the-range-table one; `tests/test_vec_plan_builder.cc` — forced
+   side, illegal combinations throw.
+2. **Run the `verify` gate.** Build + C++ tests + `compare_against_sqlite.py` +
+   the regression harness in all modes. Not yet run against the new suites.
+3. **`README.md` dialect table.** The `MAX_MATERIALIZED_IN_VALUES` row must be
+   **removed** (the cap no longer exists) and four rows added: `IN` under an
+   `OR`, `IN` in `HAVING`, a computed `IN` operand, and `IN (subquery)` being
+   vectorized-only. Also add the Week 33 starting note.
+4. **`development.md` → *Relation slots and query levels*.** Add rows for the
+   consumers this week touched, each of which reads a slot on a plan that now
+   holds two range tables: the SEMI/ANTI branch of `CardinalityEstimator`
+   (reads `JoinKey::from_slot`, level 0 in the OUTER block), `lowerInSubqueries`
+   (reads `SubqueryExpr::operand`'s `relation_slot`, outer block), the
+   `VectorizedPlanBuilder` SEMI/ANTI lowering (`leftKeyIndices` against the probe
+   schema, `rightKeyIndices` against the BODY's), `JoinEnumeration`'s
+   now-live decline, and `PredicatePushdown`'s decline on `join_slot == -1`.
+   Also record that the `ColumnId { level, slot }` trigger now points at **Week
+   33**, in §0's words, and correct Week 31's hand-forward note about
+   `JoinEnumeration`'s decline going live in Week 34.
+5. **`--explain-analyze` invariant check (§4's verification).** Confirm the
+   semi-join's `est=` never exceeds its left child's `rows_out` across the suite.
+   Spot-checked on one query only. Note that the body plan's `StatsContext` is
+   emptied by its `LogicalProject`, so `have_r` is false and the estimate
+   currently falls back to `frac = 1.0` — conservative and invariant-preserving,
+   but the rule is not actually exercised on a real query yet.
