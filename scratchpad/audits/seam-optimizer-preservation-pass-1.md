@@ -19,7 +19,9 @@ Existing harnesses, run as-is:
 **Cross-week shapes the harnesses do not hold.** I built 15 queries that place a
 LATER week's construct inside a plan the optimizer (written earlier) reorders, and
 diffed optimized vs `--no-optimize` vs SQLite. Script:
-`/tmp/.../scratchpad/cross.py` (reproduced below in §5). All 15 preserve results:
+session scratchpad `cross.py` (the 15 queries are listed in the table below; each was run through
+`compare_against_sqlite.run_swiftql` in both modes and against the same SQLite fixture the
+harness loads). All 15 preserve results:
 
 | id | shape | rows | verdict |
 |---|---|---|---|
@@ -81,7 +83,7 @@ That -1 then propagates:
 2. `src/cli/main.cc:303`/`:329` print `est=` only when `estimated_rows >= 0.0`, so the
    defect is **invisible** — the column just goes blank and reads as "the estimator
    didn't run".
-3. `src/planner/join_enumeration.cc` `rels[r].rows = std::max(leaves[r]->estimated_rows, 0.0)`
+3. `src/planner/join_enumeration.cc:490` — `rels[r].rows = std::max(leaves[r]->estimated_rows, 0.0)` —
    turns the -1 into **0 rows** for the derived leaf. The DP therefore believes a
    derived relation is free to join first, whatever its true size.
 
