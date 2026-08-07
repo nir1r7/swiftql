@@ -347,6 +347,32 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
                             inferExprType(g.expr.get(), table_schema)});
             continue;
         }
+        // Week 30. A group key the Binder resolved to an ENCLOSING block carries
+        // a slot that indexes THAT block's range table, while `table_schema` is
+        // this one's. The lookup below would not miss — it would HIT the wrong
+        // relation whenever the column name is shared (`team`, `driver_id` are,
+        // on the shipped catalog), so `EXISTS (SELECT COUNT(*) FROM drivers d
+        // GROUP BY l.team)` would group by `drivers.team` instead of the
+        // correlated `laps.team`. Wrong groups, no error, in both engines, and
+        // neither the bare-name fallback nor the `idx < 0` throw below fires.
+        //
+        // THROW, not decline: grouping is not an optimization and a correlated
+        // key has no correct local fallback — its value comes from the outer
+        // row, which needs the correlation machinery Week 33 builds. Unreachable
+        // today (Validator refuses a subquery before either planner builds a
+        // schema), so this is the shape of a planner bug and says so, like the
+        // dead tripwire in join_enumeration.cc.
+        //
+        // This is the single guard for the whole GroupByColumn consumer set:
+        // HashAggregateNode, VecHashAggregateNode and CardinalityEstimator all
+        // read `g.relation_slot` too, and all three run on a plan whose schema
+        // was built here — if it throws, they never see the key.
+        if (g.query_level > 0) {
+            throw std::runtime_error(
+                "internal: a correlated GROUP BY key ('" + g.column_name
+                + "') reached plan construction; its slot names an enclosing "
+                  "query's range table");
+        }
         int idx = g.relation_slot >= 0
             ? table_schema.indexOf(g.column_name, g.relation_slot)
             : -1;

@@ -210,7 +210,16 @@ void Binder::bindExpr(Expr* expr, Scope& scope, const Catalog& catalog) {
     } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
         if (!agg->is_star) {
             bindExpr(agg->argument.get(), scope, catalog);
-            // after binding, so the argument carries its (level, slot)
+            // After binding, so the argument carries its (level, slot).
+            //
+            // Being in the Binder means this outranks every Validator rule,
+            // including the one forbidding an aggregate in WHERE — so an
+            // illegal-position aggregate with a CORRELATED STRING argument is
+            // diagnosed by type rather than by position, where the same
+            // aggregate with a local or numeric argument is diagnosed by
+            // position. Both are refused either way; only the wording differs,
+            // and moving the check back to Validator is what re-opens the
+            // wrong-relation lookup it exists to close.
             checkCorrelatedAggregateArg(agg, scope);
         }
     } else if (auto* in = dynamic_cast<InExpr*>(expr)) {
