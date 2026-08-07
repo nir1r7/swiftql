@@ -8,6 +8,8 @@
     "q14",
     "q15",
     "q16",
+    "q19",
+    "q2",
     "q20",
     "q22",
     "q3",
@@ -53,14 +55,6 @@
     "q18": [
       "EMPTY",
       "zero rows on both sides"
-    ],
-    "q19": [
-      "ALL_NULL",
-      "every value is NULL -- an aggregate over an empty input, so the comparison asserts nothing"
-    ],
-    "q2": [
-      "INERT",
-      "neutering it does not change the answer"
     ]
   }
 }

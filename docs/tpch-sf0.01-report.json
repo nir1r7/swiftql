@@ -198,14 +198,14 @@
       "zero rows on both sides"
     ],
     "q19": [
-      "ALL_NULL",
+      "DISCRIMINATING",
       "the second and third OR arms",
-      "every value is NULL -- an aggregate over an empty input, so the comparison asserts nothing"
+      "1 rows -> 1"
     ],
     "q2": [
-      "INERT",
+      "DISCRIMINATING",
       "the correlated MIN(ps_supplycost) scalar subquery",
-      "neutering it does not change the answer"
+      "7 rows -> 8"
     ],
     "q20": [
       "DISCRIMINATING",
@@ -277,6 +277,8 @@
       "q14",
       "q15",
       "q16",
+      "q19",
+      "q2",
       "q20",
       "q22",
       "q3",
@@ -322,14 +324,6 @@
       "q18": [
         "EMPTY",
         "zero rows on both sides"
-      ],
-      "q19": [
-        "ALL_NULL",
-        "every value is NULL -- an aggregate over an empty input, so the comparison asserts nothing"
-      ],
-      "q2": [
-        "INERT",
-        "neutering it does not change the answer"
       ]
     }
   },

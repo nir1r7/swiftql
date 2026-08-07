@@ -232,9 +232,12 @@ Fresh agent, no shared context with A. It has one job and no authority to fix an
 
 The `tpch:` line is why the block is five gates and not four. Phase 5's deliverable IS the
 TPC-H figure, and until Week 35 no gate looked at it — a verifier could report GREEN over a
-broken or regressed TPC-H run in perfect good faith. Baseline at the end of Week 35: **17/22
-meaningful (4 in all four modes, 13 vectorized-only), 3 vacuous, 2 unported**, recorded in
-`docs/tpch-baseline.json`. Week 36's job is to raise the 17; an improvement passes the gate
+broken or regressed TPC-H run in perfect good faith. Baseline at the end of Week 35: **19/22
+meaningful (5 in all four modes, 14 vectorized-only), 1 vacuous, 2 unported**, recorded in
+`docs/tpch-baseline.json`. It reads 19 rather than the 17 first published because the round-2
+audit showed q2's INERT and q19's ALL_NULL were artifacts of the SPEC's validation parameters
+against this generator's distributions, not properties of the queries; both were re-chosen from
+within the spec's own value domains and both now discriminate. Week 36's job is to raise the 19; an improvement passes the gate
 and says so, and the improving commit must carry the refreshed baseline with it.
 
 Then snapshot, yourself — it is two cheap commands:

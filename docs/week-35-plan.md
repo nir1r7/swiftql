@@ -46,7 +46,7 @@ written-down capability boundaries into an unqualified pass.
 | 4 — a narrowed `--queries` run prints a full-shaped PASS | **done** — the verdict token becomes `PARTIAL-PASS`/`PARTIAL-FAIL`/`PARTIAL-NO-BASELINE` and the line names how many of the 22 did not run |
 | 5 — README records Q17 as supported; the spec's Q17 text is refused | **done** — four README sites now say the *mechanism* and the constant-outside shape work while TPC-H Q17's own text is refused (verified on the binary, both forms) |
 | 6 — q18's "unreachable" holds only at threshold 300 | **done** — condition stated in both the plan and `VALIDATION_PARAMS`; the parameter is deliberately NOT re-chosen |
-| after 2+3 — regenerate `docs/tpch-baseline.json` from a full run | pending |
+| after 2+3 — regenerate `docs/tpch-baseline.json` from a full run | **done** — full 22x4 run, no regression against the old baseline, refreshed deliberately: **17/22 -> 19/22 meaningful** (5 in all four modes, 14 vectorized-only; 1 vacuous; 2 unported) |
 
 **All eight tasks are implemented.** The standing-rule sweep is done (README
 Limitations on NaN, commas-in-CSV and the stale 56/168 census; `normalize()`'s
@@ -77,8 +77,8 @@ note.
      iterating and the baseline comparison scopes itself to the queries that
      ran, but a verdict block may only report a full run — stated in the skill.
    - `run_tpch.py` gained one function, `gate_line()`, printed as the run's last
-     line: `GATE tpch: PASS (17/22 meaningful vs SQLite: 4 in all four modes, 13
-     vectorized-only; 3 vacuous; 2 unported)`. The verifier copies it rather
+     line: `GATE tpch: PASS (19/22 meaningful vs SQLite: 5 in all four modes, 14
+     vectorized-only; 1 vacuous; 2 unported)`. The verifier copies it rather
      than composing a count, so the mode split and the separate vacuous/unported
      tallies cannot be dropped on the way into the block. Three verdicts, always
      agreeing with the exit code: `PASS`, `FAIL`, and `NO-BASELINE` for a run
@@ -111,18 +111,23 @@ Language is deliberate throughout: **matches SQLite over the same files**, never
 "correct" and never "TPC-H compliant" — the published answer set does not apply
 to this data.
 
-- **matched SQLite: 20/22.** **Meaningfully answered: 17/22** — **4 in all four
-  modes** (q1, q6, q12, q14) and **13 in the two vectorized modes only** (q3,
-  q4, q5, q7, q8, q9, q10, q11, q13, q15, q16, q20, q22). 34 of the 88 query x
-  mode cells are Volcano refusals pinned by message.
-- **3 vacuous — matched while asserting nothing about the feature under test.**
-  Each was found by the mutation check (`tpch_queries.MUTATIONS`), not by
+- **matched SQLite: 20/22.** **Meaningfully answered: 19/22** — **5 in all four
+  modes** (q1, q6, q12, q14, q19) and **14 in the two vectorized modes only**
+  (q2, q3, q4, q5, q7, q8, q9, q10, q11, q13, q15, q16, q20, q22). 34 of the 88
+  query x mode cells are Volcano refusals pinned by message.
+- **1 vacuous — matched while asserting nothing about the feature under test.**
+  It was found by the mutation check (`tpch_queries.MUTATIONS`), not by
   inspection: neuter the one predicate carrying the query's characteristic
-  feature and require the answer to change.
-  - **q2 INERT** (2 modes) — deleting the correlated `MIN(ps_supplycost)`
-    subquery leaves the answer byte-identical. Only one part survives
-    `p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'` on this data,
-    so the subquery selects what was already selected.
+  feature and require the answer to change. **Two others were vacuous at the
+  SPEC's parameter and are not vacuous at a re-chosen one** — see the q2 and q19
+  entries below and `VALIDATION_PARAMS`'s header comment.
+  - **q2 — was INERT, now DISCRIMINATING** (2 modes). At the spec's `SIZE = 15`,
+    `p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'` narrows to
+    exactly one (part, supplier) pair on this data, so deleting the correlated
+    `MIN(ps_supplycost)` subquery left the answer byte-identical. That is a fault
+    in the PARAMETER: swept over all 50 sizes x 5 regions, **172 of 250
+    combinations discriminate**. `SIZE = 1` keeps TYPE and REGION at their spec
+    values and gives base 7 rows -> mutant 8.
   - **q18 EMPTY** (2 modes) — `SUM(l_quantity) > 300` is unreachable at SF=0.01
     **at the 300 threshold specifically**, which is the condition, not a
     property of the query. Measured: MAX per-order `SUM(l_quantity)` on this
@@ -134,8 +139,15 @@ to this data.
     the spec's own value domains — 300 is already the **lowest** of the spec's
     three Q18 quantities (300/312/315), so lowering it would invent a value the
     spec does not contain. The verdict therefore stands, deliberately.
-  - **q19 ALL_NULL** (4 modes) — no row matches any of the three OR arms, so the
-    comparison is a `SUM` over nothing against a `SUM` over nothing.
+  - **q19 — was ALL_NULL, now DISCRIMINATING** (4 modes). At the spec's
+    `Brand#12/23/34` no row matches any of the three OR arms, so the comparison
+    was a `SUM` over nothing against a `SUM` over nothing. Measured per arm over
+    all 25 generated brands: arm 1 (SM containers, `p_size` 1-5) is non-empty for
+    4 brands, arm 2 (MED, 1-10) for 8, arm 3 (LG, 1-15) for 14.
+    `Brand#14/34/23` is the smallest deviation that makes **all three** arms
+    contribute — only BRAND1 leaves the spec's value set, and BRAND2/BRAND3 are
+    the spec's own 23 and 34 with the arms swapped. Base revenue **56323.29**
+    against a mutant's **8473.82**, so arms 2 and 3 carry 85% of the answer.
 - **2 not answered**, both refused BY NAME for documented reasons rather than
   failing: q17 (`a correlated scalar subquery is decorrelated only when its
   select list is a single aggregate` — the standard text is
@@ -150,13 +162,20 @@ to this data.
   anti-join changes the answer, and SwiftQL still matches SQLite in both
   vectorized modes.
 
-**Why the figure moved, since three different numbers are in the history.** The
+**Why the figure moved, since four different numbers are in the history.** The
 harness first reported **20/22** and that count is still right for "matched the
 oracle"; the round-1 audit corrected it to **18** by naming q16 alongside q18;
-the mutation check finds **17**, because it can see two vacuity shapes the audit
+the mutation check found **17**, because it can see two vacuity shapes the audit
 could not spot by hand (q2's inert subquery and q19's all-NULL aggregate) while
-q16 is now genuinely discriminating. 17 is the honest figure and it is the one
-Week 36 should raise.
+q16 is now genuinely discriminating. The round-2 audit then showed that those
+two vacuity verdicts, though mechanically correct, were properties of the SPEC's
+validation PARAMETERS against this generator's distributions rather than of the
+queries — and writing a query off as vacuous understates the engine exactly as
+surely as counting a vacuous pass overstates it. Both parameters were re-chosen
+from within the spec's own value domains, and the figure is **19/22**, measured
+in a full 22x4 run and recorded as the refreshed `docs/tpch-baseline.json`. 19 is
+the honest figure and it is the one Week 36 should raise. Only q18 remains
+vacuous, and deliberately so.
 - **Q22's provenance, read off a plan rather than argued**:
   `{'LogicalDerived': 2, 'LogicalAntiJoin': 2}` — the correlated half IS Week
   33's `NOT EXISTS` anti-join, the `custsale` half IS Week 34's derived table,
