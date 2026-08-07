@@ -1157,3 +1157,114 @@ TEST(VecPlanBuilder, OuterJoinKeepsAHintOverAPreservedRelationOtherThanZero) {
     EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos)
         << "slot 1 is preserved by this outer join: " << scan->explain();
 }
+
+// ===== Week 32: semi-join / anti-join lowering =====
+
+// loadColumnar walks stmt.joins, which an IN body is not: its scan lives in a
+// nested statement, not in the outer FROM/JOIN spine. Loading it explicitly is
+// the whole shape of the week in one helper — one plan, two range tables.
+static std::unique_ptr<VecPlanNode> buildVecWithBodyTable(const std::string& sql,
+                                                          const std::string& body_table,
+                                                          const Catalog& cat) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    if (!tables.count(body_table)) {
+        const auto& bm = cat.getTable(body_table);
+        tables.emplace(body_table,
+                       CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema));
+    }
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    logical = PredicatePushdown::apply(std::move(logical), cat);
+    CardinalityEstimator::estimate(*logical, cat);
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+}
+
+// Does this subtree scan `table`? The name is not on the node handed to the
+// join — a body plan carries its own VecProject on top.
+static bool scansTable(const VecPlanNode* n, const std::string& table) {
+    if (!n) return false;
+    if (n->explain().rfind("VecScan [" + table, 0) == 0) return true;
+    for (const VecPlanNode* c : n->children()) {
+        if (scansTable(c, table)) return true;
+    }
+    return false;
+}
+
+static const VecPlanNode* findSemiJoin(const VecPlanNode* n) {
+    if (!n) return nullptr;
+    const std::string e = n->explain();
+    if (e.rfind("VecSemiHashJoin", 0) == 0 || e.rfind("VecAntiHashJoin", 0) == 0) return n;
+    for (const VecPlanNode* c : n->children()) {
+        if (const VecPlanNode* found = findSemiJoin(c)) return found;
+    }
+    return nullptr;
+}
+
+// The side is FORCED, not costed. A hash semi-join emits PROBE-side rows, so
+// the outer spine must be the probe input and the body the build input — the
+// one place Week 22's cost-based build-side decision does not apply, exactly as
+// with Week 29's left_outer. Getting it backwards does not throw at plan time,
+// it returns the body's rows, so the side is asserted by which table is where.
+TEST(VecPlanBuilder, SemiJoinForcesTheBodyOntoTheBuildSide) {
+    Catalog cat(CATALOG);
+    // drivers is far smaller than laps, so a COST-based choice would put drivers
+    // on the build side too and the test would pass for the wrong reason. The
+    // reverse direction is what pins it: a big body, a small spine.
+    auto plan = buildVecWithBodyTable(
+        "SELECT d.driver_id FROM drivers d WHERE d.driver_id IN (SELECT driver_id FROM laps)",
+        "laps", cat);
+    const VecPlanNode* join = findSemiJoin(plan.get());
+    ASSERT_NE(join, nullptr) << plan->explain();
+    auto kids = join->children();
+    ASSERT_EQ(kids.size(), 2u);
+    // The body arrives wrapped in its own VecProject, so the table name is one
+    // level down on that side — which is itself the point: children[1] is a
+    // whole plan subtree with its own range table, not a scan the outer FROM
+    // knows about.
+    EXPECT_TRUE(scansTable(kids[0], "drivers")) << kids[0]->explain();  // probe: the spine
+    EXPECT_TRUE(scansTable(kids[1], "laps"))    << kids[1]->explain();  // build: the body
+    EXPECT_FALSE(scansTable(kids[0], "laps"));
+    // ...and the output schema is the PROBE schema, unmerged — the containment
+    // that keeps the body's slot numbering out of the outer plan.
+    EXPECT_EQ(join->outputSchema().size(), kids[0]->outputSchema().size());
+}
+
+// No cost annotation. Estimates did not drive this choice, so printing one would
+// make --explain claim an optimizer decision that never happened — the same
+// discipline that keeps `order=` off a tree enumeration declined.
+TEST(VecPlanBuilder, SemiJoinPrintsNoCostDecision) {
+    Catalog cat(CATALOG);
+    for (const char* op : {"IN", "NOT IN"}) {
+        auto plan = buildVecWithBodyTable(
+            std::string("SELECT l.lap_id FROM laps l WHERE l.driver_id ") + op +
+            " (SELECT driver_id FROM drivers)", "drivers", cat);
+        const VecPlanNode* join = findSemiJoin(plan.get());
+        ASSERT_NE(join, nullptr) << plan->explain();
+        EXPECT_EQ(join->explain().find("cost="), std::string::npos) << join->explain();
+        EXPECT_EQ(join->explain().find("build="), std::string::npos) << join->explain();
+    }
+    // and the kind is named rather than left as a generic hash join
+    auto anti = buildVecWithBodyTable(
+        "SELECT l.lap_id FROM laps l WHERE l.driver_id NOT IN (SELECT driver_id FROM drivers)",
+        "drivers", cat);
+    EXPECT_EQ(findSemiJoin(anti.get())->explain().rfind("VecAntiHashJoin", 0), 0u);
+}
+
+// Two top-level IN conjuncts give two stacked semi-joins, each with its own
+// body on its own build side. Nothing is cached and nothing is shared: two
+// conjuncts are two separate membership tests, which is why Week 31's
+// statement-address cache is deliberately not ported to this path.
+TEST(VecPlanBuilder, TwoInConjunctsLowerToTwoStackedSemiJoins) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecWithBodyTable(
+        "SELECT l.lap_id FROM laps l WHERE l.driver_id IN (SELECT driver_id FROM drivers) "
+        "AND l.lap_id IN (SELECT lap_id FROM laps)", "drivers", cat);
+    const VecPlanNode* outer = findSemiJoin(plan.get());
+    ASSERT_NE(outer, nullptr) << plan->explain();
+    const VecPlanNode* inner = findSemiJoin(outer->children()[0]);
+    ASSERT_NE(inner, nullptr) << outer->children()[0]->explain();
+    // both keep the probe schema, so stacking them changes no column
+    EXPECT_EQ(outer->outputSchema().size(), inner->outputSchema().size());
+}
