@@ -1155,7 +1155,12 @@ removed or weakened.
       the hand-off below.
 - [!] **Task 4 (correlated scalar / Q17): BLOCKED, with the reason below.** Not
       a deferral of convenience — the blocker is structural and named.
-- [ ] Tasks 6, 7, 8.
+- [~] Task 7: item (1) pinned — `refuseUnloweredIn`'s call sites now have a
+      rejection-suite test (`WEEK33_NESTED_TRIPWIRE_REFUSED`) for an `IN` nested
+      inside an `IN` body's `HAVING`, which round 4 left as a read rather than a
+      test. Items (2) Volcano `HashJoinNode` refusal totality and (3)
+      `setCostDecision`'s `rowWidth` remain.
+- [ ] Tasks 6, 8.
 
 ### Task 4 — why the Q17 shape does not execute this week
 

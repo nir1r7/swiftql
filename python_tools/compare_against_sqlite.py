@@ -604,6 +604,24 @@ WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
 # the two Volcano modes via WEEK32_LOWERING_REFUSED_VOLCANO below, against the
 # message that path really emits. Each query is still pinned in all four modes —
 # each against the refusal that mode actually owns.
+# Week 33, Task 7(1). Audit round 4 left refuseUnloweredIn's call sites in
+# LogicalPlanBuilder::build as an explicit HUNCH: it never confirmed the tripwire
+# runs on EVERY entry to build() rather than once at the top, which decides
+# whether an IN nested inside an IN body's HAVING gets its own diagnostic or dies
+# at dispatch site 12 with an internal-defect message. build() recurses (the
+# lowerings plan the body through it), so the claim is directly checkable — and a
+# read is not a test. This is the test.
+WEEK33_NESTED_TRIPWIRE_REFUSED = [
+    ("SELECT lap_id FROM laps WHERE driver_id IN "
+     "(SELECT driver_id FROM laps GROUP BY driver_id "
+     " HAVING COUNT(*) > (SELECT 1 WHERE 1 = 1))",
+     "IN subquery"),
+    ("SELECT lap_id FROM laps WHERE driver_id IN "
+     "(SELECT l.driver_id FROM laps l GROUP BY l.driver_id "
+     " HAVING MAX(l.speed) > 0 AND l.driver_id IN (SELECT driver_id FROM drivers))",
+     "HAVING"),
+]
+
 WEEK32_LOWERING_REFUSED = [
     # A COMPUTED OPERAND. The grammar allows `additive [NOT] IN (select_stmt)`,
     # so this parses — but JoinKey holds column NAMES, and there is no
@@ -1418,6 +1436,17 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
+
+    # Week 33, Task 7(1) — the nested-tripwire hunch, pinned. Vectorized only:
+    # the Volcano path refuses an IN subquery before reaching the tripwire at
+    # all, so running it there would assert the wrong refusal.
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK33_NESTED_TRIPWIRE_REFUSED,
+            f"Week 33 nested IN tripwire — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
 
     # Week 33 — decorrelated EXISTS / NOT EXISTS. Same split, same reason as
     # Week 32's: the capability difference is real, so BOTH halves are asserted.
