@@ -35,7 +35,29 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
 
     for (auto& conjunct : conjuncts) {
         auto* sq = dynamic_cast<SubqueryExpr*>(conjunct.get());
-        if (!sq || sq->kind != SubqueryExpr::Kind::IN) {
+        // A CORRELATED IN is NOT this pass's business, and the ordering here is
+        // load-bearing: refuseUnloweredCorrelated runs on what is LEFT in
+        // `conjuncts` (logical_plan.cc), so a node this loop consumes is a node
+        // the tripwire never sees. Consuming one lowered it to a semi-join whose
+        // ONLY key was the IN operand -- the body's correlated equality was
+        // simply planned inside the body, where the outer ref fell back to
+        // bare-name resolution against the BODY's own schema and
+        // `l.team = d.team` became the tautology `laps.team = laps.team`. The
+        // predicate was silently discarded and the semi-join degenerated to
+        // "does the body have any row at all": 20 rows where SQLite says 6, and
+        // 0 where it says 14.
+        //
+        // This is the third instance of one shape -- code trusting the Validator
+        // refusal Week 33 deleted -- so the routing decision is made HERE, off
+        // the Binder's own flag, rather than inherited from a precondition
+        // stated in another file. See the header, whose precondition bullet was
+        // corrected in the same commit.
+        //
+        // A correlated IN IS lowerable in principle (a second join key, from the
+        // body's correlated equality, exactly as lowerExistsSubqueries builds
+        // one) but that is a feature and not this week's; it is refused by name
+        // downstream instead of being half-supported.
+        if (!sq || sq->kind != SubqueryExpr::Kind::IN || sq->correlated) {
             kept.push_back(std::move(conjunct));
             continue;
         }

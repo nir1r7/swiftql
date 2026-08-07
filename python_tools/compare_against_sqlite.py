@@ -804,13 +804,37 @@ WEEK33_DECORRELATED_VOLCANO_REJECTED = [
 # asserting the correlation wording there would be asserting a message that path
 # has no business producing. Same split, and the same reason, as
 # WEEK32_LOWERING_REFUSED / WEEK32_LOWERING_REFUSED_VOLCANO.
-WEEK33_CORRELATED_NESTED_IN_BODY = (
+#
+# Round 2 R2-C1 joins it, for the same mode reason: a DIRECTLY correlated IN is
+# refused on the vec path by decorrelation ("a correlated IN / NOT IN is not
+# lowered") and on Volcano by the IN capability boundary, which is hit first.
+# Before the fix, lowerInSubqueries consumed the node THIRTEEN LINES before
+# refuseUnloweredCorrelated could see it and lowered it to a ONE-KEY semi-join,
+# discarding the correlation: `l.team = d.team` was planned inside the body,
+# where the outer ref fell back to bare name and became the tautology
+# `laps.team = laps.team`. Measured on the committed data: SwiftQL 20 where
+# SQLite says 6, and 0 where SQLite says 14. This file held no directly
+# correlated IN at all, which is exactly why every mode passed.
+WEEK33_CORRELATED_IN_SHAPES = [
+    # nested two deep, the inner one correlated to the MIDDLE block (Q20)
     "SELECT name FROM drivers d WHERE d.driver_id IN "
     "(SELECT l.driver_id FROM laps l WHERE l.speed > "
-    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))")
-WEEK33_CORRELATED_NESTED_VEC = [(WEEK33_CORRELATED_NESTED_IN_BODY, "correlated subquer")]
+    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
+    # R2-C1: SwiftQL 20, SQLite 6
+    "SELECT COUNT(*) FROM drivers d WHERE d.driver_id IN "
+    "(SELECT l.lap_id FROM laps l WHERE l.team = d.team)",
+    # R2-C1, negated: SwiftQL 0, SQLite 14
+    "SELECT COUNT(*) FROM drivers d WHERE d.driver_id NOT IN "
+    "(SELECT l.lap_id FROM laps l WHERE l.team = d.team)",
+    # ...and the shape where the two engines happened to AGREE (0 = 0) while the
+    # body was still a tautology, so a matching row count was never evidence
+    "SELECT COUNT(*) FROM drivers d WHERE d.age IN "
+    "(SELECT l.season FROM laps l WHERE l.driver_id = d.driver_id)",
+]
+WEEK33_CORRELATED_NESTED_VEC = [
+    (q, "correlated subquer") for q in WEEK33_CORRELATED_IN_SHAPES]
 WEEK33_CORRELATED_NESTED_VOLCANO = [
-    (WEEK33_CORRELATED_NESTED_IN_BODY, "not supported on the Volcano path")]
+    (q, "not supported on the Volcano path") for q in WEEK33_CORRELATED_IN_SHAPES]
 
 WEEK33_CORRELATED_BINDS = [
     # scalar, correlated (Q17), composed with arithmetic

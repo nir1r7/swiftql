@@ -823,8 +823,17 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // Anything left holding an IN node is a shape lowering cannot express —
         // an IN under an OR, most of all. Refuse by name here rather than let
         // site 12 report it as a materialization defect.
-        refuseUnloweredIn(stmt.where.get(), "a non-top-level position");
+        //
+        // CORRELATION IS TESTED FIRST, and the order is a diagnostic decision,
+        // not a stylistic one. A correlated IN is left in `conjuncts` on
+        // purpose (subquery_lowering.cc declines it), so it IS a whole top-level
+        // conjunct — refuseUnloweredIn would report "not a whole top-level WHERE
+        // conjunct" about a query that is exactly that, naming the wrong cause
+        // for the right refusal. refuseUnloweredCorrelated declines to fire when
+        // nothing is correlated, so an ordinary IN under an OR still reaches the
+        // message that owns it.
         refuseUnloweredCorrelated(stmt.where.get(), "a non-top-level position");
+        refuseUnloweredIn(stmt.where.get(), "a non-top-level position");
     }
 
     // filter (WHERE)
@@ -858,8 +867,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // solves the problem. Stated in the README dialect table and pinned in
         // the rejection suite, because the diffed oracle cannot hold a query
         // that errors.
-        refuseUnloweredIn(stmt.having.get(), "HAVING");
+        // Same order, same reason as the WHERE site above.
         refuseUnloweredCorrelated(stmt.having.get(), "HAVING");
+        refuseUnloweredIn(stmt.having.get(), "HAVING");
         inferExprType(stmt.having.get(), node->output_schema);
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.having));
     }

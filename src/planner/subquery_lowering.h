@@ -22,13 +22,29 @@
 // inside LogicalPlanBuilder, after the FROM/JOIN spine exists and before the
 // WHERE LogicalFilter is constructed.
 //
-// PRECONDITIONS, all established by Validator::validate, which both planner
-// entry points run FIRST — the same trust-don't-recheck stance
-// materializeSubqueries takes, and for the same reason: re-checking here would
-// put the message in a layer that does not own it.
-//   - no correlated subquery anywhere (refused in Week 33's name), so every
-//     ColumnRef in a body is query_level 0 against the BODY's range table;
+// PRECONDITIONS. One is established by Validator::validate, which both planner
+// entry points run FIRST — the trust-don't-recheck stance materializeSubqueries
+// takes, and for the same reason: re-checking here would put the message in a
+// layer that does not own it.
 //   - an IN body has exactly one output column.
+//
+// !! THE SECOND PRECONDITION THIS HEADER USED TO STATE IS GONE, and it is worth
+// recording why rather than quietly deleting the line. It read "no correlated
+// subquery anywhere (refused in Week 33's name), so every ColumnRef in a body is
+// query_level 0 against the BODY's range table". Week 33 DELETED that Validator
+// refusal. The sentence outlived it in three files, and in two of them the code
+// went on behaving as though it held: materializeSubqueries ran correlated
+// bodies for a value (7c46bdf), and lowerInSubqueries lowered a correlated IN to
+// a one-key semi-join, discarding the correlation (round 2 R2-C1). Both returned
+// wrong rows with no error.
+//
+// So this pass no longer INHERITS the property; it ENFORCES its own share of it.
+// lowerInSubqueries skips any node whose Binder-set `correlated` flag is true,
+// which leaves it in `conjuncts` for refuseUnloweredCorrelated to refuse by name
+// (logical_plan.cc). Inside a body reached from here, every ColumnRef is
+// therefore query_level 0 against that body's range table — the same guarantee
+// as before, now held by a check in this file instead of by a refusal in
+// another one.
 //
 // WHAT IS REFUSED, and why refusing beats falling back. Since
 // materializeSubqueries no longer consumes a Kind::IN node at all, every one of

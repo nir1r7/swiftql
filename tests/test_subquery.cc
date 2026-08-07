@@ -802,3 +802,48 @@ TEST(ExistsDecorrelation, AJoinBodyIsProjectedToItsKeyBeforeTheMergedSchemaCanSh
         << "`team` lives in BOTH body relations; a merged schema here is the bug";
     EXPECT_EQ(semi->children[1]->output_schema.column(0).name, "team");
 }
+
+// ===== Week 33 round 2: a correlated IN must not be lowered as if it were not =====
+
+// R2-C1. lowerInSubqueries ran on the WHERE conjuncts THIRTEEN LINES BEFORE
+// refuseUnloweredCorrelated, so it consumed a correlated IN the tripwire never
+// saw. The semi-join it built carried ONE key -- the IN operand -- and the
+// body's correlated equality was planned inside the body, where the outer ref
+// fell back to bare name: `l.team = d.team` became `laps.team = laps.team`. The
+// correlation was silently discarded and the semi-join degenerated to "does the
+// body have any row at all": 20 rows where SQLite says 6.
+//
+// The assertion is that NO join is built -- a plan here IS the bug -- and that
+// the refusal names the IN, not a position.
+TEST(InLowering, ACorrelatedInIsRefusedRatherThanLoweredWithoutItsCorrelation) {
+    Catalog cat(CATALOG);
+    for (const char* sql : {"SELECT COUNT(*) FROM drivers d WHERE d.driver_id IN "
+                            "(SELECT l.lap_id FROM laps l WHERE l.team = d.team)",
+                            "SELECT COUNT(*) FROM drivers d WHERE d.driver_id NOT IN "
+                            "(SELECT l.lap_id FROM laps l WHERE l.team = d.team)"}) {
+        try {
+            auto plan = planLowered(sql, cat);
+            ADD_FAILURE() << "a plan was built for " << sql << "; before the fix it "
+                          << "was a one-key semi-join that answered 20 where SQLite "
+                          << "says 6 (and 0 where SQLite says 14)"
+                          << (findJoin(plan.get()) ? " [and it contains a join]" : "");
+        } catch (const std::runtime_error& e) {
+            const std::string what = e.what();
+            EXPECT_NE(what.find("correlated IN / NOT IN is not lowered"), std::string::npos)
+                << what;
+            EXPECT_EQ(what.find("whole top-level WHERE conjunct"), std::string::npos)
+                << "position is not the reason and must not be named as it: " << what;
+        }
+    }
+}
+
+// The control, and it is what makes the fix a routing change rather than a
+// blanket refusal: an UNCORRELATED IN is still lowered to a semi-join.
+TEST(InLowering, AnUncorrelatedInIsStillLoweredAfterTheCorrelatedOneIsDeclined) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT lap_id FROM laps WHERE driver_id IN "
+                            "(SELECT driver_id FROM drivers)", cat);
+    const LogicalJoin* j = findJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    EXPECT_EQ(j->semantics, JoinSemantics::SEMI);
+}

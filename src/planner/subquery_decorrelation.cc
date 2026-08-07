@@ -257,11 +257,28 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
 
 void refuseUnloweredCorrelated(const Expr* expr, const char* clause) {
     if (!expr) return;
-    bool found = false;
+    // The KIND is kept, not just the fact, because the two reasons a correlated
+    // node survives to here are different and a message that cannot tell them
+    // apart names the wrong cause. A correlated EXISTS reaches this only from a
+    // position lowering does not read (under an OR, in HAVING); a correlated IN
+    // reaches it from a perfectly ordinary top-level conjunct, because
+    // lowerInSubqueries deliberately declines it.
+    const SubqueryExpr* found = nullptr;
     forEachSubqueryConst(expr, [&](const SubqueryExpr& sq) {
-        if (sq.correlated) found = true;
+        if (sq.correlated && !found) found = &sq;
     });
     if (!found) return;
+    if (found->kind == SubqueryExpr::Kind::IN) {
+        // No clause suffix: POSITION is not the reason. A correlated IN is
+        // declined wherever it appears, including as the whole WHERE, so naming
+        // a position here would be the same wrong-cause diagnostic the call
+        // order above exists to avoid.
+        (void)clause;
+        throw std::runtime_error(
+            "correlated subquery: a correlated IN / NOT IN is not lowered — "
+            "decorrelation covers EXISTS / NOT EXISTS only, and an IN needs a "
+            "SECOND join key built from the body's correlated equality");
+    }
     throw std::runtime_error(
         std::string("correlated subquery: supported only as a whole top-level "
                     "WHERE conjunct (found one in ") + clause + ")");
