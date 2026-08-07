@@ -1,25 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 36, round 1, step 2 (implement) — agent a8e4a55b9a68faae8, dispatched 21:20 UTC.
-  8-task plan at docs/week-36-plan.md. LAST WEEK before the five-way seam audit.
-  !! THE PLAN CORRECTED AN EXPECTATION I PASSED DOWN. I said Volcano semi/anti parity "would
-  move many queries from two modes to four". Measured breakdown: the 34 Volcano cells are
-  14 multi-way + 12 derived-table + 8 semi/anti, and only q4's 2 are reachable without a plan
-  shape Planner::plan cannot express. So mode-coverage gain is ~0 and the target is honest
-  about its shape.
-  TARGET: 20/22 meaningful committed (Q17, verified both ways and DISCRIMINATING), 21/22 if
-  Q21's residual semi/anti lands — ALL HEADLINE COUNT, ZERO MODE COVERAGE.
-  Four things held to in the brief:
-  1. The refusal sweep rides IN THE SAME CHANGE as the constant-wrapper lift, not after — that
-     lift is the exact shape that produced week 33's three silent wrong answers, two of them
-     living in header comments. "Checked, still true" cases must be reported too; a sweep that
-     lists only hits is not evidence of thoroughness.
-  2. THE NUMBER MUST NOT BE GAMED. q18 stays vacuous. If the figure starts rising by weakening
-     what a query tests rather than by making the engine do more, stop. An honest 20 beats a
-     flattering 21.
-  3. Q21 decided IN THE OPEN — lands, or a precise statement of what it needs and why that is
-     after this week. No ambiguity: week 37 is the user's.
-  4. Re-baseline DELIBERATELY from a full run, per-query deltas in the commit. The gate fails
-     on regression, so drift can never be silent and an improvement is recorded as such.
+Current: week 36 — implementation is COMPLETE and pushed through d57d740, and the agent
+  COMMITTED "close week 36 ... 20/22" AND REFRESHED docs/tpch-baseline.json ITSELF.
+  !! WEEK 36 IS NOT CLOSED. There is NO week-36 gate log and NO week-36 audit. The implementer
+  declared its own work done and moved the baseline the gate compares against — the exact
+  failure this cycle exists to prevent. Not the agent's fault: a container restart broke my
+  loop and it was never told a verifier would follow. Do not treat 20/22 as established until
+  a verifier has measured it.
+  Gate + audit launching 22:47 UTC. The audit's first job is whether the figure rose HONESTLY:
+  the lift of `found[0] == select_list[0]`, the refusal sweep that lift obliges, and whether
+  the re-baseline is justified by a run rather than by assertion.
+  Week 36 shipped, per its own commits: the Q17 constant-wrapper lift (TPC-H's own Q17 text
+  now runs), q21 DECLINED IN THE OPEN with its blocker recorded, the NaN oracle fix (a NaN
+  compared EQUAL to anything), the random_diff projection fix (it named the join key, so it
+  could not see a wrong relation), scale/memory limits, the STRING-year contract, and the
+  correctness report.
+  AFTER week 36 closes: the FIVE-WAY SEAM AUDIT (join chain 26-29, subquery chain 30-34,
+  engine divergence, optimizer preservation, storage), then stop. Week 37 is the user's.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
