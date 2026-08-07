@@ -54,8 +54,27 @@ measurement that contradicts the assumption.**
 
 ---
 
-*(Sections below are appended as each task is worked. This file is written
-incrementally on purpose.)*
+### Prerequisite knowledge, flagged rather than assumed
+
+Read these **before** Task 1, in this order. Each is load-bearing for a decision
+below, and none of the tasks re-derives it:
+
+- `src/planner/subquery_decorrelation.h` — the whole file. Its Week 33 header
+  states the four conditions for the `EXISTS` rewrite; its Week 34 header states
+  the three things that make the scalar rewrite harder, including the zero-row
+  rule and why `COUNT` is the exception. Tasks 1 and 3 change one condition each.
+- `src/planner/logical_plan.h` around `LogicalJoin` — `JoinSemantics`,
+  `join_slot`, `on_residual`, and the invariant that a `SEMI`/`ANTI` join's
+  `output_schema` **is** its left child's. Task 3 lives inside that invariant.
+- `src/planner/planner.cc`'s first 110 lines — the four Volcano capability
+  refusals, in order. Task 4's entire argument is which of them fires first.
+- `development.md → Relation slots and query levels`, and `→ Extending the
+  expression language` (the 17-site dispatch checklist). Task 1 adds a walker
+  that deliberately does **not** join that list; Task 2 says why.
+- The `verify`, `invariants`, `operator-correctness` and `vectorized-audit`
+  skills. `verify` carries the five-step gate and the sentence about why the
+  claim is "matches SQLite"; `operator-correctness` carries the NULL tables
+  Task 3 must hand-simulate against.
 
 ## Task 1 — Lift the constant-wrapper restriction so TPC-H's own Q17 text runs
 
