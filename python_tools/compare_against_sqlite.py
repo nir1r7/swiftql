@@ -612,9 +612,14 @@ WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
 # lowerings plan the body through it), so the claim is directly checkable — and a
 # read is not a test. This is the test.
 WEEK33_NESTED_TRIPWIRE_REFUSED = [
+    # This entry used to write `(SELECT 1 WHERE 1 = 1)`. SwiftQL has no FROM-less
+    # SELECT, so it died at PARSE and never reached the tripwire it was written
+    # to test — it asserted nothing for two rounds. Rewritten to the same claim
+    # in syntax the engine has: an IN nested in the IN BODY's HAVING, whose
+    # operand is an aggregate rather than a column (the other spelling below).
     ("SELECT lap_id FROM laps WHERE driver_id IN "
      "(SELECT driver_id FROM laps GROUP BY driver_id "
-     " HAVING COUNT(*) > (SELECT 1 WHERE 1 = 1))",
+     " HAVING COUNT(*) IN (SELECT age FROM drivers))",
      "IN subquery"),
     ("SELECT lap_id FROM laps WHERE driver_id IN "
      "(SELECT l.driver_id FROM laps l GROUP BY l.driver_id "
@@ -768,17 +773,27 @@ WEEK33_DECORRELATED_VOLCANO_REJECTED = [
     for query in WEEK33_DECORRELATED_VEC_ONLY
 ]
 
+# Nested two deep, the inner one correlated to the MIDDLE block (Q20). The TOP
+# node is uncorrelated, so this is the query that proves the statement flag
+# propagates outward. It is OUT of WEEK33_CORRELATED_BINDS because it is the one
+# entry whose refusal is NOT the same on all four modes: the two Volcano modes
+# refuse it for the OUTER IN — a genuinely different and genuinely correct
+# capability boundary, hit before correlation can be diagnosed at all — and
+# asserting the correlation wording there would be asserting a message that path
+# has no business producing. Same split, and the same reason, as
+# WEEK32_LOWERING_REFUSED / WEEK32_LOWERING_REFUSED_VOLCANO.
+WEEK33_CORRELATED_NESTED_IN_BODY = (
+    "SELECT name FROM drivers d WHERE d.driver_id IN "
+    "(SELECT l.driver_id FROM laps l WHERE l.speed > "
+    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))")
+WEEK33_CORRELATED_NESTED_VEC = [(WEEK33_CORRELATED_NESTED_IN_BODY, "correlated subquer")]
+WEEK33_CORRELATED_NESTED_VOLCANO = [
+    (WEEK33_CORRELATED_NESTED_IN_BODY, "not supported on the Volcano path")]
+
 WEEK33_CORRELATED_BINDS = [
     # scalar, correlated (Q17), composed with arithmetic
     "SELECT l.lap_id FROM laps l WHERE l.speed > "
     "0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
-    # nested two deep, the inner one correlated to the MIDDLE block (Q20). The
-    # TOP node is uncorrelated, so this is the query that proves the statement
-    # flag propagates outward — without it the refusal fires from a nested run
-    # after the outer levels have already been materialized
-    "SELECT name FROM drivers d WHERE d.driver_id IN "
-    "(SELECT l.driver_id FROM laps l WHERE l.speed > "
-    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
     # a correlated ref inside the NESTED query's own ON clause
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
@@ -1446,6 +1461,21 @@ def main():
     # so running everywhere is what proves the four modes agree rather than
     # asserting it.
     week33_binds = [(q, WEEK33_CORRELATED_EXPECT) for q in WEEK33_CORRELATED_BINDS]
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK33_CORRELATED_NESTED_VEC,
+            f"Week 33 correlated inside an IN body — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK33_CORRELATED_NESTED_VOLCANO,
+            f"Week 33 correlated inside an IN body, refused earlier — {label}",
+            extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
     for label, extra in modes:
         for suite, name in ((week33_binds, "Week 33 correlated subqueries refused"),
                             (WEEK31_MATERIALIZATION_REFUSED,
