@@ -2080,6 +2080,51 @@ from the diff. A successor agent resumes from this section.)*
       section, the 37-week plan row), `docs/week-33-plan.md` (hand-off
       disposition).
 
+### Audit round 1 — findings and disposition
+
+Independent audit of `fe17f40..HEAD`, in `scratchpad/audits/week-34-round-1.md`.
+One blocker, one low, three areas not reached.
+
+- **F1 (BLOCKER) — FIXED.** *Reproduced first:* `WHERE d.age > (SELECT COUNT(*)
+  FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)` returned **0
+  rows** against SQLite's **20**. The LEFT join was right and its stated reason
+  was half right — `SUM`/`AVG`/`MIN`/`MAX` over an empty set *are* NULL, so
+  null-extension **is** their value — but **`COUNT` over zero rows is 0**, and the
+  rewrite produces no group row at all for a key with no matching body rows.
+  Fixed by making the substituted value depend on the body's aggregate: a `COUNT`
+  body's `ColumnRef` is wrapped in `CASE WHEN ref IS NULL THEN 0 ELSE ref END` —
+  `COALESCE` spelled in the dialect this engine has, no new node or operator, both
+  branches typing INT. Tests the **function**, not the `distinct` flag, because
+  `COUNT(DISTINCT x)` is still a `COUNT`. The audit's offered minimum (refuse a
+  `COUNT` body) was **declined with a reason**: it would cost TPC-H a correlated
+  shape for something the dialect can already express. Cost stated at the site —
+  `CASE` has no vectorized kernel by Week 25 decision, so the enclosing predicate
+  falls back to scalar `evaluate()`, paid only by a correlated-scalar `COUNT` body.
+- **F2 (LOW) — FIXED, and the audit's point demonstrated with a mutant.** Three
+  execution-level tests in `test_vec_plan_builder.cc`. Proof they pin what the old
+  ones could not: make the DERIVED lowering report the **child's** schema (the
+  "rename does not survive into the physical plan" failure) and **both** old
+  schema-only tests still pass while two of the three new ones fail.
+- **Not reached (1/3) — `Scope::owned_schemas` lifetime: CHECKED, clean.** Traced
+  end to end and written at the field. `unique_ptr` not `vector<Schema>` because
+  growth moves pointers, not objects; a `Scope` is a stack local and no `Scope*`
+  outlives its frame; `RangeEntry::schema` is reachable only through the same
+  Scope's `range_table`; a nested body's Scope dies inside `relationSchema` but
+  the schema it returns was pushed onto the **enclosing** scope; a `ColumnRef`
+  keeps only a `ColumnId`. Exercised on two derived relations in one `FROM`/`JOIN`
+  list (the reallocation case) and a derived table nested in another.
+- **Not reached (2/3) — `VecDerivedNode` lifecycle: CHECKED, one defect found and
+  fixed.** It counted `chunk->num_rows` unconditionally; that is the buffer
+  *width*, and a derived body with a `WHERE` arrives with `filter_applied` set, so
+  both `rows_in` and `rows_out` were over-reported on `--explain-analyze`. Now
+  uses the `filter_applied ? sel.indices.size() : num_rows` convention
+  `VecLimitNode` and `VecFilterNode` already share. `open`/`close` delegate and
+  hold no state; `nextChunk` passes the child pointer through without touching
+  `sel`, `filter_applied` or data — a strictly weaker pass-through than either of
+  those two, and not a chunk *producer*, so the reset rule does not apply.
+- **Not reached (3/3) — the harness suite definitions in
+  `compare_against_sqlite.py`: STILL UNAUDITED.** Carries into the next round.
+
 ### Still open, handed to Week 35/36
 
 - **`buildScanSchema` narrowing** — still widens for a subquery query, and now
