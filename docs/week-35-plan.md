@@ -44,8 +44,8 @@ written-down capability boundaries into an unqualified pass.
 | 2 — q2's INERT is a parameter artifact | **done** — `SIZE` 15 -> 1 (172/250 combos discriminate); q2 is now DISCRIMINATING (7 rows -> 8) and still matches SQLite in both vectorized modes |
 | 3 — q19's ALL_NULL is a parameter artifact | **done** — BRANDs 12/23/34 -> 14/34/23; q19 is now DISCRIMINATING (56323.29 vs 8473.82) and matches SQLite in **all four** modes |
 | 4 — a narrowed `--queries` run prints a full-shaped PASS | **done** — the verdict token becomes `PARTIAL-PASS`/`PARTIAL-FAIL`/`PARTIAL-NO-BASELINE` and the line names how many of the 22 did not run |
-| 5 — README records Q17 as supported; the spec's Q17 text is refused | pending |
-| 6 — q18's "unreachable" holds only at threshold 300 | pending |
+| 5 — README records Q17 as supported; the spec's Q17 text is refused | **done** — four README sites now say the *mechanism* and the constant-outside shape work while TPC-H Q17's own text is refused (verified on the binary, both forms) |
+| 6 — q18's "unreachable" holds only at threshold 300 | **done** — condition stated in both the plan and `VALIDATION_PARAMS`; the parameter is deliberately NOT re-chosen |
 | after 2+3 — regenerate `docs/tpch-baseline.json` from a full run | pending |
 
 **All eight tasks are implemented.** The standing-rule sweep is done (README
@@ -123,7 +123,17 @@ to this data.
     subquery leaves the answer byte-identical. Only one part survives
     `p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'` on this data,
     so the subquery selects what was already selected.
-  - **q18 EMPTY** (2 modes) — `SUM(l_quantity) > 300` is unreachable at SF=0.01.
+  - **q18 EMPTY** (2 modes) — `SUM(l_quantity) > 300` is unreachable at SF=0.01
+    **at the 300 threshold specifically**, which is the condition, not a
+    property of the query. Measured: MAX per-order `SUM(l_quantity)` on this
+    data is **295.0** (at most 7 lineitems × max quantity 50), so 300 → EMPTY
+    and 295 → EMPTY, but **290 → DISCRIMINATING** (base 2 rows → mutant 100) and
+    280 → DISCRIMINATING (5 → 100). The `IN (subquery with HAVING)` semi-join
+    *is* exercisable on this data; only fidelity to the spec's threshold keeps it
+    vacuous. Unlike q2's `SIZE` and q19's `BRAND`s — both re-chosen from within
+    the spec's own value domains — 300 is already the **lowest** of the spec's
+    three Q18 quantities (300/312/315), so lowering it would invent a value the
+    spec does not contain. The verdict therefore stands, deliberately.
   - **q19 ALL_NULL** (4 modes) — no row matches any of the three OR arms, so the
     comparison is a `SUM` over nothing against a `SUM` over nothing.
 - **2 not answered**, both refused BY NAME for documented reasons rather than

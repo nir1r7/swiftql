@@ -467,6 +467,18 @@ VALIDATION_PARAMS = {
             "S1": "49", "S2": "14", "S3": "23", "S4": "45",
             "S5": "19", "S6": "3", "S7": "36", "S8": "9"},
     "q17": {"BRAND": "Brand#23", "CONTAINER": "MED BOX"},
+    # NOT re-chosen, unlike q2 and q19 above, and the difference is the point.
+    # q18 is EMPTY here because MAX per-order SUM(l_quantity) on this data is
+    # 295.0 (max 7 lineitems x max quantity 50), so the > 300 threshold matches
+    # nothing. Measured: 300 -> EMPTY, 295 -> EMPTY, 290 -> DISCRIMINATING (base
+    # 2 rows -> mutant 100), 280 -> DISCRIMINATING (5 -> 100). So the
+    # IN (subquery with HAVING) semi-join IS exercisable on this data and the
+    # DATA is not the obstacle -- fidelity to the spec is. 300 is already the
+    # LOWEST of the spec's three Q18 quantities (300/312/315), so lowering it
+    # invents a value the spec does not contain, where q2's SIZE and q19's BRANDs
+    # were re-chosen from within the spec's own domains. The vacuity verdict
+    # therefore stands, and "unreachable at SF=0.01" is true OF THE 300
+    # THRESHOLD, not of the query.
     "q18": {"QUANTITY": "300"},
     # BRANDs: spec 12/23/34 -> 14/34/23. DEVIATION, measured. At the spec brands
     # NO row matches ANY of the three OR arms on this data, so the query is a SUM
