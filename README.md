@@ -1611,6 +1611,42 @@ re-derived.
 
 **Checkpoint:** Required correlated TPC-H queries execute correctly.
 
+> **Starting note, from Week 32's semi-joins.** **Week 33 is the week the
+> `ColumnId { level, slot }` refactor fires**, and it fires *before* the feature
+> work rather than folded into it. The refactor was bound to a trigger and not a
+> date — whichever of Weeks 32/34 first lowers a correlated reference — and
+> Week 32 established, twice over, that it is not that week: `Validator::validate`
+> still refuses `has_correlated_subquery` in Week 33's name, and the shapes
+> Week 32 lowers are uncorrelated by definition. Week 33 removes that refusal, so
+> a `ColumnRef` with `query_level > 0` reaches a plan node for the first time.
+> Measured cost: 87 non-comment mentions of `relation_slot` / `from_slot` across
+> six source layers, plus every test that hand-builds a `ColumnRef`,
+> `GroupByColumn` or `AggregateSpec`. Both facts are recorded in
+> `development.md` rather than left to be re-derived.
+>
+> **Both Week 30 tripwires are still armed and still unreached** — `ChunkPruner`
+> declines a `query_level > 0` ref, `buildAggregateSchema` throws on one. Week 33
+> is the week that **replaces** them with real behaviour; replace, do not delete.
+> They differ on purpose: pruning is an optimization, so contributing nothing is
+> correct-and-slower, while grouping is semantics and the failure mode is a clean
+> hit on the *wrong* relation, which no local fallback can repair.
+>
+> **The operator Week 33 decorrelates into already exists.** A correlated
+> `EXISTS` decorrelates to a semi-join over the correlated key and a correlated
+> `NOT EXISTS` to an anti-join, both built in Week 32 (`JoinSemantics`,
+> `VecHashJoinNode`'s set-probe, `lowerInSubqueries`). Week 33 should need **no
+> new operator** — only the rewrite that produces the join keys. It does need the
+> Volcano refusal reconsidered: Week 32 shipped option (b), refusing `IN`
+> subqueries on the Volcano path entirely, so these queries are diffed in two
+> modes rather than four. Restoring the baseline means semi/anti in
+> `HashJoinNode`, which is the honest end state.
+>
+> **One plan already holds two range tables**, and the containment is that a
+> semi/anti join's `output_schema` **is** its left child's, so nothing from the
+> body is ever in scope above the join. Week 33's decorrelated joins must keep
+> that property. Week 34's derived tables are what break it for real, because a
+> derived table's columns *are* in scope above it.
+
 ### Week 34 — Derived Tables + Distinct Aggregates
 
 - Bind and execute subqueries in `FROM`
@@ -1663,6 +1699,31 @@ re-derived.
 - Publish coverage, limitations, plans, and benchmark plots
 
 **Checkpoint:** TPC-H results are reproducible and the full project story is documented.
+
+> **Starting note, from Week 32's semi-joins.** **The semi/anti probe is
+> structurally a filter that does not behave like one.** Its output schema *is*
+> the probe schema and it changes no column — it only selects a subset of probe
+> rows — so the late-materialization-correct implementation produces a
+> `SelectionVector` over the probe chunk and copies nothing, exactly as
+> `VecFilterNode` does. Week 32 shipped the **row path** instead: each surviving
+> probe row is copied into `output_buffer_`. That is correct and it is one code
+> path in the node, but it forfeits the design principle Phase 3 is built on, and
+> it does so on the operator whose whole reason for existing is to make
+> `IN (subquery)` cheap at scale. Measure it here before deciding — the row copy
+> is per *surviving* row, so a highly selective semi-join may not show it while
+> `lap_id IN (SELECT lap_id FROM laps)` (which survives everything) will. If it
+> pays, convert; do not ship both paths.
+>
+> **Two more measurements this week inherits.** `buildScanSchema` declines to
+> narrow while a `SubqueryExpr` survives, so projection pushdown is off for every
+> `IN`-subquery query — expected, not a regression, but it belongs in the numbers
+> rather than in a surprise. And the semi/anti estimate currently falls back to
+> `frac = 1.0` on a real query, because the body plan's `LogicalProject` empties
+> its `StatsContext` and the right-side NDV lookup misses; the rule itself is
+> exercised only by hand-built nodes in `tests/test_cardinality.cc`. That is
+> conservative and it preserves the `est <= left child's rows_out` invariant, but
+> estimate-accuracy plots will show it as a flat over-estimate on exactly these
+> queries.
 
 ---
 
@@ -1835,7 +1896,8 @@ Execution: 72.0ms
 - No write path — `INSERT`, `UPDATE`, `DELETE` are not supported
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
 - Joins of three or more relations execute on the columnar/vectorized path only; row and columnar Volcano refuse them with `multi-way joins are not supported on the Volcano path; use --execution vectorized`. Multi-key and residual-`ON` joins execute on every path (Week 27)
-- **Uncorrelated** subqueries execute by **materialization** (Week 31): the body is planned and run once, before the outer query is planned, and the node is replaced by a constant. Three consequences, all deliberate. `--explain` therefore **executes** the nested query — it has to, to know the constant, exactly as it already performs constant folding — and that time is charged to `--explain-analyze`'s `Plan:` line rather than `Execution:`. The nested query gets its own **copy** of every table it scans, since both scan nodes take their table by value. And an `IN` subquery's result set is capped at 1024 distinct values, because `evaluate()` compares `InExpr::values` linearly per row; Week 32's semi-join removes the cap by materializing nothing
+- **Uncorrelated** subqueries execute by one of **two productions**, chosen by shape and never by a cost threshold. A **scalar** `(SELECT ...)` or an `[NOT] EXISTS` **materializes** (Week 31): the body is planned and run once, before the outer query is planned, and the node is replaced by a constant. That is right exactly when the subquery's contribution *is* a constant — an uncorrelated `EXISTS` does not depend on the outer row at all, so probing a hash table per row would be strictly worse. Two consequences, both deliberate: `--explain` therefore **executes** the nested query — it has to, to know the constant, exactly as it already performs constant folding — and that time is charged to `--explain-analyze`'s `Plan:` line rather than `Execution:`; and the nested query gets its own **copy** of every table it scans, since both scan nodes take their table by value
+- An `x [NOT] IN (SELECT ...)` instead **lowers to a hash semi-join or anti-join** (Week 32), because its contribution is a membership test evaluated per outer row rather than a constant. Nothing is materialized, so the Week 31 1024-distinct-value cap is gone rather than raised. The routing is total: there is no shape where an `IN` subquery materializes, which is what keeps the two productions from having to agree on `NOT IN`'s NULL semantics. `buildScanSchema` still declines to narrow while a `SubqueryExpr` survives in the tree, so projection pushdown stays off for these queries — expected, not a regression. The restrictions the lowering imposes (a plain-column operand, a whole top-level `WHERE` conjunct, and the vectorized path) are rows in the dialect table above
 - **Correlated** subqueries are refused with `correlated subqueries are not yet executable (Week 33)` — one check at the end of `Validator::validate`, so all four modes agree by construction, and it fires only after every parse, bind and validate error the query is entitled to. Positions are restricted to `WHERE` and `HAVING`; `FROM (subquery)` is Week 34
 - A subquery whose **body joins three or more relations** executes on the vectorized path only, for the same reason a top-level three-way join does: the nested query runs on the engine that contains it, and Volcano builds exactly one join
 - A NaN is its own `GROUP BY` / `DISTINCT` group (both signs together), and matches nothing in a join. SQLite has neither case: it converts NaN to NULL on storage, so its NaNs land in the NULL group. Reachable only by writing `nan` into a CSV cell — no engine arithmetic produces one, since `x / 0` is NULL. Week 29 looked at closing it at load and did not: `CSVLoader::parseField` returning `Value::null()` breaks the very next stage, because `CSVToColumnar::convert` calls `row[c].asDouble()` unconditionally and `ColumnarTable` has no NULL representation at all. Closing it therefore means giving columnar storage a validity mask, which touches every scan, encoding and zone map — so it belongs to Week 35, which rewrites the loader anyway. The outer join does not make it more urgent: a NaN key on the preserved side is unmatchable and is now emitted null-extended, which is what SQLite does with the same row
