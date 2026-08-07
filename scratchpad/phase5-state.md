@@ -1,22 +1,17 @@
 # Phase 5 orchestrator state
-Current: week 34, round 1, steps 3+4 IN PARALLEL (gate ab12a3af1f893a53d + audit
-  a333f92cd212018fe), launched 14:46 UTC.
-  ALL 10 TASKS SHIPPED, INCLUDING Q17 — the deliverable week 33 missed. TableRef's table_name
-  is private behind tableName(site), the same discipline ColumnId::localSlot established.
-  !! A PREDICTION FOUR WEEKS OF NOTES CARRIED WAS BACKWARDS: hasSlotOutsideRangeTable does NOT
-  fire for derived tables. countRelations counted SCANS, over-counting a derived body's, so
-  `slot >= n` was too PERMISSIVE, not too strict. Fixed; the search now reorders derived
-  relations normally. The agent deliberately did NOT add the predicted decline string, because
-  a decline that cannot fire is week 33's dead-assertion failure. Newly live as a result:
-  joinCardinality's non-multiplicative branch and week 28's method=written-floor.
-  Other decisions: the scalar rewrite's join is LEFT not INNER (zero-row groups must yield NULL,
-  not drop rows); non-aggregate bodies refused; a derived relation's own schema stamps slot 0
-  like a leaf scan, which is what keeps restampSlots(c,0) and ChunkPruner's <1 test correct.
-  NEW ORACLE BLIND SPOT (mirror of week 30's): SQLite cannot parse a derived-table column alias
-  list, so that feature is neither diffable nor refusable — 2 C++ tests are its whole coverage.
-  Q22 NOT claimed closed; verify against the ported query in week 36.
-  REMAINING: buildScanSchema narrowing for derived bodies, WEEK33_CORRELATED_EXPECT still a
-  prefix, Volcano semi/anti parity (cost now COUNTED: 56 queries in 2 modes vs 168 in 4).
+Current: week 34, fix round 1 (agent a4e5229d58781224a, launched ~14:52 UTC).
+  !! BLOCKER F1 IN Q17 — the deliverable week 33 handed here. The correlated-scalar rewrite's
+  LEFT join yields NULL for a zero-row group, but SQL requires 0 when the body's aggregate is
+  COUNT. Verified as a wrong answer against the shipped binary AND SQLite.
+  The LEFT join itself was right (SUM/AVG/MIN/MAX over an empty set ARE NULL, so INNER would
+  have dropped the outer row). COUNT is the exception, and COUNT(DISTINCT) — added this week —
+  has the same 0-over-empty rule. Fix must depend on the body's aggregate FUNCTION, and pin
+  EVERY aggregate kind over a zero-row group in the oracle, so the whole rule is visible.
+  F2 (low): the two derived-table column-alias tests pin only the logical schema, not the
+  resolution behaviour they cite. Matters more than a normal low — SQLite cannot parse that
+  syntax, so those two tests are the feature's ENTIRE possible coverage.
+  NOT REACHED by audit r1, do not treat as approved: the harness suite definitions in
+  compare_against_sqlite.py, Scope::owned_schemas lifetime, VecDerivedNode's operator lifecycle.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
