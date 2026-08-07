@@ -116,7 +116,16 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         // slot-first with bare-name fallback — same contract as
         // resolveColumnIndex() in evaluator.cc
-        int idx = col->id.isResolved()
+        // Week 33. A CORRELATED ref indexes an ENCLOSING block's range table,
+        // so the slot lookup below would compare two numbering domains. Skip
+        // straight to the bare-name fallback, which is byte-identical to what
+        // the pre-ColumnId code did whenever that lookup missed — and the fact
+        // that it could also HIT, on a shared column name, is the silent wrong
+        // answer ColumnId's throw exposed here. Trusting the type of the
+        // same-named column is the same "a lower layer already established
+        // this" move validateExpr (site 4) and validateJoinCondition (site 18)
+        // make; the Binder verified the ref against the scope that supplies it.
+        int idx = (col->id.isResolved() && col->id.isLocal())
             ? schema.indexOf(col->column_name,
                              col->id.localSlot("inferExprType")) : -1;
         if (idx < 0) idx = schema.indexOf(col->column_name);

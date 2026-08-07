@@ -1148,33 +1148,17 @@ removed or weakened.
       dialect rows, rejection-suite entries.
 - [ ] Tasks 4, 6, 7, 8, 9.
 
-**IN PROGRESS — the one live defect, and it is the good kind.** A correlated
-`EXISTS` now reaches decorrelation and dies with:
+**Correlated `EXISTS` / `NOT EXISTS` now execute** on the vectorized path.
 
-```
-Error: internal: inferExprType read a correlated column reference as a local
-relation slot (query level 1)
-```
-
-That is `ColumnId`'s narrowing doing exactly what Task 1 built it for: a
-correlated ref reaching a consumer that assumed a local slot, named at the
-site, loud instead of a silent hit on the wrong relation. Before Task 1 this
-would have been wrong rows.
-
-**Next concrete step:** find which `inferExprType` call sees the correlated ref.
-It is *not* the body (its correlated conjuncts are stripped before
-`LogicalPlanBuilder::build` runs on it) and *not* the outer `WHERE` (the
-`EXISTS` conjunct is extracted). The likely candidates, in order: (1)
-`Validator::validate` / `validateQuery` recursing into the subquery statement
-and typing its `WHERE` **before** decorrelation strips it — validation runs
-first, so the correlated equality is still in the body there; (2)
-`buildScanSchema` / the pruning hint walking the un-stripped body; (3)
-`materializeSubqueries`' walker typing a correlated node. Reproduce with
-`--explain` on the first query in `WEEK33_CORRELATED_BINDS`, then decide
-whether `inferExprType` should return the *outer* type for a `level > 0` ref
-(it can: the Binder verified it against the supplying scope) or whether the
-caller must skip it — the same "trust what a lower layer established" move
-`validateExpr` (site 4) and `validateJoinCondition` (site 18) already make.
+The one defect this uncovered is worth recording, because it is exactly what
+Task 1 was for. `inferExprType` (dispatch site 12) indexed the schema with a
+bare slot; a correlated ref made `ColumnId::localSlot` throw and name the site.
+Pre-`ColumnId` that lookup would not have thrown — it would have scored a clean
+hit on a same-named column of the WRONG relation and returned its type. The fix
+is the same "a lower layer already established this" move `validateExpr` (site
+4) and `validateJoinCondition` (site 18) make: skip the slot lookup for a
+non-local ref and take the bare-name fallback, which is byte-identical to the
+old behaviour whenever the slot lookup missed.
 
 Then: Task 5's rejection-suite entries and README dialect rows, Task 4, and
 Tasks 6-9.
