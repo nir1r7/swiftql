@@ -126,8 +126,13 @@ inline std::string exprKey(const Expr* expr) {
             // query with no subquery — is byte-identical. This text is for
             // MATCHING, never display, so widening it costs nothing visible.
             std::string key = std::to_string(col->relation_slot) + "#" + col->column_name;
+            // The ':' is load-bearing, not decoration. Concatenating two decimal
+            // numbers is not prefix-free: level 1 / slot 23 and level 12 / slot 3
+            // both render "^123#team" — the identical collision this prefix
+            // exists to remove, one order of magnitude further out. Both halves
+            // are legal SwiftQL (a 24-relation block plans; nesting is unbounded).
             return col->query_level > 0
-                ? "^" + std::to_string(col->query_level) + key
+                ? "^" + std::to_string(col->query_level) + ":" + key
                 : key;
         }
         return col->table_name.empty()
