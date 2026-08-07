@@ -944,11 +944,18 @@ WEEK34_DERIVED_TABLE_VEC_ONLY = [
     # normalization — the shape that would put two numbering domains in one schema
     "SELECT x.t AS t, x.nm AS nm FROM (SELECT l.team AS t, d.name AS nm FROM laps l "
     "JOIN drivers d ON l.driver_id = d.driver_id) AS x ORDER BY t, nm LIMIT 10",
-    # Q13's shape: a LEFT JOIN inside the body, plus the COLUMN ALIAS LIST, plus a
-    # regroup above the derived relation
-    "SELECT c.k AS k, COUNT(*) AS n FROM (SELECT dr.name, COUNT(l.lap_id) AS c "
+    # Q13's shape: a LEFT JOIN inside the body plus a regroup above the derived
+    # relation. THE COLUMN ALIAS LIST IS DELIBERATELY NOT HERE — `AS c (nm, k)`
+    # is standard SQL that SQLITE DOES NOT PARSE (`near "(": syntax error`), so
+    # the oracle cannot hold a query using it in EITHER direction: it is neither
+    # diffable nor refusable. This is the mirror image of the blind spot Week 30
+    # named — the oracle cannot hold a query SwiftQL rejects, and it equally
+    # cannot hold one SQLITE rejects. The feature is covered by
+    # LogicalPlanTest DerivedTable.ColumnAliasListRenamesPositionally and its
+    # arity twin instead, and that is the whole coverage it can have.
+    "SELECT c.k AS k, COUNT(*) AS n FROM (SELECT dr.name AS nm, COUNT(l.lap_id) AS k "
     "FROM drivers dr LEFT JOIN laps l ON dr.driver_id = l.driver_id GROUP BY dr.name) "
-    "AS c (nm, k) GROUP BY c.k ORDER BY k",
+    "AS c GROUP BY c.k ORDER BY k",
     # three relations, one of them derived: exercises join enumeration over a
     # relation with no TableStats (joinCardinality's non-multiplicative branch)
     "SELECT dr.name AS n, d.s AS s FROM (SELECT driver_id, AVG(speed) AS s FROM laps "
@@ -962,8 +969,9 @@ WEEK34_DERIVED_TABLE_VEC_ONLY = [
     # which is the shape Week 32 shipped a regression in that no suite could see
     "SELECT COUNT(*) AS n FROM laps WHERE speed > (SELECT AVG(x.s) FROM "
     "(SELECT AVG(speed) AS s FROM laps GROUP BY team) AS x)",
-    # SELECT * over a derived relation, with the alias list naming the columns
-    "SELECT * FROM (SELECT team, speed FROM laps WHERE speed > 340) AS d (a, b) "
+    # SELECT * over a derived relation. Aliased in the body rather than by a
+    # column alias list, for the SQLite reason given above.
+    "SELECT * FROM (SELECT team AS a, speed AS b FROM laps WHERE speed > 340) AS d "
     "ORDER BY a, b",
 ]
 
@@ -1039,6 +1047,18 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "SELECT COUNT(*) AS n FROM laps l WHERE l.season = 2024 OR l.speed > "
     "(SELECT MAX(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id "
     "AND l2.season = 2024)",
+    # ARRIVED FROM WEEK33_CORRELATED_BINDS. Week 33 refused this exact shape and
+    # recorded it as its checkpoint miss; it is Q17's, and it is why this suite
+    # exists.
+    "SELECT l.lap_id AS id FROM laps l WHERE l.speed > 0.2 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) ORDER BY id LIMIT 10",
+    # ARRIVED FROM WEEK33_CORRELATED_IN_SHAPES. The correlation is INSIDE the IN
+    # body and relative to that block, so the scalar rewrite runs during the
+    # body's own build() - two lowerings stacked on two different spines in one
+    # query, which nothing else here exercises.
+    "SELECT d.name AS nm FROM drivers d WHERE d.driver_id IN "
+    "(SELECT l.driver_id FROM laps l WHERE l.speed > "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)) ORDER BY nm",
 ]
 
 WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
@@ -1740,8 +1760,6 @@ def main():
                              "Week 34 DISTINCT aggregate refusals"),
                             (WEEK34_DERIVED_REFUSED,
                              "Week 34 derived-table refusals"),
-                            (WEEK34_CORRELATED_SCALAR_REFUSED,
-                             "Week 34 correlated-scalar refusals"),
                             (WEEK31_MATERIALIZATION_REFUSED,
                              "Week 31 materialization divergences from SQLite"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
@@ -1769,6 +1787,21 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
+
+    # Week 34 — the scalar shapes decorrelation declines. VECTORIZED ONLY, and
+    # the reason is the one WEEK32_LOWERING_REFUSED already documents: on the
+    # Volcano path the CAPABILITY refusal ("correlated subqueries are
+    # decorrelated to a semi-join and are not supported on the Volcano path")
+    # fires first, so asserting these messages there would assert the wrong
+    # refusal. The Volcano half is already covered by
+    # WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED.
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK34_CORRELATED_SCALAR_REFUSED,
+            f"Week 34 shapes scalar decorrelation declines — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
 
     # Week 33, Task 7(1) — the nested-tripwire hunch, pinned. Vectorized only:
     # the Volcano path refuses an IN subquery before reaching the tripwire at
