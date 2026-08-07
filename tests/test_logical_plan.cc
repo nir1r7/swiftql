@@ -1257,10 +1257,16 @@ TEST(SubqueryValidation, CorrelatedRefsAreNotThisScopesToCheckOrGroup) {
         buildLogical("SELECT l.team FROM laps l WHERE EXISTS "
                      "(SELECT d.name FROM drivers d WHERE d.driver_id = l.driver_id "
                      " GROUP BY d.name)", cat);
-        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
+        ADD_FAILURE() << "expected a correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
-            << e.what();
+        // Week 33 deleted the blanket Validator refusal this used to name and
+        // replaced it with per-shape refusals from decorrelation. The subject of
+        // the test is unchanged and is what the arrival of ANY refusal proves:
+        // neither site 4 nor site 5 threw first, so the correlated ref was
+        // neither checked against this scope's schema nor demanded as a group
+        // key. What is pinned now is the shape-specific message that arrives.
+        EXPECT_NE(std::string(e.what()).find("a body with GROUP BY cannot be decorrelated"),
+                  std::string::npos) << e.what();
     }
 }
 
@@ -1277,9 +1283,15 @@ TEST(SubqueryValidation, ACorrelatedRefInANestedOnClauseIsNotCheckedHere) {
         buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
                      "(SELECT 1 FROM drivers d JOIN drivers d2 "
                      " ON d.driver_id = d2.driver_id AND d.age = l.lap_id)", cat);
-        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
+        ADD_FAILURE() << "expected a correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
+        // The correlated ref is in the body's ON clause, which splitCorrelation
+        // does not read, so no join key is produced and decorrelation refuses
+        // the whole shape. That refusal is what now stands in for the deleted
+        // Validator one; the negative assertion below is the actual subject and
+        // is untouched.
+        EXPECT_NE(std::string(e.what()).find("no equality links the subquery to the "
+                                             "enclosing query"), std::string::npos)
             << e.what();
         EXPECT_EQ(std::string(e.what()).find("not found in table 'd'"), std::string::npos)
             << "an inner-scope schema must not be indexed by an outer-scope slot";
@@ -1310,9 +1322,14 @@ TEST(SubqueryValidation, ANestedKeylessJoinStillHitsTheCrossProductRefusal) {
         buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
                      "(SELECT 1 FROM drivers d JOIN laps p "
                      " ON d.driver_id = p.driver_id AND p.speed > l.speed)", cat);
-        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
+        ADD_FAILURE() << "expected a correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
+        // Still refused, and the point survives: the correlated residual
+        // `p.speed > l.speed` was not mistaken for the inner key. The message is
+        // now decorrelation's, because the body's WHERE holds no correlated
+        // equality to key on.
+        EXPECT_NE(std::string(e.what()).find("no equality links the subquery to the "
+                                             "enclosing query"), std::string::npos)
             << e.what();
     }
 }
@@ -1328,9 +1345,15 @@ TEST(SubqueryValidation, ACorrelatedGroupKeyIsAcceptedWhateverTheOuterBlockHolds
     auto expectRefusal = [&](const std::string& sql) {
         try {
             buildLogical(sql, cat);
-            ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal for: " << sql;
+            ADD_FAILURE() << "expected a correlated-subquery refusal for: " << sql;
         } catch (const std::runtime_error& e) {
-            EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"),
+            // Reaching decorrelation's GROUP BY refusal is the proof the test
+            // wants: the correlated group key was ACCEPTED by the validator in
+            // both outer shapes (a one-relation and a two-relation enclosing
+            // block), so the skip no longer depends on the qualifier the binder
+            // writes back. A refusal from the group-key rule itself would name
+            // `season`, not the body's GROUP BY.
+            EXPECT_NE(std::string(e.what()).find("a body with GROUP BY cannot be decorrelated"),
                       std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
         }
     };
@@ -1452,10 +1475,13 @@ TEST(SubqueryValidation, ACorrelatedAggregateArgumentIsTypedWhereItResolved) {
     // ...and a LEGAL correlated numeric argument must still bind
     try {
         buildLogical(outer + "(SELECT SUM(d.age) FROM drivers x)", cat);
-        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
+        ADD_FAILURE() << "expected a correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
-            << e.what();
+        // The legal numeric argument BOUND — no type error — and the refusal
+        // that arrives is about the body's aggregate, not about d.age. That is
+        // the property this control asserts; only the message changed.
+        EXPECT_NE(std::string(e.what()).find("a body with an aggregate cannot be decorrelated"),
+                  std::string::npos) << e.what();
     }
 }
 
