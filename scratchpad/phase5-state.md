@@ -30,7 +30,18 @@ Current: SEAM AUDIT PASS 1 — five auditors launched 23:41 UTC, each committing
   Not reached there: the three-valued NOT IN probe loop in VecHashJoinNode (no NULL INT key in
   the shipped catalog), Volcano HashJoinNode semi/anti (refused on that path anyway), and an
   optimized-vs---no-optimize diff of the new LEFT-join shape.
-  WAITING on three (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
+  3 of 5 REPORTED. Join chain (seam-join-chain-pass-1.md): 1 HIGH, 2 low. All five targets
+  reached; T1-T5 otherwise clean, T2/T3 verified empirically against the pre-built binary.
+  !! H-1 IS THE ARCHETYPAL SEAM DEFECT: CardinalityEstimator::estimateNode has NO DERIVED CASE
+  (cardinality_estimator.cc:308-532). Week 34 added the node type; week 28's estimator was
+  written before it existed and never learned. So join_enumeration.cc:490 costs a derived
+  relation at 0 ROWS and the DP REORDERS ON IT — cost=1525 vs written=4216 on a 3-relation
+  sf0.01 query — while the -1 propagates up and SILENTLY DISABLES the week 22 build-side choice
+  and SIMD eligibility. RESULTS UNAFFECTED, which is exactly why nothing caught it: week 28's
+  own audit warned that a cost model picking a bad plan fails no test.
+  2 low: unfloored semi/anti zero estimate; have_ndv set from EITHER side, which falsifies the
+  invariant claim written at join_enumeration.cc:454-462.
+  WAITING on two (optimizer preservation, storage) (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
   before dispatching fixes, so they batch into one round rather than racing the tree.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
