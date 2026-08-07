@@ -9,10 +9,12 @@
 #include "execution/vec_hash_join_node.h"
 #include "execution/vec_simd_loop_join_node.h"
 #include "planner/cost_model.h"
+#include "planner/predicate_pushdown.h"   // collectSlots — dispatch site 8, shared
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace {
 
@@ -258,19 +260,46 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // relation 0. Loosening the test to `<= 0` would let a hint through
             // for a leftmost stamp nobody can reason about — the wrong direction.
             //
-            // Two preconditions this rests on, neither of them local:
-            //   1. every ColumnRef reaching a hint carries a real binder slot
-            //      (binder.cc stamps them; Validator rejects anything left at -1);
-            //   2. a post-pushdown residual holds no `ColumnRef op Literal`
-            //      conjunct, because soleSlot() routed every single-slot conjunct
-            //      to its own relation (predicate_pushdown.cc).
-            // If either stops holding, this guard is the thing that still has to
-            // be true, which is why it is tested directly rather than trusted.
+            // One precondition this rests on, and it is not local: every
+            // ColumnRef reaching a hint carries a real binder slot (binder.cc
+            // stamps them; Validator rejects anything left at -1).
+            //
+            // !! A SECOND precondition was stated here through Week 28 and is now
+            // FALSE BY DESIGN: "a post-pushdown residual holds no
+            // `ColumnRef op Literal` conjunct, because soleSlot() routed every
+            // single-slot conjunct to its own relation". Week 29's outer join
+            // deletes it — distribute() declines to push a conjunct onto an outer
+            // join's null-supplying side, and pushIntoJoin's leftover loop then
+            // leaves exactly such a conjunct in the residual above the join, from
+            // where it descends to the PRESERVED side's scan as this hint.
+            // (`... d LEFT JOIN l ON k WHERE l.season = 2024` is the shape.)
+            //
+            // With that precondition gone, the only thing standing between a
+            // slot-1 predicate and the slot-0 relation's zone maps is
+            // chunk_pruner.h's `relation_slot < 1` test in ANOTHER file — and the
+            // failure mode is silent row loss on the preserved side, the one side
+            // this week exists to protect. So do not delegate it: withhold the
+            // hint outright when this join does not preserve every relation the
+            // hint mentions. Scoped to outer joins deliberately — an inner join's
+            // hint is unchanged, byte for byte, including the mixed-slot
+            // `--no-optimize` WHERE the Phase 4 benchmark measures. An outer join
+            // loses nothing under the optimizer either, since a preserved-side
+            // conjunct was pushed to its own leaf and carries its own hint there.
             const bool leftmost_is_slot0 =
                 join->output_schema.size() > 0 &&
                 join->output_schema.column(0).relation_slot == 0;
+            bool hint_is_preserved = true;
+            if (pruning_where && join->join_type != JoinType::INNER) {
+                std::unordered_set<int> slots;
+                collectSlots(pruning_where, slots);
+                // slot 0 is the leftmost relation, guarded above; anything else
+                // this join introduced is null-supplied and must not steer a scan
+                hint_is_preserved = slots.empty() ||
+                                    (slots.size() == 1 && slots.count(0) == 1);
+            }
             auto from_child = lower(join->children[0].get(),
-                                    leftmost_is_slot0 ? pruning_where : nullptr);
+                                    (leftmost_is_slot0 && hint_is_preserved)
+                                        ? pruning_where : nullptr);
             auto join_child = lower(join->children[1].get(), nullptr);
 
             // Week 27: arbitrary key counts, and children[0] may itself be a
@@ -373,9 +402,18 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 decision = d.str();
                 if (outer) {
                     // Never print an (alt=) that was not an option: the side was
-                    // forced, not costed against its alternative.
+                    // forced, not costed against its alternative. On INT keys the
+                    // suffix also has to say that the ALGORITHM was not a choice
+                    // either — the `algo=` clause is suppressed above, so without
+                    // this a reader of a plan whose keys are both INT cannot tell
+                    // whether the SIMD loop join was ineligible or merely lost on
+                    // cost, and "SIMD is never costed for an outer join" is one of
+                    // the properties this week claims. Only on INT keys, because
+                    // that is exactly when SIMD would otherwise have been in the
+                    // running.
                     decision = decision.substr(0, decision.find(" (alt="))
-                             + " (outer: the preserved side must probe)";
+                             + (int_keys ? " (outer: the preserved side must probe, hash only)"
+                                         : " (outer: the preserved side must probe)");
                 }
             }
 
