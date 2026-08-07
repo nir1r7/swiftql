@@ -59,3 +59,5 @@ scratchpad/
 %HOME/
 
 .cache/
+# Generated TPC-H data (deterministic: python_tools/generate_tpch.py --scale N --seed S)
+data/tpch/

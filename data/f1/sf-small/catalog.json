@@ -1,0 +1,72 @@
+{
+  "tables": [
+    {
+      "name": "laps",
+      "file": "laps.csv",
+      "columns": [
+        {
+          "name": "lap_id",
+          "type": "INT"
+        },
+        {
+          "name": "driver_id",
+          "type": "INT"
+        },
+        {
+          "name": "team",
+          "type": "STRING"
+        },
+        {
+          "name": "speed",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_1",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_2",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_3",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "season",
+          "type": "INT"
+        },
+        {
+          "name": "round",
+          "type": "INT"
+        }
+      ]
+    },
+    {
+      "name": "drivers",
+      "file": "drivers.csv",
+      "columns": [
+        {
+          "name": "driver_id",
+          "type": "INT"
+        },
+        {
+          "name": "name",
+          "type": "STRING"
+        },
+        {
+          "name": "nationality",
+          "type": "STRING"
+        },
+        {
+          "name": "team",
+          "type": "STRING"
+        },
+        {
+          "name": "age",
+          "type": "INT"
+        }
+      ]
+    }
+  ]
+}
