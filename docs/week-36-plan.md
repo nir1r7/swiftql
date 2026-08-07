@@ -795,3 +795,463 @@ There is no code in this task. What it produces is:
 - Re-run the classification **after** Tasks 1 and 3, not before: q17 leaves the
   `correlated` row and q21 leaves the `multi-way` row only if q21 lands. The
   table published in the report must be the post-change one.
+
+---
+
+## Task 5 — The dialect and divergence items three earlier weeks handed here
+
+### Why it matters
+
+The checkpoint is "supported TPC-H queries match reference results within numeric
+tolerance". Four earlier weeks recorded facts that make that sentence
+conditional, and each explicitly said the Week 36 correctness report inherits it.
+A report that states a figure without them converts a documented divergence into
+a silent claim.
+
+### 5a — The `SUBSTRING(d, 1, 4)` year (Week 25's hand-forward)
+
+**The fact.** The dialect has no `extract(year from d)`; the documented rewrite
+is `SUBSTRING(d, 1, 4)`, which yields a **STRING** year where the TPC-H text
+yields an integer. Used by q7, q8, q9 (`l_year`, `o_year`). `normalize()`'s
+`coerce()` runs `float()` on both sides, so `'1995'` and `1995` already compare
+equal — Week 35 recorded that as a **coincidence it did not want to rely on**.
+
+**The decision to make, and the recommendation.** Three options:
+
+| | Cost | Verdict |
+|---|---|---|
+| Keep the harness normalizing | zero code | **take this** |
+| Grow a numeric conversion (`CAST`, or a numeric `YEAR`) | a new expression node — 17 dispatch sites per `development.md` — for **zero** additional queries | decline |
+| Compare the STRING as a STRING | the oracle's own column is an INTEGER, so this makes q7/q8/q9 fail on a correct answer | decline |
+
+Take option 1, but **stop relying on the coincidence**: state the dependency in
+`normalize()`'s own comment, and pin it with a test that would fail if `coerce()`
+ever stopped numeric-coercing a numeric-looking string. The reason the
+normalization is *sound* here, and the reason it must be written down, is a
+property of these three queries specifically: `l_year` / `o_year` are only ever
+**group keys and output columns**, never arithmetic operands. `SUM(SUBSTRING(...))`
+is rejected at plan time — correctly, because the result is a STRING — so there
+is no path by which the STRING year reaches an arithmetic kernel.
+
+**One boundary to state rather than discover:** `ORDER BY` on a STRING year is
+lexicographic. For fixed-width four-digit years that is the same order as
+numeric. It would not be for a two-digit or mixed-width year, and no TPC-H date
+produces one — so the property holds *because of the data format*, not because of
+the comparison. Say so.
+
+### 5b — The `ON` STRING-vs-numeric silent half-match (Week 27's hand-forward)
+
+**The fact.** `inferExprType` type-checks only the arithmetic operators — `=`
+falls through to `INT` — and `classifyJoinCondition` accepts any cross-slot
+`ColumnRef = ColumnRef` as a key. Keys are compared as text, which carries no
+type tag, so a STRING `"7"` matches an INT `7` while `"007"` does not, and
+`Value::operator==` throws `Type mismatch` for the same pair in a `WHERE`. Both
+halves are reachable on the **shipped** F1 catalog (`drivers.team` vs
+`laps.lap_id`).
+
+**This is the only item on the list that is a live wrong answer rather than a
+documented divergence**, so it gets an explicit in-or-out decision rather than a
+mention:
+
+- **The containment is small:** a plan-time check that a join's two key columns
+  are both STRING or both numeric — which also makes the `int_keys` SIMD gate's
+  assumption explicit instead of implicit.
+- **The cost is not the check, it is the gate:** it adds a *rejection* path.
+  New error, new rejection-suite entries, and queries that execute today stop
+  executing. Week 27 deferred it for exactly that reason.
+- **No TPC-H query needs it.** Every TPC-H join key is numeric-to-numeric.
+
+**Decision rule, not a decision:** close it **only if** Task 3b does not consume
+the week. If it does, declare it in the report as a live divergence with the
+containment named, and leave it. Do not half-land it — a type check added without
+its rejection suite is the "half-landed move" Week 35's behavioural sweep was
+built to catch.
+
+### 5c — NaN, and the three places it diverges
+
+Three separate NaN facts, all inherited, all belonging in the report:
+
+1. **NaN reaches keys as its own group** where SQLite has none. SQLite converts
+   a *computed* NaN to NULL at storage; SwiftQL keeps it, so a NaN forms a
+   `GROUP BY` / `DISTINCT` group of its own (both signs together —
+   `key_encoding.h` drops the sign) and matches nothing in a join. The close is a
+   conversion in `CSVLoader`, a **storage** decision, not a key-encoding one.
+2. **`isUnmatchableKey` counts NaN with NULL** in the join build side, so
+   `3.0 NOT IN {1.0, NaN}` is dropped where it is relationally TRUE. Already
+   documented at `vec_hash_join_node.cc`; the real close is a columnar validity
+   mask (README, Week 35), not a patch here.
+3. **The oracle itself cannot see a NaN** — Task 6a. That one **is** a defect and
+   is fixed this week.
+
+No committed dataset holds a NaN cell, which is why 1 and 2 stay declared rather
+than closed. Say that explicitly: "no dataset exercises it" is a different claim
+from "it is correct", and only the first is true.
+
+### 5d — Two numeric facts the Limitations section already owes the report
+
+- **DOUBLE keys are compared exactly while results are displayed with `%.15g`,**
+  so two rows that legitimately fail to group together can print identical
+  values. The alternative — comparing what is displayed — silently merges
+  distinct doubles, which is worse.
+- **`SUM`/`AVG` accumulate in `double`.** SQLite's `SUM` over an INTEGER column
+  returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond
+  2^53 loses precision where SQLite would not. Deliberate; TPC-H SF1 sums stay
+  far below that bound — **state the bound, since the report is what a reader
+  would check it against.**
+
+### 5e — Q22's provenance (Week 34's hand-forward, already discharged)
+
+Week 34 asked Week 36 to verify Q22 against the *ported* query and record which
+half was which. Week 35's harness already did it, by fingerprint rather than
+argument:
+
+```
+plan fingerprint: {'LogicalDerived': 2, 'LogicalAntiJoin': 2}
+correlated half  : ANTI-JOIN (Week 33 NOT EXISTS)
+custsale half    : LogicalDerived (Week 34)
+correlated-scalar rewrite present: no
+```
+
+**Do not re-do it. Do record that it was done and where** — an owed item that is
+silently satisfied looks identical to one that was forgotten.
+
+### Verification
+
+- Every item above appears in the Week 36 report with a verdict: *closed*,
+  *declared and why*, or *discharged earlier and where*. An item with no verdict
+  is the failure this task exists to prevent.
+- 5a's dependency has a test that fails if `coerce()` changes.
+- 5b, if closed, ships with its rejection-suite entries and a mutation check
+  proving they bite; if declared, the report names the containment so the next
+  week can price it.
+
+---
+
+## Task 6 — The small items owed
+
+### 6a — `compare_against_sqlite.py`'s NaN comparison is worse than recorded
+
+**Why it matters.** This is not a tidy-up. `rows_equal` is the comparison every
+diffed query in the tree passes through, including the TPC-H leg.
+
+**The measurement — run it, the result is not what the note says:**
+
+```python
+>>> nan = float("nan")
+>>> rows_equal([[nan]], [[5.0]])     # a NaN against an ordinary number
+True                                  # <-- equal
+>>> rows_equal([[5.0]], [[nan]])
+True
+>>> rows_equal([[nan]], [[nan]])
+True
+>>> rows_equal([[float("inf")]], [[float("inf")]])
+True
+```
+
+The note inherited from Week 35 says "nan/inf compare equal at :1874". The actual
+behaviour is stronger and worse: **a NaN on either side compares equal to
+anything at all.** The cause is one line —
+
+```python
+if abs(x - y) > max(abs_tol, rel_tol * max(abs(x), abs(y))):
+    return False
+```
+
+`abs(nan - 5.0)` is `nan`, and every comparison against `nan` is `False`, so the
+`return False` is never reached and the loop falls through to `return True`. A
+NaN anywhere in a SwiftQL answer is invisible to the oracle — an engine defect
+that produces NaN passes every diff in the tree.
+
+**The fix,** in the function that already carries a written derivation of its
+tolerance:
+
+```python
+# Week 36 — IEEE 754 makes every comparison against NaN False, so the tolerance
+# test above can never reject a NaN and `nan == 5.0` passed the whole harness.
+# NaN is not a value this engine should ever produce; make it a MISMATCH unless
+# BOTH sides are NaN, in which case the two engines agree and the diff is not the
+# place to complain. Infinities compare by sign, which the subtraction gets wrong
+# in the other direction: abs(inf - inf) is nan, i.e. "equal", which is right,
+# but only by accident -- state it.
+if math.isnan(x) or math.isnan(y):
+    return math.isnan(x) and math.isnan(y)
+if math.isinf(x) or math.isinf(y):
+    return x == y            # sign-sensitive, and exact
+```
+
+**Verification — mutate before trusting.** The fix is worthless if nothing would
+have caught the old behaviour, so add the four cases above as direct assertions
+on `rows_equal`, then re-run the **whole** `compare_against_sqlite.py` suite: if
+any existing diffed query changes verdict, a real answer contained a NaN and the
+finding is bigger than the fix.
+
+### 6b — `random_diff.py:113-117` projects the join key
+
+**Why it matters.** The randomized differ is Week 28's deferred gap, closed in
+Week 35, and it is the only *generated* result-preservation coverage the
+optimizer has. Its projection is what a wrong-relation defect would have to show
+up in.
+
+**The defect, in two parts:**
+
+```python
+proj_pool = []
+for table, alias in rels[:3]:                       # (1) only the first three
+    proj_pool.append(f"{alias}.driver_id AS {alias}_did")   # (2) the JOIN KEY
+    proj_pool.append(f"{alias}.team AS {alias}_team")
+```
+
+1. **`rels[:3]`** — a shape has 3–8 relations, so relations 4–8 are never
+   projected. A join-order change that mis-resolves a column in relation 5
+   produces an identical answer.
+2. **`driver_id` is the join key.** Every relation is joined on it (or on `team`,
+   between two `drivers`), so `r1.driver_id` and `r4.driver_id` are **equal by
+   construction**. Projecting it cannot distinguish which relation a column came
+   from — which is the one class of defect this generator exists to find
+   (H-1/H-2 in Week 33's audit were exactly that class).
+
+**The fix:** project **relation-distinguishing, non-key** columns, over **all**
+relations. `laps` has `lap_id`, `speed`, `season`, `round`, `sector_1..3`;
+`drivers` has `name`, `nationality`, `age`. Pick per relation by its table, keep
+the aliasing (`AS {alias}_{col}`) that makes `normalize()`'s name-keyed rows
+work, and keep the projection width bounded so the diff stays readable.
+
+**Keep `team`** — it exists on *both* tables and is a join key only when both
+sides are `drivers`, so it is the one column that tests the mixed case. But it is
+no longer the only non-key column.
+
+**Verification:** the generator must **fail** when it should. Temporarily
+mis-resolve a column (e.g. make the builder emit `r1.speed` where it means
+`r4.speed`) and confirm the differ reports a mismatch; with the old projection it
+would not have. Then re-run the 40-shape batch and confirm it still completes in
+about a minute against the 500-row fixture — the widened projection must not
+reintroduce the timeout Week 28 hit.
+
+### 6c — `--time` and `--fingerprint-all`, the two switches never exercised
+
+Both work; the item is that nothing had run them. Discharge by running, and
+record what they show:
+
+```bash
+python3 python_tools/run_tpch.py --catalog data/tpch/sf0.01/catalog.json \
+    --queries q1,q6 --time --reps 2 --warmups 1
+```
+
+```
+LATENCY (engine Execution: line, median of 2 after 1 warmup; CSV load excluded)
+  q1    col-vec        median=414690.5us      q1  col-volcano  median=1176307.8us
+  q6    col-vec        median= 27008.1us      q6  col-volcano  median= 602169.4us
+```
+
+`--fingerprint-all` captures a plan fingerprint for **every answering cell** into
+the JSON (only q22's is printed), and roughly doubles the run because of the
+extra `--explain` per cell.
+
+**These are Week 36 deliverables only as far as "the switch runs and its output
+is recorded".** The numbers themselves belong to Week 37 — do not draw
+conclusions from them here, and in particular do not tune anything on the
+strength of two queries measured twice.
+
+### 6d — Per-query hand verification beyond q2 / q18 / q19
+
+**Why it matters.** The mutation check bounds the figure **from above**: it
+proves the *data* makes one predicate selective, not that SwiftQL's plan used it.
+Three queries have been hand-verified. Nineteen have not.
+
+**Make it affordable rather than heroic.** A full `--fingerprint-all` run gives
+the cheap half for free — a plan shape per query, per mode — and a plan shape is
+what settles "did the engine really use the feature". The expensive half is
+reading each query's answer against its intent, and it should be **sampled and
+recorded**, not claimed for all 22.
+
+Concretely: run `--fingerprint-all` over all 22, put the fingerprint table in the
+report, and hand-verify the queries where a fingerprint alone is not conclusive —
+the ones whose feature is a *predicate* rather than an operator (q12, q14, q16,
+q19). State in the report exactly which queries were hand-verified and which rest
+on fingerprint plus mutation, in those words. **Do not write "verified" for the
+set as a whole.**
+
+---
+
+## Task 7 — Document supported scale and memory limits
+
+### Why it matters
+
+This is the README's third Week 36 bullet and the only one nobody has started.
+It is also the one a reader is most likely to act on: "what can I run this on"
+is the first question a benchmark invites, and Week 37 publishes benchmarks.
+
+### The measurements (reproduce; these are indicative)
+
+`SELECT COUNT(*) FROM lineitem`, wall time and peak RSS of the whole process:
+
+| dataset | `--storage row` | `--storage columnar` |
+|---|---|---|
+| sf0.01 (12 MB on disk, 60 144 lineitem rows) | 1.5 s / 64 MB | 2.5 s / 83 MB |
+| sf0.1 (117 MB on disk, 600 865 lineitem rows) | 16.6 s / 594 MB | 27.1 s / 782 MB |
+
+```bash
+python3 - <<'PY'
+import subprocess, resource, time
+t = time.time()
+subprocess.run(["./build/swiftql", "--catalog", "data/tpch/sf0.1/catalog.json",
+                "--storage", "columnar", "--execution", "vectorized",
+                "--format", "tsv", "--query", "SELECT COUNT(*) FROM lineitem"],
+               capture_output=True)
+print("%.1fs  %.0f MB" % (time.time() - t,
+      resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024))
+PY
+```
+
+### The finding the numbers contain, and it is not the obvious one
+
+**Columnar peaks HIGHER than row, despite compressing to 0.43.** `--storage-stats`
+says `lineitem (columnar): 10 MB` against `raw=24773.7 KB encoded=10681.6 KB
+ratio=0.43`, yet peak RSS is 83 MB columnar against 64 MB row.
+
+The cause is in `main.cc`: every table is loaded into `table_rows` **first**, then
+converted, and `table_rows.clear()` runs only **after every table has been
+converted**. So peak memory holds the row image of every table *plus* the
+columnar image of every table. The compression ratio describes the steady state;
+the **peak is the sum**.
+
+That is a genuine scale limit and it belongs in the README as one:
+
+- **Peak memory ≈ row image + columnar image of every table the query touches**,
+  not the columnar size.
+- **Load is per-process and per-query.** Each `swiftql` invocation re-reads and
+  re-parses the `.tbl` files. This is why the fifth gate costs ~5 minutes at
+  sf0.01 — 88 invocations, each reloading a 9 MB `lineitem.tbl` — and why sf0.1
+  is opt-in rather than the default.
+- **`TableStats::compute` runs over the row image** before conversion, so it is
+  paid at every startup.
+
+### What to document, and what not to claim
+
+Write these, each with the measurement beside it:
+
+1. The table above, with the command that produced it.
+2. The peak-memory rule (row + columnar, not columnar alone) and the one-line
+   reason (`table_rows.clear()` placement).
+3. The per-invocation load cost, and its consequence for the gate's runtime.
+4. **The largest scale actually exercised: sf0.1.** Say so plainly. Do **not**
+   extrapolate to SF1 — a linear extrapolation of the sf0.1 figure lands near
+   8 GB, and an untested number in a limits section is worse than no number.
+5. The `SUM`-in-`double` 2^53 bound from Task 5d, which is the *numeric* scale
+   limit and belongs beside the memory one.
+
+**Do not "fix" the peak by moving `table_rows.clear()` into the conversion loop
+this week.** It is a real improvement and it is a *performance* change to the
+load path in the week whose figure is a *correctness* figure. Record it as a
+measured, named, one-line opportunity.
+
+### Verification
+
+- Each number in the section is reproducible with the command printed next to
+  it, from a clean process.
+- The section names the largest scale run and does not extrapolate beyond it.
+- `data/tpch/` is gitignored, so a reader following the section must be able to
+  regenerate both datasets: cite `generate_tpch.py` and its seed, and confirm the
+  regenerated sf0.01 is byte-identical (it is seeded — Week 35 made it so
+  precisely because two runs used to differ).
+
+---
+
+## Task 8 — Re-baseline, the correctness report, and the five-step gate
+
+### Why it matters
+
+Week 35 built the mechanism that makes this week's work checkable; this task is
+where it is used correctly. The gate fails on regression **and** notices
+improvement: an improved run passes, says so, and **asks for the baseline to be
+refreshed in the same commit**. Refreshing it in a later commit leaves a window
+in which the tree's own recorded figure is wrong.
+
+### The order of operations, which is not optional
+
+1. **Land the capability** (Task 1, and Task 3b if it lands) **with its sweep**
+   (Task 2) in one commit.
+2. **Run the gate full** — no `--queries`. A narrowed run reports
+   `PARTIAL-PASS` and names how many of the 22 did not run, precisely so a subset
+   figure cannot be quoted as a full measurement:
+   ```bash
+   python3 python_tools/run_tpch.py \
+       --catalog data/tpch/sf0.01/catalog.json \
+       --baseline docs/tpch-baseline.json
+   ```
+3. **Refresh the baseline in the same commit** as the change that moved it
+   (`--write-baseline docs/tpch-baseline.json`), and re-run to confirm the gate
+   is green against the new baseline.
+4. **Copy the `GATE tpch:` line verbatim** into the report, the README and
+   `.claude/skills/verify/SKILL.md`. Never retype a count.
+5. **Run all five gate steps**, not just the fifth: build, `swiftql_tests`,
+   `compare_against_sqlite.py`, `test_new_queries.py`, `run_tpch.py`. Tasks 1–3
+   touch decorrelation, which Weeks 30–34's suites cover far more densely than
+   TPC-H does.
+
+### What the report must carry
+
+**Every count states its mode split.** The expected line if Task 1 lands and
+Task 3b does not:
+
+```
+GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes,
+                 15 vectorized-only; 1 vacuous; 1 unported)
+```
+
+and if Task 3b lands as well, `21/22 ... 16 vectorized-only; 1 vacuous;
+0 unported`.
+
+Required contents, each already argued in an earlier task:
+
+- The figure with its mode split, copied not retyped.
+- **The provenance sentence.** "Matches SQLite over the same `.tbl` files."
+  Never "correct", never "TPC-H compliant". `dbgen` was unavailable; the
+  generator reproduces the spec's value domains but not its distributions, and
+  `PROVENANCE.txt` states the published answer set does not apply.
+- **The Volcano breakdown table** (Task 4) and the sentence saying this week
+  targeted the headline count rather than mode coverage, with the reason.
+- **q18 remains vacuous by choice.** Its `SUM(l_quantity) > 300` is unreachable
+  on this data (the maximum per-order sum is 295.0). 290 would discriminate, but
+  **300 is already the lowest of the spec's three Q18 quantities**, so lowering
+  it would invent a value the spec does not contain — gaming the benchmark rather
+  than fixing the engine. It stays at 300 and stays counted as vacuous. The
+  report says so in those terms, next to the two parameters (q2's `SIZE`, q19's
+  brands) that **were** re-chosen — from within the spec's own value domains,
+  with the deviation recorded on the line in `VALIDATION_PARAMS`. The contrast is
+  the point: it shows where the line is.
+- **The inherited divergences** from Task 5, each with a verdict.
+- **The scale and memory limits** from Task 7.
+- **What the harness cannot check**, carried from Week 35 rather than restated
+  from memory: a refusal has no rows to diff; SQLite cannot parse a
+  derived-table column alias list; the mutation check neuters **one** predicate
+  per query and therefore bounds the figure from above; the data is synthetic.
+- **Which queries were hand-verified** (Task 6d) and which rest on fingerprint
+  plus mutation — in those words.
+
+### Anticipated mistakes, specific to this gate
+
+- **A gate that could not run is not a gate that passed.** `data/tpch/` is
+  gitignored; on a fresh clone the harness says so and exits non-zero. Do not
+  read that as a TPC-H failure, and do not "fix" it by skipping the step.
+- **An improvement still requires the baseline refresh.** The gate passes on
+  improvement; a passing gate is not evidence the baseline is current.
+- **`--queries` is for iteration, never for the final measurement.** The verdict
+  word changes to `PARTIAL-PASS` for exactly this reason; the report must quote
+  a `PASS` line.
+- **The five minutes are real.** 88 invocations, each reloading a 9 MB
+  `lineitem.tbl`, not parallelised. Budget it rather than narrowing the run.
+
+### Verification
+
+Success criteria for the week, in the form the gate reports them:
+
+1. `GATE tpch:` reads `PASS` with `20/22` (or `21/22`), and its mode split is
+   the one the report prints.
+2. `docs/tpch-baseline.json` records `q17: 2` and no longer lists `q17` under
+   `unported`; `mismatched`, `mutation_broken` and `unexplained` are all empty.
+3. All four earlier gate steps are green, and the rejection sweep's entry count
+   went up by exactly the number of entries Tasks 2 and 3 added.
+4. No count anywhere in the tree still says 19/22 as a current figure.
+5. Every claim in the report is of the form "matches SQLite", and the mode split
+   accompanies every count.
