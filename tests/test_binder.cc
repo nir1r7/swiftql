@@ -1243,3 +1243,69 @@ TEST(BinderTest, BetweenClonesShareAStatementAndBothStayCorrelated) {
         EXPECT_EQ(slots.count(-1), 1u) << "a correlated subquery must contribute -1";
     }
 }
+
+// ---------------------------------------------------------------------------
+// Week 34 — derived tables in the Binder.
+// ---------------------------------------------------------------------------
+
+// THIS TEST PINS AN ARGUMENT, not a behaviour. Binder::relationSchema binds a
+// derived body against `parent` — the block ENCLOSING this one — and never
+// against the scope being built. That single argument choice IS the non-LATERAL
+// rule: sibling FROM items are invisible by construction, with no separate
+// check. A refactor that passes `&scope` compiles, most queries still work, and
+// a lateral query silently binds and returns wrong rows. Nothing else would
+// catch it, because the SQLite oracle cannot hold a query that errors.
+TEST(BinderTest, DerivedTableCannotSeeTheEnclosingBlocksRelations) {
+    Catalog cat(CATALOG);
+    // Nested, so there IS a parent scope for the reference to resolve in: the
+    // body is marked correlated and the LATERAL refusal fires by name.
+    try {
+        bindQuery(
+            "SELECT COUNT(*) FROM laps o WHERE EXISTS (SELECT 1 FROM "
+            "(SELECT team FROM drivers d WHERE d.team = o.team) AS x "
+            "WHERE x.team = o.team)", cat);
+        FAIL() << "a lateral derived table must be refused";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("LATERAL is not supported"),
+                  std::string::npos) << e.what();
+    }
+}
+
+// The OTHER half of the same boundary, pinned so it cannot drift into silently
+// binding. At top level there is no parent scope, so the reference resolves
+// nowhere and the diagnostic is the ordinary unresolved-qualifier one — a
+// sibling FROM item genuinely is not in scope, and the Binder cannot tell a
+// lateral reference from a typo.
+TEST(BinderTest, LateralAtTopLevelReportsAnUnresolvedQualifier) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(bindQuery(
+        "SELECT * FROM laps l JOIN (SELECT team FROM drivers d WHERE d.team = l.team) "
+        "AS x ON x.team = l.team", cat), std::runtime_error);
+}
+
+// A derived table is a relation of the block it appears in, so the duplicate-
+// alias rule applies to it exactly as to a base one — and shadowing across
+// blocks still works, because the range table is PER SCOPE. `d` names a base
+// relation outside and a different base relation inside, which is what SQL
+// scoping means and what proves the body really got its own Scope.
+TEST(BinderTest, DerivedTableBodyGetsItsOwnScope) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT x.nm FROM laps d JOIN (SELECT d.name AS nm, d.driver_id FROM drivers d) "
+        "AS x ON x.driver_id = d.driver_id", cat);
+    EXPECT_TRUE(stmt.has_derived_table);
+    // has_subquery is a DIFFERENT flag and must stay false: it means "a
+    // SubqueryExpr is still in this tree" and drives buildScanSchema's
+    // conservative widening plus Planner::plan's refusal scan. Reusing it would
+    // silently turn projection pushdown off for every derived-table query and
+    // give the wrong Volcano refusal message.
+    EXPECT_FALSE(stmt.has_subquery);
+}
+
+TEST(BinderTest, DerivedTableRequiresAnAlias) {
+    Catalog cat(CATALOG);
+    // A PARSE error, before any catalog lookup: the range table is keyed on the
+    // ref name, so an unaliased derived entry is unreferenceable.
+    EXPECT_THROW(bindQuery("SELECT * FROM (SELECT team FROM laps)", cat),
+                 std::exception);
+}

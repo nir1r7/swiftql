@@ -9,6 +9,7 @@
 #include "catalog/catalog.h"
 #include "common/schema.h"
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1617,4 +1618,152 @@ TEST(SubqueryDispatch, ExprKeyLevelAndSlotCannotRunTogether) {
 
     EXPECT_NE(exprKey(&a), exprKey(&b))
         << "concatenated decimals are not prefix-free: " << exprKey(&a);
+}
+
+// ---------------------------------------------------------------------------
+// Week 34 — derived tables. These pin DECISIONS the SQLite oracle structurally
+// cannot see: it compares rows, so a plan that produces the right rows for the
+// wrong reason passes it. Each test below names the reason.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Walk to the LogicalDerived under a plan, wherever it sits on the spine.
+const LogicalDerived* findDerived(const LogicalPlanNode* node) {
+    if (!node) return nullptr;
+    if (node->type == LogicalNodeType::DERIVED)
+        return static_cast<const LogicalDerived*>(node);
+    for (const auto& child : node->children) {
+        if (const LogicalDerived* d = findDerived(child.get())) return d;
+    }
+    return nullptr;
+}
+
+const LogicalJoin* findJoin(const LogicalPlanNode* node) {
+    if (!node) return nullptr;
+    if (node->type == LogicalNodeType::JOIN)
+        return static_cast<const LogicalJoin*>(node);
+    for (const auto& child : node->children) {
+        if (const LogicalJoin* j = findJoin(child.get())) return j;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+// THE WEEK'S CENTRAL INVARIANT, and nothing else asserts it directly. A derived
+// relation's OWN schema stamps slot 0, exactly as a leaf scan's does; the outer
+// slot is applied only by the merged join schema. Stamp the outer slot here
+// instead and the rows are still right for a one-relation query, while
+// PredicatePushdown's restampSlots(c, 0) before a push and ChunkPruner's
+// relation_slot < 1 scan-local test both silently stop matching.
+TEST(DerivedTable, RelationColumnsAreStampedSlotZero) {
+    Catalog cat(CATALOG);
+    // The BODY joins, so its own output schema carries slots 0 AND 1 before
+    // normalization — the case that would put two numbering domains in one schema.
+    auto plan = buildLogical(
+        "SELECT x.t FROM (SELECT l.team AS t, d.name AS nm FROM laps l "
+        "JOIN drivers d ON l.driver_id = d.driver_id) AS x", cat);
+    const LogicalDerived* derived = findDerived(plan.get());
+    ASSERT_NE(derived, nullptr);
+    ASSERT_EQ(derived->output_schema.size(), 2);
+    for (const auto& col : derived->output_schema.columns()) {
+        EXPECT_EQ(col.relation_slot, 0) << "column " << col.name;
+    }
+    // The body's own plan still carries the body's numbering — the normalization
+    // is applied at the boundary, not inside.
+    const Schema& body = derived->children[0]->output_schema;
+    ASSERT_EQ(body.size(), 2);
+}
+
+// The merged join schema is where the OUTER slot appears, applied by the same
+// loop that stamps a base relation. If it did not, a derived relation joined to
+// a base one would be unreferenceable by slot from above.
+TEST(DerivedTable, MergedJoinSchemaStampsTheOuterSlot) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT dr.name, d.s FROM (SELECT driver_id, AVG(speed) AS s FROM laps "
+        "GROUP BY driver_id) AS d JOIN drivers dr ON d.driver_id = dr.driver_id", cat);
+    const LogicalJoin* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->join_slot, 1);
+    bool saw_slot_zero = false, saw_slot_one = false;
+    for (const auto& col : join->output_schema.columns()) {
+        if (col.relation_slot == 0) saw_slot_zero = true;
+        if (col.relation_slot == 1) saw_slot_one = true;
+    }
+    EXPECT_TRUE(saw_slot_zero) << "the derived relation's columns";
+    EXPECT_TRUE(saw_slot_one)  << "the joined base relation's columns";
+}
+
+// The column-alias list RENAMES positionally and its arity is checked. The
+// rename has to survive into the plan schema, because resolveColumnIndex and
+// every indexOf above the graft look the new names up.
+TEST(DerivedTable, ColumnAliasListRenamesPositionally) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT d.a FROM (SELECT team, speed FROM laps) AS d (a, b)", cat);
+    const LogicalDerived* derived = findDerived(plan.get());
+    ASSERT_NE(derived, nullptr);
+    ASSERT_EQ(derived->output_schema.size(), 2);
+    EXPECT_EQ(derived->output_schema.column(0).name, "a");
+    EXPECT_EQ(derived->output_schema.column(1).name, "b");
+}
+
+TEST(DerivedTable, ColumnAliasArityMismatchIsRefused) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical("SELECT * FROM (SELECT team FROM laps) AS d (a, b)", cat),
+                 std::runtime_error);
+}
+
+// A base table cannot produce two columns of one name; a derived table can, and
+// after the slot-0 normalization BOTH indexOf overloads become a coin flip.
+// Refused rather than disambiguated.
+TEST(DerivedTable, DuplicateOutputColumnNameIsRefused) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical(
+        "SELECT * FROM (SELECT l.team, d.team FROM laps l "
+        "JOIN drivers d ON l.driver_id = d.driver_id) AS x", cat),
+        std::runtime_error);
+}
+
+// Week 34's correlated-scalar rewrite MUST produce a LEFT join. An INNER join
+// returns the same rows for most shapes — SQL's NULL comparison excludes the
+// unmatched rows anyway — and a different answer as soon as the predicate sits
+// under an OR. The harness carries that query; this pins the plan property
+// directly, so a regression is localized to the rewrite rather than to a diff.
+TEST(CorrelatedScalar, DecorrelatesToALeftJoinOverADerivedRelation) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT COUNT(*) FROM laps l WHERE l.speed > "
+        "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)", cat);
+    const LogicalJoin* join = findJoin(plan.get());
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->join_type, JoinType::LEFT)
+        << "an INNER join drops the outer row where SQL says the scalar is NULL";
+    EXPECT_EQ(join->semantics, JoinSemantics::STANDARD);
+    // The right child is the SAME node FROM (subquery) produces, not a special
+    // case — if it stops being one, four walkers and the range-table size each
+    // need a second argument and the two will drift.
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::DERIVED);
+    // ONE aggregate under the join, not one per outer row.
+    const LogicalPlanNode* right = join->children[1].get();
+    int aggregates = 0;
+    std::function<void(const LogicalPlanNode*)> count = [&](const LogicalPlanNode* n) {
+        if (n->type == LogicalNodeType::AGGREGATE) ++aggregates;
+        for (const auto& c : n->children) count(c.get());
+    };
+    count(right);
+    EXPECT_EQ(aggregates, 1);
+}
+
+// The guard that keeps Week 31's runtime cardinality divergence honest: after
+// the rewrite the GROUP BY gives one row per key by construction, so a
+// non-aggregate body has no `returned more than one row` check left anywhere.
+TEST(CorrelatedScalar, NonAggregateBodyIsRefusedRatherThanSilentlyAnswered) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(buildLogical(
+        "SELECT COUNT(*) FROM laps l WHERE l.speed > "
+        "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)", cat),
+        std::runtime_error);
 }
