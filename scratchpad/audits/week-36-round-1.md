@@ -138,3 +138,89 @@ rebuilt) and a typed SQLite oracle. Evidence:
   declined option's defect is real and the taken option avoids it.
 
 ### T3 — the re-baseline: deltas VERIFIED, no coverage lost. Provenance of the run is NOT established — see F1.
+
+Deltas re-verified above under F1. Nothing else moved; no query lost modes.
+
+### T4 — q21 declined in the open: VERIFIED. No issue found.
+
+- **The recorded blocker is accurate.** `6054d50` widens the refusal at
+  `src/planner/subquery_decorrelation.cc:58-73` to say the inequality "would have
+  to ride as an ON residual on the semi/anti join, which this engine's set-probe
+  build side cannot evaluate". Checked against the code it cites:
+  `src/execution/vec_hash_join_node.h:89` declares
+  `std::unordered_set<std::string> build_keys_`, filled at
+  `vec_hash_join_node.cc:130` and probed at `:278` with `build_keys_.count(...)`.
+  Keys only, no rows — so a residual over a probe(+)build pair genuinely has
+  nothing to evaluate against. The claim is read off the code, not asserted.
+- **It is refused by name, not silently skipped.** The q21 shape
+  `EXISTS (SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND
+  l.lap_id != d.driver_id)` errors with exactly that message.
+- **It is pinned.** `python_tools/compare_against_sqlite.py:1372` opens a Week 36
+  block pinning Q21's shape on the F1 catalog, registered at `:2449`; `:1543`
+  pins the executable ON-residual counterpart.
+- **The record is honest.** `docs/tpch-baseline.json` keeps `modes.q21 = 0` and
+  `unported: ["q21"]` — declined and recorded, not counted.
+
+### T5 — the two harness fixes: BOTH VERIFIED. No issue found.
+
+**`629cf74` (NaN compared EQUAL to anything).** The hole was real and is closed:
+
+- Pre-fix, `abs(x - y) > max(abs_tol, rel_tol * ...)` was the *only* float test
+  (`compare_against_sqlite.py:1956` in the old form). IEEE 754 makes every
+  comparison against NaN False, so the mismatch branch was unreachable and
+  `rows_equal([[nan]], [[5.0]])` returned True — a NaN in any SwiftQL answer was
+  invisible to the oracle.
+- Post-fix, run against the checked-in source:
+  `rows_equal([[nan]],[[5.0]]) -> False`, `rows_equal([[nan]],[[nan]]) -> True`,
+  `rows_equal([[inf]],[[-inf]]) -> False`. The previously-slipping case is caught.
+- **It is on the live path.** `rows_equal` has exactly one production call site,
+  `compare_against_sqlite.py:2082`
+  (`rows_equal(normalize(swift_rows, ordered), normalize(sqlite_rows, ordered))`)
+  — every query suite in the file funnels through it. No suite compares with a
+  bare `==` on normalized rows, so the fix is not bypassed.
+- `check_rows_equal_non_finite()` (`:2259`) asserts all seven cases and raises
+  rather than counting, so a future regression stops the run.
+
+**`c793407` (random_diff's projection named the join key).** Both defects are
+real and both are fixed at `python_tools/random_diff.py:112-165`:
+
+- Old pool: `for table, alias in rels[:3]: proj_pool.append(f"{alias}.driver_id
+  AS {alias}_did"); proj_pool.append(f"{alias}.team AS {alias}_team")`. Two
+  independent holes — (a) `rels[:3]`, so on an 8-relation shape five relations
+  were never projected and a wrong-relation resolution in relation 5 produced a
+  byte-identical answer; (b) `driver_id` is the join key every relation is joined
+  on (`random_diff.py:112`, `key = "driver_id"`), so `r1.driver_id` and
+  `r4.driver_id` are equal **by construction** and projecting them cannot
+  distinguish which relation a column came from. That is precisely the Week 33
+  H-1/H-2 defect class (bare-name key resolved against the wrong relation of a
+  merged schema: wrong rows, no error, identical `--explain`) — the generator
+  built to find it could not see it.
+- New pool iterates `rels` (no slice) and gives each relation non-key,
+  per-row-varying columns — `lap_id`/`speed`/`season` for `laps`,
+  `name`/`age` for `drivers` — keeping `team` only as the mixed case rather than
+  the only case. A swapped relation reference now changes the projected values.
+- Cost was measured rather than waved at (40-shape batch 61 s -> 102 s) and
+  recorded in the comment.
+
+## Verdict
+
+**20/22 is honest as a capability claim, and unproven as a measurement.**
+
+q17 genuinely runs the spec's own text, matches SQLite inside tolerance,
+produces a plan byte-identical to the form already diffed against SQLite,
+discriminates under mutation, and the lift refuses everything it should still
+refuse — including the COUNT zero-row case that the declined Option A would have
+answered wrongly. The template was not weakened. Nothing in the range moves the
+figure by moving the goalposts.
+
+What is not established is that the *recorded* figure came from the full run its
+commit message describes. The run that writes `docs/tpch-baseline.json` also
+writes `docs/tpch-sf0.01-report.json`, and the latter was never updated — it
+still publishes 19/22 with q17 UNPORTED (F1). Given that an implementer with no
+verifier refreshed the baseline that scores it, the missing sibling artifact is
+the one piece of evidence that would have made the refresh self-proving, and it
+is absent.
+
+Severity tally: 1 medium-high (F1), 0 high, 0 blockers.
+
+Targets reached: 1, 2 (partial — sweep spot-checks folded into T1/F1), 3, 4, 5.
