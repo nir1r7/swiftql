@@ -17,6 +17,7 @@
 #include "common/schema.h"
 #include "common/value.h"
 #include "parser/ast.h"
+#include <cmath>
 #include <numeric>
 #include <vector>
 
@@ -2442,6 +2443,40 @@ TEST(VecLeftHashJoin, NullProbeKeyIsUnmatchableButStillEmitted) {
     auto inner = std::make_unique<VecHashJoinNode>(
         std::make_unique<NullableSourceNode>(probe_schema, probe_rows),
         makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    EXPECT_EQ(drainRows(*inner).size(), 1u);
+}
+
+// The other half of isUnmatchableKey, on the vectorized path. A NaN is
+// unmatchable by the IEEE rule rather than the SQL one (two NaNs serialize to the
+// same text but Value::operator== on the pair is false), so an outer join must
+// preserve its row exactly as it preserves a NULL one — which is also what SQLite
+// does, since it stores NaN as NULL. Reachable through makeScan: a ColumnarTable
+// cannot express NULL but it can hold a NaN DOUBLE.
+TEST(VecLeftHashJoin, NaNProbeKeyIsUnmatchableButStillEmitted) {
+    Schema probe_schema = vecSchema({{"pk", TypeId::DOUBLE}, {"pval", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bk", TypeId::DOUBLE}});
+    Schema out_schema   = vecSchema({{"pk", TypeId::DOUBLE}, {"pval", TypeId::STRING},
+                                     {"bk", TypeId::DOUBLE}});
+    const double nan_v = std::nan("");
+    std::vector<Row> probe_rows = {
+        {Value(1.0),   Value(std::string("one"))},
+        {Value(nan_v), Value(std::string("nan"))},
+    };
+    // a NaN on the build side must not be inserted either, so it cannot match
+    std::vector<Row> build_rows = {{Value(1.0)}, {Value(nan_v)}};
+
+    auto join = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        out_schema, /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(*join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[1][1].asString(), "nan");
+    EXPECT_TRUE(rows[1][2].isNull()) << "a NaN key matches nothing, including another NaN";
+
+    auto inner = std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
         std::vector<int>{0}, std::vector<int>{0}, out_schema);
     EXPECT_EQ(drainRows(*inner).size(), 1u);
 }

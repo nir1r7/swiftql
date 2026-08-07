@@ -687,7 +687,11 @@ TEST(JoinEnumeration, DeclinesAnyTreeContainingAnOuterJoin) {
         "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
         "LEFT JOIN drivers d2 ON d.team = d2.team";
     auto plan = optimize(outer, cat);
-    EXPECT_TRUE(decisionOf(plan.get()).empty());
+    // reported, not silent: a decision WAS available here and was refused, and
+    // the cost (no ordering for the query's inner block either) is real. Spelled
+    // without `order=`, because no order was chosen.
+    EXPECT_EQ(decisionOf(plan.get()), "join-ordering=skipped (outer join)");
+    EXPECT_EQ(decisionOf(plan.get()).find("order="), std::string::npos);
     // written order preserved: relation 0 stays at the bottom of the spine
     EXPECT_EQ(chosenOrder(plan.get()), (std::vector<int>{0, 1, 2}));
 
@@ -721,4 +725,38 @@ TEST(JoinEnumeration, OuterJoinEstimateIsFlooredAtThePreservedSide) {
     auto inner_plan = optimize(
         "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.lap_id = d.driver_id", cat);
     EXPECT_DOUBLE_EQ(topJoin(inner_plan.get())->estimated_rows, 20.0);
+}
+
+// The ON residual narrows the MATCH term, so ignoring it is unsafe in exactly the
+// direction the floor exposes: a selective residual drives the true answer down
+// TO the floor while an unadjusted estimate stays at the ceiling. Measured on the
+// shipped catalog before this was applied: est=10000 against rows_out=20.
+// It is not cosmetic — the parent join of a mixed query reads this number as
+// `from_est` for its build-side and algorithm choice.
+TEST(JoinEnumeration, OuterJoinEstimateAppliesTheOnResidualToTheMatchTerm) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // 20 drivers x 1000 laps / NDV(driver_id) 20 = 1000 matches, well above the
+    // 20-row floor, so the residual is what moves the number. season has NDV 3,
+    // so an equality on it keeps a third.
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
+        "ON d.driver_id = l.driver_id AND l.season = 2022", cat);
+    const LogicalJoin* j = topJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    ASSERT_NE(j->on_residual, nullptr);
+    EXPECT_NEAR(j->estimated_rows, 1000.0 / 3.0, 0.001);
+
+    // the same join without the residual keeps the full match estimate, so the
+    // difference is the residual and not the floor
+    auto plain = optimize(
+        "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id", cat);
+    EXPECT_DOUBLE_EQ(topJoin(plain.get())->estimated_rows, 1000.0);
+
+    // ...and the floor still wins when the residual would take it below the
+    // preserved side's row count
+    auto floored = optimize(
+        "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
+        "ON d.driver_id = l.driver_id AND l.lap_id = 7", cat);
+    EXPECT_DOUBLE_EQ(topJoin(floored.get())->estimated_rows, 20.0);
 }

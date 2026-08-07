@@ -1057,6 +1057,11 @@ TEST(VecPlanBuilder, OuterJoinReportsAForcedBuildSide) {
     EXPECT_NE(e.find("build=drivers"), std::string::npos) << e;
     EXPECT_NE(e.find("outer: the preserved side must probe"), std::string::npos) << e;
     EXPECT_EQ(e.find("(alt="), std::string::npos) << e;
+    // both keys are INT, so SIMD would have been in the running for an inner
+    // join. The suffix has to say the algorithm was not a choice either, or a
+    // reader cannot tell "ineligible" from "lost on cost" — the `algo=` clause
+    // is suppressed for an outer join.
+    EXPECT_NE(e.find("hash only"), std::string::npos) << e;
 }
 
 // The residual travels from LogicalJoin::on_residual into the operator, and the
@@ -1078,4 +1083,60 @@ TEST(VecPlanBuilder, OuterJoinCarriesItsOnResidualIntoTheOperator) {
     const size_t drivers_rows = CSVLoader::load(dm.filepath, dm.schema).size();
     ASSERT_EQ(rows.size(), drivers_rows);
     for (const Row& r : rows) EXPECT_TRUE(r[1].isNull());
+}
+
+// The leftmost VecScan, following children()[0] to the bottom of the spine —
+// the only scan a pruning hint can reach.
+static const VecPlanNode* leftmostScan(const VecPlanNode* root) {
+    const VecPlanNode* n = root;
+    while (n && !n->children().empty()) n = n->children()[0];
+    return n;
+}
+
+// Week 29. Predicate pushdown now leaves a single-slot `ColumnRef op Literal`
+// conjunct in the residual above an outer join (it may not be pushed onto the
+// null-supplying side), and that residual descends to the PRESERVED side's scan
+// as its zone-map pruning hint. So a predicate over `laps` reaches `drivers`'
+// scan, where the only thing standing between it and the wrong table's zone maps
+// is ChunkPruner's `relation_slot < 1` test in another file. The answer is right
+// either way today; the guard exists so the safety argument is local, because the
+// failure mode is silent row loss on the side the whole feature preserves.
+TEST(VecPlanBuilder, OuterJoinWithholdsAPruningHintOverTheNullSupplyingSide) {
+    Catalog cat(CATALOG);
+    auto plan = buildVecOptimized(
+        "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+        "WHERE l.season = 2024", cat);
+    const VecPlanNode* scan = leftmostScan(plan.get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("VecScan [drivers"), std::string::npos) << scan->explain();
+    EXPECT_EQ(scan->explain().find("pruning=on"), std::string::npos)
+        << "the hint over the null-supplying relation must not reach the preserved "
+           "side's scan: " << scan->explain();
+}
+
+// ...and the guard is scoped to outer joins, so an INNER join's hint is
+// unchanged — including the mixed-slot un-pushed WHERE that the Phase 4
+// benchmark measures (buildVec skips pushdown, which is the --no-optimize shape).
+TEST(VecPlanBuilder, InnerJoinKeepsItsPruningHintUnchanged) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.season = 2024 AND d.age > 30", cat);
+    const VecPlanNode* scan = leftmostScan(plan.get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("VecScan [laps"), std::string::npos) << scan->explain();
+    EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
+}
+
+// A preserved-side-only hint still descends: withholding it would cost an outer
+// join the pruning it is entitled to, and sigma_p(R) LEFTJOIN S is equivalent.
+TEST(VecPlanBuilder, OuterJoinKeepsAPreservedSideOnlyPruningHint) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.season = 2024", cat);
+    const VecPlanNode* scan = leftmostScan(plan.get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("VecScan [laps"), std::string::npos) << scan->explain();
+    EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
 }

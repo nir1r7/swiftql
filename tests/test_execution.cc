@@ -669,6 +669,47 @@ TEST(HashJoinNode, LeftOuterEmitsAProbeRowWhoseKeyIsNull) {
     EXPECT_EQ(drainAll(&inner).size(), 1u);
 }
 
+// The other half of isUnmatchableKey. A NaN key is unmatchable by the IEEE rule
+// rather than the SQL one — two NaNs serialize to the same text and would land in
+// one bucket, while Value::operator== on the pair is false — so an outer join
+// must preserve its row exactly as it preserves a NULL one. SQLite agrees for a
+// different reason (it stores NaN as NULL, which is also unmatchable), so this is
+// the case where the outer join NARROWS the documented NaN divergence. Only
+// reachable in memory: the shipped CSVs contain no NaN.
+TEST(HashJoinNode, LeftOuterEmitsAProbeRowWhoseKeyIsNaN) {
+    Schema left_schema  = makeSchema({{"pk", TypeId::DOUBLE}, {"pval", TypeId::STRING}});
+    Schema right_schema = makeSchema({{"bk", TypeId::DOUBLE}});
+    Schema merged       = makeSchema({{"pk", TypeId::DOUBLE}, {"pval", TypeId::STRING},
+                                      {"bk", TypeId::DOUBLE}});
+
+    const double nan_v = std::nan("");
+    std::vector<Row> left_rows = {
+        {Value(1.0),   Value(std::string("one"))},
+        {Value(nan_v), Value(std::string("nan"))},
+    };
+    // a NaN on the BUILD side too: it must not be inserted, so it cannot rescue
+    // the probe-side NaN by matching it
+    std::vector<Row> right_rows = {{Value(1.0)}, {Value(nan_v)}};
+
+    HashJoinNode join(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged,
+        /*swapped=*/false, /*left_outer=*/true);
+
+    auto rows = drainAll(&join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[1][1].asString(), "nan");
+    EXPECT_TRUE(rows[1][2].isNull()) << "a NaN key matches nothing, including another NaN";
+
+    // and as an INNER join the row is dropped, so the two really differ
+    HashJoinNode inner(
+        makeScan(left_rows,  left_schema),
+        makeScan(right_rows, right_schema),
+        std::vector<std::string>{"pk"}, std::vector<std::string>{"bk"}, merged);
+    EXPECT_EQ(drainAll(&inner).size(), 1u);
+}
+
 // An ON residual filters the MATCH TEST: a candidate that fails it is not a
 // match, so a probe row whose every candidate fails is null-extended rather than
 // dropped. Get this wrong and the row vanishes — neither joined nor preserved.
