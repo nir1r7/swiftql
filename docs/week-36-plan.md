@@ -1285,7 +1285,7 @@ Success criteria for the week, in the form the gate reports them:
 |---|---|---|
 | 1 — lift the constant wrapper (Q17) | **DONE** | spec form runs; plan byte-identical to the constant-outside form |
 | 2 — the sweep the lift obliges | **DONE** | landed in the same commit; sweep report below |
-| 3 — Q21 | next | 3a (establish + record) mandatory, 3b (implement) stretch |
+| 3 — Q21 | **3a DONE, 3b DECLINED** | requirement established and pinned; see the decision below |
 | 4 — Volcano breakdown | measured, unwritten | table is in Task 4 above; owed to the report |
 | 5 — inherited divergences | not started | — |
 | 6 — small items owed | 6a DONE (uncommitted) | 6b/6c/6d not started |
@@ -1339,5 +1339,58 @@ The wrapped case worked and every Week 34 shape broke. A defensive
 first run; the fix was structural — locate **after** the move, on the caller's
 own local, so the pointer cannot outlive what it names.
 
-**Next concrete step:** Task 3a — reproduce q21's refusal against the rebuilt
-binary and record the requirement; then decide 3b.
+### Task 3 — the decision, in the open
+
+**3a is done. 3b is declined this week, on a size that was measured rather than
+guessed.** q21 stays UNPORTED, with a recorded reason instead of a bare zero.
+
+**What q21 needs, exactly.** Not a missing key — *both* its bodies have one. It
+pairs a valid correlated equality with a correlated **inequality**:
+`l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey != l1.l_suppkey`. The inequality
+would have to ride as an **`ON` residual on the semi/anti join**, evaluated
+inside the probe against a probe⊕build pair.
+
+**Why that is an operator change and not a flag** — four facts, each read off the
+code rather than inferred:
+
+1. `VecHashJoinNode::open` fills `build_keys_` (an `unordered_set<string>` of
+   serialized keys) when `semantics_ != STANDARD`, and `hash_table_`
+   (`key -> vector<Row>`) otherwise. A residual needs the **rows**.
+2. `passes()` evaluates the residual against `output_schema_`, which for a
+   semi/anti join **is the probe schema**. A residual naming a body column cannot
+   resolve there, and widening `output_schema_` is forbidden — it is the Week 32
+   containment that keeps the body's slot numbering out of the outer plan.
+3. `lowerExistsSubqueries` replaces the body's select list with **its key columns
+   only**, for three named defects (round 1 H-1/H-2/M-3). Residual columns would
+   have to be appended after the keys, never inserted, or the positional right
+   key indices break.
+4. Q21's residual compares `l3.l_suppkey` with `l1.l_suppkey` — **two columns
+   with the same name** from two aliases of one table. In a merged residual
+   schema `indexOf(name)` takes the first. That is the H-1 wrong-relation class
+   verbatim: wrong rows, no error, an identical `--explain`.
+
+**Why it belongs after this week.** The change is ~200 lines across four files
+with a slot-domain correctness question at its centre, and the operator it
+changes is **shared**: q4, q16, q18, q20 and q22 all probe through it — ten cells
+against q21's two. A half-landed residual costs more than q21 gains, and the week
+already carries the sweep, the divergence record, the scale limits and a
+re-baseline. This is the "an honest 20 beats a flattering 21" call, made
+deliberately.
+
+**What 3a shipped instead of a bare refusal:**
+
+- The message now names **what it would take** rather than reading as a dead
+  end: `... a correlated inequality has no equi-join to lower to; it would have
+  to ride as an ON residual on the semi/anti join, which this engine's set-probe
+  build side cannot evaluate`.
+- `WEEK36_CORRELATED_RESIDUAL_REFUSED` pins q21's shape on the F1 catalog in
+  **both polarities** (`EXISTS` and `NOT EXISTS`) plus the scalar family, which
+  shares `splitCorrelation`. Every pre-existing inequality entry is correlated
+  *only* by an inequality and would still be refused by any future work; none of
+  them covered "a valid key with an inequality beside it". These three are what
+  a residual implementation must **move** to a diffed suite, not delete.
+- README's dialect row now carries the requirement, so the next reader inherits
+  the four facts above rather than re-deriving them.
+
+**Next concrete step:** Task 4 — write the Volcano breakdown into the README and
+`planner.cc`'s cost paragraph.

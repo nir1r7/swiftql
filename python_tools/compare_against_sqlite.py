@@ -1369,6 +1369,44 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
      "must appear in GROUP BY or be used in an aggregate function"),
 ]
 
+# WEEK 36 — TPC-H Q21'S SHAPE, pinned on the F1 catalog so the boundary is a
+# behavioural fact here and not only a line in the TPC-H report.
+#
+# Every existing correlated-inequality entry is correlated ONLY by an inequality,
+# so it fails the `keys.empty()` test and would STILL be refused by any future
+# work. Q21 is the shape nothing covered: a perfectly good correlated EQUALITY
+# with an inequality BESIDE it --
+#
+#     EXISTS (SELECT * FROM lineitem l2
+#             WHERE l2.l_orderkey = l1.l_orderkey       <- a join key
+#               AND l2.l_suppkey != l1.l_suppkey)       <- a correlated inequality
+#
+# That inequality would have to ride as an ON RESIDUAL on the semi/anti join.
+# It is refused today, and these entries are what a residual implementation
+# would have to MOVE rather than delete -- the discipline that nothing leaves a
+# rejection suite without arriving in a diffed one.
+#
+# Both polarities, because SEMI and ANTI part company on the residual: a semi
+# join emits the probe row if SOME matching build row passes, an anti join if
+# NONE does, and the two are not one boolean apart in the operator.
+WEEK36_CORRELATED_RESIDUAL_REFUSED = [
+    ("SELECT l.lap_id FROM laps l WHERE EXISTS "
+     "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+     " AND l2.speed != l.speed)",
+     "would have to ride as an ON residual"),
+    ("SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
+     "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+     " AND l2.speed > l.speed)",
+     "would have to ride as an ON residual"),
+    # ...and the SCALAR family reaches the same guard, which is worth pinning
+    # separately: splitCorrelation is shared, so a residual added for EXISTS
+    # would change this query's behaviour too, and it must not do so silently.
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team "
+     " AND l2.lap_id != l.lap_id)",
+     "would have to ride as an ON residual"),
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -2359,6 +2397,20 @@ def main():
         rp, rf, re_ = run_rejection_suite(
             WEEK34_CORRELATED_SCALAR_REFUSED,
             f"Week 34 shapes scalar decorrelation declines — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+
+    # Week 36 — TPC-H Q21's shape: a correlated equality WITH an inequality beside
+    # it. Vectorized only, for the same reason as the suite above: the Volcano
+    # path refuses a correlated subquery outright and would assert the wrong
+    # refusal. The Volcano half is covered by the correlated-subquery Volcano
+    # entries already.
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK36_CORRELATED_RESIDUAL_REFUSED,
+            f"Week 36 correlated inequality beside a valid key — {label}",
+            extra_args=extra)
         r_passed += rp
         r_failed += rf
         r_errors += re_

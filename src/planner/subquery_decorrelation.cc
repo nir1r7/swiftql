@@ -55,8 +55,22 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
 
         auto* bin = dynamic_cast<BinaryExpr*>(c.get());
         if (!bin || bin->op != "=")
+            // Week 36 — the message now names WHAT IT WOULD TAKE, because "no
+            // equi-join to lower to" reads as a dead end and it is not one. TPC-H
+            // Q21 is exactly this shape: `l2.l_orderkey = l1.l_orderkey AND
+            // l2.l_suppkey != l1.l_suppkey` -- a perfectly good key WITH an
+            // inequality beside it. The inequality would have to ride as an ON
+            // RESIDUAL on the semi/anti join, evaluated inside the probe against a
+            // probe(+)build pair. That is a real operator change and not a flag:
+            // the semi/anti build side keeps KEYS ONLY (build_keys_, a set), the
+            // residual would need the build ROWS, and it would have to be
+            // evaluated against a private probe(+)build schema -- output_schema_
+            // IS the probe schema and must stay that way (Week 32's containment).
+            // See docs/week-36-plan.md Task 3 for the full requirement.
             refuse("only an equality between two columns can become a join key "
-                   "(a correlated inequality has no equi-join to lower to)");
+                   "(a correlated inequality has no equi-join to lower to; it "
+                   "would have to ride as an ON residual on the semi/anti join, "
+                   "which this engine's set-probe build side cannot evaluate)");
 
         auto* l = dynamic_cast<ColumnRef*>(bin->left.get());
         auto* r = dynamic_cast<ColumnRef*>(bin->right.get());
