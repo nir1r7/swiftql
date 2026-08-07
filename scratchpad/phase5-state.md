@@ -1,28 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 33 — gate r3 running (ab7127093c9d5a289, launched 12:47 UTC) on the post-fix
-  tree at 12efb77. SERIAL: no concurrent audit until a gate is GREEN again.
-  ROOT CAUSE OF THE RED, found and fixed (7c46bdf): materializeSubqueries never stopped
-  materializing CORRELATED subqueries after Task 2 deleted the Validator refusal ITS HEADER
-  SAYS IT TRUSTS. It ran each correlated body once, resolved the outer ref BY BARE NAME against
-  the body's own schema (l.driver_id = d.driver_id became a tautology) and folded EXISTS to
-  Filter [1] — and made decorrelation dead code from the CLI. One cause behind all 56 sqlite
-  failures. This is the exact hazard flagged when Task 2 removed the refusal: a tripwire
-  removed without updating what depended on it.
-  All 6 unit failures were STALE ASSERTIONS, checked one at a time — every query is still
-  refused, now by decorrelation's per-shape message instead of the deleted blanket one.
-  C-1 REPRODUCED vs SQLite before fixing (build-side NULL 0 vs 20; probe-side NULL 0 vs 16),
-  fixed by SPLITTING ANTI (textbook = NOT EXISTS) from ANTI_NOT_IN (three-valued), so the rule
-  lives IN THE TYPE. C-2 reproduced (5 vs 20), now refused by name. Both HIGHs + M-3 fixed by
-  projecting the body to its key columns so build indices are POSITIONAL, no name lookup left.
-  M-3's "only SELECT * bodies" was real and is REMOVED, not documented.
-  STILL OPEN after the gate: M-4 (tautological containment assertion in both lowerings),
-  M-5 (site-12 comment cites the deleted refusal; refuseUnloweredCorrelated missing on SELECT
-  list + ORDER BY), M-7 (false predicate_pushdown.cc rationale), L-8 (refusal names the wrong
-  cause), and appending items 4-7 to the plan's ## Progress.
+Current: week 33 — gate r3 GREEN. Audit r2 running (aee0d3c8966e1a6f1, 13:00 UTC, 30-min
+  budget), auditing THE FIX ROUND AS NEW CODE. Its target #1 is to hunt the same shape of bug
+  elsewhere: any code whose comments or preconditions cite a refusal/guard/invariant that
+  week 33 removed. That pattern has now caused a SILENT WRONG ANSWER TWICE in this project.
+  STILL OPEN, to do after the audit lands (one combined cleanup round, then a closing gate):
+  M-4 tautological containment assertion in both lowerings; M-5 site-12 comment cites the
+  deleted refusal + refuseUnloweredCorrelated missing on SELECT list and ORDER BY; M-7 false
+  predicate_pushdown.cc rationale; L-8 refusal names the wrong cause; and appending the fix
+  round's items 4-7 to docs/week-33-plan.md's ## Progress.
+  Then: week 33 closes with a partial checkpoint (EXISTS/NOT EXISTS met; correlated scalar
+  Q17/Q22 missed and owned by week 34), and week 34 begins.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
-Last gate: !! RED (week 33 round 2) — FIRST RED GATE OF THE PHASE.
+Last gate: GREEN (week 33 round 3) — unit 783/783, sqlite 1052, regression 318 all modes;
+  staleness disproved down to per-.o timestamps. Parallel gate+audit is permitted again.
+Previous: RED (week 33 round 2) — the phase's first and so far only red gate.
   build PASS (verified not stale); unit 769/775 with 6 SubqueryValidation/SubqueryMaterialization
   failures; sqlite 952 passed / 56 failed / 4 errors, first being "expected a rejection, got
   rows" on a correlated scalar in the Rejections mode; regression 318 PASS.
