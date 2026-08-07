@@ -339,6 +339,24 @@ std::unique_ptr<Expr> Parser::parseCompare(){
         consume();
         expect(TokenType::LPAREN, "( after IN");
 
+        // Week 30. IN (subquery) is a DIFFERENT production, not a longer
+        // constant list: InExpr's whole design is a set hashed once at compile
+        // time (ast.h), which a subquery cannot be, and Week 32 lowers this
+        // shape to a semi-/anti-join instead. One token of lookahead keeps them
+        // apart — SELECT can begin no expression, so the grammar stays
+        // unambiguous.
+        if (check(TokenType::SELECT)) {
+            auto sq = std::make_unique<SubqueryExpr>();
+            sq->kind = SubqueryExpr::Kind::IN;
+            sq->negated = negated;
+            sq->operand = std::move(left);
+            // parseSelect(), never parse(): parse() requires end-of-input and a
+            // subquery ends at its own ')'.
+            sq->subquery = std::make_shared<SelectStatement>(parseSelect());
+            expect(TokenType::RPAREN, ") to close the IN subquery");
+            return sq;
+        }
+
         auto node = std::make_unique<InExpr>();
         node->operand = std::move(left);
         node->negated = negated;
@@ -431,12 +449,35 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
     // write, and it reaches here — parseCompare's lookahead only sees a NOT that
     // follows a complete left operand. Without this it failed with the generic
     // "Expected an expression", which says nothing about what is supported.
+    // Week 30 — NOT EXISTS. parseCompare's NOT lookahead only fires after a
+    // complete left operand, so a LEADING NOT — which is how EXISTS is always
+    // written (TPC-H Q21) — arrives here and would hit kNotSupportMessage
+    // below. Same one-token lookahead idiom parseCompare uses: current_ is NOT,
+    // so lexer_.peek() is the token after it. Must precede the throw.
+    if (check(TokenType::NOT) && lexer_.peek().type == TokenType::EXISTS) {
+        consume();                       // the NOT
+        return parseExistsSubquery(/*negated=*/true);
+    }
+    if (check(TokenType::EXISTS)) {
+        return parseExistsSubquery(/*negated=*/false);
+    }
+
     if (check(TokenType::NOT)) {
         throw ParseError(kNotSupportMessage, current_);
     }
 
-    // parenthesized expression
+    // Parenthesized expression, or a Week 30 SCALAR subquery. One token of
+    // lookahead separates them. The scalar form lives at the primary level
+    // because it is self-delimiting, so it composes with arithmetic for free —
+    // TPC-H Q17's `< 0.2 * (select avg(...) ...)` needs exactly that.
     if (match(TokenType::LPAREN)) {
+        if (check(TokenType::SELECT)) {
+            auto sq = std::make_unique<SubqueryExpr>();
+            sq->kind = SubqueryExpr::Kind::SCALAR;
+            sq->subquery = std::make_shared<SelectStatement>(parseSelect());
+            expect(TokenType::RPAREN, ") to close the subquery");
+            return sq;
+        }
         auto expr = parseExpr();
         expect(TokenType::RPAREN, ")");
         return expr;
@@ -584,6 +625,20 @@ std::unique_ptr<Expr> Parser::parsePrimary(){
     }
 
     throw ParseError("Expected an expression", current_);
+}
+
+// [NOT] EXISTS (subquery). Self-delimiting, so it sits at the primary level
+// beside CASE and needs no precedence work: `EXISTS (...) AND x = 1` folds
+// through parseAndExpr unchanged.
+std::unique_ptr<Expr> Parser::parseExistsSubquery(bool negated) {
+    expect(TokenType::EXISTS, "EXISTS");
+    expect(TokenType::LPAREN, "( after EXISTS");
+    auto node = std::make_unique<SubqueryExpr>();
+    node->kind = SubqueryExpr::Kind::EXISTS;
+    node->negated = negated;
+    node->subquery = std::make_shared<SelectStatement>(parseSelect());
+    expect(TokenType::RPAREN, ") to close the EXISTS subquery");
+    return node;
 }
 
 std::vector<GroupByColumn> Parser::parseColumnList(){

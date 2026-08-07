@@ -37,5 +37,8 @@ class Parser {
         std::unique_ptr<Expr> parseMultiplicative();
         std::unique_ptr<Expr> parseUnary();
         std::unique_ptr<Expr> parsePrimary();
+        // [NOT] EXISTS (subquery). Called from parsePrimary: the form is
+        // self-delimiting, so it needs no precedence level of its own.
+        std::unique_ptr<Expr> parseExistsSubquery(bool negated);
         std::vector<GroupByColumn> parseColumnList();
 };

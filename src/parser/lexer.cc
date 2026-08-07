@@ -199,6 +199,9 @@ const std::unordered_map<std::string, TokenType> Lexer::KEYWORDS = {
     // neither name is a column.
     {"LEFT",      TokenType::LEFT},
     {"OUTER",     TokenType::OUTER},
+    // Week 30. Same rule again: verified against catalog.json and the TPC-H
+    // schema (whose columns are all prefixed) that `exists` is not a column.
+    {"EXISTS",    TokenType::EXISTS},
     {"SUBSTRING", TokenType::SUBSTRING},
     {"FOR",       TokenType::FOR},
     {"DATE",      TokenType::DATE},

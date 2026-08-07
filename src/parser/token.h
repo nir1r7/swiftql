@@ -22,6 +22,14 @@ enum class TokenType {
     // nothing needs it, and it is one more identifier taken away.
     LEFT, OUTER,
 
+    // Week 30 subqueries. EXISTS is the only new keyword: SELECT and IN are
+    // already tokens, and the scalar form `(SELECT ...)` is punctuation.
+    // Reserved rather than matched as identifier text — verified against
+    // catalog.json and the TPC-H schema that no column is called `exists`.
+    // ALL/ANY/SOME are deliberately absent: no TPC-H query in the documented
+    // dialect uses them.
+    EXISTS,
+
     // aggregate functions
     COUNT, SUM, AVG, MIN, MAX,
 

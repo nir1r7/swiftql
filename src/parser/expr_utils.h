@@ -1,5 +1,6 @@
 #pragma once
 #include "ast.h"
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -64,6 +65,19 @@ inline std::string exprToString(const Expr* expr) {
         const char* unit = iv->unit == IntervalLiteral::Unit::DAY   ? "DAY"
                          : iv->unit == IntervalLiteral::Unit::MONTH ? "MONTH" : "YEAR";
         return "INTERVAL '" + std::to_string(iv->count) + "' " + unit;
+    }
+    // Week 30 — DISPATCH SITE 10. Abbreviated on purpose: this string reaches
+    // --explain's predicate text, and no output column is ever named after a
+    // subquery because Validator refuses one in a select list. Rendering the
+    // whole nested query here would make a filter line unreadable for no gain.
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        const char* notq = sq->negated ? "NOT " : "";
+        switch (sq->kind) {
+            case SubqueryExpr::Kind::SCALAR: return "(SELECT ...)";
+            case SubqueryExpr::Kind::EXISTS: return std::string(notq) + "EXISTS (SELECT ...)";
+            case SubqueryExpr::Kind::IN:
+                return exprToString(sq->operand.get()) + " " + notq + "IN (SELECT ...)";
+        }
     }
     return "?";
 }
@@ -150,6 +164,24 @@ inline std::string exprKey(const Expr* expr) {
         return "INTERVAL " + std::to_string(iv->count) + " "
              + std::to_string(static_cast<int>(iv->unit));
     }
+    // Week 30 — DISPATCH SITE 1. Falling through to "?" here would give two
+    // different subqueries the SAME identity, and substituteInto() rewrites any
+    // subtree whose exprKey matches a GROUP BY key — so a subquery in HAVING
+    // could be replaced by a ColumnRef to a group column.
+    //
+    // The statement's address is the identity. It is stable across cloneExpr
+    // precisely BECAUSE the statement is shared rather than deep-copied
+    // (ast.h), so a clone keys the same as its original, and two distinct
+    // subqueries can never collide. exprKey is for MATCHING, never for display,
+    // which is what makes an address acceptable here and nowhere else.
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        std::string s = "SUBQUERY";
+        s += sq->negated ? "!" : "";
+        s += std::to_string(static_cast<int>(sq->kind));
+        if (sq->operand) s += "(" + exprKey(sq->operand.get()) + ")";
+        s += "@" + std::to_string(reinterpret_cast<uintptr_t>(sq->subquery.get()));
+        return s;
+    }
     return "?";
 }
 
@@ -206,6 +238,15 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
         collectAggregates(sub->operand.get(), out);
         collectAggregates(sub->start.get(), out);
         collectAggregates(sub->length.get(), out);   // nullptr-safe
+        return;
+    }
+    // Week 30 — DISPATCH SITE 7, and the sharpest of the silent ones. Descend
+    // into the IN operand, which is written in THIS query, and NEVER into the
+    // subquery's body: `HAVING SUM(x) > (SELECT AVG(y) FROM z)` would otherwise
+    // collect the inner AVG(y) as an outer AggregateSpec, computing it over the
+    // outer relation and emitting a column for it.
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        collectAggregates(sq->operand.get(), out);   // nullptr-safe
         return;
     }
     // IntervalLiteral: a constant, nothing to collect
@@ -291,6 +332,20 @@ inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
         out = std::move(n);
     } else if (auto* iv = dynamic_cast<const IntervalLiteral*>(expr)) {
         out = std::make_unique<IntervalLiteral>(*iv);   // memberwise: count + unit
+    } else if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        // Week 30. The nested statement is SHARED, not deep-copied:
+        // SelectStatement is move-only, so a deep copy would need a
+        // clone-a-statement walker whose omissions (a dropped HAVING) are
+        // silent. Sharing is safe because binding is idempotent — see
+        // Binder::resolveColumnRef — and it is what makes exprKey's identity
+        // stable across a clone.
+        auto n = std::make_unique<SubqueryExpr>();
+        n->kind = sq->kind;
+        n->negated = sq->negated;
+        n->correlated = sq->correlated;
+        n->operand = cloneExpr(sq->operand.get());   // nullptr-safe
+        n->subquery = sq->subquery;
+        out = std::move(n);
     } else {
         throw std::runtime_error("cloneExpr(): unknown Expr subtype");
     }

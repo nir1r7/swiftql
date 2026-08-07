@@ -23,6 +23,17 @@ struct ColumnRef : Expr {
     // share a canonical table_name. Evaluation resolves by (slot, name) when
     // slot >= 0, falling back to bare name otherwise.
     int relation_slot = -1;
+    // Week 30. How many query blocks OUT from the block this ref is written in
+    // the relation lives: 0 = this query's own range table (the default, so
+    // every pre-existing ref and every hand-built test tree keeps its meaning),
+    // 1 = the immediately enclosing query, and so on. RELATIVE, like Postgres's
+    // varlevelsup, so a subquery's tree means the same thing wherever it sits.
+    //
+    // !! relation_slot is a position in the range table of the scope this many
+    // steps OUT. Reading a slot without its level compares two different
+    // numbering domains — an inner slot 1 and an outer slot 1 are different
+    // relations. Every walker that routes by slot must test the level first.
+    int query_level = 0;
 };
 
 // literal or constant
@@ -103,6 +114,52 @@ struct SubstringExpr : Expr {
     std::unique_ptr<Expr> operand;
     std::unique_ptr<Expr> start;    // 1-based
     std::unique_ptr<Expr> length;   // nullptr = to the end of the string
+};
+
+// Defined at the bottom of this file; a subquery expression holds a whole one.
+struct SelectStatement;
+
+// A nested query in an expression position (Week 30).
+//
+// ONE node with a kind tag, not three: the three forms differ only in whether
+// there is a left-hand operand and whether the result is a value or a
+// predicate. Three structs would cost three branches at each of the eighteen
+// dispatch sites (development.md) and give three chances to miss one.
+//
+// OWNERSHIP: `subquery` is a shared_ptr because SelectStatement holds
+// unique_ptr members and is therefore move-only, while cloneExpr (dispatch site
+// 11) must copy any Expr. Sharing rather than deep-copying is the same choice
+// GroupByColumn::expr makes, for the same reason, and it is safe because the
+// bound AST is read-only after binding — which holds only because
+// Binder::resolveColumnRef is IDEMPOTENT (binder.cc). Two nodes sharing one
+// statement is a real state: BETWEEN's desugaring clones its left operand
+// before binding, and the GROUP BY / ORDER BY alias substitution clones an
+// already-bound select item.
+//
+// POSITION: legal in WHERE and HAVING only. Validator refuses every other
+// clause and validateJoinCondition (dispatch site 18) refuses ON — no TPC-H
+// query puts a subquery anywhere else, and allowing one in the select list
+// would mean buildProjectSchema must type it and aggregateOutputName must name
+// an output column after it. That is a restriction on POSITION, not on
+// representation: all three kinds are represented. FROM is Week 34.
+struct SubqueryExpr : Expr {
+    enum class Kind {
+        SCALAR,   // (SELECT one_column FROM ...) — a value
+        EXISTS,   // EXISTS (SELECT ...)          — a predicate
+        IN        // x IN (SELECT one_column ...) — a predicate over `operand`
+    };
+    Kind kind = Kind::SCALAR;
+    bool negated = false;                 // NOT EXISTS / NOT IN
+    // IN only; nullptr for SCALAR and EXISTS. Belongs to the ENCLOSING scope,
+    // never to the subquery's — the Binder binds it against the outer range
+    // table and every walker must descend into it there.
+    std::unique_ptr<Expr> operand;
+    std::shared_ptr<SelectStatement> subquery;
+    // Set by the Binder: true when some ColumnRef inside `subquery` resolved to
+    // an enclosing scope. Read by collectSlots (dispatch site 8) to decide
+    // whether this node can be routed by relation slot at all; Week 33
+    // decorrelates on it.
+    bool correlated = false;
 };
 
 // INTERVAL 'n' day|month|year.
@@ -188,4 +245,12 @@ struct SelectStatement {
 
     // optional LIMIT
     std::optional<int> limit;
+
+    // Week 30. Set by the Binder when it binds a SubqueryExpr directly inside
+    // THIS statement. It exists so the "not yet executable" refusal and
+    // buildScanSchema's conservative widening need no nineteenth walker over
+    // the statement to find out. Any statement containing a subquery at any
+    // depth contains one DIRECTLY, so the top-level flag is always the right
+    // test for "this query uses a subquery".
+    bool has_subquery = false;
 };
