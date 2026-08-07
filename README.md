@@ -67,7 +67,7 @@ The project is structured in five progressive phases, each leaving a working and
 - `--execution volcano | vectorized` — switches the execution model
 - Query result cache — identical queries served from cache without re-execution
 - Cost-based optimizer for vectorized execution — statistics, cardinality estimation, predicate pushdown, and physical join selection (Phase 4); left-deep cost-based join ordering with a greedy fallback for large join graphs (Week 28)
-- Subqueries — scalar `(SELECT ...)`, `[NOT] EXISTS (SELECT ...)` and `x [NOT] IN (SELECT ...)` **parse and bind**, in `WHERE` and `HAVING`, with nested scopes and correlation resolved (Week 30). Execution is Weeks 31–34, so a bound subquery is refused with `subqueries are parsed and bound but not yet executable (Week 31)`
+- Subqueries — scalar `(SELECT ...)`, `[NOT] EXISTS (SELECT ...)` and `x [NOT] IN (SELECT ...)`, in `WHERE` and `HAVING`, with nested scopes and correlation resolved (Week 30). **Uncorrelated subqueries execute** (Week 31): the body is run once before planning and the node is replaced by a constant — a value for a scalar, a truth value for `EXISTS`, a constant list for `IN`. A scalar returning more than one row is refused at run time; a scalar returning no rows is NULL. **Correlated** subqueries are refused with `correlated subqueries are not yet executable (Week 33)`, and `FROM (subquery)` is Week 34
 - Multi-way joins, richer expressions, subqueries, and TPC-H benchmarking (Phase 5)
 - CSV-based table storage with a `catalog.json` metadata file
 
@@ -98,7 +98,8 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 | General `NOT` — `WHERE NOT (x = 1)` | `NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL` | Those four cover every TPC-H negation. A general prefix `NOT` would need its own node and three-valued kernel for no query's benefit. Both the leading position (`NOT x = 1`, what users write) and the postfix one (`x NOT 5`) give this message |
 | A subquery outside `WHERE` / `HAVING` — in `SELECT`, `GROUP BY`, `ORDER BY` | `<clause>: subqueries are supported in WHERE and HAVING only` | No TPC-H query puts one anywhere else. Allowing it in a select list means `buildProjectSchema` must type it and `aggregateOutputName` must name an output column after it — five schema-visible decisions for zero queries. A restriction on *position*, not on representation: all three kinds bind. `FROM (subquery)` is Week 34 |
 | A subquery in a `JOIN ... ON` clause | `JOIN ON: subqueries are not supported in a join condition` | A residual carrying one would be handed to a probe loop that cannot evaluate it (outer join) or folded into the `WHERE` conjunction and routed by a relation slot it does not have (inner). Same shape as the `AggregateExpr` refusal beside it. Note `classifyJoinCondition` runs first, so a subquery that *also* forward-references a later relation reports the forward reference — shape before contents, as elsewhere |
-| A scalar or `IN` subquery returning more than one column | `scalar subquery must return exactly one column` / `IN subquery ...` | Decidable at bind time from the select list alone. `EXISTS` has no arity rule — Q4 and Q21 both write `select *`. *Cardinality* ("returned more than one row") is a runtime check and is Week 31's |
+| A scalar or `IN` subquery returning more than one column | `scalar subquery must return exactly one column` / `IN subquery ...` | Decidable at bind time from the select list alone. `EXISTS` has no arity rule — Q4 and Q21 both write `select *`. *Cardinality* ("returned more than one row") needs data and is checked when the subquery runs (Week 31) |
+| An `IN` subquery producing more than 1024 distinct values | `IN subquery produced N distinct values, above the materialization limit of 1024 (Week 32 lowers this form to a semi-join)` | Week 31 executes `IN` by materializing the set into the Week 25 `InExpr`, whose values `evaluate()` compares **linearly per row** — right for a hand-written list, quadratic for a subquery result. `lap_id IN (SELECT lap_id FROM laps)` is 10 000 × 10 000 comparisons on the correctness baseline. The bound is temporary by construction: Week 32's semi-join materializes nothing |
 | A join key comparing a STRING column with a numeric one — `ON d.team = l.lap_id` | `JOIN ON: cannot join a STRING column with a numeric one` | Keys are compared as serialized **text**, which carries no type tag, so a STRING `"7"` matched the INT `7` while `"007"` did not — half a match, while the identical predicate in a `WHERE` clause throws `Type mismatch`. Found in the Week 27 audit, closed in Week 29 because an outer join returns the unmatched half as null-extended rows that look like data. INT vs DOUBLE stays legal: `7.0` and `7` must still join, which is SQLite's numeric affinity. Also makes the SIMD loop join's INT-key gate rest on a stated rule rather than an accident |
 | `RIGHT` / `FULL OUTER JOIN` | parse error — `RIGHT` lexes as an identifier and trips the end-of-input check | A `RIGHT` join is not a flag on the left one: swapping the operands would change the merged schema's column order, which the fixed `[FROM, JOIN]` output order forbids. No TPC-H query in the documented dialect needs either |
 | `JOIN ... ON` with no equi-join key — `ON a.x < b.x`, `ON a.x = b.x OR a.y = b.y`, `ON a.x = 5` | `JOIN ON: at least one equality between the joined table and an already-joined table is required` | Such a join is a cross product with a filter on top, and there is no cross-product operator to run it on. Every other `ON` conjunct is legal as of Week 27 and becomes a post-join residual, so what is left to refuse is exactly the missing key. An `OR` is one indivisible conjunct, which is why it contributes no key even though it contains equalities |
@@ -1224,6 +1225,11 @@ parses, binds and validates, then stops at one refusal:
 week returns rows to diff, so `compare_against_sqlite.py` grew two rejection
 suites in all four modes, the same stance Week 26 took for multi-way joins.
 
+> That refusal narrowed in Week 31 rather than moving: it is the same check, at
+> the same place, now testing `has_correlated_subquery` and naming Week 33. The
+> uncorrelated half of the bind suite became a diff suite the same week. The
+> paragraphs below are kept as the record of what a nested scope cost.
+
 The parser is the small part. A subquery is the first NESTED SCOPE this codebase
 has had, and the range table, `relation_slot` and every `Expr` walker were
 written for a single flat one:
@@ -1503,7 +1509,71 @@ correlated ref can actually reach the second group.
 - Execute scalar subqueries and materialized uncorrelated subqueries
 - Validate scalar cardinality at runtime
 
-**Checkpoint:** Uncorrelated TPC-H subqueries execute correctly.
+**Checkpoint:** Uncorrelated TPC-H subqueries execute correctly. ✅
+
+Every uncorrelated form — scalar in `WHERE` (Q22's half) and in `HAVING` (Q11),
+`IN` / `NOT IN` (Q16/Q18), `EXISTS` / `NOT EXISTS`, a body that itself joins
+three relations — executes and is diffed against SQLite in all four modes.
+Correlated subqueries are refused with `correlated subqueries are not yet
+executable (Week 33)`; the plan is [docs/week-31-plan.md](docs/week-31-plan.md).
+
+The operator is the part that does not exist. **Uncorrelated means
+loop-invariant**, and this engine already has a pass whose whole purpose is
+turning a loop-invariant subtree into a `Literal` so three fast paths can
+pattern-match on `ColumnRef op Literal` — so the subquery is run **once, before
+planning**, and the node is replaced by a constant. `WHERE speed > (SELECT
+AVG(speed) FROM laps)` becomes `WHERE speed > 312.48`, which prunes chunks, takes
+`scanColumn`'s tight loop and gets a real selectivity estimate. An
+expression-level `SubPlan` would have had none of the three, and would have armed
+all ten of the dispatch sites that handle `SubqueryExpr` but have never been
+reached:
+
+| Shipped | Why it was required |
+|---|---|
+| **The refusal narrows rather than moves** — `Validator::validate`'s last check now tests `has_correlated_subquery` | Week 30's placement is what makes every parse/bind/validate error outrank an engine limitation, and one check is what makes the four modes agree by construction. Only the condition and the message changed. It is also the **new containment** for `development.md`'s slot-consumer table: a `ColumnRef` with `query_level > 0` exists only inside a correlated subquery, so refusing those keeps every consumer on level-0 refs from one range table — and an *uncorrelated* body is planned as its own top-level statement, where the same is true for a second reason |
+| **Correlation is propagated UP to the outermost statement**, by the Binder | `has_subquery` needs no propagation (a statement containing one at any depth contains one directly); correlation does, because it is **relative to a block**. In Q20's two-deep shape the inner subquery is correlated to the *middle* block, so the top node's `correlated` flag is false — and a top-level test on it alone accepted the query, then refused it from a nested run after the outer levels had already been materialized and executed |
+| **One walker, dispatch site 19**, shared by the rewrite and by the CLI's table loader | Nested queries scan tables the outer `FROM`/`JOIN` list never names, and the loader walked only those two — `WHERE x > (SELECT AVG(age) FROM drivers)` on a `FROM laps` query died in `std::out_of_range`. It is the one walker that deliberately descends **into** the body: Week 30's "never into the body" rule is about *scope*, and "which statements must run, in what order" is not a scope question. Its failure mode is loud rather than silent, because sites 12 and 13 still throw — which is why those two throws stay |
+| **One run per statement, cached on the statement's address** | Week 30 handed this week the decision explicitly. `cloneExpr` *shares* the `shared_ptr` (`SelectStatement` is move-only), so `(SELECT MAX(age) FROM drivers) BETWEEN 1 AND 99` really is two `SubqueryExpr` nodes over one statement. Building two subplans doubles the work; the address is the identity `exprKey` already uses, so the two cannot disagree |
+| **Three-valued `IN`, decided at the substitution site** | `InExpr::values` is documented "non-empty, never NULL" — true only because the grammar has no NULL literal, and a subquery result is not the grammar. `x NOT IN (S ∪ {NULL})` is FALSE where `x` matches and UNKNOWN elsewhere, so it is **never TRUE** and folds to a constant false; the positive form drops the NULLs, because UNKNOWN and FALSE are indistinguishable to every consumer reachable here. That last clause is a proof, not a shrug: a subquery is legal in `WHERE`/`HAVING` only, there is no general `NOT`, `IS NULL` parses at the additive level so it cannot apply to a predicate's result, and `CASE WHEN` does not take an UNKNOWN branch. **Adding a general `NOT` breaks this first** |
+| **The first constant NULL in the engine, and its type** | A scalar subquery over zero rows is NULL, and so is one over a single NULL row — two different result sets, one answer. `Value` has no typed null (`Value::type()` throws) and `inferExprType` must answer for every node, so the type rides on the `Literal` (`null_type`), taken from the subquery's own output schema. Typing it `INT` instead is one line shorter and wrong where it shows: `SUBSTRING((SELECT name FROM drivers WHERE driver_id = -1), 1, 2)` would fail plan-time typing on a query whose answer is NULL |
+| **`CardinalityEstimator::selectivity` learned about NULL — it was a live throw** | Both comparison branches called `lit->value.type()` unguarded, so the **optimized** vectorized path died with `Cannot get type of null Value` on a query `--no-optimize` answered correctly. It now returns `0.0`, which is the exact answer (a comparison against NULL is UNKNOWN for every row), not a fallback. `ChunkPruner` gained a matching decline and `cloneExpr` now carries `null_type`; the full audit of every `Literal` reader is in `development.md` → *Null constants* |
+| **`has_subquery` is cleared once nothing is left** | It means "a `SubqueryExpr` is still in this tree", and `buildScanSchema` widens to the full schema while it is set. Clearing it returns projection pushdown to every subquery query — which is Week 30's hand-forward note about "a surprise in Week 31's first benchmark", answered rather than absorbed |
+| **The nested query runs on the engine that contains it, and honours `--no-optimize`** | A three-relation body executes wherever a three-relation query does — the vectorized path — so routing every body through Volcano would have invented a capability difference TPC-H Q11 immediately trips over. And `compare_against_sqlite.py`'s second vectorized leg is the differential oracle: a runner that always optimized would give both legs one sub-result and quietly stop testing the sub-plan |
+
+Two containments deliberately left alone. **Both Week 30 tripwires stay armed**:
+`ChunkPruner` still declines a `query_level > 0` ref and `buildAggregateSchema`
+still throws on one, because this week makes neither reachable — an uncorrelated
+body's refs are level 0 against its own range table. And the **`ColumnId { level,
+slot }` structural change is not this week's**: it belongs to the first week that
+lowers a correlated reference into a plan node, which on the current schedule is
+Week 33. Both facts are recorded in `development.md` rather than left to be
+re-derived.
+
+> **Starting notes, from Week 31's foundations.**
+> - **`--explain` now executes the nested query**, because the constant is part
+>   of the plan — the same way `--explain` already performs constant folding. The
+>   subquery's time is charged to `--explain-analyze`'s **Plan:** line, not
+>   **Execution:**. Week 37's measurements must split it out rather than report a
+>   plan time that contains a full table scan.
+> - **The nested query gets its own COPY of every table it scans**, because both
+>   scan nodes take their table by value. `Lowering`'s `scan_uses` counter has
+>   copied for a self-join since Week 27, so this is the existing cost model
+>   rather than a new one — but it is the first place the cost is paid for a
+>   whole second query, and a shared (reference-counted) table representation is
+>   the fix when Week 37 profiles it.
+> - **The `IN` materialization limit is a bound on `evaluate()`'s linear scan,
+>   not a measurement.** Week 32's semi-join removes the need for it entirely; if
+>   a query needs a larger set before then, the honest fix is the semi-join, not
+>   a bigger constant.
+> - **Two textually identical but distinct subqueries still run twice.** Identity
+>   is the statement pointer, which is what makes the shared-statement case
+>   correct; a structural key would also collapse this one, and is worth exactly
+>   as much as a query that writes the same subquery twice.
+> - **`JoinEnumeration`'s decline for a slot outside the range table did not
+>   become live**, contrary to what Weeks 28–30 expected of this week: an
+>   uncorrelated body is its own plan with its own range table, so no foreign
+>   slot enters the outer tree. Week 34's derived tables are where a nested scan
+>   genuinely joins the outer one.
 
 ### Week 32 — Semi-Joins + Anti-Joins
 
@@ -1619,7 +1689,7 @@ correlated ref can actually reach the second group.
 | 28 | Join enumeration | DP join ordering with greedy fallback works ✅ |
 | 29 | Outer join | Left outer hash join correct ✅ |
 | 30 | Subquery parsing + binding | Nested scopes and subquery forms bind ✅ |
-| 31 | Scalar + uncorrelated subqueries | Uncorrelated subqueries execute |
+| 31 | Scalar + uncorrelated subqueries | Uncorrelated subqueries execute ✅ |
 | 32 | Semi-joins + anti-joins | Set-membership subqueries optimized |
 | 33 | Correlated subqueries | Required TPC-H patterns decorrelated |
 | 34 | Derived tables + distinct aggregates | Q15 rewrite and `COUNT(DISTINCT)` supported |
@@ -1753,7 +1823,9 @@ Execution: 72.0ms
 - No write path — `INSERT`, `UPDATE`, `DELETE` are not supported
 - No `CREATE TABLE` SQL — tables must be registered via `catalog.json`
 - Joins of three or more relations execute on the columnar/vectorized path only; row and columnar Volcano refuse them with `multi-way joins are not supported on the Volcano path; use --execution vectorized`. Multi-key and residual-`ON` joins execute on every path (Week 27)
-- Subqueries **parse and bind but do not execute**. All three forms (scalar, `EXISTS`, `IN`) resolve through a scope chain, a correlated reference carries the level it resolved at, and every semantic check a query is entitled to fires first — then the query is refused with `subqueries are parsed and bound but not yet executable (Week 31)`. One check at the end of `Validator::validate`, so all four modes agree by construction. Positions are restricted to `WHERE` and `HAVING`; `FROM (subquery)` is Week 34. A plan-time type error in the *same* query is masked by the refusal, because `inferExprType` runs after `Validator` — it emits the identical message, so only the order in which two faults are reported differs
+- **Uncorrelated** subqueries execute by **materialization** (Week 31): the body is planned and run once, before the outer query is planned, and the node is replaced by a constant. Three consequences, all deliberate. `--explain` therefore **executes** the nested query — it has to, to know the constant, exactly as it already performs constant folding — and that time is charged to `--explain-analyze`'s `Plan:` line rather than `Execution:`. The nested query gets its own **copy** of every table it scans, since both scan nodes take their table by value. And an `IN` subquery's result set is capped at 1024 distinct values, because `evaluate()` compares `InExpr::values` linearly per row; Week 32's semi-join removes the cap by materializing nothing
+- **Correlated** subqueries are refused with `correlated subqueries are not yet executable (Week 33)` — one check at the end of `Validator::validate`, so all four modes agree by construction, and it fires only after every parse, bind and validate error the query is entitled to. Positions are restricted to `WHERE` and `HAVING`; `FROM (subquery)` is Week 34
+- A subquery whose **body joins three or more relations** executes on the vectorized path only, for the same reason a top-level three-way join does: the nested query runs on the engine that contains it, and Volcano builds exactly one join
 - A NaN is its own `GROUP BY` / `DISTINCT` group (both signs together), and matches nothing in a join. SQLite has neither case: it converts NaN to NULL on storage, so its NaNs land in the NULL group. Reachable only by writing `nan` into a CSV cell — no engine arithmetic produces one, since `x / 0` is NULL. Week 29 looked at closing it at load and did not: `CSVLoader::parseField` returning `Value::null()` breaks the very next stage, because `CSVToColumnar::convert` calls `row[c].asDouble()` unconditionally and `ColumnarTable` has no NULL representation at all. Closing it therefore means giving columnar storage a validity mask, which touches every scan, encoding and zone map — so it belongs to Week 35, which rewrites the loader anyway. The outer join does not make it more urgent: a NaN key on the preserved side is unmatchable and is now emitted null-extended, which is what SQLite does with the same row
 - An outer join's build side is **forced, not costed**: the preserved side must be the probe input, so the null-supplying relation is always hashed however large it is (`build=<table> ... (outer: the preserved side must probe)`). Costing the alternative needs a matched flag per build row and an end-of-probe drain; whether that pays is a Week 37 measurement, not a hunch. The SIMD loop join is never selected for an outer join at all — its probe loop emits matches and has no unmatched path
 - Join ordering is not attempted at all for a query containing an outer join: the pass declines the whole tree, since `R ⟕ S ≠ S ⟕ R` and associativity fails, and legality here needs conflict/eligibility sets rather than a better cost model. One outer join therefore turns off reordering for every join in the query — including its fully inner block, which is legally reorderable. `--explain` reports it as `join-ordering=skipped (outer join)` rather than printing nothing, so the loss is visible; the token is deliberately not `order=`, which has to keep meaning "the search ran"

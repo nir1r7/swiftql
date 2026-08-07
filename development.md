@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **726 tests, 0 failures.**
+Expected: **747 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,24 +223,29 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **864 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
+Expected: **932 passed, 0 failed, 0 errors**: 169 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
-`--no-optimize`), plus 12 rejections × the same 4 modes, plus the multi-way
-capability split — 13 multi-way queries × the 2 vectorized modes, diffed against
-SQLite, and the same 13 asserted to be refused × the 2 Volcano modes — plus
-Week 30's two subquery suites × the same 4 modes (23 forms that must *bind* and
-reach the Week 31 refusal, and 19 that must fail earlier for their own stated
-reason).
+`--no-optimize`), plus 14 rejections × the same 4 modes, plus the multi-way
+capability split — 16 multi-way queries × the 2 vectorized modes, diffed against
+SQLite, and the same 16 asserted to be refused × the 2 Volcano modes — plus the
+subquery block × the same 4 modes (14 correlated forms that must *bind* and reach
+the Week 33 refusal, and 19 that must fail earlier for their own stated reason),
+plus the Week 31 multi-relation-body split (1 query × 2 vectorized modes diffed,
+× 2 Volcano modes refused).
 
 The multi-way block is 6 Week 27 execution shapes plus 7 Week 28 join-ordering
 ones. Running the ordering queries in the `--no-optimize` vectorized mode as well
 is the point, not duplication: that mode keeps the **written** join order, so the
 pair is what makes this file able to catch a reordering that changes an answer.
 
-Week 30's block is a rejection suite for a different reason: nothing that week
-ships returns rows, so **reaching** the refusal is the assertion — lexing,
-parsing, nested-scope resolution, correlation detection and validation of the
-nested query all had to succeed to get there. The second suite exists so the
+The subquery block changed shape in Week 31. Its 25 **uncorrelated** queries now
+return rows and moved into `QUERIES`, where they are diffed against SQLite in all
+four modes — the only oracle for the rules a materialization gets wrong: a scalar
+over zero rows, a scalar whose one row is NULL, and `NOT IN` over a set
+containing NULL (never TRUE, so no rows). What is left as a rejection suite is
+the **correlated** half, and reaching *that* refusal is still the assertion:
+lexing, parsing, nested-scope resolution, correlation detection and validation of
+the nested query all had to succeed to get there. The second suite exists so the
 refusal cannot become a catch-all that hides a real defect: a bad nested table, a
 bad nested column, a wrong arity or a disallowed position must all outrank it.
 
@@ -292,8 +297,10 @@ FROM table
                                                      -- only (Week 27).
                                                      -- LEFT OUTER: Week 29
                                                      -- (all modes)
-[WHERE expr [AND expr ...]]                          -- subqueries: Week 30
-                                                     -- (bind only)
+[WHERE expr [AND expr ...]]                          -- subqueries: uncorrelated
+                                                     -- execute (Week 31);
+                                                     -- correlated bind only
+                                                     -- (Week 33)
 [GROUP BY expr, ...]                                 -- expressions + aliases (Week 24)
 [HAVING expr]
 [ORDER BY expr [ASC|DESC], ...]                      -- expressions + aliases (Week 24)
@@ -379,13 +386,34 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 > name that resolves outward marks every scope between it and the supplying block
 > correlated.
 >
-> Nothing executes. Every parse, bind and validate error a query is entitled to
-> fires first — including the nested query's own, which is validated against its
-> own `FROM` schema — and then one check at the end of `Validator::validate`
-> raises `subqueries are parsed and bound but not yet executable (Week 31)`. One
-> site, so the four modes agree by construction rather than by two guards that
-> can drift. A *plan-time* type error in the same query is masked by it, since
-> `inferExprType` runs after `Validator`; both emit the identical string.
+> **Uncorrelated subqueries execute (Week 31), by materialization.** Uncorrelated
+> means the body references no relation of any enclosing block, so its value
+> cannot depend on the outer row: it is run ONCE before the outer query is
+> planned, and the node is replaced by a constant — a value for a scalar, a truth
+> value for `EXISTS`, a constant list for `IN`. That is the same argument
+> constant folding makes (`constant_folding.h`): the substituted `Literal` puts
+> the predicate back into the `ColumnRef op Literal` shape that zone-map pruning,
+> `scanColumn`'s tight loop and range selectivity all pattern-match on. The pass
+> is `materializeSubqueries` (`planner/subquery_materialization.h`), called from
+> `main.cc` ABOVE both engines, so the four modes agree by construction; the
+> nested query runs on the engine that contains it, and honours `--no-optimize`.
+>
+> **Correlated subqueries do not.** Every parse, bind and validate error a query
+> is entitled to fires first — including the nested query's own, which is
+> validated against its own `FROM` schema — and then one check at the end of
+> `Validator::validate` raises `correlated subqueries are not yet executable
+> (Week 33)`. One site, four modes. That check is also the containment the
+> [slot-consumer table](#relation-slots-and-query-levels) rests on: a `ColumnRef`
+> with `query_level > 0` exists only inside a correlated subquery.
+>
+> Three rules to know before touching the pass. A scalar over **zero rows** is
+> NULL, and so is one over a single NULL row — the first constant NULL in the
+> engine, typed from the body's output schema (`Literal::null_type`). A scalar
+> over **more than one row** is a run-time error. And `NOT IN` over a set
+> containing NULL is **never TRUE**, so it folds to a constant false; the
+> positive form drops the NULLs, because UNKNOWN and FALSE are indistinguishable
+> to every consumer reachable from `WHERE`/`HAVING` — which stops being true the
+> day a general `NOT` is added.
 
 Week 25 also adds `CASE WHEN ... THEN ... [ELSE ...] END`, `SUBSTRING`, ISO date
 literals and constant-folded interval arithmetic — see [Week 25 dialect notes](#week-25-dialect-notes).
@@ -618,8 +646,8 @@ That collapse appeared **five times in one week**, across three audit rounds, at
 consumers nobody had listed — twice at sites found only when this table was
 itself audited for completeness. This table is the list. Add a row when you add a
 consumer, and re-check every "contained" row on the day a new nested-scope
-construct lands (Week 31's uncorrelated subqueries, Week 32's semi-/anti-joins,
-Week 34's derived tables).
+construct lands (Week 31's uncorrelated subqueries — done, see below; Week 32's
+semi-/anti-joins; Week 34's derived tables).
 
 **A missing row is worse than a wrong one.** A future week reads this as
 already-checked and skips the verification. `ChunkPruner` was absent from both
@@ -654,9 +682,25 @@ resolution and therefore *can* name an enclosing block's relation.
 
 ### Unreachable with a correlated ref today (behind the refusal)
 
-`Validator::validate` refuses any statement with `has_subquery`, and both planner
-entry points call it first, so everything below receives level-0 refs **by
-construction**. That containment is the only thing making most of them safe.
+**The containment changed shape in Week 31 and still holds.** It used to be "no
+statement with a subquery is planned at all". It is now two facts that together
+say the same thing:
+
+1. `Validator::validate` refuses any statement with `has_correlated_subquery`
+   (propagated upward by the Binder, so it means "correlated at any depth"), and
+   both planner entry points call it first. A `ColumnRef` with `query_level > 0`
+   exists **only** inside a correlated subquery, so none reaches a plan.
+2. An **uncorrelated** subquery is materialized before planning
+   (`subquery_materialization.h`): its body is handed to the planner as its own
+   **top-level statement**, where every ref is level 0 against that statement's
+   own range table, and the outer statement is left holding a constant. There is
+   never more than one range table in play for one plan.
+
+So everything below still receives level-0 refs **by construction**, and both
+guarded rows below stay **armed and unreached** — Week 31 checked each consumer
+in this table and made none of them reachable. Do not replace a tripwire with
+"real behaviour" until the week that genuinely lowers a correlated reference; on
+the current schedule that is Week 33.
 
 Two rows carry a guard of their own as well, because their failure mode is a
 silent wrong answer rather than a miss, and because neither is protected by the
@@ -665,8 +709,8 @@ marked **guarded**; the rest are contained only.
 
 | Consumer | Note for the week that removes the containment |
 |---|---|
-| `collectSimplePredicates` / `ChunkPruner::shouldSkip` (`chunk_pruner.h`) | **Guarded.** Tested `relation_slot < 1` on a WHERE-clause `ColumnRef` and then matched **by name** against the scanned table's zone maps. A correlated ref is `(level 1, slot 0)`, which reads as scan-local, so with a shared column name (`team`, `driver_id`) the wrong relation's zone maps prune the scan — chunks skipped silently, invariant 12's subject. Reached on the `--no-optimize` path, where the whole un-pushed WHERE goes to the FROM-side scan as a hint and pushdown never saw it. Now **declines** a `query_level > 0` ref: a pruning hint is an optimization, so contributing nothing is correct-and-slower |
-| `buildAggregateSchema` (`logical_plan.cc`) — and through it every `GroupByColumn` consumer: `HashAggregateNode` (`plan_nodes.cc`), `VecHashAggregateNode` (`vec_hash_aggregate_node.cc`), `CardinalityEstimator` | **Guarded.** `GroupByColumn` is the one struct that *carries* a level and whose every consumer ignored it. The failure is quieter than a miss: for `GROUP BY l.team` inside a subquery over `drivers`, `indexOf("team", 0)` is a clean **hit on the wrong relation**, so neither the bare-name fallback nor the `idx < 0` throw fires and the query groups by the wrong column. Now **throws**: grouping is not an optimization and a correlated key has no correct local fallback — its value comes from the outer row, which is Week 33's machinery. One guard covers all four consumers, since the other three run on a plan whose schema was built here |
+| `collectSimplePredicates` / `ChunkPruner::shouldSkip` (`chunk_pruner.h`) | **Guarded.** Tested `relation_slot < 1` on a WHERE-clause `ColumnRef` and then matched **by name** against the scanned table's zone maps. A correlated ref is `(level 1, slot 0)`, which reads as scan-local, so with a shared column name (`team`, `driver_id`) the wrong relation's zone maps prune the scan — chunks skipped silently, invariant 12's subject. Reached on the `--no-optimize` path, where the whole un-pushed WHERE goes to the FROM-side scan as a hint and pushdown never saw it. Now **declines** a `query_level > 0` ref: a pruning hint is an optimization, so contributing nothing is correct-and-slower. **Week 31 checked and did NOT arm it**: an uncorrelated body's hints are level-0 refs against that body's own scan. It gained a second decline in Week 31 for a different new input — a NULL literal, see *Null constants* below |
+| `buildAggregateSchema` (`logical_plan.cc`) — and through it every `GroupByColumn` consumer: `HashAggregateNode` (`plan_nodes.cc`), `VecHashAggregateNode` (`vec_hash_aggregate_node.cc`), `CardinalityEstimator` | **Guarded.** `GroupByColumn` is the one struct that *carries* a level and whose every consumer ignored it. The failure is quieter than a miss: for `GROUP BY l.team` inside a subquery over `drivers`, `indexOf("team", 0)` is a clean **hit on the wrong relation**, so neither the bare-name fallback nor the `idx < 0` throw fires and the query groups by the wrong column. Now **throws**: grouping is not an optimization and a correlated key has no correct local fallback — its value comes from the outer row, which is Week 33's machinery. One guard covers all four consumers, since the other three run on a plan whose schema was built here. **Week 31 checked and did NOT arm it**: a correlated group key can only appear inside a correlated subquery, which is refused |
 | `restampSlots` (`predicate_pushdown.cc`, site 9) | Stamps unconditionally, and has a **second, independent** proof: `collectSlots` gives a correlated ref `-1`, so `soleSlot` is `-1`, so the conjunct is never pushed and this is never called on one. Its `SubqueryExpr` branch touches only `operand`. Listed here rather than above because its only caller, `PredicatePushdown`, runs on a built logical plan — i.e. after the refusal |
 | `AggregateSpec::relation_slot` (`logical_plan.cc`, and `plan_nodes.cc` / `vec_hash_aggregate_node.cc` resolving it) | Copied straight off a `ColumnRef`. This is the struct `GroupByColumn` was given a `query_level` for; it was contained instead. The invariant is stated at the field |
 | `JoinKey::from_slot` (`join_enumeration.cc`, `logical_plan.cc`, `vectorized_plan_builder.cc`, `cardinality_estimator.cc`) | Contract stated at the struct: only meaningful while every key operand is level 0, which `classifyJoinCondition` enforces |
@@ -674,6 +718,36 @@ marked **guarded**; the rest are contained only.
 | `resolveColumnIndex` (`evaluator.cc`) | Same, per row, with a bare-name fallback that would silently pick *some* column |
 | `CardinalityEstimator` / `StatsContext::findForRef` | A miss degrades the estimate silently — the failure mode statistics code specialises in |
 | `Planner::plan`, `VectorizedPlanBuilder` | Merged-schema stamping and pruning-hint slot sets |
+| `materializeSubqueries` / `buildReplacement` (`subquery_materialization.cc`, Week 31) | **Reads no slot, safe by PRECONDITION — and the precondition is named here rather than assumed:** `Validator::validate` refuses a correlated statement first, so this pass only ever meets an uncorrelated `SubqueryExpr`, whose body is a self-contained query block. It moves the `IN` operand (already bound, level 0, this block's) into the substituted `InExpr` and copies nothing else. If a later week lets it run before validation, or on a correlated node, this row is void |
+| `forEachSubquery` / `collectQueryTables` (`subquery_materialization.cc`, Week 31) | Reads no slot. Dispatch site 19, and the one walker that deliberately descends INTO the body — materialization asks "which statements must run, in what order", which is not a scope question. It reaches no `ColumnRef` at all |
+
+### Null constants (Week 31)
+
+A second "find every reader" question, with the same shape as the slot one and
+the same answer method, recorded because it caught a live throw.
+
+Until Week 31 a `Literal` could never hold a NULL: the grammar has no NULL
+literal, and `foldNode` declines any fold that evaluates to one. A materialized
+scalar subquery that returned **zero rows**, or **one NULL row**, produces the
+first constant NULL in the engine — carrying its type on `Literal::null_type`,
+because `Value::type()` throws when null and `inferExprType` must answer for
+every node.
+
+Every reader of a `Literal`'s value or type, audited:
+
+| Reader | Status |
+|---|---|
+| `inferExprType` (`logical_plan.cc`) | **Reads `null_type`.** The producer's contract |
+| `CardinalityEstimator::selectivity` | **Fixed in Week 31.** Both branches called `lit->value.type()` unguarded, so the OPTIMIZED vectorized path died with `Cannot get type of null Value` on a query `--no-optimize` answered correctly. Now returns `0.0`: a comparison against NULL is UNKNOWN for every row, which is the exact answer, not a fallback |
+| `collectSimplePredicates` (`chunk_pruner.h`) | **Declines.** `canSkipChunk` would in fact skip nothing — `Value`'s comparisons are three-valued — but that is an accident of the operators, not a stated rule |
+| `cloneExpr` (`expr_utils.h`, site 11) | **Copies `null_type`.** It is part of the node's meaning; dropping it retypes a cloned NULL as INT and makes `inferExprType` disagree with itself across a clone |
+| `ExpressionExecutor::compileNode` (site 15) | **Declines** (pre-existing, now reachable). The decline cascades, so the enclosing predicate falls back to `evaluate()` — correct-but-slow, and the reason no kernel needs to know about null constants |
+| `evalPredicate`'s fast path (`columnar_eval.cc`) | Already tested `lit->value.isNull()` and fell back |
+| `foldNode` (`constant_folding.cc`, site 14) | Already refuses to PRODUCE one, and arithmetic over one evaluates to NULL, so it declines to fold THROUGH one |
+| `evaluate` (`evaluator.cc`) | NULL-safe throughout: AND/OR are three-valued, every other operator propagates |
+| `exprToString` / `literalKey` (`expr_utils.h`) | `Value::toString()` renders `"NULL"`; `literalKey` has an explicit null branch |
+| The `ORDER BY` / `GROUP BY` column-ordinal checks (`validator.cc`) | Already guarded with `!lit->value.isNull()` |
+| `SUBSTRING`'s constant-argument checks (`logical_plan.cc`) | Same guard |
 
 ### The structural alternative
 
@@ -688,9 +762,19 @@ containment above means the change buys nothing until a correlated ref can
 actually reach the second table. The week that removes the containment is the
 week to do it, and this table is what makes that change reviewable.
 
+**Week 31 is not that week, and said so before starting.** Uncorrelated
+subqueries execute by materialization — the body is planned as its own top-level
+statement and the outer node becomes a constant — so no `ColumnRef` with
+`query_level > 0` reaches a logical plan. The trigger condition, restated for
+whoever reads this next: *the first week in which a correlated reference is
+lowered into a plan node.* On the current schedule that is Week 33; Week 32 trips
+it only if it chooses to lower a correlated `EXISTS` to an anti-join, in which
+case the structural change is its prerequisite and is done **as its own
+standalone commit**, never folded into the feature.
+
 ## Extending the expression language
 
-Eighteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
+Nineteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
 one is missed — no error, no crash, a wrong answer or a lost optimization
 somewhere far away. Adding a node type means visiting all of them.
 
@@ -725,6 +809,8 @@ Ordered by how hard the failure is to find:
 | 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
 | 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
 | 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents. **The "re-checks by relation slot, never by `table_name`" rule above is only true within one query block.** `validateQuery` recurses into a NESTED statement's ON clauses, where a correlated ref is an ordinary top-level ref carrying an *enclosing* block's slot; indexing `relations` with it compares two numbering domains. Both this site and `classifyJoinCondition` therefore test `query_level` first — skip for existence here, and refuse to make a KEY there, or a key-less nested join joins on a fabricated key instead of hitting the cross-product refusal |
+
+| 19 | `forEachSubquery` — `subquery_materialization.cc` (Week 31) | returns | **Loud, by construction.** The subquery inside the missed subtype is never materialized, survives into planning and hits site 12's throw. That backstop is the whole reason this walker may be added without becoming the eleventh silent site — do not "simplify" sites 12/13 into the generic unknown-subtype throw, which says nothing about which walker failed. It is also the ONE walker that deliberately descends INTO a `SubqueryExpr`'s body: Week 30's rule (descend into the parts written in THIS block, never into the body) is a rule about SCOPE, and "which statements must run, and in what order" is not a scope question — a nested body must be materialized before the body containing it can run. Its read-only twin `forEachSubqueryConst` answers the same question for the CLI's table loader, so a nested query's tables are loaded; the two must stay in step |
 
 `ChunkPruner::shouldSkip` is not on the list *for the dispatch question*:
 `collectSimplePredicates` returns immediately on anything that is not a
