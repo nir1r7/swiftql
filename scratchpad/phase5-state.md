@@ -1,5 +1,15 @@
 # Phase 5 orchestrator state
-Current: week 33, round 1, step 1 (teach) — launching ~10:44 UTC.
+Current: week 33, TASK 1 ONLY (agent aa6b3121eb7ae18de, launched 10:52 UTC) — the standalone
+  ColumnId {level, slot} migration. 9-task plan at docs/week-33-plan.md.
+  DELIBERATE SPLIT: Task 1 lands, then a GATE, then tasks 2-9. The migration is required to be
+  verified green before feature work, and a verifier owns the gate — bundling them would mean
+  the migration alone was never measured.
+  The migration is 87 mentions / 6 layers / every test hand-building a ColumnRef,
+  GroupByColumn or AggregateSpec, so it will span reclaims. Protocol: commit+push per step,
+  keep tree building between steps, maintain ## Progress in docs/week-33-plan.md as the
+  handoff. ON RECLAIM: resume from that section, never restart the migration.
+  It is a REPRESENTATION change only — any behaviour difference is a bug, and the gate after it
+  is checking exactly that.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
