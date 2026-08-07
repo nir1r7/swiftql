@@ -2019,7 +2019,19 @@ anything cut or re-declined — is recorded here rather than left to be inferred
 from the diff. A successor agent resumes from this section.)*
 
 - [x] Task 1 — refusal inventory and sweep checklist (below)
-- [ ] Task 2 — `TableRef` (own commit, derived form still refused) — IN PROGRESS
+- [x] Task 2 — `TableRef` landed. `table_name_` private, `tableName(site)` is the
+      narrowing point (the `ColumnId::localSlot` discipline). 94 sites; unique_ptr
+      ownership, with the asymmetry vs `SubqueryExpr` stated at the field.
+- [x] Task 3 — Binder derived range-table entries. `Scope::owned_schemas`;
+      `relationSchema` binds the body against `parent` (NOT LATERAL, the argument
+      IS the rule); `has_derived_table` is a SEPARATE flag from `has_subquery`.
+      Known boundary recorded: at top level there is no parent, so a lateral
+      reference reports as an ordinary unresolved qualifier.
+- [x] Task 4 — graft. `LogicalDerived` + `VecDerivedNode`;
+      `derivedRelationSchema` flattens to slot 0; `blockOutputSchema` shared with
+      the Binder and asserted against the built plan at the graft; four
+      descend-to-SCAN walkers stopped at the node; `Validator` rebuilt around one
+      range table; `Planner::plan` refuses derived tables (third Volcano refusal).
 - [ ] Task 3 — Binder: derived range-table entries
 - [ ] Task 4 — `LogicalPlanBuilder`: graft and normalize
 - [ ] Task 5 — the three synthetic-slot consumers, slot-table sweep
