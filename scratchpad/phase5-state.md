@@ -1,22 +1,31 @@
 # Phase 5 orchestrator state
-Current: week 35 fix round 2 (agent a5e22b2abf18e4eb4, launched 20:34 UTC).
-  Audit r2 audited the harness AS AN INSTRUMENT: 1 blocker, 4 major, 1 minor.
-  !! THE MEASUREMENT UNDERSTATES, not overstates. q2's INERT verdict is a PARAMETER ARTIFACT —
-  172 of 250 parameter combinations DISCRIMINATE. It is not vacuous; it is vacuous at the
-  parameter we picked. q19's ALL_NULL is the same. Fixing these RAISES the honest count
-  legitimately, and leaving them would understate the engine — the mirror of the overstatement
-  we have been guarding against, and just as wrong.
-  !! A GATE STEP THAT CANNOT FAIL: --baseline together with --write-baseline on one path is an
-  unconditional PASS. Everything else is measured THROUGH that gate, so it was ordered first.
-  Also fixing: a narrowed --queries run prints a full-shaped PASS (4/4 ...; 0 vacuous;
-  0 unported) that reads as a complete result; the README still records Q17 as SUPPORTED while
-  the spec's Q17 text is REFUSED (week 34 shipped the MECHANISM, and I recorded that checkpoint
-  as met on the mechanism — the harness later showed the query does not run); q18's
-  "unreachable" holds only at threshold 300.
-  The baseline will be REGENERATED from a full run after q2/q19; if the figure rises above 17
-  that is correct, and the refresh must be deliberate and stated, never drift.
-  NOT REACHED by audit r2, not approved: hand re-derivation of the other 19 mutation verdicts
-  (structural check only), any engine run, --time/--fingerprint-all.
+Current: week 35 — all six audit-r2 findings FIXED and pushed. Closing gate next.
+  THE HONEST FIGURE IS NOW 19/22 MEANINGFUL vs SQLite — 5 in all four modes, 14
+  vectorized-only; 1 vacuous (q18); 2 unported (q17, q21). Regenerated from a full 22x4 run;
+  the rise from 17 is a DELIBERATE refresh recorded in the commit with per-query deltas, and
+  no mode was lost anywhere. It came from fixing OUR parameters, not from relaxing anything:
+    q2  INERT -> DISCRIMINATING (SIZE 15->1, TYPE/REGION stay at spec; base 7 rows, mutant 8)
+    q19 ALL_NULL -> DISCRIMINATING (BRANDs 12/23/34 -> 14/34/23; only BRAND1 leaves the spec's
+        value set; all three OR arms now contribute; base revenue 56323.29 vs mutant 8473.82)
+  GATE HOLE CLOSED AND PROVED: --write-baseline now runs AFTER compare_baseline and refuses to
+  write unless the run passed. Synthetic regression: before -> PASS, exit 0, baseline
+  overwritten; after -> FAIL, exit 1, "REGRESSION: q18 was meaningfully answered, now VACUOUS
+  (EMPTY)", baseline md5 unchanged.
+  Partial runs now announce themselves in the VERDICT TOKEN — PARTIAL-PASS / PARTIAL-FAIL /
+  PARTIAL-NO-BASELINE, plus "N-QUERY SUBSET — M of 22 NOT RUN, so this is NOT a full
+  measurement", so the words survive any excerpt.
+  README corrected at four sites and verified on the binary: week 34 shipped the
+  correlated-scalar MECHANISM and the constant-outside shape — `0.2 * (SELECT AVG(...))`
+  returns 2732.80428571429 matching SQLite, while `(SELECT 0.2 * AVG(...))` is refused by name.
+  So TPC-H Q17's OWN TEXT does not run and the harness records it 0-mode UNPORTED.
+  q18 stays vacuous BY CHOICE: max per-order SUM(l_quantity) here is 295, so 300 -> EMPTY and
+  290 -> DISCRIMINATING, but 300 is already the LOWEST of the spec's three quantities.
+  Lowering it would game the benchmark rather than fix it.
+  >> WEEK 36 OPPORTUNITY, flagged not taken: lifting `found[0] == select_list[0]` to allow an
+  aggregate under a constant-only expression tree would make q17 run and take the figure to 20.
+  STILL OWED: compare_against_sqlite.py's NaN comparison; random_diff.py's projection; and the
+  audit's not-reached list (per-query hand verification beyond q2/q18/q19, --time,
+  --fingerprint-all).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
