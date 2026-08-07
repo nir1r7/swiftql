@@ -1,16 +1,28 @@
 # Phase 5 orchestrator state
-Current: week 36 fix round — ONE item outstanding, then close.
+Current: week 36 fix round — BOTH closing items DONE (F1 + full sweep); needs a verifier pass,
+  then close. NOTE FOR THE VERIFIER: the closing round edited a COMMENT in
+  src/planner/subquery_decorrelation.cc (a stale "17-site checklist" cross-reference), so the
+  build is stale and must be rebuilt. No behaviour changed.
   Audit r1 verdict: "20/22 is HONEST AS A CAPABILITY CLAIM, UNPROVEN AS A MEASUREMENT" — and
   the gate has since PROVEN the measurement. Q17 runs the spec's own unaltered text, matches
   SQLite (2732.80428571429 vs 2732.804285714286), is byte-identical in --explain to the
   already-verified constant-outside form, DISCRIMINATES under mutation, and still refuses every
   shape it should (two-aggregate, CASE wrapper, non-aggregate body, non-constant wrapper,
   nested aggregate). So the lift was CORRECT, not merely permissive.
-  F1 (medium-high, outstanding): docs/tpch-sf0.01-report.json was NEVER REGENERATED — it still
-  publishes 19/22 with q17 UNPORTED, contradicting the baseline beside it. run_tpch.py's --json
-  and --write-baseline are separate flags and only the latter was passed. It is also a site the
-  obligatory refusal sweep MISSED.
-  ALSO OWED: target 2's sweep was only SPOT-CHECKED — 11 cited sites, not independently walked.
+  F1 (medium-high) — CLOSED. docs/tpch-sf0.01-report.json regenerated from a full 22x4 run
+  (--json + --baseline; BASELINE OK, no IMPROVED line, so the baseline was not rewritten).
+  report["summary"] is now byte-equal to docs/tpch-baseline.json. The flag independence is
+  fixed at the root: --write-baseline WITHOUT --json is now REFUSED up front, because the
+  baseline IS the report's "summary" key. The documented refresh path (verify/SKILL.md and the
+  plan's step 3) named only --write-baseline, so following the instructions produced the drift;
+  both now carry --json, as does the harness's own IMPROVED suffix.
+  SWEEP — CLOSED. All cited sites walked: FIFTEEN, not eleven (8 changed + 7 checked, matching
+  README's "eight rewritten, seven checked"). 13 already correct, 2 stale and both COUNTS:
+  "17-site checklist" (development.md's has NINETEEN) and "7 new diffed entries" (ffab914 adds
+  SIX). No lifted restriction is described as still in force anywhere — the Week 33 failure mode
+  did not recur, confirmed by an independent grep as well as by walking the list. Behavioural
+  rows RUN against the committed binary, not read. Left deliberately: the pre-existing
+  "BetweenExpr would cost 17 dispatch sites" in 3 files (a2fc0c2), same drift, not Week 36's.
   Verified clean by the audit: q21's blocker accurate and refused by name and pinned; both
   harness fixes close their holes (the NaN comparator, random_diff's projection).
   AFTER THIS: close week 36, then THE FIVE-WAY SEAM AUDIT — join chain 26-29, subquery chain
