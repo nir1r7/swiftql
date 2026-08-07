@@ -475,3 +475,323 @@ silent claim of support.
   over `README.md`, `docs/`, `.claude/` and `python_tools/` must return nothing
   outside historical Week 35 narrative — and where it is historical narrative,
   it must read as a record of Week 35's measurement, not as the current figure.
+
+---
+
+## Task 3 — Q21: establish what it actually needs, and decide it in the open
+
+### Why it matters
+
+q21 is the other 0-mode query. Unlike q17, nothing about it was left to this week
+"because it is a capability change and not harness tidying" — it was left because
+**nobody had established what it needs**. Establishing that is the deliverable;
+implementing it is a decision that follows, and this task is written so the week
+still delivers if the answer is "not this week".
+
+### What it actually needs — measured, not inferred
+
+```
+$ ./build/swiftql --catalog data/tpch/sf0.01/catalog.json \
+      --execution vectorized --query "<q21 with :NATION = SAUDI ARABIA>"
+Error: correlated subquery: only an equality between two columns can become a
+join key (a correlated inequality has no equi-join to lower to)
+```
+
+That is `splitCorrelation` in `subquery_decorrelation.cc`, and it fires twice:
+
+```sql
+EXISTS     (SELECT * FROM lineitem l2
+            WHERE l2.l_orderkey = l1.l_orderkey     -- an equality: a join key
+              AND l2.l_suppkey != l1.l_suppkey)     -- a correlated INEQUALITY
+NOT EXISTS (SELECT * FROM lineitem l3
+            WHERE l3.l_orderkey = l1.l_orderkey     -- a join key
+              AND l3.l_suppkey != l1.l_suppkey      -- a correlated INEQUALITY
+              AND l3.l_receiptdate > l3.l_commitdate)   -- body-local, fine
+```
+
+So q21 is **not** blocked by anything Week 33 declined for lack of a key: both
+bodies *have* a key. It is blocked by the residual that sits beside it. The
+requirement is precisely: **a semi/anti join that carries an `ON` residual over
+both sides.**
+
+The mutation check confirms the data will test it:
+`('DISCRIMINATING', 'the NOT EXISTS anti-join', '3 rows -> 3')`, and SQLite's
+answer is 3 rows (`Supplier#000000044 | 9`, `...054 | 7`, `...013 | 4`).
+
+### Conceptual explanation
+
+`R ⋉_(p ∧ q) S ≡ R ⋉ over σ… ` does **not** decompose the way an inner join's
+does. For an INNER join, `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)` — which is the identity
+`join_condition.h` relies on to fold residuals into the `WHERE`. For a **semi**
+join the identity fails, because the semi join has already collapsed the
+matching build rows to a yes/no answer: by the time `q` could be applied, the row
+that would satisfy it is gone. The residual must be evaluated **inside the
+probe**, against a probe⊕build pair, exactly like an outer join's residual —
+which the operator already does.
+
+Three properties of the current operator are what make this a real change rather
+than a flag:
+
+1. **The semi/anti build side keeps keys, not rows.** `VecHashJoinNode::open`
+   inserts into `build_keys_` (an `unordered_set<std::string>` of serialized
+   keys) for `semantics_ != STANDARD`, and into `hash_table_`
+   (`key -> vector<Row>`) otherwise. A residual needs the *rows*. The machinery
+   exists — it is the STANDARD path's — so this is a routing change, not a new
+   data structure.
+2. **The probe's residual is evaluated against `output_schema_`, which for a
+   semi/anti join IS the probe schema.** `passes()` calls
+   `evaluate(on_residual_.get(), row, output_schema_)`. A residual naming a body
+   column cannot resolve there. It needs a **private** `residual_schema_` =
+   probe schema ⊕ projected-body schema, and a concatenated row to evaluate
+   against. The output schema must **not** move: that it is the probe's schema
+   is the containment Week 32 established and Week 33 preserved, and widening it
+   would put body columns in scope above the join.
+3. **The body is projected to its key columns only.** `lowerExistsSubqueries`
+   does `body.select_list = std::move(body_key_refs)` — deliberately, and for
+   three named defects (round 1 H-1/H-2/M-3). A residual's body-side columns must
+   therefore be **added to that projection**, after the keys, so the right key
+   indices stay positional `0..k-1`. Appending, never inserting.
+
+And one hazard that is specific to q21 and easy to miss: the residual compares
+`l3.l_suppkey` with `l1.l_suppkey` — **two columns with the same name** from two
+aliases of the same table. In a merged residual schema, `indexOf(name)` takes the
+first match. This is exactly the wrong-relation class `ColumnId` exists to
+prevent, and it is the reason the residual's refs must be **restamped by slot**
+rather than left to resolve by name. Getting this wrong produces wrong rows, no
+error, and an identical `--explain` — the H-1 failure shape, verbatim.
+
+### Code snippets (illustrative)
+
+`splitCorrelation` currently refuses a correlated non-equality outright. The
+change routes it instead, and only when a key survives:
+
+```cpp
+// Week 36 — a correlated conjunct that is NOT an equality becomes an ON RESIDUAL
+// on the semi/anti join, evaluated inside the probe against a probe(+)build pair.
+// TPC-H Q21 needs exactly this: `l2.l_suppkey != l1.l_suppkey` beside the key
+// `l2.l_orderkey = l1.l_orderkey`.
+//
+// !! STILL REFUSED when NO equality survives (the `keys.empty()` check at the
+// call site): a body correlated only by inequalities has no hash key at all, and
+// the fallback would be a cross product this engine has no operator for. The
+// refusal narrows; it does not disappear.
+if (!bin || bin->op != "=") {
+    correlated_residuals.push_back(std::move(c));   // was: refuse(...)
+    continue;
+}
+```
+
+The operator's constructor assertion is the site the standing rule points at:
+
+```cpp
+if (semantics_ != JoinSemantics::STANDARD) {
+    ...
+    // WAS: if (on_residual_) throw "a semi/anti join takes no ON residual";
+    // Week 36: a SEMI/ANTI join MAY carry a residual (Q21). ANTI_NOT_IN may NOT:
+    // its build_had_unmatchable_key_ short-circuit answers "S contains a NULL, so
+    // `x NOT IN S` is never TRUE" -- a statement about the KEY column that a
+    // residual makes untrue, because a build row with a NULL key can no longer
+    // stand for "some row matched". `NOT IN` never produces a residual, so this
+    // is a containment, not a limitation.
+    if (on_residual_ && semantics_ == JoinSemantics::ANTI_NOT_IN)
+        throw std::runtime_error(
+            "internal: a NOT IN anti-join takes no ON residual");
+    // The output schema assertion STAYS, unchanged and load-bearing: the residual
+    // is evaluated against residual_schema_, which is PRIVATE. No body column
+    // enters output_schema_, so nothing above the join can name one.
+    if (output_schema_.size() != probe_child_->outputSchema().size()) ...
+}
+```
+
+and the probe, where SEMI and ANTI part company:
+
+```cpp
+// SEMI  — emit the probe row iff SOME build row with this key passes the residual.
+// ANTI  — emit it iff NO build row with this key passes. Not the negation of a
+//         boolean computed elsewhere: it is the same scan with the opposite
+//         verdict, so a residual that is UNKNOWN (NULL) counts as NOT passing on
+//         BOTH sides. EXISTS is two-valued; there is no third answer to carry.
+bool matched = false;
+auto it = hash_table_.find(key_buf_);
+if (it != hash_table_.end()) {
+    for (const Row& build_row : it->second) {
+        if (residualPasses(probe_row, build_row)) { matched = true; break; }
+    }
+}
+if (matched != (semantics_ == JoinSemantics::SEMI)) continue;
+```
+
+Note the early `break`: a semi join emits each probe row **at most once**, which
+is the whole reason the operator exists, and the loop must not turn into an
+inner join's multiply-emitting one.
+
+### Implementation guidance
+
+1. **Stage it, and put the decision gate first.** Task 3a — reproduce the
+   refusal, write the requirement down (this section), and confirm the mutation
+   verdict — is **mandatory** and cheap. Task 3b — implement it — is the stretch.
+   If 3b does not land, 3a still ships: the refusal message gets sharpened to
+   name what it declined (`a correlated inequality beside a valid key is an ON
+   residual on the semi/anti join, which is not implemented`), the boundary is
+   pinned in the rejection suite, and q21 stays UNPORTED with a recorded reason
+   instead of an unexplained zero.
+2. **Do not touch `requireDecorrelatableBody`'s conditions 1, 3 or 4.** Only
+   condition 2 (every correlated conjunct is an equality) narrows. The header
+   spells out all four; rewrite condition 2 there in the same edit — the same
+   rule as Task 2.
+3. **Order of work inside 3b:** guard first (routing), then the logical join
+   (carry `on_residual` on a `SEMI`/`ANTI` node, keep `join_slot = -1`), then the
+   body projection (append residual columns after the keys), then
+   `VectorizedPlanBuilder` (pass the residual through, build `residual_schema_`),
+   then the operator. Build and run the existing suites after **each** step: the
+   semi/anti path is shared with `IN` lowering (q16, q18, q20) and Week 33's
+   `EXISTS` (q4, q22), and a regression there costs more than q21 gains.
+4. **The `build_had_unmatchable_key_` flag is not the only NULL question.** With
+   a residual, a build row whose *key* is NULL is still unmatchable (correct,
+   unchanged), but a build row whose *residual column* is NULL now makes the
+   residual UNKNOWN — which `passes()` already treats as not-a-match via
+   `!v.isNull() && v.asInt() != 0`. Confirm that by test, do not assume it: for
+   `NOT EXISTS`, "the residual was UNKNOWN" must keep the outer row, and it is
+   one sign flip away from dropping every row (the Week 33 round-2 failure).
+5. **Watch the join count.** After both lowerings q21 has three base joins plus a
+   semi plus an anti — five joins in one vectorized plan, more than any query
+   shipped so far. Check `join-ordering=` in `--explain` says something sensible
+   and that `hasSlotOutsideRangeTable` does not silently decline the tree: a
+   `join_slot = -1` right child is expected and handled, but five joins is a new
+   scale for it.
+6. **Do not convert the semi/anti probe's row copy to a `SelectionVector` here.**
+   That is a *measurement* question (README's starting note under Week 37) and
+   changing it in the same week as the residual would confuse a correctness
+   change with a performance one.
+
+### Verification
+
+- **The refusal narrows correctly.** A body correlated **only** by an inequality
+  (`WHERE l2.speed > l.speed`) must still refuse, with the `keys.empty()`
+  message. That entry already exists in `WEEK34_CORRELATED_SCALAR_REFUSED`;
+  confirm it still fires and now reports the *no key* message rather than the
+  *no equality* one — the message changes, so the pin must change with it.
+- **q21 matches SQLite** in both vectorized modes: three rows, `numwait`
+  9 / 7 / 4 for `Supplier#000000044 / 054 / 013`, ordered
+  `numwait DESC, s_name`.
+- **The semi/anti family does not regress.** q4, q16, q18, q20, q22 must all
+  still be MATCH in their two modes, and the twelve rejection suites must still
+  report every entry reaching its own guard. This is the check that matters most:
+  q21 is worth one cell, and the shared operator is worth ten.
+- **Hand-simulate the ANTI residual on paper before trusting the run.** Take one
+  order with two suppliers, one late and one not, and walk the four combinations
+  (key match / no key match) × (residual passes / fails) through the probe.
+  `operator-correctness`'s NULL tables are the reference. A semi/anti join is the
+  one operator in this engine where a wrong answer is a *missing* row, and a
+  missing row is invisible in a spot check.
+
+---
+
+## Task 4 — Mode coverage: settle Volcano semi/anti parity on the measured breakdown
+
+### Why it matters
+
+The report distinguishes two figures — **how many queries are meaningfully
+answered** and **in how many of the four modes** — because collapsing them is how
+a documented limitation becomes a silent claim of full coverage. Week 36 has to
+say which of the two it is moving, and back it with a measurement rather than an
+expectation. The standing expectation, carried since Week 33, is that *Volcano
+semi/anti parity would move many queries from two modes to four*. **That
+expectation is wrong, and the report already contains the data that disproves
+it.**
+
+### The measurement
+
+34 of 88 cells are Volcano refusals. Classified by the message each cell actually
+recorded in `docs/tpch-sf0.01-report.json` — not by which feature the query
+"is about":
+
+| Guard that fired | Queries | Cells |
+|---|---|---|
+| `multi-way joins are not supported on the Volcano path` | q2 q3 q5 q10 q11 q18 q21 | **14** |
+| `derived tables (FROM (subquery)) ...` | q7 q8 q9 q13 q15 q22 | **12** |
+| `IN subqueries are lowered to a semi-join ...` | q16 q20 | **4** |
+| `correlated subqueries are decorrelated to a semi-join ...` | q4 q17 | **4** |
+| | | **34** |
+
+Reproduce it before quoting it:
+
+```python
+import json
+d = json.load(open("docs/tpch-sf0.01-report.json"))["details"]
+for k, v in sorted(d.items()):
+    if "volcano" in k:
+        print(k, "::", str(v)[:80])
+```
+
+So the semi/anti family is **8 cells of 34**, not most of them. And of those 8,
+six are unreachable even with a Volcano semi-join, because the query needs a
+*second* join that `Planner::plan` cannot express:
+
+- **q16** — `partsupp JOIN part` **plus** the `NOT IN` anti-join.
+- **q20** — `supplier JOIN nation` **plus** two nested `IN` semi-joins.
+- **q17** (after Task 1) — `lineitem JOIN part` **plus** the decorrelated LEFT
+  join. It would hit `stmt.joins.size() > 1` first anyway.
+- **q4** — `FROM orders` with no explicit join at all. The decorrelated semi-join
+  is the **only** join. This is the one reachable case: **2 cells**.
+
+### Conceptual explanation — what those 2 cells would cost
+
+`Planner::plan` is the Volcano entry point and it builds exactly one
+`HashJoinNode` out of `stmt.joins`. `HashJoinNode` has **no `JoinSemantics`
+parameter** — `plan_nodes.h` says so explicitly and says why. And critically,
+this path does **not** run `LogicalPlanBuilder`, which is where decorrelation
+grafts the body's subtree. So closing q4's two cells means:
+
+1. adding `JoinSemantics` to `HashJoinNode`, and with it the three-valued
+   `SEMI` / `ANTI` / `ANTI_NOT_IN` rules, the `build_had_unmatchable_key_`
+   short-circuit, and the empty-build-side case;
+2. a **second decorrelation production** on a path with no logical layer, which
+   must agree with the first on `NOT EXISTS`'s NULL semantics.
+
+Point 2 is, in this project's own words, "the two-paths drift Weeks 26/28/30 each
+had to undo". The cost is two engine paths that must agree forever; the benefit
+is 2 cells of 88.
+
+### The decision, stated so it does not have to be re-argued
+
+**Week 36 targets the headline count, not mode coverage.** Volcano semi/anti
+parity is re-declined, now on a measurement rather than on an estimate of
+difficulty:
+
+- it addresses **8 of 34** Volcano refusal cells, not most of them;
+- **6 of those 8** are additionally blocked by a plan shape `Planner::plan`
+  cannot express, so parity alone changes nothing for them;
+- the reachable remainder is **q4's 2 cells**, at the price of a second
+  execution production for a family whose NULL rules already produced one
+  whole-result-set defect (Week 33 round 2).
+
+The two guards that actually dominate — multi-way joins (14 cells) and derived
+tables (12 cells) — are both **deliberately** vectorized-only, stated in
+`planner.cc` as "Volcano is the correctness baseline, not the feature-complete
+path". Nothing this week changes that, and nothing should: Volcano's value is
+being a *different* implementation to diff against, and the 54 cells it does
+cover are what make that oracle meaningful.
+
+### Implementation guidance
+
+There is no code in this task. What it produces is:
+
+1. **The table above, in the Week 36 report**, so the next reader inherits the
+   breakdown instead of the expectation.
+2. **A correction to the carried-forward note.** README's Week 33/34 hand-forward
+   says parity "would move many queries from two modes to four". Rewrite it to
+   the measured claim. Leaving it is how a wrong expectation survives three more
+   weeks.
+3. **A restatement in `planner.cc`'s cost paragraph.** It currently says "three
+   families of query the four-mode oracle does not cover, and the count is stated
+   in README Limitations so the week it tips is visible". Add which family costs
+   what — 14 / 12 / 8 — so "the week it tips" is a number, not a feeling.
+
+### Verification
+
+- The four counts must sum to 34, and 34 + 54 must equal 88. Arithmetic, but it
+  is the arithmetic the whole claim rests on.
+- Re-run the classification **after** Tasks 1 and 3, not before: q17 leaves the
+  `correlated` row and q21 leaves the `multi-way` row only if q21 lands. The
+  table published in the report must be the post-change one.
