@@ -1,8 +1,15 @@
 # Phase 5 orchestrator state
-Current: week 32, round 2 — gate (a0fcc6e60dad0237f) + audit (acf60ae53b336400e) launched
-  09:33 UTC, right after the reclaim, so both have a full window.
-  Week 32 implementation + audit-r1 fixes are all COMPLETE and pushed through 6d7c7e9.
-  The 09:26 reclaim killed gate r1 (never reported) and audit r2 (file wiped with scratchpad).
+Current: week 32 — gate r2 (a0fcc6e60dad0237f) still running; audit r2 DONE and self-committed
+  at 8297bc6 (0 blocker, 0 high, 2 medium, 3 low). Audit r3 (aeccd2c91496e936d, launched
+  09:41, 30-min budget) is covering ONLY what r2 could not reach: tests/test_subquery.cc, the
+  13 WEEK32_SEMI_JOIN_VEC_ONLY oracle queries, the subquery_materialization removals, and the
+  README/development.md diffs.
+  SEQUENCING RULE learned here: do NOT dispatch a fix agent while a gate is running — the fix
+  mutates the tree the gate is measuring. Read-only audits alongside a gate are fine.
+  NEXT: when gate r2 returns, dispatch ONE fix round covering r2's + r3's findings together.
+  r2 mediums: `RefusesEveryIllegalCombination` cannot tell its four guards apart;
+  `collectSlotTables` (vectorized_plan_builder.cc:120) stamps the body's table at slot -1,
+  reachable via two IN conjuncts.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
