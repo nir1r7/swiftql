@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **713 tests, 0 failures.**
+Expected: **720 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,13 +223,13 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **792 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
+Expected: **828 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
 `--no-optimize`), plus 12 rejections × the same 4 modes, plus the multi-way
 capability split — 13 multi-way queries × the 2 vectorized modes, diffed against
 SQLite, and the same 13 asserted to be refused × the 2 Volcano modes — plus
-Week 30's two subquery suites × the same 4 modes (13 forms that must *bind* and
-reach the Week 31 refusal, and 11 that must fail earlier for their own stated
+Week 30's two subquery suites × the same 4 modes (19 forms that must *bind* and
+reach the Week 31 refusal, and 14 that must fail earlier for their own stated
 reason).
 
 The multi-way block is 6 Week 27 execution shapes plus 7 Week 28 join-ordering
@@ -638,11 +638,11 @@ Ordered by how hard the failure is to find:
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
 | 12 | `inferExprType` — `logical_plan.cc` | **throws** | Loud, at plan time |
 | 13 | `evaluate` — `evaluator.cc` | **throws** | Loud, at execution |
-| 14 | `foldNode` — `constant_folding.cc` | returns false | Safe: no folding |
+| 14 | `foldNode` — `constant_folding.cc` | returns false | Safe **for the node itself**: no folding. Not safe for a CONTAINER node — every other one folds inside itself so the operand reaches `ChunkPruner` / `scanColumn` / `selectivity()` in the `ColumnRef op Literal` shape they pattern-match on. `SubqueryExpr` was missed here in Week 30 and corrected in its round-1 audit: fold the `IN` operand, never the body |
 | 15 | `ExpressionExecutor::compileNode` | returns `nullptr` | Safe: caller falls back to `evaluate()` — slow, never wrong |
 | 16 | `evalPredicate` — `columnar_eval.cc` | `evalFallback` | Safe. Needs no change for a new node: the fallback routes through `PredicateExecutorCache`, so adding a kernel at #15 is enough to make it fast |
 | 17 | `CardinalityEstimator::selectivity` | `FALLBACK_SELECTIVITY` | Safe: a flat 0.5 guess. Add a real rule only when you can also afford to be *right* — `orderByWork` ranks conjuncts on selectivity alone, so an estimate that is low and wrong promotes an expensive predicate ahead of cheap ones. `IN` gets `k/ndv`; `LIKE` deliberately does not (see below) |
-| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents |
+| 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents. **The "re-checks by relation slot, never by `table_name`" rule above is only true within one query block.** `validateQuery` recurses into a NESTED statement's ON clauses, where a correlated ref is an ordinary top-level ref carrying an *enclosing* block's slot; indexing `relations` with it compares two numbering domains. Both this site and `classifyJoinCondition` therefore test `query_level` first — skip for existence here, and refuse to make a KEY there, or a key-less nested join joins on a fabricated key instead of hitting the cross-product refusal |
 
 `ChunkPruner::shouldSkip` is not on the list: `collectSimplePredicates` returns
 immediately on anything that is not a `BinaryExpr`, so a new node contributes no

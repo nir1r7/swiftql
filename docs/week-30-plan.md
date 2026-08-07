@@ -1898,8 +1898,40 @@ and the correction are both readable.
 
 6. **Correlated references resolve outward and are marked**, rather than being
    left unresolved. The README's Week 30 bullet is "represent scalar,
-   set-returning, and **correlated** subqueries", and Q4/Q17/Q20/Q21's correlated
-   references are unqualified, so leaving them unresolved would make
-   `validateExpr` report `column not found` against the subquery's own schema and
-   the checkpoint's own queries would not bind. Week 33 owns *decorrelation* —
-   turning the marked reference into a join — which is untouched here.
+   set-returning, and **correlated** subqueries", and without outward resolution
+   the checkpoint's own queries do not bind — in two different ways, which the
+   first version of this note got wrong by lumping them together. Q4, Q17 and Q20
+   write their correlated references **unqualified**, so leaving them unresolved
+   makes `validateExpr` report `column not found` against the subquery's own
+   schema. Q21 writes its correlated references **qualified** — it aliases
+   `lineitem` three times (`l2.l_orderkey = l1.l_orderkey`,
+   `l3.l_suppkey <> l1.l_suppkey`) — so an unresolved ref there would not have
+   reached `validateExpr` at all: the Binder itself throws
+   `unknown table qualifier: 'l1'`. Both shapes fail without outward resolution,
+   with different messages. Week 33 owns *decorrelation* — turning the marked
+   reference into a join — which is untouched here.
+
+---
+
+## Round 1 — what the audit found, and what it changed
+
+Two blockers, two majors, three minors. Every one was a *consumer* that collapsed
+`(query_level, relation_slot)` back to a bare slot, or a place the week's own
+rules were stated but not applied. The pattern is worth naming, because Week 31
+inherits it: adding a field to `ColumnRef` is not the work — finding every reader
+of the field it qualifies is.
+
+| # | Finding | Fix |
+|---|---|---|
+| B1 | `validateJoinCondition` and `classifyJoinCondition` route a **nested** query's `ON` refs by slot against the *inner* range table. A correlated ref there is an ordinary top-level ref of that expression carrying an *outer* slot | `validateJoinCondition` skips `query_level > 0` (the Binder verified it where it resolved). `classifyJoinCondition` refuses to make a **key** out of such a ref, so a genuinely key-less nested join reaches the cross-product refusal instead of joining on a fabricated key |
+| B2 | Binding was idempotent for stamps but **not** for `SubqueryExpr::correlated`: `markCorrelated` ran only on the resolution path, which the early return skips, so a second walk cleared the flag — reachable inside one `bind()` via `BETWEEN`'s shared-statement clone | Correlation is derived from the *stamp* on the idempotent path, so it survives any number of walks. That is what keeps `collectSlots`' `-1` — and therefore `restampSlots`' safety argument — true for every node over a shared statement |
+| M3 | `query_level` was dropped on the `ColumnRef` → `GroupByColumn` round trip, and the validator's skip keyed on `!table_name.empty()`, which the `>= 2` qualification rule makes depend on the **enclosing** block's relation count | `GroupByColumn` carries `query_level`; the skip tests the level. `checkGroupedRefs` compares the level too, so a slot is never matched across two range tables |
+| M4 | The `ORDER BY` position rule tested only the **root** node | Routed through `validateExpr`, whose `allow_subqueries=false` default is checked at every node — the same mechanism `SELECT` and `GROUP BY` already had. No bespoke recursive walker, which would have been a nineteenth silent dispatch site |
+| m5 | `collectSlots`' new comment claimed a top-level ref is always level 0 — false, and the same class of false justification the week was handed as a finding | Corrected to say *why* the branch is there: `classifyJoinCondition` calls this walker on a nested query's `ON` conjuncts |
+| m6 | Dispatch site 14 (`foldNode`) was the one place the week's own rule — descend into the `IN` operand, never the body — was not applied | Branch added. Week 32 probes a semi-join on exactly that operand, and three fast paths pattern-match on the shape folding restores |
+| m7 | This note's Q21 evidence was wrong | Corrected above |
+
+B1(b) and B2 were the two that would have produced **wrong rows** rather than a
+wrong message once Week 31 lowers a subquery: a fabricated join key, and a
+correlated conjunct pushed onto one relation's scan. Both are now pinned by tests
+confirmed failing against the pre-fix tree.

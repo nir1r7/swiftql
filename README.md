@@ -1269,6 +1269,20 @@ nothing clean to return) — that check was the one place the optimized path cou
 fail on input `--no-optimize` accepts, and Week 31/34 make its condition
 reachable for a legitimate plan.
 
+Round 1's audit found the pattern the week had to learn: adding a field to
+`ColumnRef` is not the work — finding every *reader* of the field it qualifies
+is. Seven findings, all of them a consumer collapsing `(query_level,
+relation_slot)` back to a bare slot, or a place the week's own rule was written
+down and not applied:
+
+| Found | Why it mattered |
+|---|---|
+| **`validateJoinCondition` and `classifyJoinCondition` route a NESTED query's `ON` refs against the INNER range table** | `validateQuery` recurses into a subquery's own joins, and there a correlated ref is an ordinary top-level ref carrying an *enclosing* slot. Indexing `relations` with it reported `column 'lap_id' not found in table 'd'` — an error the query is not entitled to. Worse, `classifyJoinCondition` made a **key** out of it: `EXISTS (SELECT 1 FROM drivers d JOIN laps p ON p.driver_id = l.driver_id)` has no equality between `d` and `p` at all, and instead of the cross-product refusal it produced `JoinKey{driver_id, driver_id, from_slot=0}` — a join the user never wrote. Wrong rows the moment Week 31 lowers one. `JoinKey` carries no level, so the containment is that a correlated ref can never *be* a key |
+| **Binding was idempotent for stamps and not for `correlated`** | `markCorrelated` ran only on the resolution path, which the idempotency guard skips, so a second walk cleared the flag — and that is reachable inside ONE `bind()`, because `BETWEEN` clones its left operand before binding and `cloneExpr` shares the statement. The second node was left uncorrelated, `collectSlots` contributed no `-1`, and pushdown would push a correlated conjunct onto one relation's scan: the exact wrong answer the sentinel exists to prevent, and the precondition `restampSlots`' safety argument rests on. Correlation is now derived from the stamp, so it survives any number of walks |
+| **`query_level` was dropped on the `ColumnRef` → `GroupByColumn` round trip** | A `GROUP BY` item resolves through `resolveColumnRef`, which walks out, so a correlated group key stored an *outer* slot in an inner-scope struct. The validator's skip keyed on `!table_name.empty()`, which the ≥ 2 qualification rule makes depend on the **enclosing** block's relation count — so the same subquery was refused under a one-relation outer query and accepted under a two-relation one |
+| **The `ORDER BY` position rule tested only the root node** | `ORDER BY lap_id + (SELECT ...)` slipped through. `SELECT` and `GROUP BY` had no such hole because they route through `validateExpr`, whose `allow_subqueries=false` default is checked at every node; `ORDER BY` had been given a bespoke one-liner. It routes through `validateExpr` too now — a dedicated recursive walker would have been a nineteenth silent dispatch site |
+| **Three smaller ones** | `collectSlots`' new comment claimed a top-level ref is always level 0 (false, and the same class of false-justification the week was handed as a finding); dispatch site 14 (`foldNode`) was the one place the "descend into the operand, never the body" rule was not applied, which Week 32's semi-join probe key would have paid for; and the deviation record's Q21 evidence was wrong — Q21's correlated refs are *qualified*, so the pre-Week-30 binder fails there with `unknown table qualifier`, not `column not found` |
+
 > **Starting note, from a Week 28 audit.** `ORDER BY <alias>` over an
 > *unqualified* select-list column is refused in any query whose relations are
 > aliased, and this is the next week that owns binder scope resolution:
@@ -1349,7 +1363,10 @@ reachable for a legitimate plan.
 > **Starting notes, from Week 30's foundations.**
 > - **A shared subquery statement is one statement with two parents.**
 >   `cloneExpr` shares the `shared_ptr` rather than deep-copying, because
->   `SelectStatement` is move-only. Binding is safe (it is idempotent);
+>   `SelectStatement` is move-only. Binding is safe — but only since round 1,
+>   which found that the *second* node over a shared statement was left marked
+>   uncorrelated, so treat "idempotent" as a property to re-check rather than
+>   assume for anything else derived during binding. Binding is safe;
 >   **lowering is not**. Week 31 must decide whether two `SubqueryExpr` nodes
 >   over one statement build one subplan or two — building two silently doubles
 >   the work, building one needs a cache keyed on the statement pointer. Nothing
