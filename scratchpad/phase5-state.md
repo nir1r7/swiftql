@@ -1,39 +1,32 @@
 # Phase 5 orchestrator state
-Current: week 35 — all six audit-r2 findings FIXED and pushed. Closing gate next.
-  THE HONEST FIGURE IS NOW 19/22 MEANINGFUL vs SQLite — 5 in all four modes, 14
-  vectorized-only; 1 vacuous (q18); 2 unported (q17, q21). Regenerated from a full 22x4 run;
-  the rise from 17 is a DELIBERATE refresh recorded in the commit with per-query deltas, and
-  no mode was lost anywhere. It came from fixing OUR parameters, not from relaxing anything:
-    q2  INERT -> DISCRIMINATING (SIZE 15->1, TYPE/REGION stay at spec; base 7 rows, mutant 8)
-    q19 ALL_NULL -> DISCRIMINATING (BRANDs 12/23/34 -> 14/34/23; only BRAND1 leaves the spec's
-        value set; all three OR arms now contribute; base revenue 56323.29 vs mutant 8473.82)
-  GATE HOLE CLOSED AND PROVED: --write-baseline now runs AFTER compare_baseline and refuses to
-  write unless the run passed. Synthetic regression: before -> PASS, exit 0, baseline
-  overwritten; after -> FAIL, exit 1, "REGRESSION: q18 was meaningfully answered, now VACUOUS
-  (EMPTY)", baseline md5 unchanged.
-  Partial runs now announce themselves in the VERDICT TOKEN — PARTIAL-PASS / PARTIAL-FAIL /
-  PARTIAL-NO-BASELINE, plus "N-QUERY SUBSET — M of 22 NOT RUN, so this is NOT a full
-  measurement", so the words survive any excerpt.
-  README corrected at four sites and verified on the binary: week 34 shipped the
-  correlated-scalar MECHANISM and the constant-outside shape — `0.2 * (SELECT AVG(...))`
-  returns 2732.80428571429 matching SQLite, while `(SELECT 0.2 * AVG(...))` is refused by name.
-  So TPC-H Q17's OWN TEXT does not run and the harness records it 0-mode UNPORTED.
-  q18 stays vacuous BY CHOICE: max per-order SUM(l_quantity) here is 295, so 300 -> EMPTY and
-  290 -> DISCRIMINATING, but 300 is already the LOWEST of the spec's three quantities.
-  Lowering it would game the benchmark rather than fix it.
-  >> WEEK 36 OPPORTUNITY, flagged not taken: lifting `found[0] == select_list[0]` to allow an
-  aggregate under a constant-only expression tree would make q17 run and take the figure to 20.
-  STILL OWED: compare_against_sqlite.py's NaN comparison; random_diff.py's projection; and the
-  audit's not-reached list (per-query hand verification beyond q2/q18/q19, --time,
-  --fingerprint-all).
+Current: week 36, round 1, step 1 (teach) — launching ~20:50 UTC. LAST WEEK before the
+  five-way seam audit. Week 37 belongs to the user.
+  WEEK 36'S JOB IS TO RAISE 19/22, and it is now measurable at every step — the fifth gate
+  step fails on any regression, so the number cannot drift down unnoticed.
+  Concrete leads it inherits:
+  - Lifting `found[0] == select_list[0]` to allow an aggregate under a constant-only expression
+    tree makes TPC-H's OWN Q17 text run and takes the figure to 20. Flagged in week 35,
+    deliberately not taken there — it is a capability change, not harness tidying.
+  - Q21 is the other unported query (0 modes).
+  - q18 is vacuous BY CHOICE and should stay so: 300 is already the lowest of the spec's three
+    quantities, and lowering it would game the benchmark rather than fix the engine.
+  - 34 of 88 cells are Volcano refusals. Volcano semi/anti parity would move many queries from
+    two modes to four — a real coverage gain distinct from raising the headline count.
+  Small items still owed, fine to ride with week 36: compare_against_sqlite.py's NaN comparison
+  (nan/inf compare equal at :1874); random_diff.py:113-117 projects only driver_id/team from
+  rels[:3] where driver_id is the join key; and the week-35 audit's not-reached list (per-query
+  hand verification beyond q2/q18/q19, --time, --fingerprint-all).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
-Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
-Last gate: GREEN (week 35 round 2) — FIVE STEPS, the first gate ever to measure TPC-H:
-  build PASS, unit 805/805, sqlite 1290, regression 318, tpch PASS
-  (17/22 meaningful vs SQLite: 4 in all four modes, 13 vectorized-only; 3 vacuous; 2 unported).
-  Baseline matched EXACTLY in both directions; 17 rejection suites clean (157/157).
-  Staleness disproved across all 107 files under src/ and tests/.
+Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
+Last gate: GREEN (week 35 round 3, closing) — build PASS, unit 805/805, sqlite 1290,
+  regression 318, tpch PASS (19/22 meaningful: 5 four-mode, 14 vec-only; 1 vacuous; 2 unported).
+  Baseline md5 and mtime UNCHANGED across the run, so the write path stayed inert on a passing
+  --baseline-only run, as designed. Staleness disproved.
+Week 35 verdict: checkpoint met. 3 gates, 2 audits, 2 fix rounds, and four agents killed by
+  container restarts mid-round — every one resumed from a handoff instead of restarting.
+  The phase goal is now MEASURED rather than asserted, and the gate that measures it cannot
+  silently pass.
 THE GATE NOW COVERS TPC-H (fifth step, c7b8262). It reports meaningfully-answered with the
   mode split, counts vacuous and unported APART from the headline, fails on a regression
   (stops answering / becomes vacuous / answers in fewer modes), and reports NO-BASELINE when
