@@ -789,3 +789,84 @@ TEST(JoinEnumeration, OuterJoinEstimateAppliesTheOnResidualToTheMatchTerm) {
         "ON d.driver_id = l.driver_id AND l.lap_id = 7", cat);
     EXPECT_DOUBLE_EQ(topJoin(floored.get())->estimated_rows, 20.0);
 }
+
+// ── Week 32: the slot-outside-the-range-table decline goes live ─────────────
+
+// Week 30 added hasSlotOutsideRangeTable and Weeks 28-30 expected Week 31 to
+// make it live; Week 31 reported it had not, because a materialized subquery's
+// scans form their own plan with their own range table and never enter the
+// outer tree. Semi-join lowering is what finally grafts a second range table
+// into ONE plan, so this is where the decline first fires on a real query.
+//
+// It matters which decline fires, not just that one did: the outer-join decline
+// is REPORTED and this one is SILENT, so a test that only checked "the order
+// did not change" would pass on either and would not notice the two swapping.
+TEST(JoinEnumeration, DeclinesASemiJoinTreeAsSlotOutsideTheRangeTable) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // Three SCANs — laps, drivers, and the body's laps — so the pass is past its
+    // <3-relation guard and a decline is a real refusal rather than the no-op.
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.lap_id IN (SELECT lap_id FROM laps)", cat);
+
+    std::vector<const LogicalJoin*> joins;
+    collectJoins(plan.get(), joins);
+    ASSERT_EQ(joins.size(), 2u);
+    const LogicalJoin* semi = joins.front();
+    ASSERT_EQ(semi->semantics, JoinSemantics::SEMI);
+
+    // SILENT: no order_decision on any join in the tree. The outer-join decline
+    // would have stamped "join-ordering=skipped (outer join)" on the top join,
+    // so an empty string here is what identifies WHICH decline fired.
+    for (const LogicalJoin* j : joins) EXPECT_TRUE(j->order_decision.empty());
+    EXPECT_TRUE(decisionOf(plan.get()).empty());
+
+    // ...and the condition it declined on is the one this test names: the semi
+    // join has no slot in this block's range table.
+    EXPECT_EQ(semi->join_slot, -1);
+
+    // The written order survives untouched, which is the point of declining.
+    auto baseline = writtenOrder(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.lap_id IN (SELECT lap_id FROM laps)", cat);
+    EXPECT_EQ(chosenOrder(plan.get()), chosenOrder(baseline.get()));
+
+    // CONTROL: the same FROM spine WITHOUT the IN is only two relations, so it
+    // is left alone by the <3-relation guard rather than by this decline — the
+    // decline above is caused by the semi join, not by the shape of the spine.
+    auto no_semi = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat);
+    EXPECT_EQ(topJoin(no_semi.get())->join_slot, 1);
+}
+
+// The semi/anti rule is stamped at the estimator and is NEVER reachable from
+// joinCardinality: both halves are non-multiplicative (a clamp against the left
+// row count, and a subtraction), so a subset's estimate inside the DP would
+// depend on the path that reached it. The decline above and the stamp's
+// placement must hold INDEPENDENTLY — this asserts the estimate that lands.
+TEST(JoinEnumeration, SemiAndAntiEstimatesNeverExceedTheLeftChild) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    for (const char* op : {"IN", "NOT IN"}) {
+        auto plan = optimize(
+            std::string("SELECT COUNT(*) FROM laps l JOIN drivers d "
+                        "ON l.driver_id = d.driver_id WHERE l.lap_id ") + op +
+            " (SELECT lap_id FROM laps)", cat);
+        std::vector<const LogicalJoin*> joins;
+        collectJoins(plan.get(), joins);
+        ASSERT_EQ(joins.size(), 2u);
+        const LogicalJoin* semi = joins.front();
+        ASSERT_NE(semi->semantics, JoinSemantics::STANDARD);
+        // A semi/anti join is a FILTER on its left input: it emits a subset of
+        // left rows, each at most once, and never null-extends. So the estimate
+        // can never exceed the left child's — the invariant --explain-analyze
+        // is checked against, and the one the outer-join rule's max() breaks by
+        // design and this rule must not.
+        EXPECT_LE(semi->estimated_rows, semi->children[0]->estimated_rows);
+        EXPECT_GE(semi->estimated_rows, 0.0);
+        // and it carries no ON residual, which the estimator asserts rather
+        // than assumes
+        EXPECT_EQ(semi->on_residual, nullptr);
+    }
+}
