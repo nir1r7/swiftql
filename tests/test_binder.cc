@@ -76,7 +76,7 @@ TEST(Binder, UnqualifiedSingleRelationGetsSlotZero) {
     auto stmt = bindQuery("SELECT team FROM laps", cat);
     const ColumnRef* c = firstSelectCol(stmt);
     ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->relation_slot, 0);
+    EXPECT_EQ(c->id.slotInOwnScope("test"), 0);
 }
 
 TEST(Binder, QualifiedJoinColumnsGetCorrectSlots) {
@@ -86,7 +86,7 @@ TEST(Binder, QualifiedJoinColumnsGetCorrectSlots) {
         "SELECT drivers.nationality FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
     const ColumnRef* c = firstSelectCol(stmt);
     ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->relation_slot, 1);
+    EXPECT_EQ(c->id.slotInOwnScope("test"), 1);
     EXPECT_EQ(c->table_name, "drivers"); // alias/name normalized to canonical
 }
 
@@ -97,7 +97,7 @@ TEST(Binder, SharedColumnNameQualifierPicksSide) {
         "SELECT drivers.team FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id", cat);
     const ColumnRef* c = firstSelectCol(stmt);
     ASSERT_NE(c, nullptr);
-    EXPECT_EQ(c->relation_slot, 1);
+    EXPECT_EQ(c->id.slotInOwnScope("test"), 1);
 }
 
 TEST(Binder, SelfJoinAliasesGetDistinctSlots) {
@@ -109,8 +109,8 @@ TEST(Binder, SelfJoinAliasesGetDistinctSlots) {
     auto* b_val = dynamic_cast<const ColumnRef*>(stmt.select_list[1].get());
     ASSERT_NE(a_id, nullptr);
     ASSERT_NE(b_val, nullptr);
-    EXPECT_EQ(a_id->relation_slot, 0);   // FROM occurrence
-    EXPECT_EQ(b_val->relation_slot, 1);  // JOIN occurrence
+    EXPECT_EQ(a_id->id.slotInOwnScope("test"), 0);   // FROM occurrence
+    EXPECT_EQ(b_val->id.slotInOwnScope("test"), 1);  // JOIN occurrence
 }
 
 // ===== Binder error cases =====
@@ -305,7 +305,7 @@ TEST(SelfJoin, IsNullResolvesJoinSideColumn) {
     // WHERE b.w IS NULL  -> operand is the slot-1 "w" column
     auto w_ref = std::make_unique<ColumnRef>();
     w_ref->column_name = "w";
-    w_ref->relation_slot = 1;
+    w_ref->id = ColumnId::local(1);
     auto isnull = std::make_unique<IsNullExpr>();
     isnull->operand = std::move(w_ref);
     isnull->is_not_null = false;
@@ -781,9 +781,9 @@ TEST(Binder, ThreeRelationsGetAscendingSlots) {
         "SELECT a.id, b.grp, c.val FROM sj a "
         "JOIN sj b ON a.grp = b.id JOIN sj c ON b.grp = c.id", cat);
     ASSERT_EQ(stmt.select_list.size(), 3u);
-    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[0].get())->relation_slot, 0);
-    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[1].get())->relation_slot, 1);
-    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[2].get())->relation_slot, 2);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[0].get())->id.slotInOwnScope("test"), 0);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[1].get())->id.slotInOwnScope("test"), 1);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(stmt.select_list[2].get())->id.slotInOwnScope("test"), 2);
 }
 
 // The duplicate-name check must compare against every prior entry: this clash
@@ -848,7 +848,7 @@ TEST(Binder, OrderByAliasSubstitutesSelectExpression) {
     auto* col = dynamic_cast<ColumnRef*>(mul->left.get());
     ASSERT_NE(col, nullptr);
     EXPECT_EQ(col->column_name, "speed");
-    EXPECT_EQ(col->relation_slot, 0);   // clone carries binder stamps
+    EXPECT_EQ(col->id.slotInOwnScope("test"), 0);   // clone carries binder stamps
 }
 
 TEST(Binder, OrderByRealColumnNotShadowedWithoutAlias) {
@@ -950,8 +950,7 @@ TEST(BinderTest, UncorrelatedSubqueryRefsAreLocalToTheirOwnScope) {
     // not to the outer query's laps at slot 0
     const ColumnRef* inner = findRef(sq->subquery->select_list[0].get(), "speed");
     ASSERT_NE(inner, nullptr);
-    EXPECT_EQ(inner->query_level, 0);
-    EXPECT_EQ(inner->relation_slot, 1);
+    EXPECT_EQ(inner->id, ColumnId::local(1));
 }
 
 // TPC-H Q17's shape. A ref that resolves in an ENCLOSING scope is correlated:
@@ -971,9 +970,8 @@ TEST(BinderTest, CorrelatedRefCarriesItsLevelAndTheOuterScopesSlot) {
     auto* outer = dynamic_cast<const ColumnRef*>(cmp->right.get());   // l.team
     ASSERT_NE(local, nullptr);
     ASSERT_NE(outer, nullptr);
-    EXPECT_EQ(local->query_level, 0);
-    EXPECT_EQ(outer->query_level, 1);
-    EXPECT_EQ(outer->relation_slot, 0);
+    EXPECT_EQ(local->id.level(), 0);
+    EXPECT_EQ(outer->id, ColumnId::outer(1, 0));
 }
 
 // The shape that fails if the two numbering domains were conflated: the outer
@@ -992,8 +990,7 @@ TEST(BinderTest, CorrelatedRefAcrossAJoinKeepsTheOuterSlot) {
     ASSERT_NE(cmp, nullptr);
     auto* outer = dynamic_cast<const ColumnRef*>(cmp->right.get());   // d.team
     ASSERT_NE(outer, nullptr);
-    EXPECT_EQ(outer->query_level, 1);
-    EXPECT_EQ(outer->relation_slot, 1) << "the outer range table's second entry";
+    EXPECT_EQ(outer->id, ColumnId::outer(1, 1));
 }
 
 // SHADOWING 1 — an inner relation whose alias repeats an outer one. SQL says the
@@ -1011,8 +1008,8 @@ TEST(BinderTest, InnerAliasShadowsAnOuterAliasOfTheSameName) {
     ASSERT_NE(cmp, nullptr);
     auto* age = dynamic_cast<const ColumnRef*>(cmp->left.get());
     ASSERT_NE(age, nullptr);
-    EXPECT_EQ(age->query_level, 0) << "x must be the INNER drivers, not the outer laps";
-    EXPECT_EQ(age->relation_slot, 0);
+    EXPECT_EQ(age->id.level(), 0) << "x must be the INNER drivers, not the outer laps";
+    EXPECT_EQ(age->id.slotInOwnScope("test"), 0);
     EXPECT_FALSE(sq->correlated) << "nothing here reaches out";
 }
 
@@ -1031,7 +1028,7 @@ TEST(BinderTest, UnqualifiedNameInBothScopesResolvesToTheInnerOne) {
     ASSERT_NE(cmp, nullptr);
     auto* team = dynamic_cast<const ColumnRef*>(cmp->left.get());
     ASSERT_NE(team, nullptr);
-    EXPECT_EQ(team->query_level, 0) << "`team` exists in laps AND drivers; inner wins";
+    EXPECT_EQ(team->id.level(), 0) << "`team` exists in laps AND drivers; inner wins";
     EXPECT_FALSE(sq->correlated);
 }
 
@@ -1053,8 +1050,8 @@ TEST(BinderTest, NameOnlyInTheOuterScopeResolvesOutwardAndMarksCorrelation) {
     ASSERT_NE(cmp, nullptr);
     auto* season = dynamic_cast<const ColumnRef*>(cmp->left.get());
     ASSERT_NE(season, nullptr);
-    EXPECT_EQ(season->query_level, 1) << "sj has no `season`; laps does";
-    EXPECT_EQ(season->relation_slot, 0);
+    EXPECT_EQ(season->id.level(), 1) << "sj has no `season`; laps does";
+    EXPECT_EQ(season->id.slotInOwnScope("test"), 0);
 
     // and a name in NEITHER scope stays this scope's problem, reported by the
     // Validator against the subquery's own schema rather than resolved outward
@@ -1107,7 +1104,7 @@ TEST(BinderTest, CorrelationMarksEveryScopeBetween) {
     ASSERT_NE(icmp, nullptr);
     auto* two_out = dynamic_cast<const ColumnRef*>(icmp->right.get());
     ASSERT_NE(two_out, nullptr);
-    EXPECT_EQ(two_out->query_level, 2);
+    EXPECT_EQ(two_out->id.level(), 2);
 }
 
 // ===== Week 30: binding is idempotent, which closes two live alias bugs =====
@@ -1127,7 +1124,7 @@ TEST(BinderTest, OrderByOverAnUnqualifiedSelectAliasBindsInAnAliasedQuery) {
     auto* col = dynamic_cast<const ColumnRef*>(stmt.order_by[0].expr.get());
     ASSERT_NE(col, nullptr) << "the alias must be substituted by the bound select item";
     EXPECT_EQ(col->column_name, "name");
-    EXPECT_EQ(col->relation_slot, 1);
+    EXPECT_EQ(col->id.slotInOwnScope("test"), 1);
 }
 
 TEST(BinderTest, GroupByOverAnUnqualifiedSelectAliasBindsInAnAliasedQuery) {
@@ -1138,7 +1135,7 @@ TEST(BinderTest, GroupByOverAnUnqualifiedSelectAliasBindsInAnAliasedQuery) {
         "ON l.driver_id = d.driver_id GROUP BY n", cat));
     ASSERT_EQ(stmt.group_by.size(), 1u);
     EXPECT_EQ(stmt.group_by[0].column_name, "name");
-    EXPECT_EQ(stmt.group_by[0].relation_slot, 1);
+    EXPECT_EQ(stmt.group_by[0].id.slotInOwnScope("test"), 1);
 }
 
 // The fix must NOT be "write ref_name back": aggregateOutputName IS
@@ -1172,13 +1169,13 @@ TEST(BinderTest, BindingIsIdempotent) {
     Binder::bind(stmt, cat);
     const ColumnRef* before = firstSelectCol(stmt);
     ASSERT_NE(before, nullptr);
-    const int slot = before->relation_slot;
+    const int slot = before->id.slotInOwnScope("test");
     const std::string qualifier = before->table_name;
 
     ASSERT_NO_THROW(Binder::bind(stmt, cat));
     const ColumnRef* after = firstSelectCol(stmt);
     ASSERT_NE(after, nullptr);
-    EXPECT_EQ(after->relation_slot, slot);
+    EXPECT_EQ(after->id.slotInOwnScope("test"), slot);
     EXPECT_EQ(after->table_name, qualifier);
 }
 

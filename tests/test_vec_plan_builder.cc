@@ -975,7 +975,7 @@ static std::string lapsScanExplain(const Catalog& cat, int leftmost_slot) {
     // exactly what ChunkPruner::collectSimplePredicates accepts
     auto col = std::make_unique<ColumnRef>();
     col->column_name = "lap_id";
-    col->relation_slot = 0;
+    col->id = ColumnId::local(0);
     auto pred = std::make_unique<BinaryExpr>();
     pred->op = "=";
     pred->left = std::move(col);

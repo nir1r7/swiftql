@@ -1107,7 +1107,8 @@ to them.
       because the round trip between the two (binder.cc) is what a split would
       have had to express as two half-migrated copies.
 - [x] `AggregateSpec` (planner/logical_plan.h) + consumers.
-- [ ] Tests (9 files hand-build these types).
+- [x] Tests (6 files needed edits; the other three touched only `ColumnDef` /
+      `ColumnStatsEntry` slots, which are not migrated).
 - [ ] `development.md` → *Relation slots and query levels*.
 
 All of `src/` compiles. Narrowing sites created, each named in its
@@ -1119,8 +1120,16 @@ All of `src/` compiles. Narrowing sites created, each named in its
 schema lookup. One escape-hatch use each in `exprKey` and
 `Binder::checkCorrelatedAggregateArg`, both documented at the call site.
 
-**Next concrete step:** migrate the test files. `tests/test_storage.cc` is where
-the compiler currently stops; then test_binder, test_vec_plan_builder,
-test_logical_plan, test_join_enumeration, test_cardinality,
-test_predicate_pushdown, test_planner, test_subquery. Spelling only — an
-assertion that has to change is a behaviour change hiding in a rename.
+Test translation rules used, so a reviewer can check them mechanically:
+`x->relation_slot = N` → `x->id = ColumnId::local(N)`; an adjacent
+`relation_slot` + `query_level` assignment pair → one `ColumnId::outer(L, N)`;
+an adjacent `EXPECT_EQ(x->query_level, L)` + `EXPECT_EQ(x->relation_slot, N)`
+assertion pair → one `EXPECT_EQ(x->id, ColumnId::outer/local(...))`, which
+asserts exactly the conjunction it replaced; a **lone** slot assertion →
+`x->id.slotInOwnScope("test")`, which preserves it exactly rather than
+strengthening it into a level assertion the test never made. No assertion was
+removed or weakened.
+
+**Next concrete step:** the two pinning tests (`localSlot` throws on a
+correlated id; `exprKey`'s encoding is byte-identical for a level-0 ref), then
+`development.md` → *Relation slots and query levels*.

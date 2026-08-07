@@ -315,7 +315,7 @@ TEST(PredicatePushdown, JoinSideConjunctSlotsRestampedToScanSlot) {
         stack.pop_back();
         if (auto* col = dynamic_cast<const ColumnRef*>(e)) {
             ++refs_seen;
-            EXPECT_EQ(col->relation_slot, 0) << col->column_name;
+            EXPECT_EQ(col->id.slotInOwnScope("test"), 0) << col->column_name;
         } else if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
             stack.push_back(bin->left.get());
             stack.push_back(bin->right.get());
@@ -582,7 +582,7 @@ TEST(PredicatePushdown, RestampsSlotsInsideWeek25Nodes) {
     ASSERT_NE(in, nullptr) << "the IN conjunct should be the pushed predicate";
     const auto* col = dynamic_cast<const ColumnRef*>(in->operand.get());
     ASSERT_NE(col, nullptr);
-    EXPECT_EQ(col->relation_slot, 0) << "pushed join-side refs must be re-stamped to slot 0";
+    EXPECT_EQ(col->id.slotInOwnScope("test"), 0) << "pushed join-side refs must be re-stamped to slot 0";
 }
 
 // IN gets a real estimate (k/ndv from statistics); LIKE deliberately does not.
@@ -773,7 +773,7 @@ TEST(PredicatePushdown, ThirdRelationConjunctRestampedToScanSlot) {
     ASSERT_NE(bin, nullptr);
     const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
     ASSERT_NE(col, nullptr);
-    EXPECT_EQ(col->relation_slot, 0);
+    EXPECT_EQ(col->id.slotInOwnScope("test"), 0);
 }
 
 // A conjunct spanning two relations still stays above the whole join tree.

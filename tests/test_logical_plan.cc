@@ -307,7 +307,7 @@ TEST(LogicalPlan, SelectStarOnSelfJoinPreservesSlots) {
     bool found_join_side = false;
     for (const auto& e : project->exprs) {
         if (auto* col = dynamic_cast<const ColumnRef*>(e.get())) {
-            if (col->relation_slot == 1) {
+            if (col->id.slotInOwnScope("test") == 1) {
                 found_join_side = true;
                 break;
             }
@@ -983,8 +983,8 @@ TEST(LogicalPlan, ResidualOnConjunctKeepsItsRelationSlots) {
     const auto* rhs = dynamic_cast<const ColumnRef*>(bin->right.get());
     ASSERT_NE(lhs, nullptr);
     ASSERT_NE(rhs, nullptr);
-    EXPECT_EQ(lhs->relation_slot, 0);
-    EXPECT_EQ(rhs->relation_slot, 1);
+    EXPECT_EQ(lhs->id.slotInOwnScope("test"), 0);
+    EXPECT_EQ(rhs->id.slotInOwnScope("test"), 1);
 }
 
 // A residual column must survive scan narrowing: buildScanSchema collects from
@@ -1052,8 +1052,8 @@ TEST(SubqueryDispatch, CloneSharesTheStatementAndCopiesTheOperand) {
     ASSERT_NE(c, nullptr);
     EXPECT_EQ(c->subquery.get(), sq->subquery.get()) << "the statement is shared";
     EXPECT_NE(c->operand.get(), sq->operand.get()) << "the operand is a real copy";
-    EXPECT_EQ(dynamic_cast<ColumnRef*>(c->operand.get())->relation_slot,
-              dynamic_cast<const ColumnRef*>(sq->operand.get())->relation_slot);
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(c->operand.get())->id.slotInOwnScope("test"),
+              dynamic_cast<const ColumnRef*>(sq->operand.get())->id.slotInOwnScope("test"));
     EXPECT_EQ(c->kind, sq->kind);
     EXPECT_EQ(c->negated, sq->negated);
     EXPECT_EQ(c->correlated, sq->correlated);
@@ -1511,7 +1511,7 @@ TEST(SubqueryDispatch, ExprKeyIsUnchangedAtLevelZeroAndDistinctAbove) {
     ASSERT_NE(cmp, nullptr);
     auto* outer_ref = dynamic_cast<const ColumnRef*>(cmp->right.get());
     ASSERT_NE(outer_ref, nullptr);
-    ASSERT_EQ(outer_ref->query_level, 1);
+    ASSERT_EQ(outer_ref->id.level(), 1);
     EXPECT_NE(exprKey(outer_ref), "0#driver_id")
         << "a correlated ref must not key the same as a local one at the same slot";
 }
@@ -1538,13 +1538,13 @@ TEST(SubqueryValidation, ACorrelatedGroupKeyCannotReachPlanConstruction) {
     GroupByColumn local;
     local.table_name = "drivers";
     local.column_name = "team";
-    local.relation_slot = 0;
+    local.id = ColumnId::local(0);
     Schema ok = buildAggregateSchema({local}, specs, child);
     EXPECT_EQ(ok.column(0).name, "team");
 
     // the finding: one block out, the same slot names a different relation
     GroupByColumn correlated = local;
-    correlated.query_level = 1;
+    correlated.id = ColumnId::outer(1, 0);
     try {
         buildAggregateSchema({correlated}, specs, child);
         ADD_FAILURE() << "a correlated GROUP BY key must not resolve against this "
@@ -1562,13 +1562,11 @@ TEST(SubqueryValidation, ACorrelatedGroupKeyCannotReachPlanConstruction) {
 TEST(SubqueryDispatch, ExprKeyLevelAndSlotCannotRunTogether) {
     ColumnRef a;
     a.column_name = "team";
-    a.query_level = 1;
-    a.relation_slot = 23;
+    a.id = ColumnId::outer(1, 23);
 
     ColumnRef b;
     b.column_name = "team";
-    b.query_level = 12;
-    b.relation_slot = 3;
+    b.id = ColumnId::outer(12, 3);
 
     EXPECT_NE(exprKey(&a), exprKey(&b))
         << "concatenated decimals are not prefix-free: " << exprKey(&a);

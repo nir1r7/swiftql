@@ -619,7 +619,7 @@ TEST(ChunkPrunerSlots, JoinSlotRefNeverPrunes) {
     ColumnarTable tbl = makeSingleChunkTable();  // zone map [2020,2020]
 
     auto ref = columnarColRef("season");
-    ref->relation_slot = 1;  // join-side ref reaching a FROM-side hint
+    ref->id = ColumnId::local(1);  // join-side ref reaching a FROM-side hint
     auto pred = makeColumnarBinary("=", std::move(ref), columnarLit(Value(int64_t(2025))));
 
     // the zone map would prove a skip, but the slot guard must win
@@ -645,7 +645,7 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
 
     // the control: a scan-local ref at (level 0, slot 0) still prunes
     auto local = columnarColRef("season");
-    local->relation_slot = 0;
+    local->id = ColumnId::local(0);
     auto local_pred = makeColumnarBinary("=", std::move(local),
                                          columnarLit(Value(int64_t(2025))));
     EXPECT_TRUE(ChunkPruner::shouldSkip(local_pred.get(), zone_maps, 0));
@@ -653,8 +653,7 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
     // the finding: the SAME slot one block out must contribute nothing. Declining
     // is correct-and-slower; acting on it prunes another relation's chunks.
     auto correlated = columnarColRef("season");
-    correlated->relation_slot = 0;
-    correlated->query_level = 1;
+    correlated->id = ColumnId::outer(1, 0);
     auto corr_pred = makeColumnarBinary("=", std::move(correlated),
                                         columnarLit(Value(int64_t(2025))));
     EXPECT_FALSE(ChunkPruner::shouldSkip(corr_pred.get(), zone_maps, 0))
@@ -662,7 +661,7 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
 
     // and a slot >= 1 stays ignored, as it has since Week 26
     auto join_side = columnarColRef("season");
-    join_side->relation_slot = 1;
+    join_side->id = ColumnId::local(1);
     auto join_pred = makeColumnarBinary("=", std::move(join_side),
                                         columnarLit(Value(int64_t(2025))));
     EXPECT_FALSE(ChunkPruner::shouldSkip(join_pred.get(), zone_maps, 0));
