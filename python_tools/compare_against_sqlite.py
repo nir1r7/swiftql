@@ -8,6 +8,7 @@ import subprocess
 import sqlite3
 import csv
 import json
+import math
 import sys
 import os
 
@@ -1931,6 +1932,19 @@ def rows_equal(a, b, rel_tol=0.0, abs_tol=1e-5):
     percent-level error, not a 1e-9 one. That derivation is written down here
     because a tolerance without one gets loosened by the next person who sees a
     red test.
+
+    Week 36 -- NaN AND INFINITY, which the tolerance test alone cannot judge, and
+    the hole is bigger than it looks. IEEE 754 makes EVERY comparison against NaN
+    False, so `abs(nan - 5.0) > tol` is False and the mismatch branch below was
+    never reached: `rows_equal([[nan]], [[5.0]])` returned True. A NaN anywhere in
+    a SwiftQL answer was INVISIBLE to this oracle -- not merely "nan compares
+    equal to nan", but "nan compares equal to anything". Measured before the fix,
+    all four True: nan/5.0, 5.0/nan, nan/nan, inf/inf.
+
+    The rule now: a NaN is a MISMATCH unless BOTH sides are NaN, in which case the
+    two engines agree and a diff is not the place to complain about it.
+    Infinities compare exactly and by SIGN -- `abs(inf - inf)` is nan, which the
+    old test also read as "equal", right by accident rather than by rule.
     """
     if len(a) != len(b):
         return False
@@ -1939,7 +1953,15 @@ def rows_equal(a, b, rel_tol=0.0, abs_tol=1e-5):
             return False
         for x, y in zip(row_a, row_b):
             if isinstance(x, float) and isinstance(y, float):
-                if abs(x - y) > max(abs_tol, rel_tol * max(abs(x), abs(y))):
+                # Non-finite FIRST: the tolerance test below cannot reject a NaN,
+                # because every comparison against NaN is False.
+                if math.isnan(x) or math.isnan(y):
+                    if not (math.isnan(x) and math.isnan(y)):
+                        return False
+                elif math.isinf(x) or math.isinf(y):
+                    if x != y:          # exact, and sign-sensitive
+                        return False
+                elif abs(x - y) > max(abs_tol, rel_tol * max(abs(x), abs(y))):
                     return False
             else:
                 if x != y:
@@ -2166,8 +2188,39 @@ def mode_census():
 
 
 # main
+def check_rows_equal_non_finite():
+    """Week 36 -- the comparator's own NaN/inf rule, asserted directly.
+
+    This is not a query suite: it tests the FUNCTION every suite in this file
+    passes through. It exists because the pre-Week-36 form silently returned True
+    for `nan` against `5.0` -- IEEE 754 makes every comparison against NaN False,
+    so the mismatch branch was unreachable and a NaN in any answer was invisible
+    to the oracle. A defect that hides defects gets an assertion, not a comment.
+
+    Raises rather than returning a count: a broken comparator invalidates every
+    number this file prints, so there is nothing to keep running for.
+    """
+    nan, inf = float("nan"), float("inf")
+    cases = [
+        (([[nan]], [[5.0]]), False, "a NaN against an ordinary number"),
+        (([[5.0]], [[nan]]), False, "an ordinary number against a NaN"),
+        (([[nan]], [[nan]]), True,  "NaN on both sides -- the engines agree"),
+        (([[inf]], [[inf]]), True,  "+inf on both sides"),
+        (([[inf]], [[-inf]]), False, "+inf against -inf -- sign matters"),
+        (([[inf]], [[1e308]]), False, "+inf against a finite number"),
+        (([[1.0]], [[1.0 + 1e-9]]), True, "the ordinary tolerance still applies"),
+    ]
+    for (a, b), expected, why in cases:
+        got = rows_equal(a, b, rel_tol=1e-9, abs_tol=1e-6)
+        if got is not expected:
+            raise AssertionError(
+                "rows_equal regression: %s -- expected %s, got %s" % (why, expected, got))
+    print("rows_equal non-finite rule: %d cases OK" % len(cases))
+
+
 def main():
     conn = load_sqlite()
+    check_rows_equal_non_finite()
 
     p1, f1, e1 = run_query_suite(conn, QUERIES, "Default (row storage, Volcano)")
     p2, f2, e2 = run_query_suite(
