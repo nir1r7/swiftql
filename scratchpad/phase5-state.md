@@ -1,15 +1,24 @@
 # Phase 5 orchestrator state
-Current: week 33 — fix agent a18b428befd1e3c84 now owns BOTH the red gate and the 2 criticals.
-  Told to DIAGNOSE the red before fixing: decide per failing test whether it encoded the old
-  refusal (update it, and say in the commit what the new assertion pins) or caught a real break
-  (fix the code). Getting that backwards is how a real defect gets "fixed" by editing its test —
-  the exact failure week 32 shipped.
-  The sqlite red is the louder signal: correlated scalar is a recorded checkpoint MISS and is
-  supposed to be REFUSED, but the suite reports it returning ROWS. Either the refusal has a
-  hole or a shape is being decorrelated that should not be — and those rows may be wrong.
-  Then C-1 (NOT EXISTS carrying NOT IN's three-valued NULL rule, enforced by nothing) and
-  C-2 (correlated ref in a body's JOIN ... ON resolving by bare name). If the sqlite failures
-  share a cause with either, fix once.
+Current: week 33 — gate r3 running (ab7127093c9d5a289, launched 12:47 UTC) on the post-fix
+  tree at 12efb77. SERIAL: no concurrent audit until a gate is GREEN again.
+  ROOT CAUSE OF THE RED, found and fixed (7c46bdf): materializeSubqueries never stopped
+  materializing CORRELATED subqueries after Task 2 deleted the Validator refusal ITS HEADER
+  SAYS IT TRUSTS. It ran each correlated body once, resolved the outer ref BY BARE NAME against
+  the body's own schema (l.driver_id = d.driver_id became a tautology) and folded EXISTS to
+  Filter [1] — and made decorrelation dead code from the CLI. One cause behind all 56 sqlite
+  failures. This is the exact hazard flagged when Task 2 removed the refusal: a tripwire
+  removed without updating what depended on it.
+  All 6 unit failures were STALE ASSERTIONS, checked one at a time — every query is still
+  refused, now by decorrelation's per-shape message instead of the deleted blanket one.
+  C-1 REPRODUCED vs SQLite before fixing (build-side NULL 0 vs 20; probe-side NULL 0 vs 16),
+  fixed by SPLITTING ANTI (textbook = NOT EXISTS) from ANTI_NOT_IN (three-valued), so the rule
+  lives IN THE TYPE. C-2 reproduced (5 vs 20), now refused by name. Both HIGHs + M-3 fixed by
+  projecting the body to its key columns so build indices are POSITIONAL, no name lookup left.
+  M-3's "only SELECT * bodies" was real and is REMOVED, not documented.
+  STILL OPEN after the gate: M-4 (tautological containment assertion in both lowerings),
+  M-5 (site-12 comment cites the deleted refusal; refuseUnloweredCorrelated missing on SELECT
+  list + ORDER BY), M-7 (false predicate_pushdown.cc rationale), L-8 (refusal names the wrong
+  cause), and appending items 4-7 to the plan's ## Progress.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
