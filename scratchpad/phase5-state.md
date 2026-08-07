@@ -56,12 +56,17 @@ a reclaim when possible.
   an uncommitted state file does not survive the exact event it exists for.
 - **Recovery, every reboot:** `git fetch origin claude/phase5-week26-qomtkb`, confirm local HEAD
   is an ancestor, then `git reset --hard origin/claude/phase5-week26-qomtkb`.
-  THEN IMMEDIATELY re-set the git identity — a reclaim restores .git/config, so subagents
-  commit as the user until it is fixed:
-    git config user.email noreply@anthropic.com && git config user.name Claude
-  This is why 301 commits carry the user's email. DO NOT rewrite history to fix them: that
-  span includes Weeks 1-25 the user authored themselves, and force-pushing over their
-  authorship is their decision, not ours. Setting the config forward is the whole remedy.
+  GIT IDENTITY — CORRECTED DIAGNOSIS. The environment sets GIT_AUTHOR_EMAIL /
+  GIT_COMMITTER_EMAIL / GIT_AUTHOR_NAME / GIT_COMMITTER_NAME to the repo owner, and env vars
+  OVERRIDE git config entirely. So `git config user.email ...` does nothing — it is never
+  consulted. An earlier entry here blamed container reclaims resetting .git/config; that was
+  WRONG and the commit that "fixed" it was ineffective.
+  To attribute a commit to the bot you must override the env per invocation, e.g.
+    GIT_AUTHOR_NAME=Claude GIT_AUTHOR_EMAIL=noreply@anthropic.com \
+    GIT_COMMITTER_NAME=Claude GIT_COMMITTER_EMAIL=noreply@anthropic.com git commit ...
+  ~300 commits already carry the owner's identity, including Weeks 1-25 they wrote themselves.
+  DO NOT rewrite history for this — it is cosmetic (a GitHub "Unverified" badge) and force
+  pushing over their authorship is their call. Raised with the user; awaiting their preference.
 - **Root cause of lost agents:** background subagents do NOT keep the session alive. A turn that
   ends with only background agents running reads as idle → reclaim → the next heartbeat boots a
   fresh container and those agents are gone. Two gate+audit pairs were lost this way.
