@@ -662,7 +662,45 @@ safe by construction. The rest — `ColumnRef`, `GroupByColumn`, `AggregateSpec`
 `JoinKey::from_slot`, `ColumnStatsEntry` — carry a slot that came from binder
 resolution and therefore *can* name an enclosing block's relation.
 
+### Week 33: the pair is a type (`ColumnId`)
+
+`ColumnRef`, `GroupByColumn` and `AggregateSpec` no longer carry a bare
+`relation_slot` (or, on the first two, a separate `query_level`). They carry a
+single `ColumnId` (`src/common/column_id.h`), whose slot is **private**: there is
+no implicit conversion to `int` and no public member, so a bare integer cannot be
+passed where a qualified reference is required. Reading the slot costs a named
+call:
+
+| Call | Means | Fails how |
+|---|---|---|
+| `id.isLocal()` | "is this reference from the block I am planning?" | — |
+| `id.isResolved()` | "did the Binder stamp it?" (`-1` = resolve by bare name) | — |
+| `id.localSlot(site)` | "I am in this reference's scope, give me the position" | **throws**, naming `site`, if the ref is correlated |
+| `id.slotInOwnScope(site)` | "I want the slot *without* being in its scope" — the escape hatch | never; every use is greppable by `site` and justified at the call |
+| `id.couldBeSameRelation(other)` | `checkGroupedRefs`' match rule: levels equal, unresolved is a wildcard | — |
+| `id.outward()` | decorrelation's level decrement | throws on a level-0 id |
+
+**The escape hatch has exactly two justified users**, and a third would be
+suspicious: `exprKey` (`expr_utils.h`), which hashes the pair as an identity and
+never indexes anything with it, and `Binder::checkCorrelatedAggregateArg`, which
+walks the scope chain out `level()` steps *first* and then indexes that scope's
+range table — the only layer that can.
+
+**`ColumnDef::relation_slot`, `Schema::indexOf(name, slot)` and
+`ColumnStatsEntry::relation_slot` were deliberately NOT migrated.** They are
+schema slots. Narrowing happens where a binder slot is handed to them, which is
+what every `localSlot(...)` call site in the tables below is.
+
+**What this replaces.** The tables below used to be the containment: a prose list
+that a consumer could be missing from, and twice was. They are now the *audit
+trail* for a containment the compiler enforces. Adding a consumer still means
+adding a row — but a consumer that forgets the level no longer compiles, and one
+that asserts a level it does not have throws with its own name in the message.
+
 ### Reachable with a correlated ref (before `Validator::validate` refuses)
+
+Each row's "level-aware" claim is now expressed in code as one of the calls
+above; the parenthesised call is which one.
 
 | Consumer | Status |
 |---|---|
@@ -795,7 +833,7 @@ Every reader of a `Literal`'s value or type, audited:
 | The `ORDER BY` / `GROUP BY` column-ordinal checks (`validator.cc`) | Already guarded with `!lit->value.isNull()` |
 | `SUBSTRING`'s constant-argument checks (`logical_plan.cc`) | Same guard |
 
-### The structural alternative
+### The structural alternative — done in Week 33
 
 Making the level part of the *type* — a `ColumnId { int level; int slot; }`, so a
 bare `int` cannot be passed where a qualified reference is required — would turn
@@ -807,6 +845,12 @@ reports **87** non-comment mentions across `parser/`, `planner/`, `execution/`,
 containment above means the change buys nothing until a correlated ref can
 actually reach the second table. The week that removes the containment is the
 week to do it, and this table is what makes that change reviewable.
+
+**It landed in Week 33, as its own commit, before any correlation feature
+work.** `ColumnId` is described above; the trigger fired exactly as predicted —
+Week 33 removes the `has_correlated_subquery` refusal, so a correlated reference
+reaches a plan node for the first time. What follows is the record of why it
+waited, kept because the *deferral* was a decision and not an oversight.
 
 **Week 31 is not that week, and said so before starting.** Uncorrelated
 subqueries execute by materialization — the body is planned as its own top-level
