@@ -237,7 +237,7 @@ meaningful (5 in all four modes, 14 vectorized-only), 1 vacuous, 2 unported**, r
 `docs/tpch-baseline.json`. It reads 19 rather than the 17 first published because the round-2
 audit showed q2's INERT and q19's ALL_NULL were artifacts of the SPEC's validation parameters
 against this generator's distributions, not properties of the queries; both were re-chosen from
-within the spec's own value domains and both now discriminate. Week 36's job is to raise the 19; an improvement passes the gate
+within the spec's own value domains and both now discriminate. **Week 36 raised it to 20/22 meaningful (5 in all four modes, 15 vectorized-only), 1 vacuous, 1 unported** — q17, TPC-H's own Q17 text, by lifting the constant-wrapper restriction rather than by touching the template. q21 stays unported with its requirement recorded. An improvement passes the gate
 and says so, and the improving commit must carry the refreshed baseline with it.
 
 Then snapshot, yourself — it is two cheap commands:
