@@ -1,18 +1,17 @@
 # Phase 5 orchestrator state
-Current: week 32 — audit r4 DONE and self-committed: 0 blocker, 0 high, 1 medium, 2 low,
-  1 hunch. NO regression in the fix round; the IN-body recursion is idempotent, terminating,
-  and covers all three nestings; the deleted test lost no assertion.
-  ACT ON: the collectSlotTables "latent" verdict HOLDS BUT FOR A DIFFERENT REASON than the
-  commit records — a wrong recorded rationale reads as verified to a later week, so correct it.
-  Audit r4 did NOT reach: refuseUnloweredIn's call sites in LogicalPlanBuilder::build (left as
-  a hunch), the Volcano HashJoinNode refusal path, setCostDecision's use of rowWidth.
-  WAITING on gate r3 (a709747643e42ab57) — do not dispatch a fix while it runs.
-  THEN: one short closing round (medium + the wrong-reason correction + carry lows and the
-  unreached surface into Week 33's starting notes), a final gate, then close week 32.
+Current: week 32 CLOSING round (agent aada9e526e38c4e5b, launched 10:12 UTC): correct the
+  collectSlotTables rationale (conclusion right, recorded reason wrong), action r4's remaining
+  medium + 2 lows, and write the Week 32 -> 33 handoff block. Then a final gate closes the week.
+  Week 32 took 3 gates + 4 audits. Findings: 1 blocker, 1 high, 6 medium, 8 low — including a
+  REGRESSION a green 988-query oracle could not see, because the test guarding the capability
+  had been narrowed to a scalar stand-in.
+  !! WEEK 33 IS CORRELATION, so the ColumnId {level, slot} deferral TRIGGERS THERE — it must be
+  its own standalone change, never folded into the feature week. 87 non-comment mentions /
+  6 source layers / every test hand-building a ColumnRef.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
-Last gate: GREEN (week 32 round 2) — build 0 warnings, unit 770/770, sqlite 980, regression 318 all modes
+Last gate: GREEN (week 32 round 3) — build 0 warnings, unit 770/770, sqlite 988, regression 318 all modes
 Week 31 verdict: checkpoint met. 2 gates / 2 audits; round 2 audit was CLEAN (0/0/0/0).
 
 
