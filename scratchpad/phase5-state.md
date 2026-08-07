@@ -1,34 +1,34 @@
 # Phase 5 orchestrator state
-Current: week 35 — THE VERIFY GATE NOW HAS FIVE STEPS (c7b8262). TPC-H is wired in at
-  .claude/skills/verify/SKILL.md; the verdict block in .claude/skills/phase5-week/SKILL.md and
-  README Layer 9 both updated. Fifth line, printed by run_tpch.py and copied verbatim:
-    tpch: PASS (17/22 meaningful vs SQLite: 4 in all four modes, 13 vectorized-only;
-                3 vacuous; 2 unported)
-  VACUOUS AND UNPORTED ARE COUNTED APART FROM THE HEADLINE, never into it.
-  Regression detection: compare_baseline diffs docs/tpch-baseline.json and fails if a query
-  stops answering, becomes vacuous, or answers in FEWER MODES. An improvement passes and says
-  "IMPROVED, refresh the baseline". A third verdict NO-BASELINE fires when --baseline is
-  omitted, because a run that cannot see a regression must not report PASS.
-  Runtime 5m08s (88 swiftql invocations, each reloading a 9MB lineitem.tbl, not parallelised)
-  — stated plainly in the skill rather than hidden. sf0.01 default; larger SF is opt-in and
-  needs its own baseline. data/tpch/ is gitignored, so the harness exits non-zero naming the
-  seeded generator command instead of crashing.
-  NEXT: final gate + audit for week 35 (gate now ~17 min because of the TPC-H step), then
-  close week 35 and start week 36.
-  STILL OWED (small, can ride with week 36): nan/inf compare equal at
-  compare_against_sqlite.py:1874; random_diff.py:113-117 projects only driver_id/team from
-  rels[:3] and driver_id is the join key.
+Current: week 35 fix round 2 (agent a5e22b2abf18e4eb4, launched 20:34 UTC).
+  Audit r2 audited the harness AS AN INSTRUMENT: 1 blocker, 4 major, 1 minor.
+  !! THE MEASUREMENT UNDERSTATES, not overstates. q2's INERT verdict is a PARAMETER ARTIFACT —
+  172 of 250 parameter combinations DISCRIMINATE. It is not vacuous; it is vacuous at the
+  parameter we picked. q19's ALL_NULL is the same. Fixing these RAISES the honest count
+  legitimately, and leaving them would understate the engine — the mirror of the overstatement
+  we have been guarding against, and just as wrong.
+  !! A GATE STEP THAT CANNOT FAIL: --baseline together with --write-baseline on one path is an
+  unconditional PASS. Everything else is measured THROUGH that gate, so it was ordered first.
+  Also fixing: a narrowed --queries run prints a full-shaped PASS (4/4 ...; 0 vacuous;
+  0 unported) that reads as a complete result; the README still records Q17 as SUPPORTED while
+  the spec's Q17 text is REFUSED (week 34 shipped the MECHANISM, and I recorded that checkpoint
+  as met on the mechanism — the harness later showed the query does not run); q18's
+  "unreachable" holds only at threshold 300.
+  The baseline will be REGENERATED from a full run after q2/q19; if the figure rises above 17
+  that is correct, and the refresh must be deliberate and stated, never drift.
+  NOT REACHED by audit r2, not approved: hand re-derivation of the other 19 mutation verdicts
+  (structural check only), any engine run, --time/--fingerprint-all.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
-Last gate: GREEN (week 35 round 1) — build PASS, unit 805/805, sqlite 1290 checks
-  (168 four-mode diffs + 93 vec-only + 157 rejection entries), regression 318. Not stale.
-!! THE GATE DOES NOT COVER TPC-H. The verify skill runs four gates — build, swiftql_tests,
-  compare_against_sqlite.py, test_new_queries.py — and NONE exercises run_tpch.py. So a GREEN
-  gate says nothing about TPC-H, and WEEK 36'S DELIVERABLE IS TPC-H CORRECTNESS. Asked the
-  week-35 agent to wire it in as a FIFTH gate step that reports the MEANINGFULLY-ANSWERED
-  figure and goes RED on a regression (a query that stops answering, or becomes vacuous).
-  Until that lands, do not read a green gate as evidence about TPC-H.
+Last gate: GREEN (week 35 round 2) — FIVE STEPS, the first gate ever to measure TPC-H:
+  build PASS, unit 805/805, sqlite 1290, regression 318, tpch PASS
+  (17/22 meaningful vs SQLite: 4 in all four modes, 13 vectorized-only; 3 vacuous; 2 unported).
+  Baseline matched EXACTLY in both directions; 17 rejection suites clean (157/157).
+  Staleness disproved across all 107 files under src/ and tests/.
+THE GATE NOW COVERS TPC-H (fifth step, c7b8262). It reports meaningfully-answered with the
+  mode split, counts vacuous and unported APART from the headline, fails on a regression
+  (stops answering / becomes vacuous / answers in fewer modes), and reports NO-BASELINE when
+  --baseline is omitted, since a run that cannot see a regression must not report PASS.
 Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
   2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
   and one stale-rejection pair, both fixed.
