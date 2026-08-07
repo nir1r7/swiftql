@@ -158,3 +158,174 @@ predicate. For q7 and q8 the mutated predicate is a filter *inside* the derived 
 covers. The labels say so honestly ("the p_type filter inside the derived body"), but a reader
 of the 17/22 should not take it as "the derived-table rewrite is exercised by 2 queries".
 
+### 5. MAJOR — `--baseline` and `--write-baseline` on the same path makes the gate pass unconditionally, and the harness's own IMPROVED message tells you to type that path.
+
+`python_tools/run_tpch.py:695-699` writes the baseline, and `:701-707` compares against it —
+**in that order, in the same `main()`**. Nothing forbids the two flags naming the same file. So:
+
+```
+python3 python_tools/run_tpch.py --catalog data/tpch/sf0.01/catalog.json \
+    --baseline docs/tpch-baseline.json --write-baseline docs/tpch-baseline.json
+```
+
+overwrites `docs/tpch-baseline.json` with this run's summary at `:696`, then at `:703` compares
+that summary against the file it just wrote. `lost` and `gained` are empty by construction and
+every `modes` comparison is an equality, so `compare_baseline` returns `ok=True` for *any* run,
+including one where half the queries stopped answering. The gate prints
+`tpch: PASS (…)` and exits 0.
+
+This is not hypothetical operator error: `compare_baseline`'s own IMPROVED line
+(`run_tpch.py:508-509`) and `.claude/skills/verify/SKILL.md`'s PASS row both instruct
+"rerun with `--write-baseline docs/tpch-baseline.json`", and SKILL.md's gate-5 block shows
+`--baseline docs/tpch-baseline.json` as the standing invocation. A verifier following both
+instructions in one command silently disarms the gate. `SKILL.md` also says "Never edit
+`docs/tpch-baseline.json` to make this gate pass" — this is that edit, performed by the harness
+itself, with a PASS printed over it.
+
+**Fix:** reject the combination when the paths resolve to the same file, or move the
+`--write-baseline` write to *after* the comparison and after the exit-code decision.
+
+### 6. MAJOR — the headline denominator is the *run's* query subset, so a narrowed run prints a clean-looking PASS with a 100% figure.
+
+`run_tpch.py:552` (`f"{len(summary['meaningful'])}/{len(qids)} meaningful vs SQLite"`) takes
+`qids` from `--queries` (`run_tpch.py:635`), and `compare_baseline` deliberately scopes itself to
+the queries that ran (`:497-499`, `ran = set(summary["modes"])`). Both behaviours are individually
+right; together they let a narrowed run emit a gate line that is indistinguishable in shape from a
+full one. Exercised directly against the shipped baseline:
+
+```
+summary for a --queries q1,q6,q12,q14 run, compared to docs/tpch-baseline.json:
+  tpch:       PASS (4/4 meaningful vs SQLite: 4 in all four modes; 0 vacuous; 0 unported)
+```
+
+"4/4 meaningful, 4 in all four modes, 0 vacuous, 0 unported" is a stronger-reading claim than the
+true `17/22 … 3 vacuous; 2 unported`, and it is a genuine PASS with exit code 0. Nothing in the
+line records that 18 queries were not run. `SKILL.md`'s "a verdict block may only report a full
+22-query run" is a *discipline*, enforced by nothing — and the same section instructs narrowing
+with `--queries q9,q17` while iterating, so both strings are in front of the same reader.
+
+**Fix:** have `gate_line` carry the subset explicitly, e.g. `4/4 of a 4-query SUBSET (full set
+is 22)`, so a partial figure cannot be copied into a verdict block as a full one.
+
+### 7. The regression semantics of the fifth gate DO fire. Verified mechanically, three ways.
+
+Drove `compare_baseline` and `gate_line` directly against the shipped `docs/tpch-baseline.json`
+with synthetic summaries (pure Python; no build, no engine run):
+
+| injected state | result |
+|---|---|
+| q9 meaningful -> vacuous (INERT) | `ok=False`, `REGRESSION: q9 was meaningfully answered, now VACUOUS (INERT)` |
+| q1 answers in 2 modes, baseline 4 | `ok=False`, `REGRESSION: q1 answers in 2 modes, was 4` |
+| q9 stops answering (0 modes) | `ok=False`, both `no longer answers` and `answers in 0 modes, was 2` |
+
+All three propagate: `main` does `ok = ok and base_ok` (`run_tpch.py:709`), `gate_line` renders
+`FAIL` (`:576-578`), and the process exits 1 (`:717`). The three failure inputs the target named
+(stops answering / becomes vacuous / fewer modes) are all genuinely fatal.
+
+`NO-BASELINE` cannot be read as a pass. Verified: with `baseline_lines=None` and
+`mismatched=['q9']`, `gate_line` prints
+
+```
+tpch:       NO-BASELINE (17/22 meaningful vs SQLite: …) -- rerun with --baseline docs/tpch-baseline.json to gate it -- WRONG ANSWERS ['q9']
+```
+
+and the exit code is 1 because `ok` is already False from `render_report` (`:474`). One
+inaccuracy in the docstring at `run_tpch.py:578` ("The verdict always agrees with the exit code"):
+a no-baseline run with a wrong answer exits 1 while printing `NO-BASELINE`, not `FAIL`. The
+failure is still named in the same line and `SKILL.md`'s verdict table calls NO-BASELINE "Not a
+pass", so this is a stale comment rather than a hole — noted, not filed as a defect.
+
+Vacuous and unported cannot be absorbed into the headline: `meaningful` subtracts every vacuous
+query (`:389`), and `unported` is derived from cells with `correct_modes[q] == 0` (`:305-307`), so
+a query cannot appear in both. `gate_line` prints all three counts unconditionally (`:552-556`).
+
+### 8. Target 3 — q17/q21 are genuinely refused and pinned by message. But the README still records Q17 as supported, and the actual Q17 text does not run.
+
+The refusals are real, not skips. All four cells for each query carry a non-zero exit and a
+message, and `classify` (`run_tpch.py:210-224`) only reaches UNPORTED/REFUSED_EXPECTED via
+`rc != 0`:
+
+```
+q17 row-volcano / col-volcano  REFUSED_EXPECTED  "correlated subqueries are decorrelated to a semi-join"
+q17 col-vec / col-vec-noopt    UNPORTED          "correlated subquery: a correlated scalar subquery is
+                                                  decorrelated only when its select list is a single aggregate"
+q21 row-volcano / col-volcano  REFUSED_EXPECTED  "multi-way joins are not supported on the Volcano path"
+q21 col-vec / col-vec-noopt    UNPORTED          "correlated subquery: only an equality between two columns
+                                                  can become a join key"
+```
+
+Each message is emitted by name from `src/planner/subquery_decorrelation.cc:187-192` (q17) and
+`:234` / the equality-key check (q21), and `internal:` is checked first at `run_tpch.py:213` so a
+crash cannot be absorbed into either bucket. `docs/week-35-plan.md:117-124` records both reasons
+verbatim, including "the standard text is `0.2 * AVG(l_quantity)`". **That note is accurate.**
+
+**The gap is NOT what the README claims, however.** `subquery_decorrelation.cc:186-192` requires
+`found.size() == 1 && found[0] == body.select_list[0].get()` — the select-list expression must
+*be* the aggregate node. TPC-H Q17's spec text puts the constant **inside** the subquery
+(`SELECT 0.2 * AVG(l_quantity) …`), which is a `*` node wrapping the aggregate, so it is refused.
+Week 33/34 built and validated the constant-**outside** form — `docs/week-33-plan.md:719` states
+the target shape as `WHERE l.speed > 0.2 * (SELECT AVG(l2.speed) …)`. The two forms are
+semantically identical; only the parenthesis position differs. So the mechanism works and the
+spec's Q17 does not, and three README lines do not say so:
+
+- `README.md:70` — "a correlated **scalar** subquery over an aggregate body decorrelates … (Week
+  34, **TPC-H Q17**)"
+- `README.md:1768-1769` — "**Checkpoint:** … ✅ — and **Q17 with them**, which Week 33 recorded as
+  a checkpoint miss and handed here."
+- `README.md:2139` — "| 34 | … | **Q17's correlated scalar supported ✅** |"
+
+Against a harness that now reports q17 as 0-mode UNPORTED, these read as a met checkpoint for a
+query that does not run. Week 35 corrected the *harness* figure (20 -> 17) but left the Week 34
+checkpoint text uncorrected. This is exactly the overstatement the round-2 brief asks about: the
+mechanism is real, the named query is not covered by it.
+
+**Fix (either, not both):** amend the three README lines to "the Q17 *shape* (constant outside the
+subquery); TPC-H's Q17 text puts the constant inside and is refused", or lift the
+`found[0] == select_list[0]` restriction to allow an aggregate under a constant-only expression
+tree — at which point q17's `0.2 * AVG(...)` decorrelates and the figure becomes 18/22.
+
+### 9. Target 5 — the recovered WIP (`cc3e4ce`) left nothing incoherent.
+
+`cc3e4ce` committed `docs/tpch-baseline.json` plus the mutation-check edits unvalidated, with the
+commit body stating "Nobody has checked it." Checked the recovery for residue:
+
+- `python3 python_tools/tpch_queries.py` exits 0: all 22 templates render and all 22 fragments
+  apply exactly once. No half-edited fragment survived.
+- `docs/tpch-baseline.json` and `docs/tpch-sf0.01-report.json` agree: same 17 `meaningful`, same
+  `modes` map, same `vacuous` {q2, q18, q19}, same `unported` {q17, q21}. The baseline was
+  regenerated from a real run at `c1ff8ae`, not carried forward from the WIP.
+- The baseline holds exactly the seven keys `compare_baseline` and `gate_line` read
+  (`meaningful, mismatched, modes, mutation_broken, unexplained, unported, vacuous`) — no orphan
+  key, no missing key that `.get()` would silently default.
+- The one thing `cc3e4ce` flagged as unchecked — "17 … Nobody has checked it" — I reproduced
+  independently for the three vacuity verdicts (finding 4). The arithmetic is sound; findings 1
+  and 2 are about *which* queries belong in the vacuous set, not about the recovery.
+
+No incoherence found.
+
+## Severity tally
+
+- **Blocker: 1** — finding 1 (q2's INERT is a parameter artifact; 172/250 param combos
+  discriminate; the figure understates by one query and leaves the correlated-scalar mechanism
+  exercised by nothing).
+- **Major: 3** — finding 2 (q19 ALL_NULL, likewise parameter-fixable, costs a 4-mode query),
+  finding 5 (`--baseline` + `--write-baseline` on one path = unconditional PASS),
+  finding 6 (narrowed run prints a full-shaped PASS with a 100% figure).
+- **Major, documentation of a measured claim: 1** — finding 8 (README records Q17 as supported;
+  the spec's Q17 text is refused, and only the constant-outside shape works).
+- **Minor: 1** — finding 3 (q18's "unreachable at SF=0.01" is true only for the 300 threshold).
+- **Verified clean:** the mutation check's hardened multiset comparison and fragment-application
+  guard (4), the fifth gate's three regression semantics and NO-BASELINE handling (7), q17/q21
+  refusals genuinely pinned by message (8, first half), the recovered WIP (9).
+
+## Not reached
+
+- Per-query hand verification beyond q2, q18 and q19 (the other 19 verdicts were checked
+  structurally — fragment uniqueness, comparison semantics, LIMIT interaction — not re-derived
+  from SQLite one at a time).
+- No engine run of any kind: a gate owns `build/`, so every measurement above is SQLite-only or
+  pure-Python. The `cells` grid in `docs/tpch-sf0.01-report.json` is taken as given (round 1
+  re-derived it and re-ran two queries against the binary).
+- `python_tools/generate_tpch.py`'s Week 35 change (`f7c6cdb`, the seeded Q16 phrase) beyond
+  confirming the week-35 plan's claim that q16 now discriminates.
+- The `--time` path and `--fingerprint-all`.
