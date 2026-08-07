@@ -1052,6 +1052,55 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     # exists.
     "SELECT l.lap_id AS id FROM laps l WHERE l.speed > 0.2 * "
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) ORDER BY id LIMIT 10",
+    # ---- THE ZERO-ROW GROUP RULE, one query per aggregate kind. ----
+    #
+    # Week 34 audit round 1, F1: a silent WRONG ANSWER, and the whole reason this
+    # block exists rather than one representative query. The rewrite groups the
+    # body by the correlation key, so a key with NO matching body rows produces no
+    # group row at all and the LEFT join null-extends it. For SUM / AVG / MIN / MAX
+    # that IS the right value — those are NULL over an empty set. **COUNT is the
+    # exception**: SQL says COUNT over zero rows is 0, so the outer predicate read
+    # NULL where it must read 0, and `WHERE d.age > (SELECT COUNT(*) ...)` returned
+    # 0 rows against SQLite's 20.
+    #
+    # Every aggregate kind is pinned, not just COUNT, because the trap is that the
+    # two families disagree and a reader checking one learns the wrong rule. The
+    # body filter `speed > 999` matches nothing, so EVERY correlation key is a
+    # zero-row group and each query below is a direct read of its aggregate's
+    # empty-set value.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(l.lap_id) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    # COUNT(DISTINCT x) is still a COUNT and has the identical 0-over-empty rule,
+    # which is why the fix tests the FUNCTION and not the `distinct` flag.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(DISTINCT l.season) FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.speed > 999)",
+    # The four that ARE NULL over an empty set. Each must return zero outer rows:
+    # a comparison against NULL is UNKNOWN, so no row qualifies. If one of these
+    # ever starts returning rows, the COUNT fix has been over-applied.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT AVG(l.speed) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT SUM(l.speed) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT MIN(l.speed) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT MAX(l.speed) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    # MIXED, and the one that would still catch the bug if the all-empty queries
+    # above were ever weakened: 19 of the 20 drivers appear in the first 60 laps,
+    # so exactly one correlation key has no group. Pre-fix this returned 19 rows
+    # where SQLite returns 20 — a one-row difference, which is what a partial
+    # regression looks like.
+    "SELECT d.driver_id AS did, d.age AS age FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.lap_id < 60) "
+    "ORDER BY did",
+    # And a COUNT body whose groups all EXIST, so the CASE wrapper must be a no-op
+    # rather than a change of value.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id)",
+
     # ARRIVED FROM WEEK33_CORRELATED_IN_SHAPES. The correlation is INSIDE the IN
     # body and relative to that block, so the scalar rewrite runs during the
     # body's own build() - two lowerings stacked on two different spines in one

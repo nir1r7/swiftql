@@ -243,8 +243,22 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             // indices positional 0..k-1 -- the same shape Week 33's body projection
             // produced and Week 32's IN lowering had by taking body column 0.
             auto agg_expr = std::move(body.select_list[0]);
-            const std::string agg_name = aggregateOutputName(
-                static_cast<const AggregateExpr*>(agg_expr.get()));
+            const auto* agg = static_cast<const AggregateExpr*>(agg_expr.get());
+            const std::string agg_name = aggregateOutputName(agg);
+            // !! COUNT IS THE EXCEPTION TO THE ZERO-ROW RULE, and getting this
+            // wrong was a silent wrong answer (Week 34 audit round 1, F1).
+            // SUM / AVG / MIN / MAX over an empty set are NULL, so the LEFT join's
+            // null-extension IS their value. COUNT over an empty set is **0**, and
+            // the rewrite produces NO GROUP ROW AT ALL for a correlation key with
+            // no matching body rows — so the join null-extends it and the outer
+            // predicate reads NULL where SQL says 0. Measured on shipped data:
+            // `WHERE d.age > (SELECT COUNT(*) FROM laps l WHERE
+            // l.driver_id = d.driver_id AND l.speed > 999)` returned 0 rows
+            // against SQLite's 20.
+            //
+            // COUNT(DISTINCT x) has the identical rule — it is still a COUNT —
+            // which is why this tests the FUNCTION and not the `distinct` flag.
+            const bool count_body = agg->function_name == "COUNT";
             body.select_list.clear();
             for (auto& ref : body_key_refs) {
                 auto* cr = static_cast<ColumnRef*>(ref.get());
@@ -301,7 +315,41 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = agg_name;
             ref->id = ColumnId::local(derived_slot);
-            slot = std::move(ref);
+
+            if (!count_body) {
+                slot = std::move(ref);
+            } else {
+                // COALESCE(ref, 0), spelled in the dialect this engine has:
+                //   CASE WHEN ref IS NULL THEN 0 ELSE ref END
+                // No new node, no new operator and no new grammar — searched CASE
+                // and IS NULL both shipped in Week 25, and both branches type as
+                // INT (aggregateResultType(COUNT) is INT, and the literal is), so
+                // inferExprType's CASE unification accepts it without promotion.
+                //
+                // WHAT IT COSTS, stated rather than discovered later: CASE has no
+                // vectorized kernel, deliberately (Week 25 — evaluate() short-
+                // circuits and an eager chunk kernel would raise on discarded
+                // branches). compileNode declines it and the enclosing predicate
+                // falls back to the scalar evaluate(). That is correct-but-slow,
+                // it is paid ONLY by a correlated-scalar COUNT body, and it is the
+                // same fallback CASE has had since it shipped. The alternative —
+                // refusing a COUNT body outright, which the audit offered as the
+                // minimum fix — would have left TPC-H a correlated shape short for
+                // a cost the dialect can already express.
+                auto is_null = std::make_unique<IsNullExpr>();
+                is_null->operand = cloneExpr(ref.get());
+                is_null->is_not_null = false;
+
+                auto zero = std::make_unique<Literal>(Value(static_cast<int64_t>(0)));
+
+                auto case_expr = std::make_unique<CaseExpr>();
+                CaseExpr::WhenClause when;
+                when.condition = std::move(is_null);
+                when.result = std::move(zero);
+                case_expr->when_clauses.push_back(std::move(when));
+                case_expr->else_expr = std::move(ref);
+                slot = std::move(case_expr);
+            }
             ++out.lowered;
         });
     }
