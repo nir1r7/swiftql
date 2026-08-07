@@ -1,18 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32, round 1, steps 3+4 IN PARALLEL (gate + audit), launched 08:45 UTC, both
-  budgeted to land before the ~09:26 reclaim.
-  Week 32 implementation is COMPLETE and pushed, across two agents via the handoff protocol
-  (the first was killed at ~08:26; the successor finished from the "## Progress" section).
-  Unit tests now 768. The successor found the predecessor's NULL tests asserted against data
-  with NO NULLS — `makeScan` builds a ColumnarTable that silently turns Value::null() into 0.
-  Rewritten through NullableSourceNode. Audit r1 is told to check every NULL test/oracle entry
-  in the week for that same defect.
-  Week 32 shipped: 1024 IN cap REMOVED; IN(subquery) is VECTORIZED-ONLY (Volcano refuses by
-  name, so those queries diff in 2 modes not 4); four lowering refusals (IN under OR, IN in
-  HAVING, computed operand, shared body statement).
-  STILL OPEN as stated Week 33+ items: Volcano semi/anti parity (restores the 4-mode
-  baseline), and the selection-vector path for the semi-join operator (deferred to Week 37).
-  Week 32 does NOT lower a correlated reference, so ColumnId defers to Week 33.
+Current: week 32, round 1, step 5 — FIX round (agent a19c64a68cf913e64, launched 08:52 UTC).
+  Audit r1: 1 BLOCKER, 1 medium, 1 low.
+  BLOCKER: WEEK32_LOWERING_REFUSED asserts in all four modes, but on Volcano
+  `Planner::plan`'s GENERIC refusal fires first, so 6 rejection assertions fail on their
+  expected message. Told A to decide which message is TRUE per mode, not to weaken the suite
+  or drop four-mode coverage. Expect the concurrent gate r1 to independently confirm this RED.
+  MEDIUM: cardinality_estimator.cc:376 stamps body stats at relation_slot = -1, contradicting
+  the consumer table this week added to development.md — one of the two is wrong, fix that one.
+  Audit did NOT reach a line-by-line read of the new C++ test bodies; a later audit must.
+  Week 32 implementation itself is complete + pushed (unit 768).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
