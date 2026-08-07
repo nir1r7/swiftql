@@ -1394,3 +1394,151 @@ deliberately.
 
 **Next concrete step:** Task 4 — write the Volcano breakdown into the README and
 `planner.cc`'s cost paragraph.
+
+---
+
+## Week 36 correctness report
+
+**Provenance, first, because every number below depends on it.** `dbgen` was
+unavailable. `python_tools/generate_tpch.py` reproduces the TPC-H spec's schema,
+column order, referential integrity and value **domains**, but not its value
+**distributions**, so — as `data/tpch/sf0.01/PROVENANCE.txt` states — the
+published TPC-H answer set **does not apply** to this data. The only valid oracle
+is **SQLite over the same `.tbl` files**. Every claim here is "matches SQLite".
+Nothing here says "correct", and nothing here says "TPC-H compliant".
+
+### The figure, with its mode split
+
+Week 35 measured, from a full 22×4 run:
+
+```
+GATE tpch: PASS (19/22 meaningful vs SQLite: 5 in all four modes,
+                 14 vectorized-only; 1 vacuous; 2 unported)
+```
+
+Week 36 moved it by **one query**, and the whole of that move is headline count:
+
+```
+GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes,
+                 15 vectorized-only; 1 vacuous; 1 unported)
+```
+
+| | Week 35 | Week 36 | why |
+|---|---|---|---|
+| meaningful | 19 | **20** | q17 — TPC-H's own Q17 text now runs (Task 1) |
+| in all four modes | 5 | 5 | unchanged; q17 joins twice, so Volcano refuses it |
+| vectorized-only | 14 | **15** | q17 |
+| vacuous | 1 (q18) | 1 (q18) | unchanged **by choice** — see below |
+| unported | 2 (q17, q21) | **1** (q21) | q21's requirement established and declined in the open |
+| Volcano refusal cells | 34 of 88 | 34 of 88 | unchanged, deliberately |
+
+**The q17 template was not touched.** The engine changed, not the query. A figure
+that rises because a template was softened is not a figure.
+
+### Volcano mode coverage: the expectation was wrong, and here is the measurement
+
+Classifying all 34 Volcano refusal cells by the message each cell **recorded**:
+
+| Guard that fired | Queries | Cells |
+|---|---|---|
+| `multi-way joins are not supported on the Volcano path` | q2 q3 q5 q10 q11 q18 q21 | **14** |
+| `derived tables (FROM (subquery)) ...` | q7 q8 q9 q13 q15 q22 | **12** |
+| `IN subqueries are lowered to a semi-join ...` | q16 q20 | **4** |
+| `correlated subqueries are decorrelated to a semi-join ...` | q4 q17 | **4** |
+| | | **34** |
+
+Semi/anti parity addresses **8 of 34**, not most of them. Six of those eight are
+additionally blocked by a plan shape `Planner::plan` cannot express — q16, q20
+and q17 each join in their `FROM` as well, so the semi/anti join is a *second*
+join. The only reachable case is **q4's 2 cells**, and reaching them costs
+`JoinSemantics` in `HashJoinNode` plus a second decorrelation production on a
+path with no logical layer: the two-paths drift Weeks 26/28/30 each had to undo,
+for 2 cells of 88.
+
+**Week 36 therefore targeted the headline count and not mode coverage, and says
+so.** The two guards that dominate are both deliberately vectorized-only; Volcano
+is the correctness *baseline*, and its value is being a different implementation
+to diff against.
+
+### q18 remains vacuous, deliberately
+
+q18's `SUM(l_quantity) > 300` is unreachable on this data — the maximum per-order
+sum is 295.0 — so it answers identically on both sides of its own mutation and is
+counted **vacuous**, not answered. 290 would discriminate. **300 is already the
+lowest of the spec's three Q18 quantities**, so lowering it would invent a value
+the spec does not contain: raising the figure by weakening what the query tests,
+which is the one thing this harness exists to prevent.
+
+The contrast with q2 and q19 shows where the line is. Both were vacuous at their
+spec validation parameters and both were re-chosen — `SIZE = 1` for q2,
+`Brand#14/34/23` for q19 — **from within the spec's own value domains**, with the
+deviation recorded on the line in `VALIDATION_PARAMS`. q18 has no such move
+available, so it keeps its parameter and keeps its verdict.
+
+### Divergences this report inherits and must declare
+
+| # | Divergence | Verdict |
+|---|---|---|
+| 1 | **The `SUBSTRING(d,1,4)` year is a STRING** where TPC-H and SQLite give an INTEGER (q7's `l_year`, q8/q9's `o_year`); `normalize()`'s `coerce()` runs `float()` on both sides, which is why they compare equal | **Closed as a decision, not as code.** Keeping the normalization beats growing a numeric conversion (a new expression node, 17 dispatch sites, zero additional queries) and beats comparing the STRING as a STRING (which fails q7/q8/q9 on a *correct* answer). Sound here because those years are only ever `GROUP BY` keys and output columns — `SUM(SUBSTRING(...))` is rejected at plan time — and because TPC-H years are fixed-width, so lexicographic `ORDER BY` matches numeric. Both halves are properties of the data format, so they are now written at `coerce()` and asserted by `check_year_coercion_dependency()` rather than left a coincidence |
+| 2 | **An `ON` clause comparing a STRING column to a numeric one is accepted and silently half-matches.** `inferExprType` type-checks only the arithmetic operators, so `=` falls through to `INT`, and `classifyJoinCondition` accepts any cross-slot `ColumnRef = ColumnRef` as a key. Keys compare as text: STRING `"7"` matches INT `7` while `"007"` does not, and `Value::operator==` throws `Type mismatch` for the same pair in a `WHERE`. Reachable on the shipped F1 catalog (`drivers.team` vs `laps.lap_id`) | **Declared, not closed** — the one live wrong answer on the list, so the reason is given rather than implied. The containment is a plan-time check that a join's two key columns are both STRING or both numeric, which would also make the `int_keys` SIMD gate's assumption explicit. It is **not** ten lines: `classifyJoinCondition` sees only `ColumnRef`s and has no catalog, so the check needs slot→schema resolution somewhere that has one, plus a new *rejection* path — new error, new suite entries in four modes, and queries that execute today stop executing. This plan said "close it if Task 3b does not consume the week"; 3b did not, but the capacity did, and a new refusal landing half-verified in the last week before a seam audit is worse than a declared divergence. **No TPC-H query needs it** — every TPC-H join key is numeric-to-numeric |
+| 3 | **NaN forms its own `GROUP BY` / `DISTINCT` group** where SQLite has none (SQLite converts a *computed* NaN to NULL at storage; SwiftQL keeps it, both signs together, and it matches nothing in a join) | **Declared.** The close is a conversion in `CSVLoader` — a storage decision, not a key-encoding one. **No committed dataset holds a NaN cell**, which is a different claim from "it is correct", and only the first is true |
+| 4 | **`isUnmatchableKey` counts NaN with NULL** on the join build side, so `3.0 NOT IN {1.0, NaN}` is dropped where it is relationally TRUE | **Declared.** Documented at `vec_hash_join_node.cc`; the real close is a columnar validity mask |
+| 5 | **DOUBLE keys are compared exactly while results are displayed with `%.15g`**, so two rows that legitimately fail to group together can print identical values | **Declared, and the alternative is worse:** comparing what is displayed silently merges distinct doubles |
+| 6 | **`SUM`/`AVG` accumulate in `double`** — SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER, so a sum beyond **2^53** loses precision where SQLite would not | **Declared, with the bound stated** so a reader can check against it. TPC-H sums at these scale factors stay far below it |
+
+**Fixed this week, and it belongs on this list because it changes what every other
+line is worth:** `rows_equal` compared a NaN as **equal to anything**. IEEE 754
+makes every comparison against NaN False, so the tolerance test could never reject
+one and the mismatch branch was unreachable — a NaN anywhere in a SwiftQL answer
+was invisible to the oracle. Non-finite values are now judged before the tolerance
+test, with seven cases asserted at the top of every run.
+
+### What the harness cannot check
+
+Carried from Week 35 rather than restated from memory, because a report that drops
+these reads as a stronger claim than the run supports:
+
+- **A query that ERRORS has no rows to diff**, so the oracle is silent on every
+  refusal. Refusals are covered by message-matching only, never as correctness.
+- **SQLite cannot parse a derived-table column alias list**
+  (`FROM (SELECT ...) AS d (c1, c2)`), so that Week 34 feature has C++ coverage
+  only. No template uses the alias-list form.
+- **The mutation check neuters ONE predicate per query.** A query it calls
+  DISCRIMINATING could still contain a second, inert feature. It bounds the
+  headline figure **from above**; it does not certify a query. And it proves the
+  *data* makes the feature selective — not that SwiftQL's plan used it.
+- **The data is synthetic**, per the provenance note above.
+
+### Which queries were hand-verified, and which were not
+
+In these words on purpose. Before this week, three queries had been hand-verified
+(q2, q18, q19, all during Week 35's vacuity round). Week 36 ran `--fingerprint-all`
+over all 22 for the first time, which gives a **plan shape per answering cell** and
+settles "did the engine really use the feature" for every operator-shaped query. It
+does **not** settle it for queries whose characteristic feature is a *predicate*.
+
+- **Plan fingerprint plus mutation:** all 20 meaningful queries.
+- **Additionally hand-verified:** q2, q18, q19 (Week 35), and q17 (this week — its
+  plan was diffed against the constant-outside form's and found byte-identical,
+  which is stronger than reading the answer).
+- **Resting on fingerprint plus mutation alone:** the remainder, including the
+  predicate-shaped q12, q14, q16 and q19 arms.
+
+`--time` was exercised for the first time as well (`q1 col-vec` median 414 ms vs
+`col-volcano` 1176 ms; `q6` 27 ms vs 602 ms). **Those numbers are recorded as
+evidence the switch works, not as a result.** Latency belongs to Week 37.
+
+### Q22's provenance — discharged earlier, recorded here
+
+Week 34 asked Week 36 to verify Q22 against the ported query and record which half
+was which. Week 35's harness already did it, by fingerprint rather than argument,
+and this report does not re-do it:
+
+```
+plan fingerprint: {'LogicalDerived': 2, 'LogicalAntiJoin': 2}
+correlated half  : ANTI-JOIN (Week 33 NOT EXISTS)
+custsale half    : LogicalDerived (Week 34)
+correlated-scalar rewrite present: no
+```
+
+An owed item that is silently satisfied looks identical to one that was forgotten.

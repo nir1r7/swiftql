@@ -1915,6 +1915,26 @@ def normalize(rows, preserve_order=False):
     """
     NULL_TOKEN = "\x00NULL"
 
+    # !! WEEK 36 — THE TPC-H LEG DEPENDS ON THIS NUMERIC COERCION, deliberately.
+    # The dialect has no `extract(year from d)`; the documented rewrite is
+    # `SUBSTRING(d, 1, 4)`, which yields a STRING year where the TPC-H text and
+    # the SQLite oracle both yield an INTEGER (q7's `l_year`, q8/q9's `o_year`).
+    # float() on both sides is what makes '1995' and 1995 compare equal. Week 35
+    # recorded that as a COINCIDENCE it did not want to rely on; Week 36 keeps it
+    # and states the dependency, rather than growing a numeric conversion in the
+    # dialect (a new expression node -- 17 dispatch sites -- for zero additional
+    # queries) or comparing the STRING as a STRING (which would fail q7/q8/q9 on
+    # a CORRECT answer, since the oracle's column really is an INTEGER).
+    #
+    # It is SOUND for those three queries because of a property they have and the
+    # rewrite does not confer: `l_year` / `o_year` are only ever GROUP BY keys and
+    # output columns, never arithmetic operands -- `SUM(SUBSTRING(...))` is
+    # rejected at plan time, correctly, because the result is a STRING. And
+    # `ORDER BY` on the STRING year matches the numeric order only because TPC-H
+    # dates are fixed-width four-digit years; it would not for a two-digit or
+    # mixed-width one. Both halves hold because of the data format, not because
+    # of the comparison, so they are written down here rather than assumed.
+    # check_year_coercion_dependency() below asserts the coercion itself.
     def coerce(v):
         if v is None or v == "NULL": return NULL_TOKEN
         try: return round(float(v), 6)
@@ -2256,9 +2276,34 @@ def check_rows_equal_non_finite():
     print("rows_equal non-finite rule: %d cases OK" % len(cases))
 
 
+def check_year_coercion_dependency():
+    """Week 36 -- the STRING-year dependency the TPC-H leg rests on, asserted.
+
+    `SUBSTRING(d, 1, 4)` is the documented rewrite for `extract(year from d)` and
+    it yields a STRING. SQLite yields an INTEGER. q7, q8 and q9 compare equal only
+    because normalize()'s coerce() runs float() on both sides. Week 35 called that
+    a coincidence; an assertion is what turns a coincidence into a contract, so a
+    future change to coerce() fails HERE rather than as three unexplained TPC-H
+    mismatches five minutes into the fifth gate step.
+    """
+    swiftql_side = normalize([{"y": "1995", "rev": "1.5"}])
+    sqlite_side = normalize([{"y": 1995, "rev": 1.5}])
+    if swiftql_side != sqlite_side:
+        raise AssertionError(
+            "normalize() no longer coerces a numeric-looking STRING to a number: "
+            "TPC-H q7/q8/q9 compare a SUBSTRING year against SQLite's INTEGER "
+            "and depend on it (%r != %r)" % (swiftql_side, sqlite_side))
+    # ...and it must NOT coerce a genuinely non-numeric string, or the equality
+    # above would be vacuous.
+    if normalize([{"y": "MED BOX"}]) == normalize([{"y": 0}]):
+        raise AssertionError("normalize() coerces a non-numeric string to a number")
+    print("normalize() STRING-year coercion: contract holds")
+
+
 def main():
     conn = load_sqlite()
     check_rows_equal_non_finite()
+    check_year_coercion_dependency()
 
     p1, f1, e1 = run_query_suite(conn, QUERIES, "Default (row storage, Volcano)")
     p2, f2, e2 = run_query_suite(

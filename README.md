@@ -2295,6 +2295,60 @@ Execution: 72.0ms
 - Join ordering is not attempted at all for a query containing an outer join: the pass declines the whole tree, since `R ⟕ S ≠ S ⟕ R` and associativity fails, and legality here needs conflict/eligibility sets rather than a better cost model. One outer join therefore turns off reordering for every join in the query — including its fully inner block, which is legally reorderable. `--explain` reports it as `join-ordering=skipped (outer join)` rather than printing nothing, so the loss is visible; the token is deliberately not `order=`, which has to keep meaning "the search ran"
 - DOUBLE keys — join, `GROUP BY` and `DISTINCT` alike — are compared exactly while results are *displayed* with `%.15g`, so two rows that legitimately fail to group together can print identical values. The alternative, comparing what is displayed, silently merges distinct doubles, which is the worse of the two. Stated here because Week 36's correctness report has to declare it alongside the `SUM` precision divergence below
 - `SUM`/`AVG` accumulate in `double`. SQLite's `SUM` over an INTEGER column returns an exact 64-bit INTEGER; SwiftQL returns a DOUBLE, so a sum beyond 2^53 loses precision where SQLite would not. Deliberate: one accumulator type keeps the aggregate nodes simple, and TPC-H SF1 sums stay far below that bound. Stated here because the Week 36 correctness report has to declare it alongside the INT-overflow decision above
+
+### Supported scale and memory (Week 36, measured)
+
+Measured on the committed datasets with `SELECT COUNT(*) FROM lineitem` — wall
+time and **peak RSS of the whole process**, which is what a machine has to have:
+
+| dataset | on disk | `lineitem` rows | `--storage row` | `--storage columnar` |
+|---|---|---|---|---|
+| `data/tpch/sf0.01` (default) | 12 MB | 60 144 | 1.5 s / 64 MB | 2.5 s / 83 MB |
+| `data/tpch/sf0.1` (opt-in via `--catalog`) | 117 MB | 600 865 | 16.6 s / 594 MB | 27.1 s / 782 MB |
+
+```bash
+python3 -c "
+import subprocess, resource, time
+t = time.time()
+subprocess.run(['./build/swiftql', '--catalog', 'data/tpch/sf0.1/catalog.json',
+                '--storage', 'columnar', '--execution', 'vectorized',
+                '--format', 'tsv', '--query', 'SELECT COUNT(*) FROM lineitem'],
+               capture_output=True)
+print('%.1fs  %.0f MB' % (time.time() - t,
+      resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024))
+"
+```
+
+**Columnar peaks HIGHER than row, and the compression ratio does not predict it.**
+`--storage-stats` reports `lineitem (columnar): 10 MB` against
+`raw=24773.7 KB  encoded=10681.6 KB  ratio=0.43`, yet peak RSS is 83 MB columnar
+against 64 MB row. The cause is in `main.cc`: every table is loaded into
+`table_rows` first, `TableStats::compute` runs over that row image, and
+`table_rows.clear()` runs only **after every table has been converted**. So
+**peak memory is the row image plus the columnar image of every table the query
+touches**, not the columnar size. The ratio describes the steady state; the peak
+is the sum. Recorded rather than fixed — moving the clear into the conversion
+loop is a change to the *load* path, and Week 36's figure is a correctness
+figure.
+
+Two more scale facts a reader would otherwise discover the hard way:
+
+- **Loading is per-invocation.** Each `swiftql` process re-reads and re-parses
+  the `.tbl` files; nothing is cached across runs. This is why the fifth gate
+  step costs ~5 minutes at sf0.01 — 88 invocations, each reloading a 9 MB
+  `lineitem.tbl` — and why sf0.1 is opt-in rather than the default.
+- **sf0.1 is the largest scale actually exercised.** No SF1 figure is quoted,
+  because none was measured; a linear extrapolation of the sf0.1 peak lands near
+  8 GB, and an untested number in a limits section is worse than no number.
+
+The *numeric* scale limit is the `SUM`/`AVG` `double` accumulator above: exact to
+2^53, and TPC-H sums at these scale factors stay far below it.
+
+`data/tpch/` is gitignored. Both datasets are regenerated with
+`python_tools/generate_tpch.py`, which is seeded (`seed: 20250101`, recorded in
+each `PROVENANCE.txt`), so a regenerated sf0.01 is byte-identical to the one
+these numbers were taken on.
+
 - Commas inside string values not supported in CSV input. The **pipe-delimited `.tbl` path added in Week 35 sidesteps this rather than fixing it** — a delimiter is now a property of the table (`FileFormat` on `TableMetadata`), so TPC-H's comma-laden `l_comment` / `c_comment` load correctly while a comma inside a CSV field still splits the row
 - No persistence beyond CSV files and catalog JSON
 - Cost-based optimization applies only to columnar/vectorized execution
