@@ -1,13 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32 CLOSING round (agent aada9e526e38c4e5b, launched 10:12 UTC): correct the
-  collectSlotTables rationale (conclusion right, recorded reason wrong), action r4's remaining
-  medium + 2 lows, and write the Week 32 -> 33 handoff block. Then a final gate closes the week.
-  Week 32 took 3 gates + 4 audits. Findings: 1 blocker, 1 high, 6 medium, 8 low — including a
-  REGRESSION a green 988-query oracle could not see, because the test guarding the capability
-  had been narrowed to a scalar stand-in.
-  !! WEEK 33 IS CORRELATION, so the ColumnId {level, slot} deferral TRIGGERS THERE — it must be
-  its own standalone change, never folded into the feature week. 87 non-comment mentions /
-  6 source layers / every test hand-building a ColumnRef.
+Current: week 32 — closing round DONE and pushed (3 commits). ONE THING LEFT: the final gate.
+  >> NEXT ACTION, for whoever wakes first after the ~10:26 reclaim: launch the week 32 closing
+  gate (verify skill, log to scratchpad/gates/week-32-round-4.log). It was deliberately NOT
+  started at 10:18 because a gate needs ~11 min and the reclaim was 8 min away — launching it
+  right after a reclaim gives it a full window instead of feeding it to the reaper.
+  If that gate is GREEN, week 32 is DONE (mark 32 done in Weeks done) and week 33 begins:
+  step 1 is the teach agent for Week 33 (correlated subqueries).
+  !! WEEK 33 TRIGGERS the ColumnId {level, slot} deferral — its own standalone change FIRST,
+  never folded into the feature week. 87 non-comment mentions / 6 source layers / every test
+  hand-building a ColumnRef. The Week 33 starting-notes block in README.md says so.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
