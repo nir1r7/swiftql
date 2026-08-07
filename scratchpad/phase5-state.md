@@ -16,7 +16,21 @@ Current: SEAM AUDIT PASS 1 — five auditors launched 23:41 UTC, each committing
   NOT REACHED by that auditor: VecDerivedNode re-entry under a derived-table self-join;
   Volcano columnar scan vs VecScanNode zone-map pruning; checked_arith.h/columnar_eval.cc vs
   scalar evaluator.cc.
-  WAITING on the other four (join chain, subquery chain, optimizer preservation, storage)
+  2 of 5 REPORTED. Subquery chain (seam-subquery-chain-pass-1.md): 0 blockers, 0 high,
+  1 medium, 1 low — and they are COUPLED, which is the point.
+  F1 subquery_decorrelation.cc:390-396 + logical_plan.cc:494-501: two correlated equalities on
+  ONE body column make $scalar0 carry a DUPLICATE COLUMN NAME, so
+  `SELECT COUNT(*) FROM drivers d WHERE d.age > (SELECT COUNT(*) FROM laps l
+   WHERE l.driver_id = d.driver_id AND l.driver_id = d.age)`
+  errors with "give one of them an alias" — naming a relation the user never wrote.
+  F2: correlated-scalar lowering is the ONLY one of four that resolves build-side keys BY BARE
+  NAME, and it is safe ONLY BECAUSE F1 REFUSES THE COLLISION.
+  >> SO THE OBVIOUS FIX FOR F1 (relax the duplicate check) OPENS A SILENT WRONG ANSWER VIA F2.
+  The auditor said so explicitly. Any fix must address F2 first or fix F1 another way.
+  Not reached there: the three-valued NOT IN probe loop in VecHashJoinNode (no NULL INT key in
+  the shipped catalog), Volcano HashJoinNode semi/anti (refused on that path anyway), and an
+  optimized-vs---no-optimize diff of the new LEFT-join shape.
+  WAITING on three (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
   before dispatching fixes, so they batch into one round rather than racing the tree.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
