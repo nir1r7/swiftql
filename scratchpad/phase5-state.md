@@ -1,5 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32, round 1, step 1 (teach) — launched ~08:06 UTC.
+Current: week 32, round 1, step 2 (implement) — agent a43340819efbce0d1 launched 08:10 UTC.
+  It WILL likely be killed by the ~08:31 reclaim mid-implementation. It is instructed to
+  commit+push after EACH pipeline layer and to append a "## Progress" section to
+  docs/week-32-plan.md naming what is done / in progress / next, then commit that.
+  ON RECLAIM: read that Progress section and launch a SUCCESSOR to continue from it — do NOT
+  restart week 32 from scratch and do NOT re-run the teach step.
+  Week 32 does NOT lower a correlated reference (confirmed in the plan), so the ColumnId
+  structural change defers again, now to Week 33.
+  Week 32 owns REMOVING the IN(subquery) 1024 cap, and must amend the README dialect row +
+  the WEEK31_MATERIALIZATION_REFUSED entry that pins it if it does.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
