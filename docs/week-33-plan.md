@@ -709,3 +709,371 @@ ExLoweringResult ex_lowered  = lowerExistsSubqueries(std::move(in_lowered.plan),
 - A correlated `NOT EXISTS` whose body's key column contains a NULL returns the
   same rows as SQLite. This is item 6 above, and it is the one place a
   copy-paste from `NOT IN` produces a wrong answer that looks plausible.
+
+---
+
+## Task 4 — Correlated scalar subqueries (the Q17 shape)
+
+### Why it matters
+
+Q17 is `WHERE l.speed > 0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team =
+l.team)` — the first shape in `WEEK33_CORRELATED_BINDS`, and the one form where
+"no new operator" stops being free. An `EXISTS` needs only a membership answer;
+a scalar subquery needs a **value per outer row**.
+
+### Conceptual explanation
+
+The standard decorrelation: group the body by its correlation key and join the
+result back.
+
+```
+outer  ⋈(team)  ( SELECT team, AVG(speed) AS agg FROM laps l2 GROUP BY team )
+```
+
+That is an ordinary `LogicalAggregate` under an ordinary `LogicalJoin`
+(`semantics = STANDARD`), and the `SubqueryExpr` in the outer `WHERE` is replaced
+by a `ColumnRef` naming the join's aggregate output column.
+
+Three things make this materially harder than Task 3, and each is a legitimate
+reason to defer it to Task 5's fallback rather than ship it half-built:
+
+1. **The join is not semi/anti, so `output_schema` is a MERGED schema** — which
+   breaks the one containment Week 32 established and Task 3 preserves ("nothing
+   from the body is in scope above the join"). The aggregate's output column
+   genuinely *is* in scope above this join, because the outer predicate reads it.
+   That is the same property the README says Week 34's derived tables break "for
+   real". Landing it here means landing a piece of Week 34's problem early.
+2. **The NULL/zero-row semantics differ from an inner join.** SQL says a scalar
+   subquery over zero rows is NULL — Week 31 shipped the typed-null `Literal` for
+   exactly this. An inner join *drops* the outer row instead. Correct
+   decorrelation therefore needs a **LEFT** join, so unmatched outer rows survive
+   null-extended — and Week 29's rules then apply: pushdown will not cross to the
+   null-supplying side and join enumeration declines to reorder any tree
+   containing one.
+3. **The "more than one row" rule.** Week 31's deliberate divergence
+   (`scalar subquery returned more than one row`) is a *runtime cardinality*
+   check. After decorrelation there is no per-outer-row result to count — the
+   `GROUP BY` makes exactly one row per key by construction. For an aggregate
+   body that is fine and is the point. For a **non-aggregate** body
+   (`(SELECT name FROM drivers d2 WHERE d2.team = l.team)`) the check disappears
+   silently, and a query that should error returns an arbitrary row.
+
+### Implementation guidance
+
+**Recommended scope, and the tradeoff stated rather than hidden:** implement
+Task 4 **only** for a body whose select list is a single aggregate with a
+`GROUP BY`-able correlation equality — the Q17 shape — and refuse every other
+scalar shape via Task 5. Rationale, in the project's own terms (minimum code that
+solves the problem): Q17 is what the phase goal needs, the aggregate body is the
+one shape where point 3 above is sound by construction, and the merged-schema
+question in point 1 is Week 34's to answer properly.
+
+If the week runs short, **Task 4 is the one to cut** — cut it to Task 5's
+refusal, not to a partial implementation. Q4 and Q21 (Task 3) are two of the 22;
+a wrong Q17 costs more than a refused one.
+
+Steps, if implemented: split the body's `WHERE` with the same `splitCorrelation`
+helper from Task 3; require every correlated conjunct to be an equality (the
+group key); build `LogicalAggregate{group_by = correlated keys, aggregates =
+the body's single spec}`; wrap in `LogicalJoin{STANDARD, LEFT-preserving}`;
+replace the `SubqueryExpr` node in the outer expression with a `ColumnRef` at
+`ColumnId::local(<the join's slot>)` naming the aggregate output column. Sites 12
+and 13 (`inferExprType`, `evaluate`) then close naturally, because no
+`SubqueryExpr` survives into the plan — which is what Week 30's note requires
+("both sites must close in the *same* commit that lowers one").
+
+### Verification
+
+- Q17's shape returns rows identical to SQLite, in every mode the query supports.
+- A body with a NULL/zero-row group returns NULL for that outer row, not a
+  dropped row. Construct the case deliberately; the shipped catalog may not
+  contain one.
+- `--explain` shows one `LogicalAggregate` under the join, not one per outer row.
+
+---
+
+## Task 5 — The correct fallback for unsupported patterns
+
+### Why it matters
+
+The README's second bullet for the week is *"retain a correct fallback for
+unsupported patterns"*, and in this engine **the correct fallback is a refusal**,
+not a second execution production. That is not a shortcut — it is the rule Weeks
+26, 28 and 30 each had to re-establish after a drift: two productions that must
+agree on the same semantics is exactly the failure mode. Week 32's
+`subquery_lowering.h` states it in as many words for `IN`.
+
+### Conceptual explanation
+
+Shapes that must be refused after Tasks 3 and 4, each with its own message naming
+what it declined:
+
+| Shape | Why |
+|---|---|
+| Correlated `EXISTS` not a whole top-level `WHERE` conjunct (under an `OR`, or in `HAVING`) | A semi-join is a whole-conjunct construct; inherited verbatim from Week 32's `IN` rule |
+| A correlated conjunct that is not an equality (`l.speed > d.age`) | `JoinKey` holds column names under `=`; there is no cross-product operator |
+| A correlated conjunct whose sides are not both plain `ColumnRef`s | `JoinKey` holds names, not expressions — the same rule as the `IN` operand |
+| `level >= 2` (correlated past the immediately enclosing block) | The rewrite promotes one level outward; skipping a block needs the intermediate join to exist first. Q20's shape is `IN`-of-scalar and is reached differently — check which of the two it actually needs before assuming it is refused |
+| A correlated **scalar** body that is not the Q17 shape | Task 4's stated scope |
+
+**One refusal site per shape, and never one per engine.** Week 30's placement
+rule stands: `Planner::plan` and `LogicalPlanBuilder::build` both run
+`Validator::validate` first, so anything that is a *dialect* rule belongs there
+and the four modes agree by construction. Anything that is a genuine **capability
+difference** between engines (Task 6's Volcano gap) belongs at that engine's
+entry point — that is Week 26's rule, and it is why the Volcano `IN` refusal
+lives in `Planner::plan`.
+
+**The harness blind spot, and what it forces.** `compare_against_sqlite.py`
+diffs *rows*. A query that errors produces none, so **the diffed oracle suite
+cannot hold a query that is refused** — it can only be pinned, by message, in a
+rejection suite. This is why `WEEK31_MATERIALIZATION_REFUSED`,
+`WEEK32_LOWERING_REFUSED` and `WEEK33_CORRELATED_BINDS` exist. Every message you
+add in this task needs a rejection-suite entry in the same commit, or it is
+untested: a refusal with no test is a string that can change silently, and the
+next week reads the green suite as coverage.
+
+### Implementation guidance
+
+- Follow `refuseUnloweredIn`'s shape exactly (`subquery_lowering.cc`): a walker
+  over what is left after lowering, called on the residual `WHERE` and on
+  `HAVING`, throwing a message that names the *clause*. Its purpose is to keep a
+  missed position **loud** — without it the node reaches `inferExprType`
+  (dispatch site 12) and dies with an internal-defect message pointing at the
+  wrong pass. Your `refuseUnloweredExists` / `refuseUnloweredCorrelated` needs
+  the same tripwire for the same reason.
+- Add a README row to *Syntax Deliberately Not Supported* for every refusal that
+  SQLite would answer — that table's discipline is that each entry states the
+  message and the reason, and divergences are named as divergences.
+- `WEEK33_CORRELATED_BINDS` does not disappear; it **shrinks**. Shapes Task 3/4
+  execute move into a diffed suite; shapes refused here stay, with their
+  `_EXPECT` message updated from `correlated subqueries are not yet executable
+  (Week 33)` to the specific new one. A rejection suite whose expectation string
+  still names Week 33 after this week is a suite that is passing for the wrong
+  reason.
+
+### Verification
+
+- Every shape in the table above has a rejection-suite entry pinning its exact
+  message, in every mode that reaches it.
+- No query anywhere still produces `correlated subqueries are not yet executable`.
+- Each refusal message names the shape, not the week.
+
+---
+
+## Task 6 — Volcano semi/anti parity: the route back to a four-mode oracle
+
+### Why it matters
+
+Week 32 shipped option (b): `IN (subquery)` is **refused outright on the Volcano
+path** (`WEEK32_SEMI_JOIN_VOLCANO_REJECTED`), so every set-membership query is
+diffed against SQLite in **two** modes rather than four. The columnar/row ×
+volcano coverage that every other feature in this engine carries does not exist
+for set membership.
+
+Task 3 decorrelates *into those same operators*, so **Week 33 inherits the halved
+coverage for correlated `EXISTS` too** — Q4 and Q21 would land with half the
+oracle confidence every other feature has. The README calls closing this "the
+cheapest available increase in confidence for the whole area", and it is the
+only route back to the four-mode baseline.
+
+### Conceptual explanation
+
+Volcano is the **correctness baseline**, not the feature-complete path — that is
+the project's stated stance, and the reason the four-mode diff is worth what it
+is. A capability that exists only on the vectorized path has no independent
+check: the vectorized answer is compared against SQLite, but nothing compares two
+independent implementations of *this engine's* semantics.
+
+The work is `JoinSemantics` in `src/execution/hash_join_node.cc` plus the same
+NULL/unmatchable rule the vectorized side has. Structurally a Volcano semi-join
+is the simplest operator in the file: build the hash set from the right input,
+then in `next()` return each left row whose key is (semi) / is not (anti)
+present, emitting the **left row unchanged** — the output schema is the probe
+schema, so there is no merge to write.
+
+The blocker is not the operator, it is the plan shape: `Planner::plan` builds
+exactly one `HashJoinNode` out of `stmt.joins`, and a semi-join is a **second**
+join for any query whose `FROM` already joins. That is the stated reason Week 32
+refused rather than implemented. So Task 6 has two halves, and only the first is
+cheap: (a) the operator, (b) a Volcano plan shape that can hold a second join.
+
+### Implementation guidance
+
+Scope honestly. **(a) alone, restricted to a single-relation `FROM`**, restores
+four-mode coverage for exactly the queries Volcano can already shape — which
+includes Q4's and Q21's `EXISTS` shape (`FROM drivers d WHERE EXISTS (...)`, one
+outer relation). That is a real and large fraction of the week's new queries, at
+a fraction of (b)'s cost. Queries whose `FROM` already joins keep the Week 32
+refusal, with its message unchanged.
+
+Do **not** relax `Planner::plan`'s `joins.size() > 1` refusal as a side effect.
+Week 29's audit found `preserved_slots{0}` is correct *only* because of that
+refusal; Week 30 fixed it to derive the set from the FROM scan's own schema, but
+the general lesson stands — that function has undocumented couplings to its own
+guards, and this is not the week to test them.
+
+### Verification
+
+- The `EXISTS` queries added in Task 3 move from a two-mode diff to a **four-mode**
+  diff in `compare_against_sqlite.py`. Count the modes explicitly; this is the
+  deliverable.
+- Volcano and vectorized return byte-identical rows for every semi/anti query
+  (this is the check that has not existed since Week 32).
+- The NULL case from Task 3 item 6, run on the Volcano path too — two
+  implementations of one NULL rule is precisely what this task exists to check.
+
+---
+
+## Task 7 — The three surfaces audit round 4 did not reach
+
+### Why it matters
+
+Week 32's hand-off names these so that Week 33 "does not read the green gate as
+coverage of them". Each is a place where a *read* stands in for a *test*.
+
+### The three, and what to do
+
+**(1) `refuseUnloweredIn`'s call sites in `LogicalPlanBuilder::build`**
+(`src/planner/logical_plan.cc`, lines 784 and 818). Round 4 left this as an
+explicit hunch: it did not confirm the tripwire runs on **every entry** to
+`build` rather than once at the top. That decides whether an `IN` nested inside
+an `IN` body's `HAVING` gets its own diagnostic or dies at dispatch site 12 with
+an internal-defect message. The closing round read the two call sites and they
+are inside `build`'s own body — the reassuring reading — **but that is a read,
+not a test, and no test pins it.** `build` recurses (`planBody` calls it), so the
+claim is checkable directly: **Week 33 nests deeper than any week so far, so pin
+it.** Write the query — an `IN` subquery whose body has a `HAVING` containing
+another `IN` — assert the message names `HAVING`, and put it in the rejection
+suite.
+
+**(2) The Volcano `HashJoinNode` refusal path.**
+`build_had_unmatchable_key_` exists only in
+`src/execution/vec_hash_join_node.{h,cc}`. That is consistent with
+`WEEK32_SEMI_JOIN_VOLCANO_REJECTED` but **does not prove the refusal is total** —
+a semi-join reaching `src/execution/hash_join_node.cc` would find no NULL rule
+there at all. Task 6 either implements the rule (making the question moot for the
+shapes it covers) or the refusal must be proven total for the rest. Prove it by
+test, not by grep: attempt to construct a Volcano plan containing a
+`JoinSemantics::SEMI` node and assert it is refused before execution.
+
+**(3) `setCostDecision`'s consumption of `rowWidth`**
+(`src/planner/vectorized_plan_builder.cc`) — never traced end to end. It is why
+half the `collectSlotTables` rationale was unconfirmed for three audit rounds.
+Read the corrected comment in that file and in `development.md` **before trusting
+anything written about that block**. Task 3 adds a new join whose children have
+asymmetric widths (a semi-join's output is its left child's, so `rowWidth` above
+it must not include the body's columns) — if `setCostDecision` sums both
+children's widths, the decorrelated plan is mis-costed. Trace it: one query, one
+`--explain` with the `cost=` string, hand-computed.
+
+### Verification
+
+Each of the three produces a **test**, not a note. The standard the README sets
+is that a read is not a test — three tests, named after the surface they pin.
+
+---
+
+## Task 8 — Precise `collectSlots` / `restampSlots`, and `buildScanSchema`
+
+### Why it matters
+
+Two Week 30 hand-forwards are addressed to this week by name, and both are
+performance rather than correctness — which is why they come after the feature
+work, and why they are cuttable.
+
+- **`collectSlots` gives a correlated subquery `-1`**, which is conservative, not
+  exact. The precise answer is the correlated refs' slots, decremented by one
+  level — `ColumnId::outward()` is exactly that operation, and it exists because
+  of this note. The README says: *land it with Week 33's decorrelation, not
+  before*, because today it would buy pushdown for a conjunct nothing can
+  execute. **`restampSlots` (site 9) must move with it** — its body branch is
+  currently unreachable *by argument*, and the precise set is what changes that
+  argument.
+- **`buildScanSchema` declines to narrow when a statement uses a subquery**, so
+  no subquery query gets projection pushdown from its correlated columns. Week 31
+  already returned pushdown to *materialized* queries by clearing `has_subquery`;
+  what remains is the correlated case, where the fix is to collect the correlated
+  columns actually referenced and keep exactly those.
+
+### Implementation guidance
+
+Do these **only after Tasks 3-6 are green**, and each as its own commit. Both
+change *which* plan is produced, not which rows come out, so the verification is
+a plan diff plus an unchanged row diff — `optimizer-diff` is the right tool.
+The specific hazard: `collectSlots`' `-1` is what currently keeps `soleSlot` and
+`pruningHintForPreservedSide` conservative. Making it precise removes a
+containment that three callers rely on, so re-read `predicate_pushdown.h`'s
+justification block first — Week 29's audit found that block's stated reason is
+false for one of its three callers (`classifyJoinCondition` **accepts** on an
+empty set where `soleSlot` declines), and that is the caller a precise set
+changes most.
+
+### Verification
+
+Rows unchanged (full oracle suite); plans changed in the expected direction
+(`--explain` shows a filter below the join, or a narrower scan schema); no
+correlated conjunct is ever pushed onto a scan.
+
+---
+
+## Task 9 — Tests, oracle suites, and the changed-test discipline
+
+### Why it matters
+
+**This is the task the week is most likely to fail at, and it has a precedent.**
+Week 32 shipped a regression — a subquery nested inside an `IN` body died at
+dispatch site 12 with an internal-invariant message — past a **green 988-query
+oracle and 770 green unit tests**. Neither could see it, because the one test
+guarding that capability (`tests/test_subquery.cc`) had been **narrowed, in that
+same week**, to a flattened scalar-outer stand-in that no longer reached through
+`sq->subquery->where` to the nested node. The suite was green about a weaker
+claim.
+
+Week 33 changes more subquery tests than any week so far: Task 1 rewrites every
+hand-built `ColumnRef` / `GroupByColumn` / `AggregateSpec` in nine test files,
+and Tasks 2-5 move queries between rejection and diffed suites wholesale.
+
+**The rule: treat every test this week edits or deletes as a place a capability
+can silently vanish, and for each one name the assertion that left and where it
+went.** The round-4 audit did exactly this for `NoLongerRefusesALargeInSet` and
+found nothing lost — that is the standard, and it is cheap when done per-edit and
+impossible when done at the end.
+
+### Implementation guidance
+
+- **Task 1's test churn is spelling-only.** If an assertion changes, that is a
+  behaviour change hiding in a rename. Verify with
+  `git diff --stat` per test file and by reading only the changed lines: they
+  should be constructor arguments, never `EXPECT_*` arguments.
+- **Suite moves are two-sided.** A query leaving `WEEK33_CORRELATED_BINDS` must
+  arrive in a diffed suite in the same commit. A query that leaves and arrives
+  nowhere is a capability that stopped being tested. Diff the suite lists
+  before/after and account for every query.
+- **Add the nesting depth Week 33 introduces.** Q20's shape — `IN` whose body's
+  `WHERE` contains a correlated scalar — is the deepest thing the engine has ever
+  planned, and it is the exact shape that hid Week 32's regression. It needs a
+  unit test that reaches *through* the outer node to the nested one
+  (`sq->subquery->where`), not a flattened stand-in.
+- **Rejection-suite expectations must be updated, not left.** Any `_EXPECT`
+  string still naming "Week 33" after this week is a test passing for the wrong
+  reason.
+
+### Verification — the week's success criteria
+
+1. `cmake --build build -j$(nproc)` clean.
+2. `cd build && ./tests/swiftql_tests` — 0 failures, count **≥** the baseline;
+   every decrease accounted for in the commit message by name.
+3. `python3 python_tools/compare_against_sqlite.py` — green, with the correlated
+   `EXISTS` / `NOT EXISTS` shapes **diffed** rather than rejected, in four modes
+   if Task 6 lands and two if it does not (state which).
+4. Every remaining refusal pinned by message in a rejection suite.
+5. `--no-optimize` and optimized agree on every new query; Volcano and vectorized
+   agree on every query both support.
+6. `development.md` → *Relation slots and query levels* rewritten for the
+   post-refusal world, with a row per consumer stating what makes it safe **now**
+   — not what the refusal used to guarantee.
+
+The `verify` skill runs 1-3 as one gate; run it before claiming any task done,
+and re-run it between Task 1 and Task 2 specifically, because that boundary is
+the one the README requires to be independently green.
