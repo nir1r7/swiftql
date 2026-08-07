@@ -85,6 +85,48 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
     body_conjuncts.clear();
 }
 
+// Condition 2, enforced over the WHOLE body rather than only its WHERE.
+//
+// splitCorrelation reads `body.where` and nothing else, so a correlated ref
+// anywhere ELSE in the body survives into a plan. The one that matters is the
+// body's `JOIN ... ON`: classifyJoinCondition routes a non-local ref to
+// out.residuals (Week 30, working as designed), LogicalPlanBuilder::build folds
+// inner-join residuals into the body's stmt.where AFTER splitCorrelation has run
+// and cleared it, and from there the ref reaches inferExprType and
+// resolveColumnIndex — both of which branch on isLocal() and fall back to a BARE
+// NAME lookup against the body's own merged schema. `d2.team = d.team` became
+// `d2.team = laps.team`: wrong rows, no error, an identical --explain. That is
+// the exact collapse ColumnId exists to prevent, surviving because the fallback
+// resolves instead of throwing.
+//
+// A refusal by name beats a plausible wrong answer, so the shape is declined
+// here rather than half-supported. Extracting ON-clause correlations as join
+// keys is a real feature (it needs the residual/key split to happen before the
+// fold, not after) and it is not this week's.
+//
+// collectSlots is the same maintained walker splitCorrelation uses, and -1 is
+// the same sentinel; an UNRESOLVED ref also maps to -1 and is named in the
+// message rather than mis-diagnosed as correlation (round 1, L-8).
+void refuseSurvivingCorrelatedRefs(const SelectStatement& body) {
+    auto check = [](const Expr* e, const char* where) {
+        if (!e) return;
+        std::unordered_set<int> slots;
+        collectSlots(e, slots);
+        if (slots.find(-1) != slots.end())
+            refuse(std::string("a reference this body cannot name locally survives "
+                               "in its ") + where + " (a correlated reference is "
+                   "lowered only from a top-level equality in the body's WHERE; "
+                   "an unresolved one would report the same)");
+    };
+    for (const auto& j : body.joins)       check(j.condition.get(), "JOIN ... ON clause");
+    for (const auto& e : body.select_list) check(e.get(), "SELECT list");
+    for (const auto& o : body.order_by)    check(o.expr.get(), "ORDER BY");
+    // splitCorrelation guarantees this one is empty of correlated refs. Checked
+    // anyway, because a guarantee that is never tested is the shape this round
+    // has now found twice.
+    check(body.where.get(), "WHERE");
+}
+
 } // namespace
 
 ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spine,
@@ -132,6 +174,7 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         // buildScanSchema and the pruning hint inside a block where it means
         // nothing.
         body.where = conjoinAll(std::move(local));
+        refuseSurvivingCorrelatedRefs(body);
         auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
 
         // !! output_schema is the LEFT child's, NOT a merged schema — the
