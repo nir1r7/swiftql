@@ -1555,6 +1555,27 @@ TEST(SubqueryValidation, ACorrelatedGroupKeyCannotReachPlanConstruction) {
     }
 }
 
+// Week 33. The ColumnId migration must not move one byte of exprKey's output:
+// the string is the identity every aggregate-spec dedupe, every GROUP BY key
+// match and every substituteInto rewrite compares on, so a changed encoding is
+// a semantic change wearing a refactor's clothes. Pinned against the literal
+// text the pre-migration encoder produced.
+TEST(SubqueryDispatch, ExprKeyEncodingIsUnchangedByColumnId) {
+    ColumnRef local;
+    local.column_name = "team";
+    local.id = ColumnId::local(1);
+    EXPECT_EQ(exprKey(&local), "1#team");
+
+    ColumnRef correlated;
+    correlated.column_name = "team";
+    correlated.id = ColumnId::outer(2, 0);
+    EXPECT_EQ(exprKey(&correlated), "^2:0#team");
+
+    ColumnRef unbound;
+    unbound.column_name = "team";
+    EXPECT_EQ(exprKey(&unbound), "team");
+}
+
 // The level prefix has to be prefix-free, or it reintroduces the collision it was
 // added to remove: level 1 / slot 23 and level 12 / slot 3 both rendered
 // "^123#team". Both halves are legal SwiftQL — a 24-relation block plans, and

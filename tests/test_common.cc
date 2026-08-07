@@ -2,6 +2,7 @@
 #include "common/value.h"
 #include "common/schema.h"
 #include "common/date_util.h"
+#include "common/column_id.h"
 
 // ===== value tests =====
 
@@ -182,4 +183,59 @@ TEST(DateUtil, ExtremeIntervalCountsDoNotOverflow) {
     EXPECT_THROW(addMonths("1994-01-01", -kMax), std::runtime_error);
     EXPECT_THROW(addYears("1994-01-01", kMax), std::runtime_error);
     EXPECT_THROW(addYears("1994-01-01", -kMax), std::runtime_error);
+}
+
+// ===== ColumnId (Week 33) =====
+
+// The narrowing point is the whole reason the slot is private. Without this
+// test localSlot() is a comment with extra steps: nothing in the shipped
+// queries reaches it with a correlated id yet, so a future edit that dropped
+// the throw would pass every other test in the suite.
+TEST(ColumnIdTest, LocalSlotRefusesACorrelatedReference) {
+    EXPECT_EQ(ColumnId::local(2).localSlot("test"), 2);
+    EXPECT_EQ(ColumnId::unresolved().localSlot("test"), -1);
+
+    ColumnId correlated = ColumnId::outer(1, 0);
+    EXPECT_THROW(correlated.localSlot("test"), std::runtime_error);
+    // ...and the message names the caller, so a planner defect points at itself
+    try {
+        correlated.localSlot("SomeConsumer");
+        ADD_FAILURE() << "a correlated id must not narrow to a local slot";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("SomeConsumer"), std::string::npos)
+            << e.what();
+    }
+}
+
+// unresolved() must be (level 0, slot -1), not (-1, -1): -1 is the "resolve by
+// bare name" sentinel that every hand-built test tree and every single-relation
+// consumer relies on, and a non-zero level on it would make isLocal() false for
+// every unbound ref in the engine.
+TEST(ColumnIdTest, UnresolvedIsLocalAndUnresolved) {
+    ColumnId u;
+    EXPECT_TRUE(u.isLocal());
+    EXPECT_FALSE(u.isResolved());
+    EXPECT_EQ(u, ColumnId::unresolved());
+}
+
+// Decorrelation (Week 33's feature half) moves a reference to the block that
+// supplies it, which is exactly a level decrement. The arithmetic lives on the
+// type so it has one home rather than being open-coded at each rewrite site.
+TEST(ColumnIdTest, OutwardDecrementsTheLevelAndKeepsTheSlot) {
+    EXPECT_EQ(ColumnId::outer(1, 3).outward(), ColumnId::local(3));
+    EXPECT_EQ(ColumnId::outer(2, 3).outward(), ColumnId::outer(1, 3));
+    EXPECT_THROW(ColumnId::local(0).outward(), std::runtime_error);
+}
+
+// couldBeSameRelation is checkGroupedRefs' matching rule, and both halves are
+// load-bearing: the LEVEL must match exactly (a correlated group key must not
+// satisfy an ungrouped local column of the same name -- Week 30 round 2), while
+// an UNRESOLVED id on either side stays a wildcard, which is what lets a
+// hand-built or single-relation tree match a stamped key.
+TEST(ColumnIdTest, CouldBeSameRelationComparesLevelsExactlyAndSlotsLoosely) {
+    EXPECT_TRUE(ColumnId::local(1).couldBeSameRelation(ColumnId::local(1)));
+    EXPECT_FALSE(ColumnId::local(1).couldBeSameRelation(ColumnId::local(0)));
+    EXPECT_FALSE(ColumnId::local(0).couldBeSameRelation(ColumnId::outer(1, 0)));
+    EXPECT_TRUE(ColumnId::unresolved().couldBeSameRelation(ColumnId::local(3)));
+    EXPECT_FALSE(ColumnId::unresolved().couldBeSameRelation(ColumnId::outer(1, 3)));
 }
