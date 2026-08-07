@@ -763,6 +763,38 @@ TEST(ExistsDecorrelation, AnAliasInTheBodysSelectListCannotShadowTheJoinKey) {
     ASSERT_EQ(body.size(), 1) << "the body must be projected to its key columns only";
     EXPECT_EQ(body.column(0).name, "driver_id")
         << "and it must be the KEY column, not the aliased one";
+    // !! THE TYPE IS WHAT MAKES THIS TEST ABLE TO FAIL (round 2 R2-M1). The alias
+    // in the query IS `driver_id`, so on the pre-fix code buildProjectSchema
+    // produced a size-1 schema named `driver_id` too and BOTH assertions above
+    // passed while the semi-join probed d.driver_id against laps.speed. Only the
+    // type separates the two states: the key column l.driver_id is INT, the
+    // aliased l.speed is DOUBLE.
+    EXPECT_EQ(body.column(0).type, TypeId::INT)
+        << "the aliased column is l.speed (DOUBLE); INT proves this is the key";
+}
+
+// The interaction round 2 flagged as unaudited: a body ORDER BY must survive the
+// select-list replacement. It does, and it is correct rather than lucky --
+// LogicalPlanBuilder places Sort BELOW Project, so the sort key resolves against
+// the pre-projection schema, and buildScanSchema keeps ORDER BY columns in
+// `required`. It could only change the ANSWER together with a LIMIT (a different
+// prefix of a different order), and requireDecorrelatableBody refuses a body
+// LIMIT outright. All three shapes below match SQLite (20).
+TEST(ExistsDecorrelation, ABodyOrderByOutlivesTheSelectListReplacement) {
+    Catalog cat(CATALOG);
+    for (const char* sql : {"SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+                            "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id "
+                            " ORDER BY l.speed)",
+                            "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+                            "(SELECT l.lap_id FROM laps l WHERE l.driver_id = d.driver_id "
+                            " ORDER BY l.speed)"}) {
+        std::unique_ptr<LogicalPlanNode> plan;
+        ASSERT_NO_THROW(plan = planLowered(sql, cat)) << sql;
+        const LogicalJoin* j = findJoin(plan.get());
+        ASSERT_NE(j, nullptr) << sql;
+        EXPECT_EQ(j->children[1]->output_schema.size(), 1) << sql;
+        EXPECT_EQ(j->children[1]->output_schema.column(0).name, "driver_id") << sql;
+    }
 }
 
 // M-3 (round 1): the correlated conjunct is removed from body.where BEFORE the

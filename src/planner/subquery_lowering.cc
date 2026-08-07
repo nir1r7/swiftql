@@ -99,19 +99,29 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
         // this rule, and a comment saying so did not stop it.
         join->semantics = sq->negated ? JoinSemantics::ANTI_NOT_IN : JoinSemantics::SEMI;
 
-        // Assert the containment rather than leaving it as an observation: this
-        // single check is what replaces an audit round.
-        const auto& jc = join->output_schema.columns();
-        const auto& lc = join->children[0]->output_schema.columns();
-        bool same = jc.size() == lc.size();
-        for (size_t i = 0; same && i < jc.size(); ++i) {
-            same = jc[i].name == lc[i].name && jc[i].type == lc[i].type
-                && jc[i].relation_slot == lc[i].relation_slot;
-        }
-        if (!same) {
-            throw std::runtime_error(
-                "internal: semi/anti join output schema must be its left child's");
-        }
+        // THE CONTAINMENT: this join's output schema is its LEFT child's, never a
+        // merged one -- the invariant that keeps the body's slot numbering out of
+        // the outer plan.
+        //
+        // A loop comparing join->output_schema against
+        // join->children[0]->output_schema STOOD HERE and was DELETED, because it
+        // could not fail: left_schema is copied from spine->output_schema on the
+        // line above and passed as the join's output_schema, children[0] IS that
+        // spine, and the unique_ptr move does not touch its schema. It compared a
+        // copy of one object with the object. It was introduced as the single
+        // check "that replaces an audit round", which is the worst thing a dead
+        // assertion can be: it reads as a guarantee and stops anyone looking.
+        //
+        // Where the property is ACTUALLY enforced, on objects that are genuinely
+        // different and can genuinely diverge:
+        //   - VectorizedPlanBuilder compares each LOWERED input's schema size
+        //     against the logical child's before building the operator;
+        //   - VecHashJoinNode's constructor throws unless output_schema_ has the
+        //     same size as the LOWERED probe child's schema -- a schema derived
+        //     through the vectorized lowering, not a copy of this one;
+        //   - rightKeyIndices(positional) throws unless the build input's schema
+        //     is exactly the key tuple.
+        // Those three run on every semi/anti join the CLI builds.
 
         spine = std::move(join);
         ++out.lowered;

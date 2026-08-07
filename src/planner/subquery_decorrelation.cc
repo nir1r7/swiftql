@@ -67,8 +67,20 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
         const bool l_outer = !l->id.isLocal();
         const bool r_outer = !r->id.isLocal();
         if (l_outer == r_outer)
-            refuse("a correlated equality must compare one column of the "
-                   "subquery with one of the enclosing query");
+            // Both branches of l_outer == r_outer land here, and they are not the
+            // same fault. BOTH-OUTER is a genuine correlation this cannot key on.
+            // BOTH-LOCAL means the conjunct reached here only because collectSlots
+            // returned -1 for an UNRESOLVED ref -- an unresolved id reports
+            // isLocal() == true -- so there is no correlation in it at all. The
+            // message used to name only the first, diagnosing a query with no
+            // correlated reference as a correlation error (round 1, L-8).
+            refuse(l_outer
+                   ? "a correlated equality must compare one column of the "
+                     "subquery with one of the enclosing query (both sides name "
+                     "an enclosing query)"
+                   : "a column reference in this body could not be resolved to "
+                     "any relation, so the conjunct cannot be classified as "
+                     "local or correlated");
 
         const ColumnRef* body_side  = l_outer ? r : l;
         const ColumnRef* outer_side = l_outer ? l : r;
@@ -113,6 +125,17 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
 // here rather than half-supported. Extracting ON-clause correlations as join
 // keys is a real feature (it needs the residual/key split to happen before the
 // fold, not after) and it is not this week's.
+//
+// IS THE REFUSAL NARROWER THAN IT NEEDS TO BE? Yes, and by a known amount, so
+// record the boundary rather than leave the next reader to rediscover it. For an
+// INNER join ON and WHERE are interchangeable -- R (join)_(p and q) S is
+// sigma_q(R (join)_p S), which is the identity join_condition.h already relies on
+// to route residuals -- so a correlated conjunct in an INNER join's ON could be
+// treated exactly as one in the body's WHERE and become a key. For a LEFT OUTER
+// join they are NOT interchangeable (a residual there decides null-extension,
+// not row survival), so that half must stay refused whatever else changes. The
+// refusal is uniform today because splitting it means moving the extraction
+// ahead of the residual fold, which is the feature above.
 //
 // collectSlots is the same maintained walker splitCorrelation uses, and -1 is
 // the same sentinel; an UNRESOLVED ref also maps to -1 and is named in the
@@ -233,18 +256,29 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         // whole result and a NULL correlated key dropped a row SQL keeps.
         join->semantics = sq->negated ? JoinSemantics::ANTI : JoinSemantics::SEMI;
 
-        // Assert the containment rather than leaving it as an observation, the
-        // same single check subquery_lowering.cc makes in place of an audit round.
-        const auto& jc = join->output_schema.columns();
-        const auto& lc = join->children[0]->output_schema.columns();
-        bool same = jc.size() == lc.size();
-        for (size_t i = 0; same && i < jc.size(); ++i) {
-            same = jc[i].name == lc[i].name && jc[i].type == lc[i].type
-                && jc[i].relation_slot == lc[i].relation_slot;
-        }
-        if (!same)
-            throw std::runtime_error(
-                "internal: semi/anti join output schema must be its left child's");
+        // THE CONTAINMENT: this join's output schema is its LEFT child's, never a
+        // merged one -- the invariant that keeps the body's slot numbering out of
+        // the outer plan.
+        //
+        // A loop comparing join->output_schema against
+        // join->children[0]->output_schema STOOD HERE and was DELETED, because it
+        // could not fail: left_schema is copied from spine->output_schema on the
+        // line above and passed as the join's output_schema, children[0] IS that
+        // spine, and the unique_ptr move does not touch its schema. It compared a
+        // copy of one object with the object. It was introduced as the single
+        // check "that replaces an audit round", which is the worst thing a dead
+        // assertion can be: it reads as a guarantee and stops anyone looking.
+        //
+        // Where the property is ACTUALLY enforced, on objects that are genuinely
+        // different and can genuinely diverge:
+        //   - VectorizedPlanBuilder compares each LOWERED input's schema size
+        //     against the logical child's before building the operator;
+        //   - VecHashJoinNode's constructor throws unless output_schema_ has the
+        //     same size as the LOWERED probe child's schema -- a schema derived
+        //     through the vectorized lowering, not a copy of this one;
+        //   - rightKeyIndices(positional) throws unless the build input's schema
+        //     is exactly the key tuple.
+        // Those three run on every semi/anti join the CLI builds.
 
         spine = std::move(join);
         ++out.lowered;

@@ -785,6 +785,18 @@ WEEK33_DECORRELATED_VEC_ONLY = [
     "SELECT COUNT(*) FROM drivers d WHERE NOT EXISTS "
     "(SELECT * FROM laps l JOIN drivers t ON l.lap_id = t.driver_id "
     " WHERE t.team = d.team)",
+    # Round 2 left this unaudited: a body ORDER BY must outlive the select-list
+    # replacement the H-1/H-2/M-3 fix performs. It does -- Sort is placed BELOW
+    # Project so the sort key resolves against the pre-projection schema -- and
+    # it can only change the ANSWER together with a LIMIT, which
+    # requireDecorrelatableBody refuses. Diffed rather than argued.
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id ORDER BY l.speed)",
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT l.lap_id FROM laps l WHERE l.driver_id = d.driver_id ORDER BY l.speed)",
+    "SELECT COUNT(*) FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.season = 1900 "
+    " ORDER BY l.sector_1)",
 ]
 
 # The other half of that capability difference, asserted so the boundary cannot
