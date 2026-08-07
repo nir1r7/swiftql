@@ -691,6 +691,17 @@ range table — the only layer that can.
 schema slots. Narrowing happens where a binder slot is handed to them, which is
 what every `localSlot(...)` call site in the tables below is.
 
+**The concrete case that justifies the 87 sites.** Recorded so nobody proposes
+simplifying `ColumnId` back to an `int`. `inferExprType` (dispatch site 12)
+resolved a `ColumnRef` *slot-first* against the schema of the block being
+planned. For a correlated ref that slot indexes an **enclosing** block's range
+table — and pre-migration the lookup would not have failed, because `team` and
+`driver_id` exist in *both* shipped tables, so `indexOf("team", 0)` against the
+wrong schema is a clean **hit**. `inferExprType` would have returned the wrong
+relation's column type and carried on. After the migration it throws, naming
+itself, and it was found on the first correlated query ever planned — minutes
+after Week 33 removed the refusal, not by an audit round.
+
 **What this replaces.** The tables below used to be the containment: a prose list
 that a consumer could be missing from, and twice was. They are now the *audit
 trail* for a containment the compiler enforces. Adding a consumer still means
