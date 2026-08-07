@@ -375,7 +375,9 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 > and `JOIN ... ON` each refuse with their own message: no TPC-H query puts one
 > elsewhere, and allowing one in a select list would make `buildProjectSchema`
 > type it and `aggregateOutputName` name an output column after it. `FROM
-> (subquery)` is Week 34.
+> (subquery)` is a derived table, added in Week 34 — a different construct
+> (a `TableRef`, i.e. a RELATION of the block) rather than an extension of this
+> position rule.
 >
 > **A subquery is the first nested scope in this engine.** `ColumnRef` carries a
 > `query_level` beside its `relation_slot`: the slot is a position in the range
@@ -647,7 +649,7 @@ consumers nobody had listed — twice at sites found only when this table was
 itself audited for completeness. This table is the list. Add a row when you add a
 consumer, and re-check every "contained" row on the day a new nested-scope
 construct lands (Week 31's uncorrelated subqueries — done, see below; Week 32's
-semi-/anti-joins; Week 34's derived tables).
+semi-/anti-joins; Week 34's derived tables — done, see below).
 
 **A missing row is worse than a wrong one.** A future week reads this as
 already-checked and skips the verification. `ChunkPruner` was absent from both
@@ -775,8 +777,26 @@ by a row below:
 `lowerInSubqueries` asserts the schema equality at construction. That single
 assertion is what keeps the two domains from meeting.
 
-**Week 34's derived tables break this containment for real**, because a derived
-table's columns *are* in scope above it.
+**Week 34's derived tables broke this containment for real, and here is what
+replaced it.** A derived table's columns *are* in scope above it, so keeping the
+body's numbering out is not available. Week 34 **normalizes** instead: a derived
+relation's own `output_schema` is stamped **slot 0** — exactly as a leaf scan's
+own schema is — by `derivedRelationSchema` (`logical_plan.cc`), and the OUTER
+slot is applied only by the merged join schema, by the same loop that stamps a
+base relation. So what enters the outer plan carries outer numbering and nothing
+else, and every `indexOf(name, slot)` above the graft is again answering a
+question about one range table.
+
+The two containments now coexist and cover different constructs:
+
+| Construct | Containment | Enforced by |
+|---|---|---|
+| `SEMI`/`ANTI` join (Weeks 32–33) | The body is never in scope above the node: `output_schema` **is** `children[0]`'s | The assertion in `subquery_lowering.cc`, `VecHashJoinNode`'s width check, `rightKeyIndices` |
+| Derived relation (Week 34) — `FROM (subquery)`, and the right side of a decorrelated correlated scalar | The body **is** in scope, and is normalized to one outer slot | `derivedRelationSchema`, plus the drift check in `buildRelation` comparing `blockOutputSchema` against the built plan |
+
+A `STANDARD` join over a `LogicalDerived` — which Week 34's correlated-scalar
+rewrite builds — relies on the second and is a wrong answer under the first
+alone.
 
 ### Week 32 consumers (one plan, two range tables)
 
@@ -815,6 +835,30 @@ marked **guarded**; the rest are contained only.
 | `Planner::plan`, `VectorizedPlanBuilder` | Merged-schema stamping and pruning-hint slot sets |
 | `materializeSubqueries` / `buildReplacement` (`subquery_materialization.cc`, Week 31) | **Reads no slot, safe by PRECONDITION — and the precondition is named here rather than assumed:** `Validator::validate` refuses a correlated statement first, so this pass only ever meets an uncorrelated `SubqueryExpr`, whose body is a self-contained query block. It moves the `IN` operand (already bound, level 0, this block's) into the substituted `InExpr` and copies nothing else. If a later week lets it run before validation, or on a correlated node, this row is void |
 | `forEachSubquery` / `collectQueryTables` (`subquery_materialization.cc`, Week 31) | Reads no slot. Dispatch site 19, and the one walker that deliberately descends INTO the body — materialization asks "which statements must run, in what order", which is not a scope question. It reaches no `ColumnRef` at all |
+
+### Week 34 consumers (a range-table entry that is a plan)
+
+Added under the rule this file states for itself: add a row when you add a
+consumer, and re-check every "contained" row on the day a new nested-scope
+construct lands. A missing row is worse than a wrong one.
+
+| Consumer | Status |
+|---|---|
+| `derivedRelationSchema` (`logical_plan.cc`) | **The producer of the containment.** Renames by the column-alias list, stamps every column `relation_slot = 0`, and REFUSES two output columns of one name — a base table cannot have them, a derived table can, and then *both* `indexOf` overloads are a coin flip |
+| `blockOutputSchema` (`logical_plan.cc`) | **Safe by sharing, and checked.** The Binder needs the derived schema before `build` has run, so this composes the same helpers `build` uses (`buildScanSchema` / `extractAggregates` / `buildAggregateSchema` / `buildProjectSchema`). A private second derivation would be the two-paths drift Weeks 26/28/30 each undid, and the two would have to agree on `aggregateOutputName`, `hidden` columns and `SELECT *` expansion |
+| `buildRelation` (`logical_plan.cc`) | **The drift check.** Asserts the planned subtree's `output_schema` equals the one the Binder resolved against, column for column. It compares objects from two different code paths, so it CAN fail — unlike the assertion Week 33 deleted for comparing a copy of an object with the object |
+| `Binder::relationSchema` (`binder.cc`) | **Level-aware by construction, and the LATERAL rule.** Binds the body against `parent`, never the scope being built, so sibling `FROM` items are invisible; a reference reaching further out marks the body correlated and is refused by name. Known boundary: at top level there is no parent, so a lateral reference reports as an ordinary unresolved qualifier — a sibling genuinely is not in scope and the Binder cannot tell a lateral reference from a typo. Both halves are pinned in the rejection suite |
+| `Validator::validateQuery` (`validator.cc`) | **Rebuilt around ONE range table.** It previously recomputed the same keying four times (FROM schema, the SUM/AVG slot arithmetic, the join-condition `relations` vector, the GROUP BY existence check). The SUM/AVG check resolved slot *k* through `catalog.getTable(joins[k-1].join_table)`, which has no answer for a derived relation — it now resolves through the range table, the same move Week 30 round 2 made for the correlated half |
+| `TableRef::tableName(site)` (`ast.h`) | **The narrowing point, and the same discipline as `ColumnId::localSlot(site)`.** `table_name_` is private; every read states by name that its caller believes the relation is a catalog table, and throws otherwise |
+| `countRelations` (`join_enumeration.cc`) | **Corrected.** Counted SCANS recursively, which equals the range-table size only while every scan belongs to this block. A derived relation is ONE relation whose body may hold many (over-count); a semi/anti `children[1]` is not a relation at all (also counted). It counts the spine now |
+| `hasSlotOutsideRangeTable` (`join_enumeration.cc`) | **Does NOT fire for a derived relation**, contrary to what Weeks 28–31 all predicted. With `countRelations` right, a derived relation has an in-range slot and the search reorders it normally (`method=dp`, optimized ≡ `--no-optimize`). No reported decline was added: Week 30's condition for earning one is that a supported query pays a real cost, and none does |
+| `joinCardinality`'s no-statistics branch | **NEWLY LIVE, and this is the real consequence.** A derived relation has no `TableStats`, so `max(l, r)` — not multiplicative — runs on a query the CLI can type, and optimal substructure fails for any subset containing one. The containment is unchanged and is the written-order bound in `reorder()` (Week 28). Week 28 recorded that `method=written-floor` had never executed; it is reachable now |
+| `leafScanTable` / `leafScanTableOf` / `isSingleRelation` | **Stop at the node.** All three descended `children[0]` to a `SCAN` and returned the BODY's base table for a derived leaf, attributing one table's `avg_width` to another relation's columns — the attribution error Week 27 refused to make. Nullable now; the callers fall back to the uniform proxy |
+| `collectSlotTables` (`vectorized_plan_builder.cc`) | **Skips a derived `children[1]`** rather than stamping the body's table at a real slot. Its rationale block was also corrected for the fourth time: its discarded alternative argument rested on "no STANDARD join is ever built above a semi join", which Week 34's correlated-scalar rewrite makes routine |
+| `PredicatePushdown::distribute` / `filterOnto` | **Safe, and the reason is `filterOnto`'s WRAPPING.** A conjunct routed to a derived relation lands as a `LogicalFilter` ABOVE the `LogicalDerived`, which is a filter on the derived table's output — correct even when the body has `GROUP BY`, `LIMIT` or `DISTINCT`, where descending would be a wrong answer. `restampSlots(c, 0)` stays correct *because of* the slot-0 normalization; that dependency is stated here rather than assumed |
+| `Lowering::lowerNode` DERIVED case / `VecDerivedNode` | **Reads no slot.** Forwards chunks unchanged and reports the renamed schema, which has to reach the physical layer because `resolveColumnIndex` and every `indexOf` above the graft look the new names up |
+| `lowerCorrelatedScalars` (`subquery_decorrelation.cc`) | **Builds a `LogicalDerived`, not a special case.** Its slot is `range_table_size + n`, one past the last the Binder issued, and it is a real merged-schema slot because the outer `WHERE` reads the aggregate's column. The join is **LEFT**: a zero-row group must yield NULL, not a dropped outer row |
+| `Planner::plan` | **Refuses.** Third Volcano capability refusal, after Week 32's `IN` and Week 33's correlated. It builds its scan from a catalog name and one `HashJoinNode`, so there is no shape there that can hold a relation which is a plan |
 
 ### Null constants (Week 31)
 
