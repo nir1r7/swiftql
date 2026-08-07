@@ -162,9 +162,24 @@ def gen_part(rng, n):
 
 
 def gen_supplier(rng, n):
+    # Q16's anti-join filters `s_comment LIKE '%Customer%Complaints%'`. dbgen
+    # seeds that phrase into 5 suppliers per 10,000; at every scale factor this
+    # project can run (SF <= 0.1, i.e. <= 1000 suppliers) that rate rounds to
+    # ZERO -- the subquery matches nothing, so Q16 returns the same answer with
+    # the whole NOT IN deleted. That was MEASURED: byte-identical 305 rows, a
+    # vacuous pass counted as an answer until the round-1 audit found it.
+    #
+    # So the phrase is seeded at a rate that survives a small scale factor: one
+    # supplier in twenty, minimum one. That is DENSER than the spec's rate, and
+    # it is a distribution deviation of exactly the kind PROVENANCE.txt already
+    # declares -- the domain is the spec's, the distribution is not.
+    complainers = set(rng.sample(range(1, n + 1), max(1, n // 20)))
     rows = []
     for k in range(1, n + 1):
         nk = rng.randint(0, 24)
+        comment = _comment(rng, 3, 10)
+        if k in complainers:
+            comment = "Customer " + comment + " Complaints"
         rows.append([
             k,
             "Supplier#{:09d}".format(k),
@@ -172,7 +187,7 @@ def gen_supplier(rng, n):
             nk,
             _phone(rng, nk),
             round(rng.uniform(-999.99, 9999.99), 2),
-            _comment(rng, 3, 10),
+            comment,
         ])
     return rows
 
