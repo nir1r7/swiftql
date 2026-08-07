@@ -1,25 +1,16 @@
 # Phase 5 orchestrator state
-Current: week 33 — CLOSING GATE running (abcb1040a09244085, launched 13:33 UTC) at faae614.
-  R2-C1 fixed two ways (lowerInSubqueries declines a correlated node by the Binder's FLAG, not
-  an inherited precondition; refuseUnloweredCorrelated now runs BEFORE refuseUnloweredIn at
-  both call sites). Unit test asserts NO PLAN IS BUILT, since a plan is the bug.
-  !! THE CLASS SWEEP IS THE WEEK'S BIGGEST RESULT: 7 MORE stale preconditions found and fixed
-  — including the HEADER OF THE VERY FILE the earlier fix repaired (same class, missed),
-  dispatch sites 12 and 13, predicate_pushdown.cc x2, ast.h, validator.h, and validator.cc
-  where the old containment stood in the PRESENT TENSE immediately above the note saying it
-  was removed. Plus 4 checked-and-still-true, which is what makes the sweep trustworthy.
-  M-5's second half was REJECTED BY RUNNING THE CODE: a subquery in SELECT list/ORDER BY is
-  refused by the position rule, so the guard there would be unreachable.
-  M-4 tautological loops DELETED (they compared a copy of an object with the object).
-  Nothing from either audit is open.
-  LESSON FOR EVERY REMAINING WEEK: after removing a refusal/guard/invariant, sweep every
-  comment, precondition, assertion and header that cites it. Three wrong answers this week
-  came from that one shape, and two of them lived in header comments.
+Current: week 34, round 1, step 1 (teach) — launching ~13:45 UTC.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
-Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
-Last gate: GREEN (week 33 round 3) — unit 783/783, sqlite 1052, regression 318 all modes;
-  staleness disproved down to per-.o timestamps. Parallel gate+audit is permitted again.
+Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
+Last gate: GREEN (week 33 round 4, closing) — unit 786/786, sqlite 1076, regression 318 all
+  modes; staleness disproved. Week 33 took 4 gates (one RED) and 2 audits.
+Week 33 verdict: CHECKPOINT PARTIALLY MET. EXISTS/NOT EXISTS decorrelation works (Q4, Q21);
+  correlated SCALAR (Q17, Q22's correlated half) is REFUSED — blocked on derived-table
+  range-table entries, which is Week 34's core deliverable and now Week 34's explicit ownership.
+  The "retain a correct fallback" bullet shipped as a REFUSAL, recorded as a conscious deviation.
+  Three silent wrong answers were found and fixed this week, all one shape: code trusting a
+  refusal that had been deleted. Two lived in header comments.
 Previous: RED (week 33 round 2) — the phase's first and so far only red gate.
   build PASS (verified not stale); unit 769/775 with 6 SubqueryValidation/SubqueryMaterialization
   failures; sqlite 952 passed / 56 failed / 4 errors, first being "expected a rejection, got
