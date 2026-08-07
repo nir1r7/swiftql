@@ -142,6 +142,12 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         auto join = std::make_unique<LogicalJoin>(
             std::move(spine), std::move(body_plan), std::move(keys),
             /*join_slot=*/-1, left_schema);
+        // ANTI, never ANTI_NOT_IN. This is where the header's central claim is
+        // ENFORCED rather than asserted: NOT EXISTS is two-valued, so Week 32's
+        // unmatchable-key machinery must not reach it. Until Week 33 round 2
+        // both lowerings named the same enumerator and the operator had no way
+        // to tell them apart, so one NULL in the body's key column emptied the
+        // whole result and a NULL correlated key dropped a row SQL keeps.
         join->semantics = sq->negated ? JoinSemantics::ANTI : JoinSemantics::SEMI;
 
         // Assert the containment rather than leaving it as an observation, the

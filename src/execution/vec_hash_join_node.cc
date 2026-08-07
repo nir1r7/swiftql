@@ -220,7 +220,12 @@ DataChunk* VecHashJoinNode::nextChunk() {
         // substitution site: UNKNOWN and FALSE are indistinguishable to every
         // consumer reachable from a WHERE, and nothing this week adds a general
         // NOT. See docs/week-32-plan.md 8.
-        if (semantics_ == JoinSemantics::ANTI && build_had_unmatchable_key_) {
+        // ANTI_NOT_IN ONLY. A decorrelated NOT EXISTS is JoinSemantics::ANTI
+        // and must NOT take this branch: EXISTS is never UNKNOWN, so a NULL in
+        // the BODY's key column makes that body row fail to match and nothing
+        // more. Taking it for ANTI returned ZERO ROWS for the whole query where
+        // SQLite returns a full set (docs/week-33-plan.md, round 2).
+        if (semantics_ == JoinSemantics::ANTI_NOT_IN && build_had_unmatchable_key_) {
             stats.rows_in += static_cast<int>(indices_ptr->size());
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             continue;   // pull the next probe chunk; this one contributes nothing
@@ -240,8 +245,29 @@ DataChunk* VecHashJoinNode::nextChunk() {
                 // nothing to compare against — which is why the empty case is
                 // tested on build_keys_ rather than folded in here.
                 if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) {
-                    if (semantics_ == JoinSemantics::ANTI && build_keys_.empty()
-                        && !build_had_unmatchable_key_) {
+                    // A NULL probe key matches nothing. The three semantics part
+                    // HERE, and this is the whole reason ANTI and ANTI_NOT_IN
+                    // are separate enumerators:
+                    //   SEMI          — `NULL IN S` is UNKNOWN, and EXISTS over
+                    //                   an unsatisfiable equality is FALSE.
+                    //                   Emits nothing either way.
+                    //   ANTI          — NOT EXISTS, two-valued. The correlated
+                    //                   equality is UNKNOWN for every body row,
+                    //                   so the body yields none, EXISTS is FALSE
+                    //                   and NOT EXISTS is TRUE. The row is
+                    //                   emitted UNCONDITIONALLY — whether the
+                    //                   build side is empty has nothing to do
+                    //                   with it.
+                    //   ANTI_NOT_IN   — three-valued. `NULL NOT IN S` is UNKNOWN
+                    //                   for a non-empty S, which a WHERE drops;
+                    //                   `x NOT IN ()` is TRUE for any x, which
+                    //                   is why the empty case is tested on
+                    //                   build_keys_ rather than folded in.
+                    const bool emit =
+                        semantics_ == JoinSemantics::ANTI
+                        || (semantics_ == JoinSemantics::ANTI_NOT_IN
+                            && build_keys_.empty() && !build_had_unmatchable_key_);
+                    if (emit) {
                         Row out_row;
                         out_row.reserve(output_schema_.size());
                         for (const auto& cv : probe_chunk->columns) out_row.push_back(valueAt(cv, r));
@@ -374,6 +400,7 @@ std::string VecHashJoinNode::explain() const {
     std::string s = "VecHashJoin [";
     if (semantics_ == JoinSemantics::SEMI)      s = "VecSemiHashJoin [";
     else if (semantics_ == JoinSemantics::ANTI) s = "VecAntiHashJoin [";
+    else if (semantics_ == JoinSemantics::ANTI_NOT_IN) s = "VecAntiHashJoin [NOT IN, ";
     else if (left_outer_)                       s = "VecLeftHashJoin [";
     for (size_t i = 0; i < from_idx.size(); ++i) {
         if (i) s += " AND ";

@@ -563,7 +563,9 @@ TEST(SemiJoinLowering, NotInBecomesAnAntiJoin) {
                             "(SELECT driver_id FROM drivers)", cat);
     const LogicalJoin* j = findJoin(plan.get());
     ASSERT_NE(j, nullptr);
-    EXPECT_EQ(j->semantics, JoinSemantics::ANTI);
+    // ANTI_NOT_IN, not ANTI: NOT IN is three-valued, and pinning the exact
+    // enumerator is what stops the two negations being merged again.
+    EXPECT_EQ(j->semantics, JoinSemantics::ANTI_NOT_IN);
     // This line was `EXPECT_NE(plan->explain().find(""), npos)` — find("")
     // returns 0 for every string, so it read as a check and could not fail. The
     // whole-plan needle it implies does not exist either: LogicalPlanNode's

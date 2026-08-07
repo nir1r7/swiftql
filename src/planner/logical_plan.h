@@ -74,10 +74,27 @@ struct LogicalScan : LogicalPlanNode {
 // clause, and SEMI/ANTI are never written — they are lowering artifacts. Adding
 // them there would make `stmt.joins[i].join_type == SEMI` representable and
 // unreachable, and grow a dead case in every parser and validator switch.
+//
+// Week 33 SPLIT ANTI IN TWO, and the split is the point: the two negations do
+// NOT agree on NULL, and one enumerator carrying both is how NOT IN's rule was
+// silently applied to NOT EXISTS. Keep the textbook meaning on the plain name so
+// that a reader who writes ANTI gets relational algebra, and make the special
+// case wear the special name.
 enum class JoinSemantics {
     STANDARD,  // ordinary equi-join; join_type says INNER or LEFT
     SEMI,      // emit each children[0] row AT MOST ONCE, when a match exists
-    ANTI       // emit each children[0] row when NO match exists
+    // The textbook anti-join, and exactly NOT EXISTS. TWO-VALUED: EXISTS is a
+    // pure existence test that is never UNKNOWN, so a NULL key on either side
+    // simply fails to match and the children[0] row SURVIVES.
+    ANTI,
+    // ANTI plus NOT IN's THREE-VALUED rule (Week 32), which is not a property of
+    // anti-join at all but of the predicate lowered to it: `x NOT IN S` is never
+    // TRUE when S holds a NULL, and `NULL NOT IN S` is UNKNOWN unless S is
+    // empty. Both facts are unrepresentable in a match/no-match probe, so they
+    // are carried here and applied in VecHashJoinNode's probe loop. Produced by
+    // subquery_lowering.cc ONLY. Anything else that reaches for a negated join
+    // wants ANTI.
+    ANTI_NOT_IN
 };
 
 // equi-join, INNER by default. keys[k].from_col resolves against children[0]'s schema,

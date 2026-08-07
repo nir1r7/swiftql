@@ -4251,10 +4251,20 @@ TEST(VecSemiJoin, AnEmptyBuildSideEmitsNothingAndAntiEmitsEverything) {
 // neither. So the ANTI join emits NOTHING AT ALL — not "everything that did not
 // match". Without the flag carried out of the build phase, this returns rows
 // 3 and 4 and SQLite disagrees the moment a NULL appears.
-TEST(VecAntiJoin, ANullOnTheBuildSideEmitsNothingAtAll) {
-    auto join = nullableSemiJoin(JoinSemantics::ANTI, kFourProbeRows,
+TEST(VecAntiJoin, ANullOnTheBuildSideEmitsNothingAtAllForNotIn) {
+    auto join = nullableSemiJoin(JoinSemantics::ANTI_NOT_IN, kFourProbeRows,
                                  {{Value(int64_t(1))}, {Value::null()}});
     EXPECT_TRUE(drainRows(*join).empty());
+}
+
+// ...and the OTHER anti-join does the opposite, which is why the enumerator was
+// split. NOT EXISTS is two-valued: a NULL in the body's key column is one body
+// row that fails to match, nothing more. Emptying the whole result here returned
+// {} for a query SQLite answers with a full set. Week 33 round 2.
+TEST(VecAntiJoin, ANullOnTheBuildSideIsJustAnUnmatchableKeyForNotExists) {
+    auto join = nullableSemiJoin(JoinSemantics::ANTI, kFourProbeRows,
+                                 {{Value(int64_t(1))}, {Value::null()}});
+    EXPECT_EQ(pids(drainRows(*join)), (std::vector<int64_t>{2, 3, 4}));
 }
 
 // The positive form is unaffected: a NULL simply never matches, so the non-null
@@ -4277,14 +4287,30 @@ TEST(VecSemiJoin, ANullProbeKeyIsDroppedUnlessTheBuildSideIsEmpty) {
                                                {{Value(int64_t(1))}}))),
               (std::vector<int64_t>{1}));
     // `NULL NOT IN (1)` is UNKNOWN and `1 NOT IN (1)` is FALSE -> nothing.
-    EXPECT_TRUE(drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows,
+    EXPECT_TRUE(drainRows(*nullableSemiJoin(JoinSemantics::ANTI_NOT_IN, probe_rows,
                                             {{Value(int64_t(1))}})).empty());
     // ...and the one asymmetry: `x NOT IN ()` is TRUE even for a NULL x, since
     // there is nothing to compare against. Both rows survive, NULL included.
-    auto empty_build = drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows, {}));
+    auto empty_build = drainRows(*nullableSemiJoin(JoinSemantics::ANTI_NOT_IN, probe_rows, {}));
     ASSERT_EQ(empty_build.size(), 2u);
     EXPECT_TRUE(empty_build[0][0].isNull());
     EXPECT_EQ(empty_build[1][0].asInt(), 1);
+}
+
+// The NOT EXISTS half, and it does not have that asymmetry because it does not
+// have the rule. A NULL correlated key makes the body's equality UNKNOWN for
+// every body row, so the body yields nothing, EXISTS is FALSE and NOT EXISTS is
+// TRUE — the outer row survives WHATEVER the build side holds. Before the split
+// this row was dropped against a non-empty build side, which is a row SQL keeps.
+TEST(VecAntiJoin, ANullProbeKeySurvivesForNotExistsWhateverTheBuildSideHolds) {
+    const std::vector<Row> probe_rows = {{Value::null()}, {Value(int64_t(1))}};
+    // non-empty build side: the NULL row survives, and pid=1 matches so it does not
+    auto nonempty = drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows,
+                                                {{Value(int64_t(1))}}));
+    ASSERT_EQ(nonempty.size(), 1u);
+    EXPECT_TRUE(nonempty[0][0].isNull());
+    // empty build side: both survive, exactly as for NOT IN — the two agree here
+    EXPECT_EQ(drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows, {})).size(), 2u);
 }
 
 // The surviving side must be the probe input and the output schema must be the

@@ -732,6 +732,32 @@ WEEK33_DECORRELATED_VEC_ONLY = [
     "(SELECT * FROM laps l WHERE l.sector_1 = d.age) ORDER BY d.driver_id",
     "SELECT d.driver_id FROM drivers d WHERE EXISTS "
     "(SELECT * FROM laps l WHERE l.sector_1 = d.age) ORDER BY d.driver_id",
+    # Week 33 round 2 — BOTH DIRECTIONS of the NULL rule NOT EXISTS must not
+    # have, pinned against SQLite instead of argued in a header. Until the ANTI /
+    # ANTI_NOT_IN split, a decorrelated NOT EXISTS was lowered to the same
+    # enumerator NOT IN uses and inherited its three-valued rule.
+    #
+    # (a) NULL on the PROBE (correlated) side. Week 29's LEFT JOIN null-extends
+    #     `l`, so `l.lap_id` is NULL for the 16 drivers with no lap under 5. The
+    #     correlated equality is UNKNOWN for every body row, so the body yields
+    #     none, EXISTS is FALSE and NOT EXISTS is TRUE: SQLite returns those 16.
+    #     SwiftQL returned 0 — the NULL probe key was dropped because the build
+    #     side was non-empty, which is `NULL NOT IN S`'s rule, not this one.
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id AND l.lap_id < 5 "
+    "WHERE NOT EXISTS (SELECT * FROM laps l2 WHERE l2.lap_id = l.lap_id)",
+    # (b) NULL on the BUILD (body) side. `y.lap_id` is NULL for every body row,
+    #     so the body is empty for every outer row and all 20 drivers survive.
+    #     SwiftQL returned 0 for the WHOLE query: one unmatchable build key set
+    #     the NOT IN short-circuit and every probe chunk was skipped.
+    "SELECT COUNT(*) FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM drivers x LEFT JOIN laps y "
+    " ON x.driver_id = y.driver_id AND y.lap_id < 0 WHERE y.lap_id = d.driver_id)",
+    # ...and the positive form of (a), which must be unaffected: a NULL probe key
+    # matches nothing, so EXISTS is FALSE and those 16 rows are the ones dropped.
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id AND l.lap_id < 5 "
+    "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.lap_id = l.lap_id)",
 ]
 
 # The other half of that capability difference, asserted so the boundary cannot

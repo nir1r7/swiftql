@@ -71,7 +71,11 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
         auto join = std::make_unique<LogicalJoin>(
             std::move(spine), std::move(body_plan), std::vector<JoinKey>{key},
             /*join_slot=*/-1, left_schema);
-        join->semantics = sq->negated ? JoinSemantics::ANTI : JoinSemantics::SEMI;
+        // ANTI_NOT_IN, not ANTI: `NOT IN` is three-valued and an anti-join is
+        // not. See JoinSemantics in logical_plan.h — the whole reason the
+        // enumerator is separate is that decorrelated NOT EXISTS must NOT get
+        // this rule, and a comment saying so did not stop it.
+        join->semantics = sq->negated ? JoinSemantics::ANTI_NOT_IN : JoinSemantics::SEMI;
 
         // Assert the containment rather than leaving it as an observation: this
         // single check is what replaces an audit round.

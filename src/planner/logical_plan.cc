@@ -620,6 +620,9 @@ std::string LogicalJoin::explain() const {
     std::string s = "LogicalJoin [";
     if (semantics == JoinSemantics::SEMI)      s = "LogicalSemiJoin [";
     else if (semantics == JoinSemantics::ANTI) s = "LogicalAntiJoin [";
+    // Printed distinctly: the two differ only in their NULL rule, so a plan
+    // that prints the same for both is a plan that cannot show the bug.
+    else if (semantics == JoinSemantics::ANTI_NOT_IN) s = "LogicalAntiJoin [NOT IN, ";
     else if (join_type == JoinType::LEFT)      s = "LogicalLeftJoin [";
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i) s += " AND ";
