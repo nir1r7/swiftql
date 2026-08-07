@@ -48,7 +48,7 @@ cd build
 
 > Must be run from inside `build/`. The tests resolve `"../catalog.json"` relative to their working directory.
 
-Expected: **720 tests, 0 failures.**
+Expected: **723 tests, 0 failures.**
 
 `ctest` works too and runs the same binary with the right working directory:
 
@@ -223,13 +223,13 @@ Runs the full correctness query suite against both SwiftQL and an in-memory SQLi
 python3 python_tools/compare_against_sqlite.py
 ```
 
-Expected: **828 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
+Expected: **856 passed, 0 failed, 0 errors**: 127 queries × 4 modes (row/Volcano,
 columnar/Volcano, columnar/vectorized, and columnar/vectorized with
 `--no-optimize`), plus 12 rejections × the same 4 modes, plus the multi-way
 capability split — 13 multi-way queries × the 2 vectorized modes, diffed against
 SQLite, and the same 13 asserted to be refused × the 2 Volcano modes — plus
-Week 30's two subquery suites × the same 4 modes (19 forms that must *bind* and
-reach the Week 31 refusal, and 14 that must fail earlier for their own stated
+Week 30's two subquery suites × the same 4 modes (21 forms that must *bind* and
+reach the Week 31 refusal, and 19 that must fail earlier for their own stated
 reason).
 
 The multi-way block is 6 Week 27 execution shapes plus 7 Week 28 join-ordering
@@ -605,6 +605,72 @@ so `MIN(team)` is a `STRING`. Typing them `DOUBLE` made that query throw
 `bad_variant_access` at the materialization point.
 
 ---
+
+## Relation slots and query levels
+
+A `relation_slot` is a **position in a range table**, and since Week 30 there can
+be more than one range table in a query: `ColumnRef::query_level` says which. The
+pair is the identity; a slot read without its level compares two different
+numbering domains, and the failure is silent — the wrong relation's column, or a
+check quietly skipped.
+
+That collapse appeared **three times in one week**, at three consumers nobody had
+listed. This table is the list. Add a row when you add a consumer, and re-check
+every "contained" row on the day a new nested-scope construct lands (Week 32's
+semi-/anti-joins, Week 34's derived tables).
+
+**Two different things are called `relation_slot`, and only one of them can be
+wrong.** `ColumnDef::relation_slot` (`schema.h`) is a *schema* slot: a schema is
+built for one query block, so there is no level to lose and every reader of it is
+safe by construction. The rest — `ColumnRef`, `GroupByColumn`, `AggregateSpec`,
+`JoinKey::from_slot`, `ColumnStatsEntry` — carry a slot that came from binder
+resolution and therefore *can* name an enclosing block's relation.
+
+### Reachable with a correlated ref (before `Validator::validate` refuses)
+
+| Consumer | Status |
+|---|---|
+| `Binder::resolveColumnRef` (`binder.cc`) | **Level-aware.** The producer: walks scopes outward and stamps `(level, slot)` together |
+| `Binder::checkCorrelatedAggregateArg` | **Level-aware.** Resolves the argument's type through the scope chain — the only layer that can, which is why the check lives here rather than in `Validator` |
+| `collectSlots` (`predicate_pushdown.cc`, site 8) | **Level-aware.** Maps `level > 0` to `-1`, this walker's "cannot name it here" value, which makes all three callers conservative |
+| `restampSlots` (`predicate_pushdown.cc`, site 9) | **Level-agnostic, contained.** Stamps unconditionally, but is provably unreachable with a correlated ref: `collectSlots` gives `-1`, so `soleSlot` is `-1`, so the conjunct is never pushed. Its `SubqueryExpr` branch touches only `operand` |
+| `exprKey` (`expr_utils.h`, site 1) | **Level-aware** since round 2. Was wrong: `0#driver_id` meant two different columns, so a *correlated* expression group key satisfied an ungrouped *local* reference, and `substituteInto` would have rewritten on the same collision |
+| `checkGroupedRefs` (`validator.cc`, site 5) | **Level-aware.** Returns for `query_level > 0`, and the plain-column match compares the level as well as the slot |
+| `validateExpr` (`validator.cc`, site 4) | **Level-aware.** Returns for `query_level > 0`: the Binder verified the ref against the scope that supplies it |
+| The SUM/AVG argument type check (`validator.cc`) | **Level-aware** since round 2. Was wrong: indexed `stmt.joins` — the *inner* list — with an outer slot, so the same illegal `SUM(d.name)` was caught or skipped depending on the inner query's own join order |
+| The GROUP BY existence check (`validator.cc`) | **Level-aware.** Skips on `g.query_level > 0`. Testing `!table_name.empty()` instead made the outcome depend on the *enclosing* block's relation count |
+| `validateJoinCondition` (`validator.cc`, site 18) | **Level-aware.** Returns for `query_level > 0`; `relations` is this block's range table |
+| `classifyJoinCondition` (`join_condition.cc`) | **Level-aware.** Refuses to build a `JoinKey` from a `level > 0` operand, *before* the unbound positional branch, so a key-less nested join still reaches the cross-product refusal |
+| The `JoinKey` STRING/numeric check (`validator.cc`) | **Level-agnostic, safe by contract.** Its `from_slot`s come only from `classifyJoinCondition`, which cannot emit a correlated one |
+| `foldNode` (`constant_folding.cc`, site 14) | Reads no slot. Descends into `SubqueryExpr::operand` only |
+
+### Unreachable with a correlated ref today (behind the refusal)
+
+`Validator::validate` refuses any statement with `has_subquery`, and both planner
+entry points call it first, so everything below receives level-0 refs **by
+construction**. That containment is the only thing making them safe — none of
+them tests a level.
+
+| Consumer | Note for the week that removes the containment |
+|---|---|
+| `AggregateSpec::relation_slot` (`logical_plan.cc`, and `plan_nodes.cc` / `vec_hash_aggregate_node.cc` resolving it) | Copied straight off a `ColumnRef`. This is the struct `GroupByColumn` was given a `query_level` for; it was contained instead. The invariant is stated at the field |
+| `JoinKey::from_slot` (`join_enumeration.cc`, `logical_plan.cc`, `vectorized_plan_builder.cc`, `cardinality_estimator.cc`) | Contract stated at the struct: only meaningful while every key operand is level 0, which `classifyJoinCondition` enforces |
+| `inferExprType`, `buildProjectSchema`, `buildAggregateSchema`, `collectCols` (`logical_plan.cc`) | Resolve `indexOf(name, slot)` against a plan schema |
+| `resolveColumnIndex` (`evaluator.cc`) | Same, per row, with a bare-name fallback that would silently pick *some* column |
+| `CardinalityEstimator` / `StatsContext::findForRef` | A miss degrades the estimate silently — the failure mode statistics code specialises in |
+| `Planner::plan`, `VectorizedPlanBuilder` | Merged-schema stamping and pruning-hint slot sets |
+
+### The structural alternative
+
+Making the level part of the *type* — a `ColumnId { int level; int slot; }`, so a
+bare `int` cannot be passed where a qualified reference is required — would turn
+all three of this week's findings into compile errors. It is the right end state
+and it is **not** a Week 30 change: `grep -c 'relation_slot\|from_slot' src/`
+reports **87** non-comment mentions across six source layers, plus every test
+that hand-builds a `ColumnRef`, a `GroupByColumn` or an `AggregateSpec` — and the
+containment above means the change buys nothing until a correlated ref can
+actually reach the second table. The week that removes the containment is the
+week to do it, and this table is what makes that change reviewable.
 
 ## Extending the expression language
 

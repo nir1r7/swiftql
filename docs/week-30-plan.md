@@ -1935,3 +1935,37 @@ B1(b) and B2 were the two that would have produced **wrong rows** rather than a
 wrong message once Week 31 lowers a subquery: a fabricated join key, and a
 correlated conjunct pushed onto one relation's scan. Both are now pinned by tests
 confirmed failing against the pre-fix tree.
+
+---
+
+## Round 2 — the same class, twice more
+
+Zero blockers; the tests and both harness files were reviewed and showed no
+weakening. Two majors and a minor, and all three are the round-1 pattern again:
+
+| # | Finding | Fix |
+|---|---|---|
+| M1 | The `SUM`/`AVG` argument type check indexes `stmt.joins` — **this** block's list — by the argument's slot, and `validateQuery` recurses into every nested statement. The same illegal `SUM(d.name)` inside a subquery was caught or skipped depending on the **inner** query's own join order | The check skips a correlated argument, and the Binder makes it properly: `checkCorrelatedAggregateArg` resolves `(query_level, relation_slot)` through the scope chain to the exact range entry. Skipping alone would have left a `SUM` over a `STRING` reaching execution in Week 31 with no plan-time guard |
+| M2 | `exprKey` encoded a `ColumnRef` as `slot#name` with no level, so two refs differing only in level hashed alike — a *correlated* expression `GROUP BY` key satisfied an ungrouped *local* reference, and `substituteInto` rewrites on the same key | The level is prefixed above 0 only, so every pre-existing key is byte-identical and no aggregate-spec dedupe or group-key match in a subquery-free query moves |
+| m3 | `AggregateSpec` carries a slot with no level — the exposure `GroupByColumn` was given a field for | Contained rather than fielded: `extractAggregates` runs after the refusal, so a correlated ref can never reach it. The invariant is now stated at the field, in the shape `JoinKey::from_slot` uses, and named in the slot-consumer table |
+
+Round 1 fixed two sites, round 2 found two more. That is the signal the fix
+should stop being per-site, so this round's real deliverable is the
+**slot-consumer table** in `development.md`: every reader of `relation_slot` /
+`from_slot`, classified level-aware / contained / wrong, with the reason each
+contained one is safe. It is split by whether a correlated ref can reach it at
+all, because that boundary — `Validator::validate` refusing `has_subquery` — is
+what makes the whole second group safe, and Weeks 32 and 34 are what remove it.
+
+**The structural change, evaluated.** Making the level part of the type
+(`ColumnId { level, slot }`, so a bare `int` cannot be passed where a qualified
+reference is required) would turn all five of this week's findings into compile
+errors, and it is the right end state. It is not a Week 30 change: `grep -c
+'relation_slot\|from_slot' src/` reports 87 non-comment mentions across six
+source layers, plus every test that hand-builds a `ColumnRef`, a `GroupByColumn`
+or an `AggregateSpec`. More to the point, it buys nothing while the containment
+holds — the second group of consumers cannot receive a correlated ref today at
+all. The week that removes the containment is the week the change pays for
+itself, and the table is what makes it reviewable then. Recommend deferring to
+whichever of Week 31/32/34 first lowers a correlated reference; do not fold it
+into a feature week.

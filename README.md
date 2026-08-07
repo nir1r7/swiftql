@@ -1283,6 +1283,29 @@ down and not applied:
 | **The `ORDER BY` position rule tested only the root node** | `ORDER BY lap_id + (SELECT ...)` slipped through. `SELECT` and `GROUP BY` had no such hole because they route through `validateExpr`, whose `allow_subqueries=false` default is checked at every node; `ORDER BY` had been given a bespoke one-liner. It routes through `validateExpr` too now — a dedicated recursive walker would have been a nineteenth silent dispatch site |
 | **Three smaller ones** | `collectSlots`' new comment claimed a top-level ref is always level 0 (false, and the same class of false-justification the week was handed as a finding); dispatch site 14 (`foldNode`) was the one place the "descend into the operand, never the body" rule was not applied, which Week 32's semi-join probe key would have paid for; and the deviation record's Q21 evidence was wrong — Q21's correlated refs are *qualified*, so the pre-Week-30 binder fails there with `unknown table qualifier`, not `column not found` |
 
+Round 2 found two more of the same class, at consumers the round-1 sweep had not
+listed — **three separate places in one week**. `exprKey` encoded a `ColumnRef` as
+`slot#name` with no level, so a *correlated* expression `GROUP BY` key satisfied
+an ungrouped *local* reference (round 1 had fixed the plain-column path and
+stopped exactly there); and the `SUM`/`AVG` argument type check indexed
+`stmt.joins` — the **inner** list — with an outer slot, so the same illegal
+`SUM(d.name)` inside a subquery was caught or silently skipped depending on the
+order of the *inner* query's own joins. That check moved to the Binder, the only
+layer holding the scope chain, rather than being skipped.
+
+The lesson is bigger than the three fixes, so it is written down rather than
+learned again: **adding a field to `ColumnRef` is not the work — finding every
+reader of the field it qualifies is.** `development.md` now carries a
+[slot-consumer table](development.md#relation-slots-and-query-levels) classifying
+every reader of `relation_slot` / `from_slot` as level-aware, level-agnostic-but-
+contained, or wrong, and stating what makes each contained one safe. Week 32's
+semi-/anti-joins and Week 34's derived tables are the weeks that remove those
+containments; the table is what makes that reviewable. The structural fix —
+making the level part of the *type*, so a bare slot cannot be passed where a
+qualified reference is required — is evaluated there and deliberately deferred:
+87 non-comment mentions across six source layers, buying nothing until a
+correlated ref can actually reach the second group.
+
 > **Starting note, from a Week 28 audit.** `ORDER BY <alias>` over an
 > *unqualified* select-list column is refused in any query whose relations are
 > aliased, and this is the next week that owns binder scope resolution:
