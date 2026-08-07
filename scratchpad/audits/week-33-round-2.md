@@ -131,3 +131,84 @@ is the conservative "cannot name it here" sentinel and it only suppresses
 pushdown. Comment only; no wrong answer. Flagged because it is the same
 sentence pattern and a future reader would take it as still-true.
 
+---
+
+## Targets verified with no finding
+
+**Target 1 — `7c46bdf` itself.** The routing in `subquery_materialization.cc:288-297`
+is correct on every path `forEachStatementExpr` + the GROUP BY walk reach: a
+correlated node is never run, its body is still recursed for nested uncorrelated
+subqueries, and `node_survives` keeps `stmt.has_subquery` set so `buildScanSchema`
+does not narrow the key column away. `refuseUnloweredCorrelated`
+(`subquery_decorrelation.cc:258`) fires on WHERE residue and HAVING
+(`logical_plan.cc:827,862`). **The one path it does not cover is R2-C1**, where
+`lowerInSubqueries` at `logical_plan.cc:814` consumes the node 13 lines earlier.
+
+**Target 2 — the `ANTI` / `ANTI_NOT_IN` split.** Complete on the producer side:
+`ANTI` is written only at `subquery_decorrelation.cc:234`, `ANTI_NOT_IN` only at
+`subquery_lowering.cc:78`; no path crosses. Every consumer was re-checked against
+the new enumerator — `cardinality_estimator.cc:469` (`SEMI ? semi : l_rows-semi`,
+estimate only, result-invariant), `vec_hash_join_node.cc:279`
+(`hit != (semantics_==SEMI)`), and the `!= STANDARD` build-side sites — all
+behave identically for the two anti flavours where they must.
+
+Confirmed end-to-end against SQLite on the committed data (columnar+vectorized,
+`--no-cache`); all four agree:
+
+| case | query | both |
+|---|---|---|
+| NULL probe key | `... d LEFT JOIN laps l ON d.driver_id=l.driver_id AND l.lap_id<5 WHERE NOT EXISTS (SELECT * FROM laps l2 WHERE l2.lap_id=l.lap_id)` | 16 |
+| NULL build key | `... WHERE NOT EXISTS (SELECT * FROM drivers x LEFT JOIN laps y ON x.driver_id=y.driver_id AND y.lap_id<0 WHERE y.lap_id=d.driver_id)` | 20 |
+| empty build side | `VecAntiJoin` unit pins at `tests/test_vectorized.cc:4245,4313` | — |
+
+Both new unit tests (`test_vectorized.cc:4258-4266`, `4300-4315`) fail on the
+pre-split code (they assert `{2,3,4}` and a surviving NULL row where the old
+`ANTI` emitted nothing).
+
+**Target 3 — the positional build-key projection (`12efb77`).** No name lookup
+survives: `rightKeyIndices(..., positional=true)` at
+`vectorized_plan_builder.cc:409-411` returns `0..k-1` and never touches
+`indexOf`, and it is selected for every `semantics != STANDARD`. Keys cannot be
+reordered or dropped — `keys` and `body_key_refs` are `push_back`ed in lockstep
+in the same loop iteration (`subquery_decorrelation.cc:82-93`, no intervening
+`continue`), and the arity mismatch throws loudly at
+`vectorized_plan_builder.cc:110-116` rather than silently mis-indexing.
+Exercised on the non-`SELECT *` shapes the round unblocked; all match SQLite:
+duplicate key column (`l.driver_id = d.driver_id AND l.driver_id = d.age` → 0),
+body with `ORDER BY` (20), multi-column select list (20), `SELECT *` JOIN body
+under `NOT EXISTS` (0), nested uncorrelated scalar in the body (20).
+
+**Target 5 — the six repinned unit tests.** Five in `tests/test_logical_plan.cc`
+(`:1264`, `:1290`, `:1329`, `:1352`, `:1481`) and
+`SubqueryMaterialization.CorrelationPropagatesToTheOutermostStatement`
+(`tests/test_subquery.cc:438-464`). Each now names a *distinct* per-shape
+message ("a body with GROUP BY…", "no equality links…", "a body with an
+aggregate…") rather than a shared catch-all, and each retains its original
+negative assertion, so a regression in the behaviour it names changes the
+message and fails the test. `CorrelationPropagates…` is strictly stronger than
+what it replaced: it now pins `calls == 0` and that the `SubqueryExpr` is still
+in the tree. `NotInBecomesAnAntiJoin` (`test_subquery.cc:566-568`) correctly
+tightened to `ANTI_NOT_IN`. No weakening found in this set — the one weak
+assertion this round added is R2-M1, which is a NEW test, not a repin.
+
+## Tally
+
+| severity | count |
+|---|---|
+| CRITICAL | 1 (R2-C1) |
+| HIGH | 0 |
+| MEDIUM | 1 (R2-M1) |
+| LOW | 1 (R2-L1) |
+
+## Not reached
+
+Target 4 covered only partially: the two refusals added this round
+(`refuseSurvivingCorrelatedRefs`, `subquery_decorrelation.cc:120-137`, and
+`requireDecorrelatableBody`'s body shapes) were verified to fire before
+`LogicalPlanBuilder::build` consumes the body (`:188` precedes `:218`), to cover
+`joins[].condition` / `select_list` / `order_by` / `where`, and to be pinned in
+both the unit suite (`test_subquery.cc:715-754`) and the rejection suite
+(`compare_against_sqlite.py:854-866`). NOT audited: whether the ON-clause
+refusal is *exactly* as narrow as it should be (whether any shape it declines
+could be safely lowered), and the interaction of `body.order_by` surviving the
+select-list replacement.
