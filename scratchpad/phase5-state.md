@@ -1,12 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 32 — gate r2 GREEN. Audit r3 (aeccd2c91496e936d) still running, due ~10:11.
-  WAITING for r3 before dispatching the fix round, because a fix agent mutating the tree while
-  an auditor reads it invalidates the audit (same reason not to fix during a gate).
-  NEXT: one fix round covering r2 + r3 findings together. It is interruption-tolerant
-  (commit+push per fix), so it may safely run across the ~10:26 reclaim.
-  r2 mediums to fix: `RefusesEveryIllegalCombination` cannot tell its four guards apart;
-  `collectSlotTables` (vectorized_plan_builder.cc:120) stamps the body's table at slot -1,
-  reachable via two IN conjuncts.
+Current: week 32, fix round 2 (agent a65e163ed9814df6a, launched 09:52 UTC, interruption-
+  tolerant: commits+pushes per fix, maintains the ## Progress handoff). Covers BOTH committed
+  audits: week-32-round-2.md (8297bc6) and week-32-round-3.md (8460c85).
+  !! r3's HIGH is a REGRESSION WITH ITS TEST REWRITTEN AROUND IT: a subquery nested inside an
+  IN body no longer materializes (subquery_materialization.cc:264 skips before runOnce's
+  recursion at :171), so a query WEEK 31 ANSWERED now dies at dispatch site 12's internal
+  invariant — and the test covering that shape was rewritten to a scalar form, so the suite
+  stayed green while the capability regressed. Fix + a test that really nests a subquery in an
+  IN body + an oracle entry, so a Week 31 capability cannot silently regress again.
+  After this fix round: gate r3, then close week 32.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
