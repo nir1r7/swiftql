@@ -1,21 +1,25 @@
 # Phase 5 orchestrator state
-Current: week 36, round 1, step 1 (teach) — launching ~20:50 UTC. LAST WEEK before the
-  five-way seam audit. Week 37 belongs to the user.
-  WEEK 36'S JOB IS TO RAISE 19/22, and it is now measurable at every step — the fifth gate
-  step fails on any regression, so the number cannot drift down unnoticed.
-  Concrete leads it inherits:
-  - Lifting `found[0] == select_list[0]` to allow an aggregate under a constant-only expression
-    tree makes TPC-H's OWN Q17 text run and takes the figure to 20. Flagged in week 35,
-    deliberately not taken there — it is a capability change, not harness tidying.
-  - Q21 is the other unported query (0 modes).
-  - q18 is vacuous BY CHOICE and should stay so: 300 is already the lowest of the spec's three
-    quantities, and lowering it would game the benchmark rather than fix the engine.
-  - 34 of 88 cells are Volcano refusals. Volcano semi/anti parity would move many queries from
-    two modes to four — a real coverage gain distinct from raising the headline count.
-  Small items still owed, fine to ride with week 36: compare_against_sqlite.py's NaN comparison
-  (nan/inf compare equal at :1874); random_diff.py:113-117 projects only driver_id/team from
-  rels[:3] where driver_id is the join key; and the week-35 audit's not-reached list (per-query
-  hand verification beyond q2/q18/q19, --time, --fingerprint-all).
+Current: week 36, round 1, step 2 (implement) — agent a8e4a55b9a68faae8, dispatched 21:20 UTC.
+  8-task plan at docs/week-36-plan.md. LAST WEEK before the five-way seam audit.
+  !! THE PLAN CORRECTED AN EXPECTATION I PASSED DOWN. I said Volcano semi/anti parity "would
+  move many queries from two modes to four". Measured breakdown: the 34 Volcano cells are
+  14 multi-way + 12 derived-table + 8 semi/anti, and only q4's 2 are reachable without a plan
+  shape Planner::plan cannot express. So mode-coverage gain is ~0 and the target is honest
+  about its shape.
+  TARGET: 20/22 meaningful committed (Q17, verified both ways and DISCRIMINATING), 21/22 if
+  Q21's residual semi/anti lands — ALL HEADLINE COUNT, ZERO MODE COVERAGE.
+  Four things held to in the brief:
+  1. The refusal sweep rides IN THE SAME CHANGE as the constant-wrapper lift, not after — that
+     lift is the exact shape that produced week 33's three silent wrong answers, two of them
+     living in header comments. "Checked, still true" cases must be reported too; a sweep that
+     lists only hits is not evidence of thoroughness.
+  2. THE NUMBER MUST NOT BE GAMED. q18 stays vacuous. If the figure starts rising by weakening
+     what a query tests rather than by making the engine do more, stop. An honest 20 beats a
+     flattering 21.
+  3. Q21 decided IN THE OPEN — lands, or a precise statement of what it needs and why that is
+     after this week. No ambiguity: week 37 is the user's.
+  4. Re-baseline DELIBERATELY from a full run, per-query deltas in the commit. The gate fails
+     on regression, so drift can never be silent and an improvement is recorded as such.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
