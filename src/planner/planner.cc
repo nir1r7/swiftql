@@ -111,8 +111,22 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // rule, one implementation (predicate_pushdown.h): Volcano is the correctness
     // baseline, so it is the last path whose latent guard should be the weaker one.
     //
-    // Volcano builds exactly one join, so the preserved side is relation 0 alone.
-    const std::unordered_set<int> preserved_slots{0};
+    // Week 30: DERIVED from the FROM scan's own schema, not asserted as {0}.
+    // The constant was correct only because of the `stmt.joins.size() > 1`
+    // refusal 110 lines above — the identical undocumented coupling the `jc`
+    // pointer above exists to remove, re-introduced at a new site with the
+    // comment stating the conclusion ("Volcano builds one join") rather than
+    // the refusal that guarantees it. Relax that refusal and
+    // `FROM a JOIN b ON k1 LEFT JOIN c ON k2 WHERE b.x = 5` would give the two
+    // engines different preserved sets: same rows, different work per mode,
+    // with nothing to catch it.
+    //
+    // Mirrors VectorizedPlanBuilder's JOIN case, which reads its set off
+    // join->children[0]->output_schema for the same reason. Byte-identical
+    // today — a catalog schema stamps slot 0 — but no longer something a future
+    // change can invalidate silently.
+    std::unordered_set<int> preserved_slots;
+    for (const ColumnDef& c : scan_schema.columns()) preserved_slots.insert(c.relation_slot);
     const Expr* prune_hint = pruningHintForPreservedSide(
         stmt.where.get(), outer ? JoinType::LEFT : JoinType::INNER, preserved_slots);
 
