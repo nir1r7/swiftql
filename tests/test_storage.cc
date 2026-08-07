@@ -69,6 +69,87 @@ TEST(CSVLoaderTest, CorrectTypes) {
     EXPECT_EQ(rows[0][2].type(), TypeId::DOUBLE);
 }
 
+// ===== Week 35 — the pipe-delimited (.tbl) format =====
+
+static Schema regionSchema() {
+    return Schema({{"r_regionkey", TypeId::INT},
+                   {"r_name",      TypeId::STRING},
+                   {"r_comment",   TypeId::STRING}});
+}
+
+// The header assumption was the DANGEROUS half of the pre-Week-35 loader: it
+// consumed line 1 unconditionally, so a headerless .tbl silently lost its first
+// row and every aggregate came out quietly wrong. Five, not four, and the first
+// key is 0 — a count alone would not catch an off-by-one at the other end.
+TEST(TblLoaderTest, KeepsTheFirstRowOfAHeaderlessFile) {
+    auto rows = CSVLoader::load("../tests/data/test_region.tbl", regionSchema(),
+                                FileFormat::tbl());
+    ASSERT_EQ(rows.size(), 5u);
+    EXPECT_EQ(rows[0][0].asInt(), 0);
+    EXPECT_EQ(rows[0][1].asString(), "AFRICA");
+    EXPECT_EQ(rows[4][0].asInt(), 4);
+}
+
+// .tbl TERMINATES each field, so a correct split yields schema.size()+1 fields
+// with an empty last one. Before the trailing-delimiter rule this threw a
+// column-count mismatch on every single line.
+TEST(TblLoaderTest, DropsTheTrailingDelimitersEmptyField) {
+    auto rows = CSVLoader::load("../tests/data/test_region.tbl", regionSchema(),
+                                FileFormat::tbl());
+    ASSERT_EQ(rows.size(), 5u);
+    // The last column survives with its real content rather than being eaten.
+    EXPECT_EQ(rows[1][2].asString(), "hs use ironic, even requests.");
+}
+
+// The comma inside r_comment is the README's `Commas inside string values not
+// supported in CSV input` limitation — sidestepped, not fixed, by the pipe
+// delimiter. This is the query-visible reason TPC-H comment columns load at all.
+TEST(TblLoaderTest, ACommaInsideAFieldSurvivesThePipeDelimiter) {
+    auto rows = CSVLoader::load("../tests/data/test_region.tbl", regionSchema(),
+                                FileFormat::tbl());
+    ASSERT_EQ(rows.size(), 5u);
+    EXPECT_NE(rows[1][2].asString().find(','), std::string::npos);
+}
+
+// The defaults ARE the pre-Week-35 behaviour. If this fails, a CSV fixture
+// somewhere started being read as something else.
+TEST(TblLoaderTest, TheDefaultFormatStillReadsCsvUnchanged) {
+    Schema schema({{"lap_id", TypeId::INT}, {"team", TypeId::STRING}, {"speed", TypeId::DOUBLE}});
+    auto with_default = CSVLoader::load("../tests/data/test_laps.csv", schema);
+    auto with_explicit = CSVLoader::load("../tests/data/test_laps.csv", schema,
+                                         FileFormat::csv());
+    ASSERT_EQ(with_default.size(), with_explicit.size());
+    EXPECT_EQ(with_default.size(), 3u);
+}
+
+// The silent-wrong-value guard. std::stod("1996-01-02") returns 1996.0 and stops
+// at the first '-', so a DATE column mistyped DOUBLE used to answer every
+// predicate on a year-shaped number with no error at any layer. Full consumption
+// turns ~61 hand-typed TPC-H columns' worth of transcription risk into a loud
+// load-time failure.
+TEST(TblLoaderTest, RejectsAPartiallyConsumedNumericField) {
+    // r_name mistyped DOUBLE: "AFRICA" is not a number at all.
+    Schema mistyped({{"r_regionkey", TypeId::INT},
+                     {"r_name",      TypeId::DOUBLE},
+                     {"r_comment",   TypeId::STRING}});
+    EXPECT_THROW(CSVLoader::load("../tests/data/test_region.tbl", mistyped,
+                                 FileFormat::tbl()),
+                 std::exception);
+
+    // The date-shaped case, which is the one that used to SUCCEED with 1996.0.
+    Schema date_as_double({{"d", TypeId::DOUBLE}});
+    try {
+        CSVLoader::load("../tests/data/test_dates.tbl", date_as_double,
+                        FileFormat::tbl());
+        FAIL() << "a date field typed DOUBLE must not load as a year";
+    } catch (const std::exception& e) {
+        // The message must name the offending text AND the column, or a 61-column
+        // catalog typo is unactionable.
+        EXPECT_NE(std::string(e.what()).find("1996-01-02"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("'d'"), std::string::npos);
+    }
+}
+
 // ===== CSVToColumnar =====
 
 // CSVToColumnar::convert() produces a ColumnarTable with correct structure and values.

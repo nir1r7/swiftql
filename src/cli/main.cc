@@ -364,7 +364,12 @@ int main(int argc, char* argv[]) {
                 // a diagnostic site.
                 if (!catalog.hasTable(tname)) continue;
                 const TableMetadata& tmeta = catalog.getTable(tname);
-                table_rows[tname] = CSVLoader::load(tmeta.filepath, tmeta.schema);
+                // Week 35: the ONE production loader call, and therefore the one
+                // that must pass the table's own file format (delimiter, header,
+                // trailing delimiter). Every other CSVLoader::load in the tree is
+                // a tests/ fixture and genuinely is CSV.
+                table_rows[tname] = CSVLoader::load(tmeta.filepath, tmeta.schema,
+                                                    tmeta.format);
                 // Week 19: statistics are table-scoped, not query-scoped —
                 // compute once per process, before columnar conversion frees the
                 // row data. A nested query's tables need them too: the optimizer
