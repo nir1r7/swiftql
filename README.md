@@ -1755,6 +1755,84 @@ consumers that break on a synthetic slot, and what closing it takes, are in
 
 **Checkpoint:** Rewritten Q15 and distinct aggregates are supported.
 
+> **Starting notes, from Week 33's foundations. Q17 AND Q22'S CORRELATED HALF ARE
+> WEEK 34 DELIVERABLES, not nice-to-haves.** Week 33 decorrelated `EXISTS` /
+> `NOT EXISTS` (Q4, Q21) into the Week 32 semi/anti join and **missed correlated
+> scalar subqueries**, for a structural reason that lands squarely inside this
+> week's scope. The sentence that settles it: *a decorrelated scalar subquery is
+> a derived table with an implicit join.* Whatever this week builds for
+> `FROM (subquery)` is the same machinery Q17 needs, so building it and then not
+> spending it on Q17 would leave the phase's TPC-H target short at Week 36 for no
+> additional work.
+>
+> **Why Week 33 could not do it.** The rewrite itself is short — group the body
+> by its correlation key, LEFT-join the result back, replace the `SubqueryExpr`
+> with a `ColumnRef` naming the aggregate output column:
+>
+> ```
+> outer  LEFT JOIN  ( SELECT team, AVG(speed) FROM laps l2 GROUP BY team )  ON team = team
+> ```
+>
+> The blocker is the join's **output schema**. A `SEMI`/`ANTI` join's
+> `output_schema` **is** its left child's, which is what keeps the body's slot
+> numbering out of the outer plan — `LogicalJoin`'s header calls that "the whole
+> containment for the two-range-table problem this node introduces". Task 4's
+> join is `STANDARD`: the aggregate's output column must be **in scope above the
+> join**, because the outer `WHERE` reads it. So the schema must be MERGED, and
+> merging requires the body's column to carry a slot in the **outer** range
+> table — a slot the Binder never issued, because the body is not a relation of
+> the outer `FROM`/`JOIN` list. That is exactly the containment this week's
+> derived tables break, arriving one week early.
+>
+> **The minimum fix, carried across verbatim so nobody re-derives it:** extend
+> the outer range table with an entry whose "schema" is a **plan node's
+> `output_schema`** rather than a catalog table's, give it a real slot, and then
+> re-check every consumer in
+> [development.md → Relation slots and query levels](development.md#relation-slots-and-query-levels)
+> against a slot that names a *derived* relation. That is this week's core
+> deliverable regardless; Q17 is what it should be spent on.
+>
+> **Three consumers break on a synthetic slot, and NONE of them fails loudly** —
+> which is the dangerous part, and the reason to do the range-table entry
+> properly rather than stamp a plausible integer:
+> - `JoinEnumeration::hasSlotOutsideRangeTable` (`join_enumeration.cc:91`) tests
+>   `join_slot < 1 || join_slot >= n` against the outer range table's size and
+>   **silently declines to reorder the whole tree**. Q17's outer query is a
+>   multi-relation join, so this is a real plan-quality loss with **no reported
+>   decision** — precisely the shape Week 30's hand-forward said must earn a
+>   `join-ordering=skipped (...)` string before it is accepted.
+> - `Validator`'s `SUM`/`AVG` argument check indexes `stmt.joins[slot - 1]` with
+>   the same slot arithmetic, and a synthetic slot is outside that vector.
+> - Every `indexOf(name, slot)` above the join resolves against a merged schema
+>   holding a column at a slot the range table cannot explain — the
+>   wrong-relation class `ColumnId` made loud *inside* one block, and which
+>   nothing checks *across* the range-table boundary.
+>
+> **`ColumnId` turns that re-check into a compiler worklist rather than an audit
+> round**, which is the second thing Week 33's Task 1 bought and the reason the
+> sweep is affordable at all: a consumer that reads a slot without deciding what
+> its level means no longer compiles. Week 30 found the same bug class five times
+> by audit; the type finds it at build time.
+>
+> **Also inherited from Week 33, and still open:**
+> - **The "correct fallback" bullet was consciously not met.** Week 33 ships a
+>   *refusal* for every shape decorrelation cannot express, named as one in the
+>   dialect table. A real fallback means a dependent-join operator (re-execute
+>   the body per outer row), which this engine has never had; a second execution
+>   production that must agree with the first on `NOT EXISTS`'s NULL semantics is
+>   the two-paths drift Weeks 26/28/30 each had to undo. It is Week 34's to build
+>   or to re-decline explicitly.
+> - **Volcano semi/anti parity (Week 33 Task 6) was not attempted**, deliberately.
+>   Only one half is cheap (`JoinSemantics` in `hash_join_node.cc`); the other
+>   needs a Volcano plan shape that can hold a *second* join, which
+>   `Planner::plan` cannot express. Correlated and `IN` queries are therefore
+>   diffed in two modes, not four. Both halves of the boundary are asserted, so
+>   it cannot drift silently.
+> - **`WEEK33_CORRELATED_EXPECT` is a prefix, not a message.** Week 33 replaced
+>   one refusal with a per-shape one and the suite asserts only the shared
+>   `correlated subquer`. Per-shape expectations are worth adding once the shapes
+>   stop moving.
+
 ### Week 35 — TPC-H Data + Harness
 
 - Add the TPC-H schema, pipe-delimited loader, and scale-factor workflow
