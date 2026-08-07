@@ -1085,13 +1085,59 @@ layer and every one is pushed to `claude/phase5-week26-qomtkb`.
   whether to convert, plus the projection-pushdown and `frac = 1.0` effects that
   would otherwise read as regressions in the plots).
 
+### Done in the third run — audit round 1 fixes
+
+Audit: `scratchpad/audits/week-32-round-1.md` (1 blocker, 1 medium, 1 low). All
+three actioned; each fix pushed on its own commit.
+
+- **BLOCKER — `WEEK32_LOWERING_REFUSED` asserted the wrong message on Volcano.**
+  It ran in all four modes against the lowering's wording, but the Volcano path
+  never reaches the lowering: `Planner::plan` refuses every `IN` subquery first,
+  so all three queries emitted the Volcano message and six assertions failed.
+  **Fixed by asserting per mode, not by weakening the assertion.** Volcano
+  refuses these queries *because they are `IN` subqueries* — a real,
+  IN-specific refusal, not a generic one — so it should not be made to emit a
+  lowering diagnostic it has no business producing. The list now runs in
+  `vec_modes`, and `WEEK32_LOWERING_REFUSED_VOLCANO` (derived from it, so a new
+  shape cannot lose its Volcano leg) asserts the same three queries in the two
+  Volcano modes. **Four-mode coverage kept; each mode pinned against the refusal
+  it owns.** All 12 assertions verified green on the built binary. Also pins an
+  ordering: the capability refusal outranks the expressibility one until Volcano
+  gains a semi-join, at which point these entries fail and say so.
+- **MEDIUM — `CardinalityEstimator::estimateNode` leaked the body's stats
+  upward.** The context merge stamped `right.entries` with `join.join_slot` for
+  *every* join, so a SEMI/ANTI node returned body columns at slot `-1` — columns
+  not in its output schema at all. **The code was wrong, not the doc.** A
+  semi-join's output schema *is* its left child's, which is the rule
+  `PredicatePushdown::pushIntoJoin` already enforces and the one
+  `development.md`'s consumer table already described. The merge is now guarded
+  on `semantics == STANDARD`; the table row records the enforcement instead of
+  asserting it. Latent, not live — `StatsContext::find`'s bare-name fallback
+  could have landed on a body column, but every outer ref above the join binds
+  to a real slot today; Week 34's derived tables are what make it a wrong
+  estimate. New test `Cardinality.SemiJoinContextCarriesNoBodyColumns`,
+  confirmed failing against the pre-fix code (2 entries, one at slot -1).
+- **LOW — the shared-body refusal was unasserted.** `planBody`'s
+  `use_count() > 1` guard has no oracle entry and had no unit test, and no SQL
+  text reaches it (`cloneExpr` is the only producer of a shared body and nothing
+  clones a WHERE conjunct before lowering). New test
+  `SemiJoinLowering.RefusesABodySharedByTwoExpressions` drives
+  `lowerInSubqueries` directly and builds the sharing by hand; confirmed failing
+  with the `use_count` check disabled. Full unit suite: **770 tests, green.**
+
+Not actioned from the audit: nothing. Its "Verified correct" section was taken
+as read, not re-derived. Its own caveat still stands — **the new C++ test bodies
+in `test_vectorized.cc` / `test_cardinality.cc` / `test_vec_plan_builder.cc`
+were never read line by line by that audit**, so a later round still owes them.
+
 ### Not done — the next concrete steps, in order
 
 1. **Run the `verify` gate.** Build + `compare_against_sqlite.py` + the
-   regression harness in all modes. The **C++ unit tests are green (768)** and
-   the `--explain-analyze` invariant is checked, but the four-mode SQLite diff
-   and the regression harness have not been run against the new suites. This is
-   the only remaining gate on the week.
+   regression harness in all modes. The **C++ unit tests are green (770)**, the
+   `--explain-analyze` invariant is checked, and the Week 32 refusal suites were
+   run in all four modes while fixing the blocker — but the *full* four-mode
+   SQLite diff and the regression harness still have not been run end to end.
+   This is the only remaining gate on the week.
 2. **§7's option (a)** — semi/anti in Volcano's `HashJoinNode` for a
    single-relation `FROM`. Still the honest end state; the refusal shipped is
    the interim. Until it lands, every `IN`-subquery query is diffed in two modes
