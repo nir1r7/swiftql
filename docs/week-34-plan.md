@@ -2059,11 +2059,43 @@ from the diff. A successor agent resumes from this section.)*
       `DISTINCT` on the other four aggregates and `COUNT(DISTINCT *)` refused at
       the parser. Harness: `WEEK34_DISTINCT_AGG_QUERIES` (all four modes) and
       `WEEK34_DISTINCT_AGG_REFUSED`.
-- [ ] Task 8 — capability boundaries: fallback, Volcano parity
-- [~] Task 9 — harness suites landed for all three families (derived tables,
-      correlated scalars, `COUNT(DISTINCT)`), diffed and rejected. C++ unit tests
-      for the decisions the oracle cannot see are still to write.
-- [ ] Task 10 — closing sweep
+- [x] Task 8 — both RE-DECLINED explicitly, dispositioned in
+      `docs/week-33-plan.md` → *Handed to Week 34*. The dependent-join fallback
+      stays a refusal, but the refused set **shrank** (Q17's shape now executes).
+      Volcano parity again not attempted, and the cost is now **counted** rather
+      than described: 55 queries diffed in two modes against 168 in four, stated
+      in README Limitations.
+- [x] Task 9 — harness suites for all three families, diffed and rejected, plus
+      11 C++ tests pinning the decisions the oracle structurally cannot see (the
+      slot-0 stamping, the `parent`-not-`&scope` LATERAL argument, LEFT-not-INNER
+      in the scalar rewrite, `has_subquery` staying false). **No existing test was
+      changed, narrowed or repointed** except by the mechanical `TableRef`
+      translation in Task 2, whose rules are in that commit message.
+- [x] Task 10 — closing sweep. Source: `ast.h`, `logical_plan.h` (the invariant
+      is now one of two, both named), `join_enumeration.h` (prediction replaced by
+      the finding), `vectorized_plan_builder.cc` (the build-order argument Week 34
+      actually dissolved), `subquery_decorrelation.h`. Docs: `development.md`
+      (how the containment was replaced, plus a Week 34 consumer table),
+      `README.md` (In Scope, 8 dialect rows, 4 Limitations bullets, the Week 34
+      section, the 37-week plan row), `docs/week-33-plan.md` (hand-off
+      disposition).
+
+### Still open, handed to Week 35/36
+
+- **`buildScanSchema` narrowing** — still widens for a subquery query, and now
+  also does not descend into a derived body. The derived case is a *different*
+  problem: narrowing means rewriting the body's select list, which changes the
+  schema the enclosing block was BOUND against. Stated at `buildRelation`.
+- **`WEEK33_CORRELATED_EXPECT` is still a prefix.** Week 34 pins per-shape
+  messages for its own refusals but did not retrofit Week 33's.
+- **Volcano semi/anti parity**, now three families deep. Counted in Limitations.
+- **Q22 is not claimed closed.** In the standard TPC-H text its correlated
+  component is a `not exists` (Week 33's), while what it additionally needs is
+  the derived table this week delivers. Verify against the ported query in
+  Week 36 and record which half was which.
+- **`method=written-floor` is reachable from the CLI for the first time**, via a
+  derived relation's missing `TableStats`. Week 28 asked for a fixture; a query
+  can do it now.
 
 **If the week runs short**, cut in this order and say so out loud: Task 6 first
 (cut to a refusal, never to a partial implementation — a wrong Q17 costs more than
