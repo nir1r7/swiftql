@@ -1,14 +1,22 @@
 # Phase 5 orchestrator state
-Current: week 34, round 1, step 2 (implement) — agent a4e5229d58781224a, launched 14:08 UTC.
-  10-task plan at docs/week-34-plan.md. Task 1 is a REFUSAL INVENTORY built BEFORE the refusal
-  is removed; Task 10 is the closing sweep. Week 33's lesson is encoded at both ends.
-  Q17 IS A DELIVERABLE here (week 33 recorded its absence as a checkpoint miss and handed it
-  over). If tasks 3-5 land and task 6 is still blocked, that must be STATED with the reason,
-  not deferred a second time.
-  Q22 nuance the plan flagged honestly: its derived-table half is tasks 2-4, but its correlated
-  half in standard TPC-H text is a NOT EXISTS already decorrelated in week 33 — so task 6 alone
-  does not close Q22.
-  ON RECLAIM: resume from ## Progress in docs/week-34-plan.md. Never restart the week.
+Current: week 34, round 1, steps 3+4 IN PARALLEL (gate ab12a3af1f893a53d + audit
+  a333f92cd212018fe), launched 14:46 UTC.
+  ALL 10 TASKS SHIPPED, INCLUDING Q17 — the deliverable week 33 missed. TableRef's table_name
+  is private behind tableName(site), the same discipline ColumnId::localSlot established.
+  !! A PREDICTION FOUR WEEKS OF NOTES CARRIED WAS BACKWARDS: hasSlotOutsideRangeTable does NOT
+  fire for derived tables. countRelations counted SCANS, over-counting a derived body's, so
+  `slot >= n` was too PERMISSIVE, not too strict. Fixed; the search now reorders derived
+  relations normally. The agent deliberately did NOT add the predicted decline string, because
+  a decline that cannot fire is week 33's dead-assertion failure. Newly live as a result:
+  joinCardinality's non-multiplicative branch and week 28's method=written-floor.
+  Other decisions: the scalar rewrite's join is LEFT not INNER (zero-row groups must yield NULL,
+  not drop rows); non-aggregate bodies refused; a derived relation's own schema stamps slot 0
+  like a leaf scan, which is what keeps restampSlots(c,0) and ChunkPruner's <1 test correct.
+  NEW ORACLE BLIND SPOT (mirror of week 30's): SQLite cannot parse a derived-table column alias
+  list, so that feature is neither diffable nor refusable — 2 C++ tests are its whole coverage.
+  Q22 NOT claimed closed; verify against the ported query in week 36.
+  REMAINING: buildScanSchema narrowing for derived bodies, WEEK33_CORRELATED_EXPECT still a
+  prefix, Volcano semi/anti parity (cost now COUNTED: 56 queries in 2 modes vs 168 in 4).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
