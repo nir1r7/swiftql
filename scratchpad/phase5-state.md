@@ -1,22 +1,18 @@
 # Phase 5 orchestrator state
-Current: week 33 — finishing tasks 7(2,3) and 8, then the Week 34 notes, then verification.
-  !! WEEK 33 CHECKPOINT IS PARTLY MISSED, ON THE RECORD (not a deferral):
-  MET for EXISTS/NOT EXISTS (Q4, Q21). NOT MET for correlated SCALAR (Q17, Q22's correlated
-  half). Blocker is STRUCTURAL: a STANDARD join must merge schemas, and merging needs the
-  aggregate's output column to carry a slot in the OUTER range table, which the Binder never
-  issued because the body is not a relation of the outer FROM. That is LogicalJoin's own
-  two-range-table containment invariant, which the README already predicted Week 34's derived
-  tables would break. KEY INSIGHT: a decorrelated scalar subquery IS a derived table with an
-  implicit join, so the minimum fix (a range-table entry whose schema is a plan subtree's
-  output_schema) is Week 34's core deliverable. Building it in week 33 = doing week 34's
-  infrastructure early and calling it correlation.
-  => WEEK 34 NOW EXPLICITLY OWNS Q17 + Q22 as deliverables, with the minimum-fix sketch and
-  the three silently-breaking consumers (JoinEnumeration::hasSlotOutsideRangeTable declining
-  with no reported decision; Validator's SUM/AVG check indexing stmt.joins[slot-1] out of
-  range; indexOf(name, slot) above the join) carried into its starting notes.
-  ALSO ON THE RECORD: the README bullet "retain a correct fallback for unsupported patterns"
-  ships as a REFUSAL — a conscious deviation, written up as one.
-  STILL OPEN: no auditor has read the ColumnId migration.
+Current: week 33 — implementation COMPLETE and pushed through ecee221. Gate r2
+  (a2b647beda9e39206) + audit r1 (a59512b5b5719b745) launched 11:22 UTC. Audit is told to
+  commit its file AS IT GOES, not just at the end (two audits have been lost this run).
+  AUDIT R1'S #1 TARGET IS THE ColumnId MIGRATION — no auditor has ever read it; a gate only
+  proved behaviour unchanged, not that the representation is sound. That gap is now closing.
+  Week 33 shipped: tasks 1,2,3,5,7,8,9. Task 4 is a RECORDED CHECKPOINT MISS (correlated
+  scalar / Q17 + Q22 need derived-table range-table entries = Week 34's core deliverable).
+  Task 6 (Volcano parity) is a stated gap. The "correct fallback" bullet ships as a REFUSAL,
+  written up as a conscious deviation.
+  Two stale rationales corrected this week: a Week 32 note pointed at src/execution/
+  hash_join_node.cc which DOES NOT EXIST (the Volcano hash join is HashJoinNode in
+  src/planner/plan_nodes.h, and its refusal is total STRUCTURALLY — no JoinSemantics
+  parameter); and a restampSlots unreachability argument rested on a refusal this week
+  removed, so it was re-derived rather than inherited.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
