@@ -1,19 +1,16 @@
 # Phase 5 orchestrator state
-Current: week 32 — gate r2 (a0fcc6e60dad0237f) still running; audit r2 DONE and self-committed
-  at 8297bc6 (0 blocker, 0 high, 2 medium, 3 low). Audit r3 (aeccd2c91496e936d, launched
-  09:41, 30-min budget) is covering ONLY what r2 could not reach: tests/test_subquery.cc, the
-  13 WEEK32_SEMI_JOIN_VEC_ONLY oracle queries, the subquery_materialization removals, and the
-  README/development.md diffs.
-  SEQUENCING RULE learned here: do NOT dispatch a fix agent while a gate is running — the fix
-  mutates the tree the gate is measuring. Read-only audits alongside a gate are fine.
-  NEXT: when gate r2 returns, dispatch ONE fix round covering r2's + r3's findings together.
-  r2 mediums: `RefusesEveryIllegalCombination` cannot tell its four guards apart;
+Current: week 32 — gate r2 GREEN. Audit r3 (aeccd2c91496e936d) still running, due ~10:11.
+  WAITING for r3 before dispatching the fix round, because a fix agent mutating the tree while
+  an auditor reads it invalidates the audit (same reason not to fix during a gate).
+  NEXT: one fix round covering r2 + r3 findings together. It is interruption-tolerant
+  (commit+push per fix), so it may safely run across the ~10:26 reclaim.
+  r2 mediums to fix: `RefusesEveryIllegalCombination` cannot tell its four guards apart;
   `collectSlotTables` (vectorized_plan_builder.cc:120) stamps the body's table at slot -1,
   reachable via two IN conjuncts.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
-Last gate: GREEN (week 31 round 2, closing) — unit 748/748, sqlite 940, regression 318 all modes
+Last gate: GREEN (week 32 round 2) — build 0 warnings, unit 770/770, sqlite 980, regression 318 all modes
 Week 31 verdict: checkpoint met. 2 gates / 2 audits; round 2 audit was CLEAN (0/0/0/0).
 
 
