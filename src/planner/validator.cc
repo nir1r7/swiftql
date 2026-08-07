@@ -169,6 +169,15 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
             if (agg->function_name != "SUM" && agg->function_name != "AVG") continue;
             auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get());
             if (!col) continue;
+            // Week 30 round 2. `stmt.joins` and `schema` below are THIS block's,
+            // and validateQuery recurses into every nested statement, so a
+            // correlated argument would index the inner join list with an outer
+            // slot. Measured: the same illegal `SUM(d.name)` inside a subquery
+            // was caught or silently skipped depending on the order of the
+            // INNER query's own joins. The check that belongs to the block
+            // owning the relation is made by the Binder, which is the only
+            // layer holding the scope chain — see checkCorrelatedAggregateArg.
+            if (col->query_level > 0) continue;
 
             // pick the schema the argument resolves against: binder slot when
             // bound, table-name match for unbound qualified refs, FROM otherwise

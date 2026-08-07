@@ -21,6 +21,19 @@ struct AggregateSpec {
     // relation slot of the argument column (binder-assigned): distinguishes
     // join sides that share a column name, e.g. AVG(l2.speed) on a self-join.
     // -1 = unresolved/single-relation (resolve by bare name).
+    //
+    // !! Carries NO query level, and is therefore only meaningful while the
+    // ColumnRef it is copied from belongs to the query block being planned —
+    // the same contract JoinKey::from_slot states (join_condition.h). It holds
+    // today by construction: extractAggregates runs after Validator::validate,
+    // which refuses any statement with a subquery, so a correlated ref (the
+    // only source of a non-zero query_level) can never reach this struct.
+    // GroupByColumn needed a `query_level` field for exactly this exposure once
+    // a subquery could appear; this one is contained instead. The week that
+    // lowers a subquery removes that containment and must revisit BOTH this
+    // struct and its two consumers, which resolve `indexOf(column,
+    // relation_slot)` against a child schema (plan_nodes.cc,
+    // vec_hash_aggregate_node.cc). See development.md's slot-consumer table.
     int relation_slot = -1;
     // output-schema column name (aggregateOutputName of the bound expr);
     // empty only for hand-built specs in tests (falls back to FUNC(column))

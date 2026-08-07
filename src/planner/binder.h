@@ -52,4 +52,10 @@ class Binder {
         // every scope between it and the resolving one: none of them can be
         // evaluated independently of the scope that supplies the value.
         static void markCorrelated(Scope& scope, int level);
+        // SUM/AVG over a STRING column, for an argument that resolved to an
+        // ENCLOSING block. Validator owns this check for every local argument
+        // and cannot own it for a correlated one: it holds one statement, while
+        // the column's type lives in a range table `query_level` blocks out.
+        // The Binder is the only layer with that chain, so the check lands here.
+        static void checkCorrelatedAggregateArg(const AggregateExpr* agg, const Scope& scope);
 };

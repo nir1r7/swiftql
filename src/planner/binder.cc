@@ -167,6 +167,34 @@ void Binder::markCorrelated(Scope& scope, int level) {
     for (int i = 0; i < level && s; ++i, s = s->parent) s->correlated = true;
 }
 
+void Binder::checkCorrelatedAggregateArg(const AggregateExpr* agg, const Scope& scope) {
+    // Mirrors Validator's local rule exactly — same functions, same shape (a
+    // bare ColumnRef argument), same message — for the one case Validator had
+    // to decline: an argument resolved to an enclosing block. It reported the
+    // right answer only when the INNER query's join list happened to hold a
+    // column of that name at the outer slot, and skipped the check otherwise.
+    //
+    // Resolving the type here is exact rather than coincidental: (query_level,
+    // relation_slot) addresses one range entry, and resolveColumnRef already
+    // verified the column exists in it.
+    if (agg->function_name != "SUM" && agg->function_name != "AVG") return;
+    auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get());
+    if (!col || col->query_level <= 0 || col->relation_slot < 0) return;
+
+    const Scope* s = &scope;
+    for (int i = 0; i < col->query_level && s; ++i) s = s->parent;
+    if (!s || col->relation_slot >= static_cast<int>(s->range_table.size())) return;
+
+    const Schema* sch = s->range_table[col->relation_slot].schema;
+    int idx = sch->indexOf(col->column_name);
+    if (idx < 0) return;   // existence is resolveColumnRef's, and it threw already
+    if (sch->column(idx).type == TypeId::STRING) {
+        throw std::runtime_error(agg->function_name
+            + "() requires a numeric column, but '" + col->column_name
+            + "' is of type STRING");
+    }
+}
+
 void Binder::bindExpr(Expr* expr, Scope& scope, const Catalog& catalog) {
     if (!expr) return;
 
@@ -180,7 +208,11 @@ void Binder::bindExpr(Expr* expr, Scope& scope, const Catalog& catalog) {
     } else if (auto* un = dynamic_cast<UnaryExpr*>(expr)) {
         bindExpr(un->operand.get(), scope, catalog);
     } else if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
-        if (!agg->is_star) bindExpr(agg->argument.get(), scope, catalog);
+        if (!agg->is_star) {
+            bindExpr(agg->argument.get(), scope, catalog);
+            // after binding, so the argument carries its (level, slot)
+            checkCorrelatedAggregateArg(agg, scope);
+        }
     } else if (auto* in = dynamic_cast<InExpr*>(expr)) {
         bindExpr(in->operand.get(), scope, catalog);   // values are literals
     } else if (auto* lk = dynamic_cast<LikeExpr*>(expr)) {
