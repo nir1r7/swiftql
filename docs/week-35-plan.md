@@ -21,6 +21,25 @@ written-down capability boundaries into an unqualified pass.
 
 ---
 
+## Progress
+
+> Kept current during implementation. A successor resumes from here.
+
+| Task | State |
+|---|---|
+| 1 — TPC-H schema | not started |
+| 2 — pipe-delimited loader | not started |
+| 3 — scale-factor workflow | not started |
+| 4 — parameterized queries / runner | not started |
+| 5 — reference comparison | not started |
+| 6 — mode-coverage report | not started |
+| 7 — randomized result differencing | not started |
+| 8 — behavioural rejection sweep | not started |
+
+**Next concrete step:** write `python_tools/tpch_schema.py` (Task 1).
+
+---
+
 ## Task list
 
 1. [The TPC-H schema in a three-type engine](#task-1--the-tpc-h-schema-in-a-three-type-engine) — eight tables, no `DATE`, no `DECIMAL`, and a second catalog rather than a second copy of the first
