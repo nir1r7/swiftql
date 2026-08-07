@@ -285,6 +285,22 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     // a narrowed-away column dies later with "column not found", far from the
     // cause. Costs projection pushdown for subquery queries; Week 33 replaces
     // this with the correlated columns actually referenced.
+    // Week 33, Task 8. STILL WIDENS for a correlated query, and that is a
+    // measured cost rather than an oversight. Week 31 gave projection pushdown
+    // back to MATERIALIZED subquery queries by clearing has_subquery once every
+    // node had become a constant; decorrelation cannot do the same, because this
+    // function runs while the FROM/JOIN spine is being built and the EXISTS
+    // conjunct is still in stmt.where — the extraction happens later, at
+    // lowerExistsSubqueries. So every correlated query scans its outer relation
+    // at full width.
+    //
+    // Narrowing correctly means collecting the outer columns the body's
+    // correlated refs name (they must survive) plus the ones the outer query
+    // uses, which is a second walker over the body — the precise-collectSlots
+    // work Week 30 handed to this week. It is a PERFORMANCE change with a real
+    // wrong-answer failure mode (a narrowed-away correlated column dies later as
+    // "column not found", far from the cause), so it is left for a week that can
+    // land it against a benchmark rather than squeezed in beside the semantics.
     if (stmt.has_subquery) return full_schema;
     std::unordered_set<std::string> required;
     for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);

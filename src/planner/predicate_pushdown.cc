@@ -36,6 +36,17 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         // this comment claimed otherwise — the same class of
         // false-justification-that-stops-anyone-checking that this file's header
         // was corrected for four lines below.
+        // Week 33, Task 8: the README asked this week to make the answer for a
+        // correlated subquery PRECISE (its refs' slots, decremented one level)
+        // rather than conservative. It turned out to be MOOT, which is a better
+        // outcome than the change: decorrelation extracts the correlated
+        // conjunct from stmt.where BEFORE the LogicalFilter is built, and the
+        // body is planned only after its correlated conjuncts have become join
+        // keys — so no correlated ref survives into any predicate this walker
+        // runs over. Shapes decorrelation refuses throw instead of arriving.
+        // The -1 stays as the answer for an UNRESOLVED ref, which is what it
+        // always also meant, and restampSlots' body branch stays unreachable by
+        // the same argument rather than by the one Week 30 wrote down.
         out.insert(cr->id.isLocal() ? cr->id.localSlot("collectSlots") : -1);
         return;
     }

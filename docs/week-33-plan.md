@@ -1170,7 +1170,20 @@ removed or weakened.
       inside an `IN` body's `HAVING`, which round 4 left as a read rather than a
       test. Items (2) Volcano `HashJoinNode` refusal totality and (3)
       `setCostDecision`'s `rowWidth` remain.
-- [ ] Tasks 6, 8.
+- [x] Task 8 RESOLVED, mostly by finding it moot. **`collectSlots`' precise
+      answer is unnecessary**: decorrelation extracts the correlated conjunct
+      from `stmt.where` *before* the `LogicalFilter` is built, and the body is
+      planned only after its correlated conjuncts have become join keys, so no
+      correlated ref survives into any predicate the walker runs over. Refused
+      shapes throw instead of arriving. `restampSlots`' body branch stays
+      unreachable — by that argument rather than by the one Week 30 wrote down.
+      **`buildScanSchema` still widens** for a correlated query, and that is now
+      a stated cost with its reason at the site: this function runs while the
+      spine is being built, when the `EXISTS` conjunct is still in `stmt.where`.
+      Narrowing it correctly needs a second walker over the body and has a real
+      wrong-answer failure mode, so it is left for a week that can land it
+      against a benchmark.
+- [ ] Task 6 — stated gap, deliberately not started.
 
 ### Task 4 — why the Q17 shape does not execute this week
 
