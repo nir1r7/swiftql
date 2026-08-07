@@ -112,11 +112,55 @@ def generate_query(rng, n_relations):
             key = "driver_id"
         froms += f" JOIN {table} {alias} ON {prev_alias}.{key} = {alias}.{key}"
 
-    # Projection: distinct aliases, and a mix of key and non-key columns so a
-    # column-order or column-identity error has somewhere to show.
+    # Projection: distinct aliases, and columns that can actually TELL RELATIONS
+    # APART -- which is the whole job of this generator.
+    #
+    # !! WEEK 36 FIXED TWO DEFECTS HERE, and the second is the one that mattered.
+    #
+    #  1. `rels[:3]` projected the first three relations only, so a shape with 8
+    #     relations never looked at five of them. A wrong-relation resolution in
+    #     relation 5 produced a byte-identical answer.
+    #  2. `driver_id` IS THE JOIN KEY. Every relation is joined on it, so
+    #     `r1.driver_id` and `r4.driver_id` are EQUAL BY CONSTRUCTION and
+    #     projecting them cannot distinguish which relation a column came from --
+    #     which is exactly the defect class this generator exists to find
+    #     (Week 33 round 1, H-1/H-2: a key resolved by bare name against the wrong
+    #     relation of a merged schema; wrong rows, no error, identical --explain).
+    #     The old pool was `driver_id` and `team` only, and under a `driver_id`
+    #     chain `team` is functionally determined by it too on the drivers side.
+    #
+    # So each relation now contributes columns that are NOT the join key and that
+    # differ per row within the relation: `lap_id`/`speed`/`season` for `laps`,
+    # `name`/`age` for `drivers`. `team` is kept because it exists on BOTH tables
+    # and is a join key only between two `drivers` -- it is the one column that
+    # exercises the mixed case -- but it is no longer the only non-key column.
+    #
+    # The width stays bounded (a random prefix) so the diff output stays readable
+    # and the sort key stays cheap; what changed is WHICH columns are in the pool
+    # and that EVERY relation is in it.
+    #
+    # WHAT IT COSTS, measured rather than assumed: the 40-shape batch went from
+    # 61 s (Week 35) to 102 s, because every row now carries more columns to
+    # print, sort and compare. That is the price of being able to SEE the defect
+    # class this generator exists to find, and it is still inside the budget
+    # Week 28's note predicted for the 500-row fixture.
+    #
+    # Demonstrated on a 4-relation shape (laps r0, drivers r1, drivers r2,
+    # laps r3, all joined on driver_id): swapping r0 -> r3 in the projection
+    # changes the answer under the NEW pool and is INVISIBLE under the old one,
+    # where both relations project the same join key. (r1 vs r2 stays identical
+    # under both, and correctly so -- two `drivers` joined 1:1 on a UNIQUE key
+    # really are the same rows, so that is a property of the data and not a
+    # weakness of the projection.)
     proj_pool = []
-    for table, alias in rels[:3]:
-        proj_pool.append(f"{alias}.driver_id AS {alias}_did")
+    for table, alias in rels:
+        if table == "laps":
+            proj_pool.append(f"{alias}.lap_id AS {alias}_lid")
+            proj_pool.append(f"{alias}.speed AS {alias}_spd")
+            proj_pool.append(f"{alias}.season AS {alias}_sea")
+        else:
+            proj_pool.append(f"{alias}.name AS {alias}_nm")
+            proj_pool.append(f"{alias}.age AS {alias}_age")
         proj_pool.append(f"{alias}.team AS {alias}_team")
     projection = ", ".join(proj_pool[:rng.randint(2, len(proj_pool))])
 

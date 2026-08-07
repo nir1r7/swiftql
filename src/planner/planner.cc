@@ -93,6 +93,25 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // refusal pinned by message in the two Volcano ones. That is now three
     // families of query the four-mode oracle does not cover, and the count is
     // stated in README Limitations so the week it tips is visible.
+    //
+    // WEEK 36 PRICED IT ON TPC-H, because "which of these guards actually costs
+    // the coverage" had been an assumption. Of the 34 Volcano refusal cells in
+    // the 22x4 matrix, classified by the message each cell RECORDED:
+    //
+    //     multi-way joins   14 cells  (q2 q3 q5 q10 q11 q18 q21)
+    //     derived tables    12 cells  (q7 q8 q9 q13 q15 q22)
+    //     IN subqueries      4 cells  (q16 q20)
+    //     correlated         4 cells  (q4 q17)
+    //
+    // So the standing expectation -- that Volcano semi/anti parity would move
+    // many queries from two modes to four -- is WRONG by measurement: the
+    // semi/anti family is 8 of 34, and SIX of those 8 additionally need a query
+    // shape this function cannot express (q16, q20 and q17 each join in their
+    // FROM as well, so the semi/anti join is a SECOND join). The only reachable
+    // case is q4, whose FROM is a single relation: 2 cells, at the price of
+    // JoinSemantics in HashJoinNode plus a second decorrelation production on a
+    // path with no logical layer -- the two-paths drift Weeks 26/28/30 undid.
+    // The two guards that actually dominate are the two that are DELIBERATE.
     {
         bool derived = stmt.from.isDerived();
         for (const auto& j : stmt.joins) derived = derived || j.relation.isDerived();
