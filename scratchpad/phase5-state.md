@@ -1,17 +1,8 @@
 # Phase 5 orchestrator state
-Current: week 32, round 2 audit running (agent aa92cc4c44a7a1bf5, 09:00 UTC, 20-min budget).
-  Gate r1 (launched 08:45) still running against the PRE-FIX tree — its verdict will be stale;
-  read it as confirmation of the blocker, then run gate r2 AFTER it finishes.
-  DO NOT run two gates at once — they contend on the same build/ directory.
-  r1's blocker + medium + low are all FIXED and pushed (4 commits).
-  Blocker fix kept FOUR-MODE coverage: WEEK32_LOWERING_REFUSED now vec-modes-only, plus a
-  derived WEEK32_LOWERING_REFUSED_VOLCANO asserting the message Volcano actually emits —
-  chosen after verifying Planner::plan's guard really is IN-subquery-specific, not generic.
-  Medium: the CODE was wrong, not the doc — cardinality_estimator merged right.entries for
-  every join, so SEMI/ANTI returned body columns at slot -1. Now guarded on STANDARD.
-  r2 audit's FIRST target is the new C++ test bodies — nobody has read them line by line, and
-  one NULL test in this week already passed for the wrong reason (makeScan silently converts
-  Value::null() to 0).
+Current: week 32, round 2 — gate (a0fcc6e60dad0237f) + audit (acf60ae53b336400e) launched
+  09:33 UTC, right after the reclaim, so both have a full window.
+  Week 32 implementation + audit-r1 fixes are all COMPLETE and pushed through 6d7c7e9.
+  The 09:26 reclaim killed gate r1 (never reported) and audit r2 (file wiped with scratchpad).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
@@ -28,6 +19,11 @@ a reclaim when possible.
   blocked turn cannot be used to hold the container open. Short budgets are the only lever.
 - **Tell every long agent to write its artifact INCREMENTALLY**, not at the end. Whatever is on
   disk when it dies is all that survives; a partial audit beats nothing.
+- **AUDITS MUST COMMIT THEMSELVES.** scratchpad/ is wiped by every reclaim, and the audit file
+  is the INPUT to the fix round — one was lost entirely this way. Every auditor is now told to
+  `git add -f scratchpad/audits/<file>` and push when it finishes, even if it stopped early.
+  Gate LOGS are deliberately NOT committed (150-250KB each); their verdict goes in this file.
+- **Never run two gates concurrently** — they contend on the same build/ directory.
 - **The git remote is the only durable store.** This file is force-added to git for that reason
   (`git add -f scratchpad/phase5-state.md`) despite the skill saying not to commit scratchpad —
   an uncommitted state file does not survive the exact event it exists for.
@@ -36,9 +32,10 @@ a reclaim when possible.
 - **Root cause of lost agents:** background subagents do NOT keep the session alive. A turn that
   ends with only background agents running reads as idle → reclaim → the next heartbeat boots a
   fresh container and those agents are gone. Two gate+audit pairs were lost this way.
-- **Mitigation: run agents SYNCHRONOUSLY** (`run_in_background: false`), several in one tool
-  block so they still run concurrently. A blocked turn keeps the container alive. Reserve
-  background for work you can afford to lose.
+- **Long work must be interruption-tolerant**, since nothing keeps the container alive:
+  commit+push after each coherent unit, and keep a "## Progress" section in the week's plan doc
+  naming done / in progress / next. Week 32's implementation survived a mid-run kill that way —
+  a successor resumed from the handoff instead of restarting the week.
 
 ## Week 31 as shipped
 Uncorrelated + scalar subqueries by materialize-then-substitute; refusal NARROWED to correlated
