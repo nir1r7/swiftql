@@ -1307,3 +1307,76 @@ comments; `grep -rn "relation_slot" src/ tests/` returns only `ColumnDef` and
 
 **Next concrete step:** a separate verifier owns the gate (build, unit suite,
 oracle suite in all four modes). Task 2 does not begin until it is green.
+
+---
+
+## Round 2 — the first red gate, and its single cause
+
+The gate came back RED: 6 unit failures and 56 sqlite failures. **They share one
+cause**, and it is not either of the audit's two criticals.
+
+**`materializeSubqueries` was still materializing CORRELATED subqueries.** Its
+header declares the precondition "no correlated subquery anywhere in `stmt` —
+refused in Week 33's name" and says the pass TRUSTS `Validator::validate` rather
+than re-checking. Task 2 deleted that refusal. Nothing else was changed, so the
+pass went on trusting a rule that no longer existed:
+
+- Every correlated subquery was **run once as if self-contained** and replaced
+  with a literal. Running it resolved the outer ref by bare name against the
+  BODY's own schema, so `l.driver_id = d.driver_id` became the tautology
+  `laps.driver_id = laps.driver_id`. `WHERE EXISTS (...)` folded to `Filter [1]`
+  and `NOT EXISTS` to `Filter [0]` — a plausible wrong answer for every
+  correlated query the engine accepted.
+- Correlated SCALAR shapes this week records as a checkpoint MISS were therefore
+  answered instead of refused: that is the sqlite suite's "expected a rejection,
+  got rows".
+- And **the week's whole feature was dead code from the CLI.**
+  `lowerExistsSubqueries` runs inside `LogicalPlanBuilder::build`, downstream of
+  materialization, so the `SubqueryExpr` it decorrelates had already been
+  consumed. The decorrelation unit tests passed only because they call the
+  builder directly. No end-to-end query ever reached a semi/anti join.
+
+Fix (`7c46bdf`): a correlated node now SURVIVES the pass exactly as a `Kind::IN`
+node does, its body still walked for nested uncorrelated subqueries. The routing
+decision is made in `subquery_materialization.cc` off the Binder's own
+`correlated` flag — not off a rule enforced in another file. Confirmed failing
+pre-fix by two unit tests; correlated `EXISTS`/`NOT EXISTS` now diff clean
+against real SQLite through the CLI.
+
+**The six unit failures were stale assertions, verified one at a time, not
+assumed.** Five `SubqueryValidation` tests pinned the literal string
+`"not yet executable (Week 33)"` — the deleted blanket refusal. Every one of
+those queries is *still refused*, by decorrelation's own per-shape message; each
+assertion was repointed at the more specific string and nothing was dropped
+(commit body lists what each now pins). The sixth,
+`SubqueryMaterialization.CorrelationPropagatesToTheOutermostStatement`, pinned
+the same deleted refusal; its assertion was replaced by the one that now carries
+the property — the pass must never RUN a correlated body (call count 0) and the
+node must still be in the tree afterwards.
+
+Sqlite harness: **1008 passed, 4 failed** (was 952/56/4). The 4 remaining are two
+distinct harness defects, not engine defects:
+
+1. The Q20-shape entry in `WEEK33_CORRELATED_BINDS` is refused on the two
+   *Volcano* modes by the **IN** capability boundary ("IN subqueries are lowered
+   to a semi-join and are not supported on the Volcano path") before correlation
+   can be diagnosed. That refusal is correct; the suite applies one expected
+   string to all four modes. Needs a per-mode expectation.
+2. `WEEK33_NESTED_TRIPWIRE_REFUSED`'s first query writes `(SELECT 1 WHERE 1 = 1)`
+   — a FROM-less SELECT this parser does not accept — so it dies at parse and
+   never reaches the tripwire it was written to test. Pre-existing; also failing
+   in the round-2 gate.
+
+### Still open (audit round 1)
+
+C-1 (`NOT EXISTS` lowered to the same `JoinSemantics::ANTI` that carries
+`NOT IN`'s three-valued NULL rule) and C-2 (a correlated ref in the body's
+`JOIN ... ON`) are **untouched**. Note that both were unreachable end-to-end
+until `7c46bdf`, because decorrelation never ran: C-1 is now genuinely live and
+must be re-reproduced through the CLI. The audit's own C-1b repro shape
+(`... LEFT JOIN laps l ... WHERE NOT EXISTS (SELECT * FROM laps l2 WHERE
+l2.lap_id = l.lap_id)`) returned 0 against SQLite's 16 *before* the fix — but
+that was this defect, not C-1, so it proves nothing about C-1 and must be run
+again.
+
+Also open: H-1, H-2, M-3..M-7, L-8.
