@@ -479,6 +479,22 @@ WEEK30_SUBQUERY_BINDS = [
     # adding the query level to exprKey has simply broken expression grouping
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)",
+
+    # --- round 3 ---
+    # The two Week 31 inputs whose consumers were missing from the slot-consumer
+    # enumeration. Both still bind, which is the point: the guards added for them
+    # are tripwires behind the refusal, not new rejections. `team` exists in BOTH
+    # tables, which is what makes each failure a silent hit on the wrong relation
+    # rather than a miss.
+    #   - a correlated ColumnRef-op-Literal in a nested WHERE, which
+    #     collectSimplePredicates read as scan-local and would have pruned the
+    #     inner scan's chunks on the outer relation's value
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM drivers d WHERE l.team = 'Ferrari')",
+    #   - a correlated GROUP BY key, which buildAggregateSchema would have
+    #     resolved to drivers.team instead
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT COUNT(*) FROM drivers d GROUP BY l.team)",
 ]
 
 # Each of these must fail EARLIER than the refusal above, and for its own stated

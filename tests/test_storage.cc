@@ -625,3 +625,45 @@ TEST(ChunkPrunerSlots, JoinSlotRefNeverPrunes) {
     // the zone map would prove a skip, but the slot guard must win
     EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), tbl.zone_maps, 0));
 }
+
+// Week 30 round 3. `relation_slot < 1` is a test on a slot, and since Week 30 a
+// slot is a position in the range table of the scope `query_level` blocks out.
+// A CORRELATED ref carries (level 1, slot 0), so it read as scan-local here and
+// was then matched against the scanned table's zone maps BY NAME — two numbering
+// domains. With a shared column name (`team` and `driver_id` are shared on the
+// shipped catalog) the wrong relation's zone maps prune the scan: chunks skipped
+// silently, no error.
+//
+// It is NOT protected by the collectSlots/soleSlot `-1` containment that covers
+// restampSlots: the vectorized builder hands the whole un-pushed WHERE to the
+// FROM-side scan as a hint, so on `--no-optimize` a correlated conjunct arrives
+// here without pushdown ever having seen it.
+TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    // this chunk holds only 2020..2023, so `season = 2025` would prove a skip
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    // the control: a scan-local ref at (level 0, slot 0) still prunes
+    auto local = columnarColRef("season");
+    local->relation_slot = 0;
+    auto local_pred = makeColumnarBinary("=", std::move(local),
+                                         columnarLit(Value(int64_t(2025))));
+    EXPECT_TRUE(ChunkPruner::shouldSkip(local_pred.get(), zone_maps, 0));
+
+    // the finding: the SAME slot one block out must contribute nothing. Declining
+    // is correct-and-slower; acting on it prunes another relation's chunks.
+    auto correlated = columnarColRef("season");
+    correlated->relation_slot = 0;
+    correlated->query_level = 1;
+    auto corr_pred = makeColumnarBinary("=", std::move(correlated),
+                                        columnarLit(Value(int64_t(2025))));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(corr_pred.get(), zone_maps, 0))
+        << "a correlated ref's slot indexes an enclosing block's range table";
+
+    // and a slot >= 1 stays ignored, as it has since Week 26
+    auto join_side = columnarColRef("season");
+    join_side->relation_slot = 1;
+    auto join_pred = makeColumnarBinary("=", std::move(join_side),
+                                        columnarLit(Value(int64_t(2025))));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(join_pred.get(), zone_maps, 0));
+}

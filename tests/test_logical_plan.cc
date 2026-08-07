@@ -1480,3 +1480,61 @@ TEST(SubqueryDispatch, ExprKeyIsUnchangedAtLevelZeroAndDistinctAbove) {
     EXPECT_NE(exprKey(outer_ref), "0#driver_id")
         << "a correlated ref must not key the same as a local one at the same slot";
 }
+
+// Week 30 round 3. GroupByColumn is the one struct that CARRIES a query_level and
+// whose every consumer ignored it — buildAggregateSchema, HashAggregateNode,
+// VecHashAggregateNode and CardinalityEstimator all read g.relation_slot bare.
+//
+// The failure is quieter than a miss: for `EXISTS (SELECT COUNT(*) FROM drivers d
+// GROUP BY l.team)` the key is (level 1, slot 0, "team"), and the aggregate's
+// child schema is `drivers`, whose slot 0 DOES hold a column named `team`. So
+// indexOf("team", 0) is a clean HIT on the wrong relation — neither the bare-name
+// fallback nor the `idx < 0` throw fires, and the subquery groups by
+// drivers.team instead of the correlated laps.team.
+//
+// Grouping is not an optimization and a correlated key has no correct local
+// fallback, so this throws rather than declining. One guard covers the whole
+// consumer set: the other three run on a plan whose schema was built here.
+TEST(SubqueryValidation, ACorrelatedGroupKeyCannotReachPlanConstruction) {
+    Schema child({{"driver_id", TypeId::INT, 0}, {"team", TypeId::STRING, 0}});
+    std::vector<AggregateSpec> specs{{"COUNT", "", true}};
+
+    // control: the identical key at level 0 builds the schema it always did
+    GroupByColumn local;
+    local.table_name = "drivers";
+    local.column_name = "team";
+    local.relation_slot = 0;
+    Schema ok = buildAggregateSchema({local}, specs, child);
+    EXPECT_EQ(ok.column(0).name, "team");
+
+    // the finding: one block out, the same slot names a different relation
+    GroupByColumn correlated = local;
+    correlated.query_level = 1;
+    try {
+        buildAggregateSchema({correlated}, specs, child);
+        ADD_FAILURE() << "a correlated GROUP BY key must not resolve against this "
+                         "block's schema — it hits the wrong relation silently";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("correlated GROUP BY key"), std::string::npos)
+            << e.what();
+    }
+}
+
+// The level prefix has to be prefix-free, or it reintroduces the collision it was
+// added to remove: level 1 / slot 23 and level 12 / slot 3 both rendered
+// "^123#team". Both halves are legal SwiftQL — a 24-relation block plans, and
+// nesting depth is unbounded.
+TEST(SubqueryDispatch, ExprKeyLevelAndSlotCannotRunTogether) {
+    ColumnRef a;
+    a.column_name = "team";
+    a.query_level = 1;
+    a.relation_slot = 23;
+
+    ColumnRef b;
+    b.column_name = "team";
+    b.query_level = 12;
+    b.relation_slot = 3;
+
+    EXPECT_NE(exprKey(&a), exprKey(&b))
+        << "concatenated decimals are not prefix-free: " << exprKey(&a);
+}
