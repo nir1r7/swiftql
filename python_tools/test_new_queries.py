@@ -857,6 +857,53 @@ WEEK30_QUERIES = [
      "ON l.driver_id = d.driver_id GROUP BY nat ORDER BY a DESC, nat LIMIT 5"),
 ]
 
+# Week 31: uncorrelated subqueries execute by materialization — the body runs
+# once, before planning, and the node becomes a constant.
+#
+# These are here for the OPTIMIZER INVARIANT specifically (optimized ==
+# --no-optimize), which is the property the substitution could break in a way the
+# SQLite oracle would not localize: the pass runs above the optimizer, and the
+# nested query is planned by the same passes in the same order as a top-level
+# one, honouring --no-optimize. If the runner ignored that flag, both legs would
+# share one optimized sub-result and this suite would silently stop testing the
+# sub-plan. Their answers are diffed against SQLite in compare_against_sqlite.py.
+WEEK31_QUERIES = [
+    ("w31_scalar_in_where",
+     "SELECT COUNT(*) FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)"),
+    ("w31_scalar_in_having",
+     "SELECT team, AVG(speed) AS a FROM laps GROUP BY team "
+     "HAVING AVG(speed) > (SELECT AVG(speed) FROM laps) ORDER BY team"),
+    ("w31_scalar_under_arithmetic",
+     "SELECT COUNT(*) FROM laps WHERE speed > 0.5 * (SELECT AVG(speed) FROM laps)"),
+    ("w31_scalar_empty_is_null",
+     "SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed FROM laps WHERE lap_id = -1)"),
+    ("w31_exists",
+     "SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT * FROM laps WHERE speed > 340)"),
+    ("w31_not_exists_empty",
+     "SELECT COUNT(*) FROM drivers WHERE NOT EXISTS (SELECT * FROM laps WHERE speed > 99999)"),
+    ("w31_in_subquery",
+     "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps) ORDER BY name"),
+    ("w31_not_in_subquery",
+     "SELECT name FROM drivers WHERE driver_id NOT IN "
+     "(SELECT driver_id FROM laps WHERE speed > 340) ORDER BY name"),
+    # a NULL in the materialized set: NOT IN is never TRUE
+    ("w31_not_in_null_bearing_set",
+     "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
+     "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
+     " ON d.driver_id = l.driver_id AND l.speed > 99999)"),
+    # the outer query still joins, so pushdown, enumeration and the restored
+    # projection narrowing all run above a materialized constant
+    ("w31_subquery_over_a_join",
+     "SELECT l.team, COUNT(*) AS c FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.speed > (SELECT AVG(speed) FROM laps) GROUP BY l.team ORDER BY l.team"),
+    # the body itself joins three relations: vectorized-only, which is the mode
+    # this suite runs in
+    ("w31_multi_relation_body",
+     "SELECT COUNT(*) FROM laps WHERE speed > "
+     "(SELECT AVG(l.speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     " JOIN drivers d2 ON d.driver_id = d2.driver_id)"),
+]
+
 WEEK28_EXPECTED_ORDER = {
     "w28_star_pivot_small": "laps@0,drivers@2,laps@1",
     "w28_star_written_good": "laps@0,drivers@1,laps@2",
@@ -1023,7 +1070,7 @@ def run_explain_estimate_format():
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES + WEEK29_QUERIES + WEEK30_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES + WEEK29_QUERIES + WEEK30_QUERIES + WEEK31_QUERIES
 
     # existing surface on the default row/Volcano path (audit fixes and
     # Week 24 expressions affected both engines, so they run here too)

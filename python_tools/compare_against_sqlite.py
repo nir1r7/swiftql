@@ -375,124 +375,190 @@ WEEK30_ALIAS_REBIND_QUERIES = [
     "ON l.driver_id = d.driver_id GROUP BY nat ORDER BY a DESC, nat LIMIT 5",
 ]
 
-# Week 30 (subquery parsing + binding). NOTHING here executes: the week ends in a
-# refusal, and REACHING that refusal is the assertion — everything before it
-# (lex, parse, nested scope resolution, correlation detection, validation of the
-# nested query against its OWN schema) had to succeed to get there. SQLite
-# answers all of them, which is why this is a rejection suite rather than a diff
-# suite: the same stance Week 26 took when multi-way joins bound but did not
-# execute ("nothing new this week returns rows to diff").
+# Week 30 (subquery parsing + binding), SPLIT IN WEEK 31.
 #
-# Run in all four modes. The refusal is engine-independent by construction — one
-# check at the end of Validator::validate, which both Planner::plan and
-# LogicalPlanBuilder::build call first — and running it everywhere is what proves
-# that rather than asserting it.
-WEEK30_SUBQUERY_BIND_EXPECT = "not yet executable (Week 31)"
-WEEK30_SUBQUERY_BINDS = [
-    # scalar, uncorrelated (TPC-H Q22's shape)
-    "SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)",
-    # scalar, correlated (Q17) — and the scalar form must compose with
-    # arithmetic, which is why it lives at the primary level
+# Week 30 ended in one refusal and this was a rejection suite: reaching the
+# refusal was the assertion, because nothing returned rows to diff. Week 31
+# executes the UNCORRELATED forms, so the same queries split three ways and each
+# part now carries a different kind of evidence:
+#
+#   WEEK31_SUBQUERY_QUERIES  — uncorrelated, diffed against SQLite in all four
+#                              modes. The first subquery ROWS this project has
+#                              produced, and the only oracle for the NULL rules.
+#   WEEK31_SUBQUERY_VEC_ONLY — uncorrelated with a 3+ relation body: diffed in
+#                              the two vectorized modes, refused in the two
+#                              Volcano ones. An ordinary capability difference,
+#                              identical in shape to MULTIWAY_QUERIES.
+#   WEEK33_CORRELATED_BINDS  — correlated: still a rejection suite, now naming
+#                              Week 33. Every scope-resolution property Week 30
+#                              bought is still asserted by reaching that refusal.
+#
+# Splitting rather than deleting is the point: the correlated half keeps proving
+# that nested scope resolution, correlation detection and per-scope validation
+# all still happen, and the uncorrelated half proves the answers are right.
+
+# Uncorrelated subqueries EXECUTE as of Week 31: materialized once, before
+# planning, and substituted as a constant. Diffed in all four modes, which is
+# what proves the pass sits above both engines rather than being reimplemented
+# in each.
+WEEK31_SUBQUERY_QUERIES = [
+    # --- scalar (TPC-H Q22's uncorrelated half, Q11's HAVING shape) ---
+    "SELECT COUNT(*) FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)",
+    "SELECT team, AVG(speed) FROM laps GROUP BY team "
+    "HAVING AVG(speed) > (SELECT AVG(speed) FROM laps) ORDER BY team",
+    # the scalar composes with arithmetic, which is why it lives at the primary
+    # level — and re-folding must put the predicate back into the
+    # ColumnRef-op-Literal shape three fast paths pattern-match on
+    "SELECT COUNT(*) FROM laps WHERE speed > 0.5 * (SELECT AVG(speed) FROM laps)",
+    # a subquery over a table the outer query never names: before Week 31 the
+    # loader walked from_table + joins only and this died in std::out_of_range
+    "SELECT COUNT(*) FROM laps WHERE speed > (SELECT AVG(age) FROM drivers)",
+
+    # --- the NULL cases, which are the ones a materialization gets wrong ---
+    # ZERO ROWS: the scalar is NULL, the comparison UNKNOWN, the answer no rows.
+    # It is also the first constant NULL this engine has ever had, so it is the
+    # test that inferExprType answers from Literal::null_type instead of throwing
+    "SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed FROM laps WHERE lap_id = -1)",
+    # ONE NULL ROW, which is a DIFFERENT result set with the same answer: an
+    # aggregate over an empty selection returns one row holding NULL
+    "SELECT COUNT(*) FROM laps WHERE speed > (SELECT AVG(speed) FROM laps WHERE season = 9999)",
+    # a scalar whose value is NULL rather than absent, from arithmetic (x/0)
+    "SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed / 0 FROM laps LIMIT 1)",
+    # an empty INNER RELATION on the EXISTS and IN paths
+    "SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT * FROM laps WHERE speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
+    "(SELECT driver_id FROM laps WHERE speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
+    "(SELECT driver_id FROM laps WHERE speed > 99999)",
+
+    # --- EXISTS / NOT EXISTS, both truth values ---
+    "SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT * FROM laps WHERE speed > 340)",
+    "SELECT COUNT(*) FROM drivers WHERE NOT EXISTS (SELECT * FROM laps WHERE speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE age > 30 AND NOT EXISTS "
+    "(SELECT * FROM laps WHERE speed > 99999)",
+
+    # --- IN / NOT IN (Q16/Q18's shape) ---
+    "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps) ORDER BY name",
+    "SELECT name FROM drivers WHERE driver_id NOT IN "
+    "(SELECT driver_id FROM laps WHERE speed > 340) ORDER BY name",
+    # the IN operand reaches constant folding (dispatch site 14) and is then
+    # moved into the substituted InExpr
+    "SELECT COUNT(*) FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
+
+    # --- THREE-VALUED IN: a NULL in the materialized set ---
+    # A LEFT JOIN is the only way to get a NULL through the whole pipeline from
+    # catalog data (invariant 14), and these are the two rules that differ:
+    #   NOT IN over a set containing NULL is NEVER TRUE -> no rows;
+    #   IN over the same set keeps the non-null values.
+    "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
+    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
+    " ON d.driver_id = l.driver_id AND l.speed > 99999)",
+    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
+    "(SELECT l.driver_id FROM drivers d LEFT JOIN laps l "
+    " ON d.driver_id = l.driver_id AND l.driver_id < 5)",
+
+    # --- the walker (dispatch site 19) must reach a subquery inside a container ---
+    "SELECT COUNT(*) FROM laps WHERE "
+    "CASE WHEN speed > (SELECT AVG(speed) FROM laps) THEN 1 ELSE 0 END = 1",
+    # BETWEEN clones its left operand before binding and cloneExpr SHARES the
+    # statement, so this is TWO SubqueryExpr nodes over ONE SelectStatement: one
+    # run, two substitutions
+    "SELECT COUNT(*) FROM laps WHERE (SELECT MAX(age) FROM drivers) BETWEEN 1 AND 99",
+
+    # --- scope resolution, kept from Week 30 and now returning rows ---
+    # an inner alias shadowing an outer one: the inner block wins, and that is
+    # not an ambiguity
+    "SELECT COUNT(*) FROM laps x WHERE EXISTS (SELECT * FROM drivers x WHERE x.age > 30)",
+    # an unqualified name present in BOTH blocks resolves to the inner one
+    "SELECT COUNT(*) FROM laps l WHERE EXISTS "
+    "(SELECT * FROM drivers d WHERE team = 'Ferrari')",
+    # a subquery in a query that also uses a LEFT JOIN, so the Week 29 passes run
+    # on the same tree
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE d.age IN (SELECT season FROM laps l2)",
+    # a local expression group key inside the body must still satisfy its own
+    # select item
+    "SELECT COUNT(*) FROM laps l WHERE EXISTS "
+    "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)",
+    # a JOIN in the outer query, so pushdown, join enumeration and the restored
+    # projection narrowing all run above a materialized constant
+    "SELECT l.team, COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "WHERE l.speed > (SELECT AVG(speed) FROM laps) GROUP BY l.team ORDER BY l.team",
+]
+
+# A three-relation body executes wherever a three-relation query does, which is
+# the vectorized path only (Week 27). The nested query runs on the SAME engine as
+# the query containing it, so this is the pre-existing capability difference
+# rather than a new one — and asserting both halves is what keeps it deliberate.
+WEEK31_SUBQUERY_VEC_ONLY = [
+    "SELECT COUNT(*) FROM laps WHERE speed > "
+    "(SELECT AVG(l.speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    " JOIN drivers d2 ON d.driver_id = d2.driver_id)",
+]
+WEEK31_SUBQUERY_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path") for query in WEEK31_SUBQUERY_VEC_ONLY
+]
+
+# Correlated subqueries are Week 33: their value depends on the outer row, so
+# there is no constant to substitute. Reaching THIS refusal still asserts
+# everything Week 30 built — nested scopes, correlation detection, per-scope
+# validation, the level carried on every ref — because all of it has to succeed
+# to get here.
+WEEK33_CORRELATED_EXPECT = "correlated subqueries are not yet executable (Week 33)"
+WEEK33_CORRELATED_BINDS = [
+    # scalar, correlated (Q17), composed with arithmetic
     "SELECT l.lap_id FROM laps l WHERE l.speed > "
     "0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
-    # scalar in HAVING, uncorrelated (Q11)
-    "SELECT team, AVG(speed) FROM laps GROUP BY team "
-    "HAVING AVG(speed) > (SELECT AVG(speed) FROM laps)",
-    # EXISTS, correlated (Q4/Q21) — `select *` inside must stay legal, so the
-    # arity rule cannot apply to EXISTS
+    # EXISTS, correlated (Q4/Q21) — `select *` inside must stay legal
     "SELECT d.name FROM drivers d WHERE EXISTS "
     "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 340)",
-    # NOT EXISTS (Q21): the leading-NOT production, which parseCompare's NOT
-    # lookahead cannot see because it fires only after a complete left operand
+    # NOT EXISTS (Q21): the leading-NOT production
     "SELECT d.name FROM drivers d WHERE NOT EXISTS "
     "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
     # ...and in the middle of an AND chain
     "SELECT d.name FROM drivers d WHERE d.age > 30 AND NOT EXISTS "
     "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
-    # IN (subquery), uncorrelated (Q18/Q20) — a DIFFERENT production from the
-    # constant list, which still parses as an InExpr
-    "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps)",
-    # NOT IN (subquery) (Q16)
-    "SELECT name FROM drivers WHERE driver_id NOT IN "
-    "(SELECT driver_id FROM laps WHERE speed > 340)",
-    # nested two deep, the inner one correlated to the MIDDLE block (Q20)
+    # nested two deep, the inner one correlated to the MIDDLE block (Q20). The
+    # TOP node is uncorrelated, so this is the query that proves the statement
+    # flag propagates outward — without it the refusal fires from a nested run
+    # after the outer levels have already been materialized
     "SELECT name FROM drivers d WHERE d.driver_id IN "
     "(SELECT l.driver_id FROM laps l WHERE l.speed > "
     " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
     # correlated across a JOIN in the outer query: the ref names relation 1, so
-    # (query_level 1, relation_slot 1). This is the shape that binds to the wrong
-    # relation if the two numbering domains are conflated
+    # (query_level 1, relation_slot 1)
     "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
     "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team)",
-    # an inner alias shadowing an outer one, and an unqualified name present in
-    # both blocks: the inner block wins both times, and neither is an ambiguity
-    "SELECT x.team FROM laps x WHERE EXISTS (SELECT * FROM drivers x WHERE x.age > 30)",
-    "SELECT l.lap_id FROM laps l WHERE EXISTS "
-    "(SELECT * FROM drivers d WHERE team = 'Ferrari')",
-    # a subquery in a query that also uses a LEFT JOIN, so the Week 29 passes are
-    # on the same tree
-    "SELECT d.name FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
-    "WHERE d.age IN (SELECT season FROM laps l2)",
-
-    # --- round 1 ---
-    # a correlated ref inside the NESTED query's own ON clause. Its slot indexes
-    # the OUTER range table, and validateJoinCondition's `relations` is the inner
-    # one, so indexing it reported "column 'lap_id' not found in table 'd'" — an
-    # error the query is not entitled to, against a relation it never named
+    # a correlated ref inside the NESTED query's own ON clause
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
     " AND d.age = l.lap_id)",
-    # the control for the cross-product refusal below: a REAL inner key beside a
-    # correlated residual is legal, and the residual must not be what saves it
+    # a REAL inner key beside a correlated residual is legal, and the residual
+    # must not be what saves it from the cross-product refusal
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d JOIN laps p ON d.driver_id = p.driver_id "
     " AND p.speed > l.speed)",
-    # a correlated GROUP BY key is legal SQL — it is constant within every group.
-    # Both spellings must behave the same: the skip used to key on whether the
-    # binder had written a qualifier back, which it only does for a block holding
-    # two or more relations, so the SAME subquery was refused under a
-    # one-relation outer query and accepted under a two-relation one
+    # a correlated GROUP BY key is legal SQL, in both spellings
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT COUNT(*) FROM drivers d GROUP BY season)",
     "SELECT l.lap_id FROM laps l JOIN drivers dd ON l.driver_id = dd.driver_id "
     "WHERE EXISTS (SELECT COUNT(*) FROM drivers d GROUP BY season)",
-    # BETWEEN clones its left operand before binding and cloneExpr SHARES the
-    # statement, so two SubqueryExpr nodes reach one SelectStatement in a single
-    # bind. Both must stay marked correlated, or collectSlots stops contributing
-    # -1 for the second and pushdown pushes a correlated conjunct onto one scan
+    # BETWEEN's clone shares the statement, so BOTH nodes must stay marked
+    # correlated — the second one was left uncorrelated until Week 30 round 1
     "SELECT lap_id FROM laps l WHERE "
     "(SELECT MAX(d.age) FROM drivers d WHERE d.driver_id = l.driver_id) "
     "BETWEEN 1 AND 99",
-    # the IN operand reaches constant folding (dispatch site 14). NOTE: this
-    # suite only asserts the query reaches the refusal, which it would do either
-    # way — the folding itself is pinned by
-    # SubqueryDispatch.ConstantFoldingReachesTheInOperandAndNotTheBody
-    "SELECT team FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
-
-    # --- round 2 ---
-    # a LEGAL correlated aggregate argument. The type check for it moved to the
-    # Binder, which is the only layer holding the scope chain, so this is the
-    # control that it did not become a blanket refusal
+    # a LEGAL correlated aggregate argument: the type check that moved to the
+    # Binder must not have become a blanket refusal
     "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
     "WHERE EXISTS (SELECT SUM(d.age) FROM drivers x)",
-    # a LOCAL expression group key must still satisfy its own select item, or
-    # adding the query level to exprKey has simply broken expression grouping
-    "SELECT lap_id FROM laps l WHERE EXISTS "
-    "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)",
-
-    # --- round 3 ---
-    # The two Week 31 inputs whose consumers were missing from the slot-consumer
-    # enumeration. Both still bind, which is the point: the guards added for them
-    # are tripwires behind the refusal, not new rejections. `team` exists in BOTH
-    # tables, which is what makes each failure a silent hit on the wrong relation
-    # rather than a miss.
-    #   - a correlated ColumnRef-op-Literal in a nested WHERE, which
-    #     collectSimplePredicates read as scan-local and would have pruned the
-    #     inner scan's chunks on the outer relation's value
+    # the two Week 31 tripwire inputs. Both still only BIND: the guards behind
+    # them (ChunkPruner declines, buildAggregateSchema throws) stay ARMED and
+    # unreached, because Week 31 lowers no correlated reference. `team` exists in
+    # both tables, which is what makes each failure a silent hit on the wrong
+    # relation rather than a miss
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d WHERE l.team = 'Ferrari')",
-    #   - a correlated GROUP BY key, which buildAggregateSchema would have
-    #     resolved to drivers.team instead
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT COUNT(*) FROM drivers d GROUP BY l.team)",
 ]
@@ -851,7 +917,7 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
   + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES \
   + WEEK27_KEY_ENCODING_QUERIES + WEEK29_OUTER_JOIN_QUERIES \
-  + WEEK30_ALIAS_REBIND_QUERIES
+  + WEEK30_ALIAS_REBIND_QUERIES + WEEK31_SUBQUERY_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -1104,23 +1170,46 @@ def main():
         r_failed += rf
         r_errors += re_
 
-    # Week 30. Two suites, two jobs. The BINDS suite asserts that each required
-    # TPC-H subquery form reaches the Week 31 refusal — nothing this week returns
-    # rows, so reaching the refusal is the only end-to-end evidence the
-    # checkpoint has. The REJECTED suite asserts that everything a query can get
-    # wrong earlier still outranks it, which is what stops the refusal becoming a
-    # catch-all. Both run in all four modes: the refusal is one check at the end
-    # of Validator::validate, and running it everywhere is what proves the two
-    # engines agree rather than asserting it.
-    week30_binds = [(q, WEEK30_SUBQUERY_BIND_EXPECT) for q in WEEK30_SUBQUERY_BINDS]
+    # Week 31. The uncorrelated forms now return rows and are diffed as part of
+    # QUERIES above, in all four modes. What is left here is the correlated half,
+    # which is still a rejection suite — reaching THAT refusal asserts every
+    # scope-resolution property Week 30 built, since all of it has to succeed to
+    # get there — and the Week 30 rejections, which assert that everything a
+    # query can get wrong earlier still outranks the refusal, in the shape that
+    # stops it becoming a catch-all.
+    #
+    # Both run in all four modes: the refusal is one check at the end of
+    # Validator::validate and the materialization pass sits above both engines,
+    # so running everywhere is what proves the four modes agree rather than
+    # asserting it.
+    week33_binds = [(q, WEEK33_CORRELATED_EXPECT) for q in WEEK33_CORRELATED_BINDS]
     for label, extra in modes:
-        for suite, name in ((week30_binds, "Week 30 subqueries bind"),
+        for suite, name in ((week33_binds, "Week 33 correlated subqueries refused"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
             rp, rf, re_ = run_rejection_suite(
                 suite, f"{name} — {label}", extra_args=extra)
             r_passed += rp
             r_failed += rf
             r_errors += re_
+
+    # A subquery whose BODY joins three or more relations executes wherever a
+    # three-relation query does — the vectorized path — because the nested query
+    # runs on the same engine as the query containing it. Same split, and for the
+    # same reason, as MULTIWAY_QUERIES / MULTIWAY_VOLCANO_REJECTED above.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK31_SUBQUERY_VEC_ONLY,
+            f"Week 31 multi-relation subquery body — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK31_SUBQUERY_VOLCANO_REJECTED,
+            f"Week 31 multi-relation subquery body refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
 
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
     total_failed = f1 + f2 + f3 + f4 + m_failed + r_failed
