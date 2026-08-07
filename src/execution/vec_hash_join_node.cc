@@ -7,7 +7,7 @@
 #include <numeric>
 #include <stdexcept>
 
-VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)) {
+VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual, JoinSemantics semantics) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)), semantics_(semantics) {
     // Loud rather than latent: with swapped_ the build block is the LEFT half of
     // the output row, so emitNullExtended's trailing-NULL assembly would null the
     // PRESERVED side's own columns and return rows that look like data.
@@ -16,6 +16,28 @@ VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::
     if (left_outer_ && swapped_) {
         throw std::runtime_error(
             "internal: a left outer join requires the preserved side on the probe input");
+    }
+    // Week 32. Same stance, same reason: the surviving side of a semi/anti join
+    // is the PROBE input, and its output schema IS the probe schema. Every one
+    // of these is unreachable from VectorizedPlanBuilder, which forces the side,
+    // so each is the shape of a planner bug and says so.
+    if (semantics_ != JoinSemantics::STANDARD) {
+        if (swapped_) {
+            throw std::runtime_error(
+                "internal: a semi/anti join requires the probed side on the probe input");
+        }
+        if (left_outer_) {
+            throw std::runtime_error(
+                "internal: a semi/anti join cannot also be a left outer join");
+        }
+        if (on_residual_) {
+            throw std::runtime_error(
+                "internal: a semi/anti join takes no ON residual");
+        }
+        if (output_schema_.size() != probe_child_->outputSchema().size()) {
+            throw std::runtime_error(
+                "internal: a semi/anti join's output schema must be the probe schema");
+        }
     }
 }
 
@@ -51,9 +73,15 @@ void VecHashJoinNode::open() {
     // operator was actually given, never derived from a probe chunk's column
     // count: the builder already checks that lowered inputs match their logical
     // schemas, and this is the value that must agree with output_schema_.
-    build_width_ = build_child_->outputSchema().size();
+    // Meaningless for a semi/anti join — nothing is null-extended and no build
+    // column is emitted — so it is left at zero rather than silently computing a
+    // width nothing uses.
+    build_width_ = (semantics_ == JoinSemantics::STANDARD)
+                 ? build_child_->outputSchema().size() : 0;
 
     hash_table_.clear();
+    build_keys_.clear();
+    build_had_null_key_ = false;
     output_buffer_.clear();
     output_cursor_ = 0;
 
@@ -74,7 +102,20 @@ void VecHashJoinNode::open() {
         for (int r : *indices_ptr) {
             // serialize the key tuple with the same '\x01' sentinel Volcano's
             // HashJoinNode uses; a NULL member makes the row unmatchable
-            if (!serializeKey(*chunk, build_key_idx_, r, key_buf_)) continue;
+            if (!serializeKey(*chunk, build_key_idx_, r, key_buf_)) {
+                // Week 32: for ANTI this is not merely "unmatchable" — it is the
+                // NULL that makes `x NOT IN S` never TRUE. Record it; the probe
+                // loop short-circuits on it.
+                build_had_null_key_ = true;
+                continue;
+            }
+
+            // Week 32: a SEMI/ANTI join never emits a build-side row, so only the
+            // key is kept.
+            if (semantics_ != JoinSemantics::STANDARD) {
+                build_keys_.insert(key_buf_);
+                continue;
+            }
 
             // reconstruct full build-side Row and insert into hash table
             Row build_row;
@@ -156,6 +197,60 @@ DataChunk* VecHashJoinNode::nextChunk() {
             return !v.isNull() && v.asInt() != 0;
         };
 
+        // Week 32 — the NULL rule, and it is NOT symmetric. `x NOT IN S` is
+        // never TRUE when S holds a NULL: FALSE where x matches, UNKNOWN
+        // elsewhere, and a WHERE keeps neither. So an ANTI join over a build
+        // side that saw one NULL key emits NOTHING AT ALL — do not probe. The
+        // positive form needs no special case, because a NULL simply never
+        // matches. This is the collapse Week 31 proved sound at the
+        // substitution site: UNKNOWN and FALSE are indistinguishable to every
+        // consumer reachable from a WHERE, and nothing this week adds a general
+        // NOT. See docs/week-32-plan.md 8.
+        if (semantics_ == JoinSemantics::ANTI && build_had_null_key_) {
+            stats.rows_in += static_cast<int>(indices_ptr->size());
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            continue;   // pull the next probe chunk; this one contributes nothing
+        }
+
+        // Week 32 — SEMI/ANTI probe. Structurally a FILTER: output_schema_ IS
+        // the probe schema, so the probe row is emitted verbatim, ONCE, and no
+        // build row is read. Emitting once is the whole point — an inner join
+        // with a projection on top would emit the probe row per match.
+        if (semantics_ != JoinSemantics::STANDARD) {
+            for (int r : *indices_ptr) {
+                stats.rows_in++;
+                // A NULL probe key emits nothing, for SEMI and ANTI alike:
+                // `NULL IN S` and `NULL NOT IN S` are both UNKNOWN whenever S is
+                // non-empty, and both are FALSE-equivalent under a WHERE. When S
+                // is EMPTY, `x NOT IN ()` is TRUE even for a NULL x — there is
+                // nothing to compare against — which is why the empty case is
+                // tested on build_keys_ rather than folded in here.
+                if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) {
+                    if (semantics_ == JoinSemantics::ANTI && build_keys_.empty()
+                        && !build_had_null_key_) {
+                        Row out_row;
+                        out_row.reserve(output_schema_.size());
+                        for (const auto& cv : probe_chunk->columns) out_row.push_back(valueAt(cv, r));
+                        output_buffer_.push_back(std::move(out_row));
+                    }
+                    continue;
+                }
+                const bool hit = build_keys_.count(key_buf_) > 0;
+                if (hit != (semantics_ == JoinSemantics::SEMI)) continue;
+                Row out_row;
+                out_row.reserve(output_schema_.size());
+                for (const auto& cv : probe_chunk->columns) out_row.push_back(valueAt(cv, r));
+                output_buffer_.push_back(std::move(out_row));
+            }
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            // NOT `continue`: the while-loop head CLEARS output_buffer_, so a
+            // continue here would discard the rows just written. Falling off the
+            // end re-tests the loop condition, which is what the standard path
+            // has always done.
+            if (!output_buffer_.empty()) break;
+            continue;
+        }
+
         for (int r : *indices_ptr) {
             stats.rows_in++;
 
@@ -230,6 +325,7 @@ DataChunk* VecHashJoinNode::nextChunk() {
 void VecHashJoinNode::close() {
     probe_child_->close();
     hash_table_.clear();
+    build_keys_.clear();
 }
 
 const Schema& VecHashJoinNode::outputSchema() const {
@@ -261,7 +357,10 @@ std::string VecHashJoinNode::explain() const {
     // Week 29: the node NAME carries the join type, so every inner-join plan
     // string is byte-identical and an outer join is unmissable. It keeps the
     // substring "Join", which the python harness greps for.
-    std::string s = left_outer_ ? "VecLeftHashJoin [" : "VecHashJoin [";
+    std::string s = "VecHashJoin [";
+    if (semantics_ == JoinSemantics::SEMI)      s = "VecSemiHashJoin [";
+    else if (semantics_ == JoinSemantics::ANTI) s = "VecAntiHashJoin [";
+    else if (left_outer_)                       s = "VecLeftHashJoin [";
     for (size_t i = 0; i < from_idx.size(); ++i) {
         if (i) s += " AND ";
         s += qualifyIfAmbiguous(from_side->outputSchema(), from_idx[i]) + " = "

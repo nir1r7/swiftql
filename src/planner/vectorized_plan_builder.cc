@@ -322,6 +322,29 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             std::vector<int> left_idx  = leftKeyIndices(from_schema, join->keys);
             std::vector<int> right_idx = rightKeyIndices(jn_schema, join->keys);
 
+            // Week 32 — SEMI/ANTI. The side is FORCED, not costed: a hash
+            // semi-join emits PROBE-side rows, so the outer spine must be the
+            // probe input and the subquery body the build input. Same stance as
+            // Week 29's left_outer, and the same enforcement — the operator's
+            // constructor throws on every other combination.
+            //
+            // The key indices resolve in DIFFERENT schemas and that is the
+            // point: the probe side by slot against the outer spine's schema
+            // (leftKeyIndices), the build side against the BODY's own schema.
+            // The two numbering domains never meet, because output_schema below
+            // is the probe schema, unmerged (docs/week-32-plan.md 0).
+            //
+            // No setCostDecision() here: estimates did not drive this choice,
+            // and printing one would make --explain claim an optimizer decision
+            // that never happened (the discipline at LogicalJoin::order_decision).
+            if (join->semantics != JoinSemantics::STANDARD) {
+                return std::make_unique<VecHashJoinNode>(
+                    std::move(from_child), std::move(join_child),
+                    std::move(left_idx), std::move(right_idx),
+                    join->output_schema, /*swapped=*/false, /*left_outer=*/false,
+                    /*on_residual=*/nullptr, join->semantics);
+            }
+
             // Week 22 (build side) + Week 23.5 (algorithm): cost every legal
             // (side, algorithm) assignment and take the cheapest jointly. With
             // the current constants each algorithm prefers the same side — the
