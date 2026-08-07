@@ -699,3 +699,48 @@ TEST(SemiJoinLowering, RefusesTheShapesItCannotExpress) {
         }
     }
 }
+
+// ===== Week 33 round 2: the shapes decorrelation must REFUSE, not answer =====
+
+// A correlated ref in the BODY's `JOIN ... ON`. splitCorrelation reads
+// body.where only; classifyJoinCondition routes this one to out.residuals and
+// LogicalPlanBuilder::build folds inner-join residuals into the body's WHERE
+// AFTER splitCorrelation has already run and cleared it. It then resolved by
+// BARE NAME against the body's merged schema — `d2.team = d.team` became
+// `d2.team = laps.team`.
+//
+// Not a hypothetical: against the committed data the query below returned 5
+// where SQLite returns 20, with no error and an identical --explain. A refusal
+// by name beats a plausible wrong answer.
+TEST(ExistsDecorrelation, ACorrelatedRefInTheBodysOnClauseIsRefusedNotMisresolved) {
+    Catalog cat(CATALOG);
+    try {
+        planLowered("SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+                    "(SELECT * FROM laps l JOIN drivers d2 "
+                    " ON l.lap_id = d2.driver_id AND d2.team = d.team "
+                    " WHERE d2.driver_id = d.driver_id)", cat);
+        ADD_FAILURE() << "expected a refusal, not a plan";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("JOIN ... ON clause"), std::string::npos)
+            << e.what();
+        EXPECT_NE(std::string(e.what()).find("correlated subquery:"), std::string::npos)
+            << e.what();
+    }
+}
+
+// The same guard over the body's SELECT list. Before it, this reached
+// buildProjectSchema, whose isResolved() (not isLocal()) guard made localSlot()
+// throw an INTERNAL-defect message for a query SQLite accepts (round 1 M-6).
+// Refusing it here is not support, but it is honest about which layer declined.
+TEST(ExistsDecorrelation, ACorrelatedRefInTheBodysSelectListIsRefusedByName) {
+    Catalog cat(CATALOG);
+    try {
+        planLowered("SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+                    "(SELECT d.name FROM laps l WHERE l.driver_id = d.driver_id)", cat);
+        ADD_FAILURE() << "expected a refusal, not a plan";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("SELECT list"), std::string::npos) << e.what();
+        EXPECT_EQ(std::string(e.what()).find("internal:"), std::string::npos)
+            << "a legal query must not report a planner defect: " << e.what();
+    }
+}

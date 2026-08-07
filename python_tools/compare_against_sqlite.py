@@ -811,6 +811,19 @@ WEEK33_CORRELATED_BINDS = [
     "(SELECT 1 FROM drivers d WHERE l.team = 'Ferrari')",
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT COUNT(*) FROM drivers d GROUP BY l.team)",
+    # Week 33 round 2 — a correlated ref in the BODY's ON clause. splitCorrelation
+    # reads body.where only, so this one survived into the body's plan and
+    # resolved by BARE NAME against the body's merged schema: `d2.team = d.team`
+    # became `d2.team = laps.team`. It returned 5 where SQLite returns 20, with
+    # no error. Refused by name now, which is why it belongs in this suite and
+    # not in the diffed one.
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l JOIN drivers d2 ON l.lap_id = d2.driver_id "
+    " AND d2.team = d.team WHERE d2.driver_id = d.driver_id)",
+    # ...and the same guard over the body's SELECT list, which used to reach
+    # buildProjectSchema and report an INTERNAL defect for a query SQLite answers
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT d.name FROM laps l WHERE l.driver_id = d.driver_id)",
 ]
 
 # Each of these must fail EARLIER than the refusal above, and for its own stated
