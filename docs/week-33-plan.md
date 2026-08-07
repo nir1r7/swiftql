@@ -1150,8 +1150,39 @@ removed or weakened.
       the diffed oracle cannot hold a query that errors). The now-executable
       shapes left `WEEK33_CORRELATED_BINDS`; nothing left that suite without
       arriving in the other.
-- [ ] Task 5: README dialect rows; the honest naming of what the fallback is.
+- [x] Task 5: two README dialect rows (the Volcano capability refusal, and the
+      shapes decorrelation declines). **Named a refusal, not a fallback** — see
+      the hand-off below.
 - [ ] Tasks 4, 6, 7, 8, 9.
+
+### Handed to Week 34
+
+1. **A genuine correct-but-slower fallback.** Week 33 ships a *refusal* for every
+   shape decorrelation cannot express. That is honest but incomplete: the
+   README's bullet asked for a fallback. Building one means a dependent-join
+   operator (re-execute the body per outer row), which this engine has never had
+   — and the reason it was not attempted here is that a second execution
+   production must agree with the first on `NOT EXISTS`'s NULL semantics, which
+   is the two-paths drift Weeks 26/28/30 each had to undo. Week 34 already owns
+   derived tables, which is the closest structural neighbour.
+2. **Task 6, Volcano semi/anti parity — not attempted, deliberately.** It is two
+   halves and only one is cheap: `JoinSemantics` in
+   `src/execution/hash_join_node.cc` (small), plus a Volcano plan shape that can
+   hold a *second* join, since `Planner::plan` builds exactly one `HashJoinNode`
+   out of `stmt.joins` (not small, and its guards have undocumented couplings —
+   Week 29's audit found `preserved_slots{0}` was correct only because of the
+   `joins.size() > 1` refusal). Correlated queries are therefore diffed in two
+   modes, not four, exactly as Week 32's `IN` queries are. Both halves of the
+   boundary are asserted, so it cannot drift silently.
+3. **Tasks 4, 7, 8 remain**: the Q17 correlated-scalar shape (a `GROUP BY` +
+   LEFT join rewrite, whose merged output schema breaks the one containment
+   Week 32 established and Week 33 preserves — which is Week 34's problem
+   anyway); the three surfaces audit round 4 never reached; and precise
+   `collectSlots` / `restampSlots` / `buildScanSchema` narrowing.
+4. **`WEEK33_CORRELATED_EXPECT` is a prefix, not a message.** Week 33 replaced
+   one refusal with a per-shape one, and the suite still asserts only the shared
+   prefix `correlated subquer`. Per-shape expectations are worth adding once the
+   shapes stop moving.
 
 ### Why `ColumnId` was worth 87 sites — the concrete case
 
