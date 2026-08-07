@@ -100,7 +100,9 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 | A subquery in a `JOIN ... ON` clause | `JOIN ON: subqueries are not supported in a join condition` | A residual carrying one would be handed to a probe loop that cannot evaluate it (outer join) or folded into the `WHERE` conjunction and routed by a relation slot it does not have (inner). Same shape as the `AggregateExpr` refusal beside it. Note `classifyJoinCondition` runs first, so a subquery that *also* forward-references a later relation reports the forward reference — shape before contents, as elsewhere |
 | A scalar or `IN` subquery returning more than one column | `scalar subquery must return exactly one column` / `IN subquery ...` | Decidable at bind time from the select list alone. `EXISTS` has no arity rule — Q4 and Q21 both write `select *`. *Cardinality* ("returned more than one row") needs data and is checked when the subquery runs (Week 31), and is the row below |
 | A scalar subquery returning more than one **row** — `WHERE speed > (SELECT speed FROM laps)` | `scalar subquery returned more than one row` | **A deliberate divergence from the SQLite oracle**, and the only one this dialect has in the subquery rules: SQLite answers this query by silently taking the subquery's *first* row (`SELECT (SELECT a FROM t)` over `1,2,3` returns `1`). Standard SQL makes it an error, and that is the honest answer for a *materialized* subquery — without an `ORDER BY` there is no first row, so SQLite's value depends on a scan order this engine is free to change with a zone map, a join order or a mode switch. Checked at run time because it needs data; the body is capped at `LIMIT 2` so proving "more than one" costs two rows, not the whole relation. `compare_against_sqlite.py` cannot diff a query that errors, so `WEEK31_MATERIALIZATION_REFUSED` pins the message instead |
-| An `IN` subquery producing more than 1024 distinct values | `IN subquery produced N distinct values, above the materialization limit of 1024 (Week 32 lowers this form to a semi-join)` | Week 31 executes `IN` by materializing the set into the Week 25 `InExpr`, whose values `evaluate()` compares **linearly per row** — right for a hand-written list, quadratic for a subquery result. `lap_id IN (SELECT lap_id FROM laps)` is 10 000 × 10 000 comparisons on the correctness baseline. SQLite answers that query, so this too is a divergence rather than a shared restriction, and it is pinned by message in `WEEK31_MATERIALIZATION_REFUSED` — the most obvious `IN` subquery over the shipped data is above the cap, so the refusal has to be asserted rather than assumed out of the suite. The bound is temporary by construction: Week 32's semi-join materializes nothing |
+| An `IN` subquery whose operand is not a plain column | `IN subquery: the left operand must be a column reference (computed operands are not supported)` | The grammar allows `additive [NOT] IN (select_stmt)`, so `season * 5 IN (SELECT ...)` parses — but Week 32 lowers `IN` to an equi-join and `JoinKey` holds column **names**; there is no computed-key join in this engine. Falling back to Week 31's materialization for this one shape would re-open the two-paths problem: two productions that must agree on `NOT IN`'s NULL semantics is the drift Weeks 26/28/30 each had to undo. SQLite answers it, so this is a divergence, pinned by message in `WEEK32_LOWERING_REFUSED` |
+| An `IN` subquery that is not a whole top-level `WHERE` conjunct | `IN subquery: supported only as a whole top-level WHERE conjunct (found one in a non-top-level position)` | A semi-join is a whole-conjunct construct; `x IN (SELECT ...) OR y > 5` has no disjunctive semi-join to lower to. No TPC-H query writes one. Same message covers an `IN` in `HAVING`, where the join would have to sit above `LogicalAggregate` — legal, but Q11's `HAVING` subquery is scalar, so lowering only `WHERE` is the minimum code that solves the problem. Both pinned in `WEEK32_LOWERING_REFUSED` |
+| An `IN` subquery on the Volcano path | `IN subqueries are lowered to a semi-join and are not supported on the Volcano path; use --execution vectorized` | `Planner::plan` builds exactly one `HashJoinNode` out of `stmt.joins`, and a semi-join is a **second** join for any query whose `FROM` already joins — there is no plan shape here to hold one, and this path does not run `LogicalPlanBuilder`, where the lowering grafts the body's subtree. A capability difference, so the refusal lives in `Planner::plan` and not in the shared `Validator` (Week 26's rule). What it costs is real: every `IN`-subquery query is diffed against SQLite in the two **vectorized** modes only, down from four in Week 31, with the refusal pinned by message in the two Volcano ones |
 | A join key comparing a STRING column with a numeric one — `ON d.team = l.lap_id` | `JOIN ON: cannot join a STRING column with a numeric one` | Keys are compared as serialized **text**, which carries no type tag, so a STRING `"7"` matched the INT `7` while `"007"` did not — half a match, while the identical predicate in a `WHERE` clause throws `Type mismatch`. Found in the Week 27 audit, closed in Week 29 because an outer join returns the unmatched half as null-extended rows that look like data. INT vs DOUBLE stays legal: `7.0` and `7` must still join, which is SQLite's numeric affinity. Also makes the SIMD loop join's INT-key gate rest on a stated rule rather than an accident |
 | `RIGHT` / `FULL OUTER JOIN` | parse error — `RIGHT` lexes as an identifier and trips the end-of-input check | A `RIGHT` join is not a flag on the left one: swapping the operands would change the merged schema's column order, which the fixed `[FROM, JOIN]` output order forbids. No TPC-H query in the documented dialect needs either |
 | `JOIN ... ON` with no equi-join key — `ON a.x < b.x`, `ON a.x = b.x OR a.y = b.y`, `ON a.x = 5` | `JOIN ON: at least one equality between the joined table and an already-joined table is required` | Such a join is a cross product with a filter on top, and there is no cross-product operator to run it on. Every other `ON` conjunct is legal as of Week 27 and becomes a post-join residual, so what is left to refuse is exactly the missing key. An `OR` is one indivisible conjunct, which is why it contributes no key even though it contains equalities |
@@ -1562,10 +1564,11 @@ re-derived.
 >   rather than a new one — but it is the first place the cost is paid for a
 >   whole second query, and a shared (reference-counted) table representation is
 >   the fix when Week 37 profiles it.
-> - **The `IN` materialization limit is a bound on `evaluate()`'s linear scan,
->   not a measurement.** Week 32's semi-join removes the need for it entirely; if
->   a query needs a larger set before then, the honest fix is the semi-join, not
->   a bigger constant.
+> - **The `IN` materialization limit is gone as of Week 32.** It was a bound on
+>   `evaluate()`'s linear scan, not a measurement, and it disappeared *because*
+>   nothing is materialized any more — `IN (subquery)` lowers to a hash semi-join
+>   — not because the constant was raised. `lap_id IN (SELECT lap_id FROM laps)`
+>   moved out of the rejection suite and into the diffed one.
 > - **Two textually identical but distinct subqueries still run twice.** Identity
 >   is the statement pointer, which is what makes the shared-statement case
 >   correct; a structural key would also collapse this one, and is worth exactly
@@ -1575,6 +1578,14 @@ re-derived.
 >   uncorrelated body is its own plan with its own range table, so no foreign
 >   slot enters the outer tree. Week 34's derived tables are where a nested scan
 >   genuinely joins the outer one.
+>   **Corrected in Week 32.** That last sentence is wrong. Semi-join lowering
+>   grafts the body's plan subtree into the outer tree, so one plan holds two
+>   range tables from Week 32 on, and `hasSlotOutsideRangeTable` fires on the
+>   semi-join's `join_slot == -1`. The decline is live now, not in Week 34. The
+>   containment is that a SEMI/ANTI join's `output_schema` **is** its left
+>   child's, so the body's slot numbering is never in scope above the join —
+>   which Week 34's derived tables genuinely do break, because a derived table's
+>   columns *are* in scope above it.
 
 ### Week 32 — Semi-Joins + Anti-Joins
 

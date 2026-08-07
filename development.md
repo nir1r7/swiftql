@@ -696,6 +696,52 @@ say the same thing:
    own range table, and the outer statement is left holding a constant. There is
    never more than one range table in play for one plan.
 
+**Week 32 broke fact 2's last sentence, deliberately, and replaced it with a
+different containment.** An uncorrelated `IN (subquery)` is no longer
+materialized: `lowerInSubqueries` (`subquery_lowering.h`) plans the body
+recursively and **grafts that subtree into the outer plan tree** as
+`children[1]` of a `LogicalJoin{SEMI|ANTI}`. One plan now holds nodes built from
+**two range tables**. Both are level 0 — no correlated ref is lowered this week,
+so the `ColumnId { level, slot }` trigger stays unfired and now points at **Week
+33**, which *is* the week that first lowers a correlated reference. The collision
+is not between levels; it is between **two slot numbering domains at the same
+level**.
+
+The containment, and it is a strong one: a semi-join and an anti-join emit
+**only left-side columns**, so a SEMI/ANTI `LogicalJoin`'s `output_schema` **is**
+`children[0]->output_schema`, never a merged schema. Consequences, each relied on
+by a row below:
+
+- No expression above the join can name a body slot, because no body column is in
+  scope — so the merged-schema slot stamping in `LogicalPlanBuilder::build` and
+  `VectorizedPlanBuilder` never runs for such a node, and `buildProjectSchema` /
+  `inferExprType` never resolve an outer name against a schema holding a
+  same-named body column.
+- `join_slot` is **-1**, meaning "children[1] is not a relation of this block's
+  range table". Every reader of `join_slot` must decline on
+  `semantics != STANDARD` or be provably unreachable for such a node.
+- The only place a body slot is read is `JoinKey::join_col`, resolved against
+  `children[1]`'s own schema — exactly the domain it came from.
+
+`lowerInSubqueries` asserts the schema equality at construction. That single
+assertion is what keeps the two domains from meeting.
+
+**Week 34's derived tables break this containment for real**, because a derived
+table's columns *are* in scope above it.
+
+### Week 32 consumers (one plan, two range tables)
+
+| Consumer | Status |
+|---|---|
+| `lowerInSubqueries` (`subquery_lowering.cc`) | **Safe by domain.** Reads `SubqueryExpr::operand`'s `relation_slot` into `JoinKey::from_slot`. The operand belongs to the **enclosing** query and is bound at level 0 there, so the slot is in the OUTER range table — the same domain `leftKeyIndices()` resolves against. `join_col` is the body's single output column, resolved against the body plan's own schema. The two never meet |
+| `CardinalityEstimator::estimateNode`, SEMI/ANTI branch | **Safe by domain.** `out.findForRef(from_col, from_slot)` uses the outer merged context; `right.find(join_col, -1)` is a bare-name lookup against the body's own one-relation context, where a bare name is unambiguous. Reads `join.join_slot` **only** in the STANDARD path above it |
+| `VectorizedPlanBuilder`, SEMI/ANTI lowering | **Safe by domain.** `leftKeyIndices` against the probe (outer spine) schema, `rightKeyIndices` against the body's own. `output_schema` handed to the operator is the probe schema, unmerged, and the operator's constructor re-checks its width |
+| `JoinEnumeration::hasSlotOutsideRangeTable` | **Level-agnostic, and now LIVE.** Fires on `join_slot == -1`, which is exactly a semi/anti join. Weeks 28–30 expected Week 31 to make this decline live and Week 31 reported it had not; **Week 32 is where it became live**, not Week 34. The decline is silent, in the same shape as the <3-relation one — there was no ordering decision to report |
+| `PredicatePushdown::pushIntoJoin` | **Declines.** Tests `semantics == STANDARD` alongside `join_type == INNER` before `by_slot.find(join_slot)`. A stronger reason than the outer join's: children[1]'s columns are not in the output schema at all, so a conjunct pushed there is unresolvable, not merely mis-scoped. The recursion into `children[0]` stays unconditional, which is what keeps a `WHERE` conjunct reaching the spine's scans |
+| `VecHashJoinNode` SEMI/ANTI probe | **Reads no slot.** Takes resolved column **indices**, and its output schema is the probe child's |
+| `buildAggregateSchema` (Week 30 tripwire) | **Still armed, still unreached.** An `IN` body may hold its own `GROUP BY`; its `GroupByColumn`s are level 0 against the **body's** range table, and the body is validated and planned as its own block, so the guard does not fire. The call context changed even though the data did not — covered by a query in `WEEK32_SEMI_JOIN_VEC_ONLY` rather than by reading |
+| `ChunkPruner::shouldSkip` (Week 30 tripwire) | **Still armed, still unreached.** Unchanged by this week |
+
 So everything below still receives level-0 refs **by construction**, and both
 guarded rows below stay **armed and unreached** — Week 31 checked each consumer
 in this table and made none of them reachable. Do not replace a tripwire with
