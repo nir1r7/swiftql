@@ -915,6 +915,93 @@ WEEK33_CORRELATED_BINDS = [
 # output name in the engine's history to contain a space at the TOP level of a
 # select item, so this constraint had never bitten. Aliasing also makes both
 # engines name the column identically, which normalize() keys rows on.
+# Week 34 — DERIVED TABLES (FROM (subquery)). Diffed in the two VECTORIZED modes
+# only: Planner::plan builds its scan from a catalog table name and exactly one
+# HashJoinNode out of stmt.joins, so there is no plan shape there that can hold a
+# relation which is itself a PLAN, and that path does not run LogicalPlanBuilder,
+# where the graft happens. Third family of query the four-mode oracle does not
+# cover (after Week 32's IN and Week 33's correlated); the count is in README
+# Limitations so the week it tips is visible.
+#
+# Every output column is ALIASED — see WEEK34_DISTINCT_AGG_QUERIES for why
+# (parse_swiftql_output splits the header line on whitespace).
+WEEK34_DERIVED_TABLE_VEC_ONLY = [
+    # the plain shape: a derived relation as the only relation
+    "SELECT d.team AS t FROM (SELECT team FROM laps) AS d ORDER BY t LIMIT 5",
+    # a derived relation with a WHERE above it — the conjunct lands as a filter
+    # ABOVE the LogicalDerived, which is what filterOnto's wrapping gives for free
+    "SELECT d.t AS t, d.s AS s FROM (SELECT team AS t, AVG(speed) AS s FROM laps "
+    "GROUP BY team) AS d WHERE d.s > 300 ORDER BY t",
+    # Q15's shape: a derived AGGREGATE relation joined to a base relation. This is
+    # the case the slot-0 normalization exists for on the join side.
+    "SELECT dr.name AS n, d.s AS s FROM (SELECT driver_id, AVG(speed) AS s FROM laps "
+    "GROUP BY driver_id) AS d JOIN drivers dr ON d.driver_id = dr.driver_id "
+    "ORDER BY n LIMIT 10",
+    # a derived relation in the JOIN position rather than the FROM one
+    "SELECT dr.name AS n, x.c AS c FROM drivers dr JOIN (SELECT driver_id, COUNT(*) AS c "
+    "FROM laps GROUP BY driver_id) AS x ON x.driver_id = dr.driver_id ORDER BY n LIMIT 10",
+    # a body that JOINS, so its own output schema carries slots 0 AND 1 before
+    # normalization — the shape that would put two numbering domains in one schema
+    "SELECT x.t AS t, x.nm AS nm FROM (SELECT l.team AS t, d.name AS nm FROM laps l "
+    "JOIN drivers d ON l.driver_id = d.driver_id) AS x ORDER BY t, nm LIMIT 10",
+    # Q13's shape: a LEFT JOIN inside the body, plus the COLUMN ALIAS LIST, plus a
+    # regroup above the derived relation
+    "SELECT c.k AS k, COUNT(*) AS n FROM (SELECT dr.name, COUNT(l.lap_id) AS c "
+    "FROM drivers dr LEFT JOIN laps l ON dr.driver_id = l.driver_id GROUP BY dr.name) "
+    "AS c (nm, k) GROUP BY c.k ORDER BY k",
+    # three relations, one of them derived: exercises join enumeration over a
+    # relation with no TableStats (joinCardinality's non-multiplicative branch)
+    "SELECT dr.name AS n, d.s AS s FROM (SELECT driver_id, AVG(speed) AS s FROM laps "
+    "GROUP BY driver_id) AS d JOIN drivers dr ON d.driver_id = dr.driver_id "
+    "JOIN laps l2 ON l2.driver_id = dr.driver_id WHERE l2.season = 2024 "
+    "ORDER BY n, s LIMIT 10",
+    # a derived table nested inside a derived table
+    "SELECT y.t AS t FROM (SELECT x.t AS t FROM (SELECT team AS t FROM laps) AS x) AS y "
+    "ORDER BY t LIMIT 5",
+    # a derived table inside a SUBQUERY body — two nesting mechanisms at once,
+    # which is the shape Week 32 shipped a regression in that no suite could see
+    "SELECT COUNT(*) AS n FROM laps WHERE speed > (SELECT AVG(x.s) FROM "
+    "(SELECT AVG(speed) AS s FROM laps GROUP BY team) AS x)",
+    # SELECT * over a derived relation, with the alias list naming the columns
+    "SELECT * FROM (SELECT team, speed FROM laps WHERE speed > 340) AS d (a, b) "
+    "ORDER BY a, b",
+]
+
+WEEK34_DERIVED_TABLE_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path")
+    for query in WEEK34_DERIVED_TABLE_VEC_ONLY
+]
+
+# LANGUAGE refusals: they fire identically on every path, so all four modes.
+# The diffed oracle cannot hold a query that errors, which is why each message is
+# pinned here rather than left to a manual check.
+WEEK34_DERIVED_REFUSED = [
+    # SQLite accepts an unaliased subquery in FROM; SwiftQL requires the alias
+    # because Binder::RangeEntry is keyed on the ref name. A divergence, pinned.
+    ("SELECT * FROM (SELECT team FROM laps)",
+     "a subquery in FROM requires an alias"),
+    ("SELECT * FROM (SELECT team FROM laps) AS d (a, b)",
+     "column aliases were supplied"),
+    # A catalog table cannot produce two columns of one name; a derived table can,
+    # and then BOTH indexOf overloads are a coin flip. SQLite answers this query
+    # (it disambiguates positionally), so it is a divergence.
+    ("SELECT * FROM (SELECT l.team, d.team FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id) AS x",
+     "is produced twice"),
+    # LATERAL. Refused by the LATERAL message when the enclosing block is itself
+    # nested — there is a parent scope for the reference to resolve in and mark
+    # the body correlated. At TOP level there is no parent, so the same shape is
+    # reported as an ordinary unresolved qualifier: a sibling FROM item genuinely
+    # is not in scope and the Binder cannot tell a lateral reference from a typo.
+    # Both halves are pinned so neither can drift into silently binding.
+    ("SELECT * FROM laps l JOIN (SELECT team FROM drivers d WHERE d.team = l.team) "
+     "AS x ON x.team = l.team",
+     "unknown table qualifier"),
+    ("SELECT COUNT(*) FROM laps o WHERE EXISTS (SELECT 1 FROM "
+     "(SELECT team FROM drivers d WHERE d.team = o.team) AS x WHERE x.team = o.team)",
+     "LATERAL is not supported"),
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -1590,6 +1677,8 @@ def main():
         for suite, name in ((week33_binds, "Week 33 correlated subqueries refused"),
                             (WEEK34_DISTINCT_AGG_REFUSED,
                              "Week 34 DISTINCT aggregate refusals"),
+                            (WEEK34_DERIVED_REFUSED,
+                             "Week 34 derived-table refusals"),
                             (WEEK31_MATERIALIZATION_REFUSED,
                              "Week 31 materialization divergences from SQLite"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
@@ -1628,6 +1717,24 @@ def main():
         r_passed += rp
         r_failed += rf
         r_errors += re_
+
+    # Week 34 — derived tables. Same split, same reason as Weeks 32 and 33: the
+    # capability difference is real, so BOTH halves are asserted and the boundary
+    # cannot drift silently.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK34_DERIVED_TABLE_VEC_ONLY,
+            f"Week 34 derived tables — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK34_DERIVED_TABLE_VOLCANO_REJECTED,
+            f"Week 34 derived tables refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
 
     # Week 33 — decorrelated EXISTS / NOT EXISTS. Same split, same reason as
     # Week 32's: the capability difference is real, so BOTH halves are asserted.
