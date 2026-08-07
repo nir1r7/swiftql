@@ -597,7 +597,9 @@ def gate_line(summary, qids, ok, baseline_lines):
     if fails:
         line += " -- " + "; ".join(fails)
     elif gained:
-        line += " -- IMPROVED, refresh the baseline (--write-baseline)"
+        line += (" -- IMPROVED, refresh the baseline "
+                 "(--write-baseline docs/tpch-baseline.json "
+                 "--json docs/tpch-sf0.01-report.json)")
     return line
 
 
@@ -615,12 +617,34 @@ def main():
                          "regression (a query that stops answering, becomes "
                          "vacuous, or answers in fewer modes)")
     ap.add_argument("--write-baseline", default="",
-                    help="write this run's summary as the new baseline")
+                    help="write this run's summary as the new baseline. Requires "
+                         "--json: the baseline IS the report's \"summary\" key, "
+                         "so moving one without the other publishes two "
+                         "artifacts that disagree")
     ap.add_argument("--fingerprint-all", action="store_true",
                     help="capture a plan fingerprint for every answering cell. "
                          "Off by default: only q22's is reported, and an extra "
                          "--explain invocation per cell roughly doubles the run")
     args = ap.parse_args()
+
+    # The baseline is not a separate measurement -- it is byte-for-byte the
+    # report's "summary" key, written by the same run from the same dict. When
+    # only --write-baseline was passed, the recorded figure moved to 20/22 while
+    # docs/tpch-sf0.01-report.json went on publishing 19/22 with q17 UNPORTED,
+    # and the plan's own reader instruction points at the stale one. Nothing in
+    # the run could notice: two independent flags, two independent files.
+    #
+    # Refused up front, before the ~4-minute run, so the fix is "add --json"
+    # rather than "run it again". This is the only coupling asserted: the paths
+    # are still the operator's to choose, and a report without a baseline stays
+    # legal -- that direction publishes no figure it can contradict.
+    if args.write_baseline and not args.json:
+        sys.exit(
+            "--write-baseline requires --json: the baseline is this run's "
+            "summary, and the report carries the same summary alongside the "
+            "per-cell detail. Writing one without the other leaves the pair "
+            "disagreeing about the headline figure, with nothing to catch it.\n"
+            "  add: --json docs/tpch-sf0.01-report.json")
 
     qids = [q.strip() for q in args.queries.split(",") if q.strip()] or QUERY_IDS
 

@@ -1199,8 +1199,11 @@ in which the tree's own recorded figure is wrong.
        --baseline docs/tpch-baseline.json
    ```
 3. **Refresh the baseline in the same commit** as the change that moved it
-   (`--write-baseline docs/tpch-baseline.json`), and re-run to confirm the gate
-   is green against the new baseline.
+   (`--write-baseline docs/tpch-baseline.json --json docs/tpch-sf0.01-report.json`
+   — the harness refuses `--write-baseline` without `--json`, because the
+   baseline is the report's `summary` key and refreshing one alone publishes a
+   contradiction), and re-run to confirm the gate is green against the new
+   baseline.
 4. **Copy the `GATE tpch:` line verbatim** into the report, the README and
    `.claude/skills/verify/SKILL.md`. Never retype a count.
 5. **Run all five gate steps**, not just the fifth: build, `swiftql_tests`,
@@ -1291,6 +1294,39 @@ Success criteria for the week, in the form the gate reports them:
 | 6 — small items owed | **DONE** | 6a NaN hole fixed + asserted; 6b projection widened + demonstrated; 6c `--time` and `--fingerprint-all` exercised; 6d recorded honestly |
 | 7 — scale + memory | **DONE** | in README Limitations, with the columnar-peaks-higher finding |
 | 8 — re-baseline + report + gate | **DONE** | three full runs: measure, `--write-baseline`, confirm |
+
+### Closing round (round-1 audit follow-up)
+
+| Item | State | Note |
+|---|---|---|
+| F1 — `docs/tpch-sf0.01-report.json` stale at 19/22 | **DONE** | regenerated from a full 22×4 run; `summary` now byte-equal to `docs/tpch-baseline.json`; `--write-baseline` now **refuses without `--json`** so the pair cannot drift again |
+| Full refusal sweep (all 11 cited sites) | in progress | table below |
+
+**F1 — regenerated, and the flag coupling closed.** The run
+(`--json docs/tpch-sf0.01-report.json --baseline docs/tpch-baseline.json`)
+reported `BASELINE docs/tpch-baseline.json: OK` — no IMPROVED line, so the
+baseline was already the tree's figure and was not rewritten by this run. The
+report moved on exactly the cells the audit named: `q17|col-vec` and
+`q17|col-vec-noopt` UNPORTED → **MATCH**, `modes.q17` 0 → 2, `q17` into
+`meaningful`, out of `unported`; plus q21's two `details` strings picking up the
+sharpened refusal text from `6054d50`. `report["summary"] == baseline` now holds
+byte-for-byte.
+
+The root cause was not the missed flag but that missing it was survivable:
+`--json` and `--write-baseline` wrote two files from one run with nothing
+relating them, and the *documented* refresh path
+(`.claude/skills/verify/SKILL.md`, and step 3 above) named only
+`--write-baseline`. Following the instructions produced the drift. So
+`--write-baseline` without `--json` is now refused **before** the ~4-minute run,
+naming the flag to add; the two instruction sites and the harness's own
+`IMPROVED` suffix now carry both flags. Only that one direction is coupled — a
+`--json` run with no baseline write stays legal, because it publishes no figure
+it can contradict.
+
+Verdict figure, unchanged and now published in both artifacts:
+`GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes, 15
+vectorized-only; 1 vacuous; 1 unported)` — matches SQLite over the same `.tbl`
+files; not a TPC-H result (`PROVENANCE.txt`).
 
 ### Task 2 sweep report — checked, not only hit
 
