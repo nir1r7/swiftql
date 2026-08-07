@@ -1,11 +1,11 @@
 # Phase 5 orchestrator state
-Current: week 31, round 2 — gate + audit launched 07:52 UTC, both budgeted to land before the
-  08:31 reclaim. r1's 4 findings all actioned (3 commits, pushed individually).
-  r1 outcome: both mediums kept as DOCUMENTED divergences from SQLite (multi-row scalar errors
-  where SQLite takes the first row; IN caps at 1024 — Week 32's to remove), now pinned by a new
-  WEEK31_MATERIALIZATION_REFUSED suite in all four modes. Key structural insight: THE DIFFED
-  ORACLE SUITE CANNOT HOLD A QUERY THAT ERRORS, so any refusal that diverges from SQLite is
-  invisible to it — refusals need their own rejection suite.
+Current: week 31, round 2 — audit came back CLEAN (0/0/0/0, all 5 targets, first fully clean
+  audit of the run). Waiting on the round-2 gate to close the week.
+  r1's 4 findings all actioned. Both mediums kept as DOCUMENTED divergences from SQLite
+  (multi-row scalar errors where SQLite takes the first row; IN caps at 1024 — Week 32's to
+  remove), pinned by WEEK31_MATERIALIZATION_REFUSED in all four modes.
+  STRUCTURAL INSIGHT worth carrying: the diffed oracle suite CANNOT HOLD A QUERY THAT ERRORS,
+  so any refusal diverging from SQLite is invisible to it. Refusals need their own suite.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅
