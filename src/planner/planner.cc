@@ -1,6 +1,8 @@
 #include "planner.h"
 #include "join_condition.h"
+#include "predicate_pushdown.h"   // pruningHintForPreservedSide — shared with the vectorized builder
 #include "parser/expr_utils.h"
+#include <unordered_set>
 
 std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
     // validate
@@ -98,9 +100,25 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     }
 
     // build seqScan (bottom of tree) using narrowed schema
+    //
+    // Week 29: the FROM scan is the PRESERVED side of an outer join, and this is
+    // the second of the engine's two pruning-hint routes. For an inner join
+    // `stmt.where` already absorbed the ON residuals and every conjunct is a legal
+    // filter on the join output; for a LEFT join the fold was deliberately dropped
+    // above, so `stmt.where` is exactly where the null-supplying side's conjuncts
+    // live — and handing it to this scan is the same delegation to
+    // chunk_pruner.h's slot test that the vectorized builder stopped making. Same
+    // rule, one implementation (predicate_pushdown.h): Volcano is the correctness
+    // baseline, so it is the last path whose latent guard should be the weaker one.
+    //
+    // Volcano builds exactly one join, so the preserved side is relation 0 alone.
+    const std::unordered_set<int> preserved_slots{0};
+    const Expr* prune_hint = pruningHintForPreservedSide(
+        stmt.where.get(), outer ? JoinType::LEFT : JoinType::INNER, preserved_slots);
+
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(stmt.from_table) > 0) {
-        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, stmt.where.get());
+        node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(columnar_tables.at(stmt.from_table)), scan_schema, prune_hint);
     } else {
         node = std::make_unique<SeqScanNode>(stmt.from_table, std::move(table_rows.at(stmt.from_table)), meta.schema);
     }

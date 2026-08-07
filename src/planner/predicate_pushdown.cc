@@ -56,6 +56,20 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     // Literal / IntervalLiteral: no slot.
 }
 
+// Week 29 — the pruning-hint rule, in ONE place for both planners. See the
+// header for why it exists and why each branch is spelled the way it is.
+const Expr* pruningHintForPreservedSide(const Expr* hint, JoinType join_type,
+                                        const std::unordered_set<int>& preserved_slots) {
+    if (!hint || join_type == JoinType::INNER) return hint;
+    std::unordered_set<int> slots;
+    collectSlots(hint, slots);
+    if (slots.empty()) return nullptr;          // fail closed: see the header
+    for (int s : slots) {
+        if (!preserved_slots.count(s)) return nullptr;
+    }
+    return hint;
+}
+
 namespace {
 
 // Flatten an AND-chain into its atomic conjuncts, moving ownership out of the

@@ -9,7 +9,7 @@
 #include "execution/vec_hash_join_node.h"
 #include "execution/vec_simd_loop_join_node.h"
 #include "planner/cost_model.h"
-#include "planner/predicate_pushdown.h"   // collectSlots — dispatch site 8, shared
+#include "planner/predicate_pushdown.h"   // pruningHintForPreservedSide — shared with Planner::plan
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -279,27 +279,25 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // chunk_pruner.h's `relation_slot < 1` test in ANOTHER file — and the
             // failure mode is silent row loss on the preserved side, the one side
             // this week exists to protect. So do not delegate it: withhold the
-            // hint outright when this join does not preserve every relation the
-            // hint mentions. Scoped to outer joins deliberately — an inner join's
-            // hint is unchanged, byte for byte, including the mixed-slot
-            // `--no-optimize` WHERE the Phase 4 benchmark measures. An outer join
-            // loses nothing under the optimizer either, since a preserved-side
-            // conjunct was pushed to its own leaf and carries its own hint there.
+            // hint when this join does not preserve every relation the hint
+            // mentions. The rule itself lives in predicate_pushdown.h, because
+            // Planner::plan routes a hint to its FROM scan for exactly the same
+            // reason and a second copy is how the two engines drift apart.
+            //
+            // `preserved` is read off the LEFT INPUT's schema rather than assumed
+            // to be {0}: in (A ⋈ B) ⟕ C, relation B is preserved too, and a hint
+            // over B belongs to a scan that is entitled to it.
             const bool leftmost_is_slot0 =
                 join->output_schema.size() > 0 &&
                 join->output_schema.column(0).relation_slot == 0;
-            bool hint_is_preserved = true;
-            if (pruning_where && join->join_type != JoinType::INNER) {
-                std::unordered_set<int> slots;
-                collectSlots(pruning_where, slots);
-                // slot 0 is the leftmost relation, guarded above; anything else
-                // this join introduced is null-supplied and must not steer a scan
-                hint_is_preserved = slots.empty() ||
-                                    (slots.size() == 1 && slots.count(0) == 1);
+            std::unordered_set<int> preserved;
+            for (const ColumnDef& c : join->children[0]->output_schema.columns()) {
+                preserved.insert(c.relation_slot);
             }
-            auto from_child = lower(join->children[0].get(),
-                                    (leftmost_is_slot0 && hint_is_preserved)
-                                        ? pruning_where : nullptr);
+            const Expr* from_hint = leftmost_is_slot0
+                ? pruningHintForPreservedSide(pruning_where, join->join_type, preserved)
+                : nullptr;
+            auto from_child = lower(join->children[0].get(), from_hint);
             auto join_child = lower(join->children[1].get(), nullptr);
 
             // Week 27: arbitrary key counts, and children[0] may itself be a
