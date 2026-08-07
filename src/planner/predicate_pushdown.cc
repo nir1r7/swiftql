@@ -124,19 +124,8 @@ const Expr* pruningHintForPreservedSide(const Expr* hint, JoinType join_type,
 
 namespace {
 
-// Flatten an AND-chain into its atomic conjuncts, moving ownership out of the
-// tree. OR / comparison / IS NULL are indivisible — each becomes one leaf.
-// Mirrors the recursion shape of collectCols() in logical_plan.cc.
-void splitConjuncts(std::unique_ptr<Expr> pred, std::vector<std::unique_ptr<Expr>>& out) {
-    auto* bin = dynamic_cast<BinaryExpr*>(pred.get());
-    if (bin && bin->op == "AND") {
-        // move both operands out before the AND node dies at end of scope
-        splitConjuncts(std::move(bin->left), out);
-        splitConjuncts(std::move(bin->right), out);
-        return;
-    }
-    out.push_back(std::move(pred));
-}
+// splitConjuncts moved to parser/expr_utils.h in Week 32 — the set-membership
+// lowering needs the SAME notion of "one conjunct" this pass uses.
 
 // The single relation slot a conjunct references, or -1 when it references none
 // (constant), several (a cross-relation residual), or an unresolved ref.

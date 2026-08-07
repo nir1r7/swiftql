@@ -40,6 +40,7 @@ add_library(swiftql_lib
     src/planner/binder.cc
     src/planner/constant_folding.cc
     src/planner/subquery_materialization.cc
+    src/planner/subquery_lowering.cc
     src/planner/join_condition.cc
     src/planner/logical_plan.cc
     src/planner/cardinality_estimator.cc

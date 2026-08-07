@@ -51,19 +51,17 @@ struct SubqueryResult {
 // the whole rewrite unit-testable with canned rows and no data at all.
 using SubqueryRunner = std::function<SubqueryResult(SelectStatement)>;
 
-// An IN subquery's materialized set is compared LINEARLY per row by evaluate()'s
-// InExpr case (evaluator.cc) — the list was a hand-written literal list until
-// now, so a linear scan was right. `lap_id IN (SELECT lap_id FROM laps)` is
-// 10000 distinct values against 10000 rows, i.e. 1e8 Value comparisons per
-// Volcano mode, and compare_against_sqlite.py runs two of them.
-//
-// So the set is capped and the refusal names the week that removes it: Week 32
-// lowers this form to a semi-join, at which point nothing is materialized.
-// Teaching evaluate() to hash instead would change the SEMANTIC REFERENCE's hot
-// path for one week's benefit. The value is a bound on work, not a measurement:
-// 1024 distinct values is ~1e7 comparisons over a 10k-row outer query, which is
-// the same order as one unindexed join and is what the harness must tolerate.
-inline constexpr int MAX_MATERIALIZED_IN_VALUES = 1024;
+// Week 32 REMOVED MAX_MATERIALIZED_IN_VALUES. Week 31 capped an IN subquery's
+// materialized set at 1024 distinct values because evaluate()'s InExpr case
+// compares the list LINEARLY per row — `lap_id IN (SELECT lap_id FROM laps)` is
+// 1e8 Value comparisons per Volcano mode — and documented the cap as a
+// deliberate SQLite divergence whose removal was this week's business. It is
+// gone because nothing is materialized any more, not because the constant was
+// raised: materializeSubqueries now skips every Kind::IN node and
+// subquery_lowering.h turns it into a hash semi-join, which is O(left + right).
+// The README dialect-table row and the rejection-suite entry that pinned it went
+// with it — the query moved into the DIFFED suite, where it is finally compared
+// against SQLite rather than only asserted to fail.
 
 // DISPATCH SITE 19 (development.md -> Extending the expression language).
 //

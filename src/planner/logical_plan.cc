@@ -1,6 +1,7 @@
 #include "logical_plan.h"
 #include "join_condition.h"
 #include "validator.h"
+#include "subquery_lowering.h"
 #include "parser/expr_utils.h"
 #include <unordered_set>
 
@@ -764,6 +765,25 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         stmt.where = conjoinAll(std::move(on_residuals));
     }
 
+    // Week 32 — set-membership lowering, BETWEEN the spine and the WHERE filter.
+    // Position is load-bearing in both directions: the semi-join's probe input
+    // must be the whole FROM/JOIN spine (so the operand's binder slot resolves
+    // in the same domain leftKeyIndices() uses), and the IN node must leave the
+    // predicate BEFORE inferExprType walks it below — dispatch site 12 still
+    // throws on a surviving SubqueryExpr, deliberately, so a missed nesting
+    // position is loud rather than silently wrong.
+    if (stmt.where) {
+        std::vector<std::unique_ptr<Expr>> conjuncts;
+        splitConjuncts(std::move(stmt.where), conjuncts);
+        InLoweringResult lowered = lowerInSubqueries(std::move(node), conjuncts, catalog);
+        node = std::move(lowered.plan);
+        stmt.where = conjoinAll(std::move(conjuncts));
+        // Anything left holding an IN node is a shape lowering cannot express —
+        // an IN under an OR, most of all. Refuse by name here rather than let
+        // site 12 report it as a materialization defect.
+        refuseUnloweredIn(stmt.where.get(), "a non-top-level position");
+    }
+
     // filter (WHERE)
     if (stmt.where) {
         // plan-time type check: reject STRING arithmetic here instead of
@@ -789,6 +809,13 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
 
     // HAVING — filter above the aggregate; no dedicated node
     if (stmt.having) {
+        // Week 32: HAVING's IN is not lowered. The join would have to sit ABOVE
+        // LogicalAggregate — legal, but no TPC-H query needs it (Q11's HAVING
+        // subquery is scalar), and lowering only WHERE is the minimum code that
+        // solves the problem. Stated in the README dialect table and pinned in
+        // the rejection suite, because the diffed oracle cannot hold a query
+        // that errors.
+        refuseUnloweredIn(stmt.having.get(), "HAVING");
         inferExprType(stmt.having.get(), node->output_schema);
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.having));
     }

@@ -276,6 +276,28 @@ inline void collectAggregates(const Expr* expr, std::vector<const AggregateExpr*
     // IntervalLiteral: a constant, nothing to collect
 }
 
+// Flatten an AND-chain into its atomic conjuncts, MOVING ownership out of the
+// tree. OR / comparison / IS NULL are indivisible — each becomes one leaf.
+// Mirrors the recursion shape of collectCols() in logical_plan.cc and of the
+// borrowing flattenAnd() in join_condition.cc.
+//
+// Week 32 hoisted this out of predicate_pushdown.cc's anonymous namespace so the
+// set-membership lowering (subquery_lowering.h) shares it rather than growing a
+// third flattener. Which subtrees count as one conjunct is a semantic decision —
+// it is what makes `x IN (SELECT ...) OR y > 5` a single indivisible conjunct,
+// and therefore not extractable as a semi-join — so the two passes must agree by
+// construction, not by coincidence.
+inline void splitConjuncts(std::unique_ptr<Expr> pred, std::vector<std::unique_ptr<Expr>>& out) {
+    auto* bin = dynamic_cast<BinaryExpr*>(pred.get());
+    if (bin && bin->op == "AND") {
+        // move both operands out before the AND node dies at end of scope
+        splitConjuncts(std::move(bin->left), out);
+        splitConjuncts(std::move(bin->right), out);
+        return;
+    }
+    out.push_back(std::move(pred));
+}
+
 // Rebuild a left-deep AND-chain from conjuncts, or nullptr if empty. The
 // inverse of splitConjuncts()/flattenAnd(). Shared by predicate pushdown (which
 // re-conjoins what it did not push) and by both planners (which fold residual ON

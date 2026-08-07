@@ -191,29 +191,6 @@ const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
     return ins.first->second;
 }
 
-// Distinct non-null values of the result's single column, in first-seen order,
-// with `has_null` reporting whether any row was NULL.
-//
-// Deduped by keyFieldText, the EXACT identity text (key_encoding.h), never by
-// Value::toString(): %.15g collapsed 3245 distinct sums into 2526 texts over the
-// shipped dataset, and this list is about value identity for the same reason a
-// GROUP BY key is. It also means the INT 7 and the DOUBLE 7.0 collapse, which is
-// what Value::operator== does with them anyway.
-//
-// The dedupe is not tidiness: evaluate()'s InExpr scans this list LINEARLY per
-// row, and driver_id has 20 distinct values in 10000 rows.
-std::vector<Value> distinctNonNull(const std::vector<Row>& rows, bool* has_null) {
-    std::vector<Value> out;
-    std::unordered_set<std::string> seen;
-    *has_null = false;
-    for (const Row& r : rows) {
-        if (r.empty()) continue;                      // arity is Validator's
-        if (r[0].isNull()) { *has_null = true; continue; }
-        if (seen.insert(keyFieldText(r[0])).second) out.push_back(r[0]);
-    }
-    return out;
-}
-
 // The constant that replaces one uncorrelated SubqueryExpr.
 std::unique_ptr<Expr> buildReplacement(SubqueryExpr* sq, const SubqueryResult& res) {
     switch (sq->kind) {
@@ -248,54 +225,21 @@ std::unique_ptr<Expr> buildReplacement(SubqueryExpr* sq, const SubqueryResult& r
     }
 
     case SubqueryExpr::Kind::IN: {
-        bool has_null = false;
-        std::vector<Value> values = distinctNonNull(res.rows, &has_null);
-
-        if (static_cast<int>(values.size()) > MAX_MATERIALIZED_IN_VALUES) {
-            throw std::runtime_error(
-                "IN subquery produced " + std::to_string(values.size())
-                + " distinct values, above the materialization limit of "
-                + std::to_string(MAX_MATERIALIZED_IN_VALUES)
-                + " (Week 32 lowers this form to a semi-join)");
-        }
-
-        // THREE-VALUED IN. InExpr::values is documented "non-empty, never NULL"
-        // because the grammar has no NULL literal — but a subquery result is not
-        // the grammar, so preserving that invariant is this week's job:
+        // Week 32 — UNREACHABLE, and deliberately loud rather than deleted.
+        // materializeSubqueries now SKIPS every Kind::IN node (see below): the
+        // set-membership form is lowered to a semi/anti join by
+        // subquery_lowering.h instead, which is what let Week 31's
+        // MAX_MATERIALIZED_IN_VALUES cap be removed outright — nothing is
+        // materialized, so there is no linear InExpr scan left to bound.
         //
-        //   x IN (S)      TRUE on a match, else FALSE without NULLs / UNKNOWN with
-        //   x NOT IN (S)  FALSE on a match, else TRUE without NULLs / UNKNOWN with
-        //
-        // UNKNOWN and FALSE are indistinguishable to every consumer REACHABLE
-        // here, which is what makes the collapses below sound rather than
-        // convenient. Precisely: a subquery is legal in WHERE and HAVING only, so
-        // the ultimate consumer is a filter, and a filter drops UNKNOWN and FALSE
-        // alike; there is no general NOT in the grammar (only NOT IN / NOT LIKE /
-        // NOT BETWEEN / IS NOT NULL, none of which applies to a predicate's
-        // RESULT); `IS [NOT] NULL` parses at the additive level, so
-        // `(x IN S) IS NULL` does not parse; three-valued AND/OR differ between
-        // UNKNOWN and FALSE only in cases a filter then drops identically; and
-        // CASE WHEN does not take an UNKNOWN branch.
-        //
-        // ADDING A GENERAL `NOT` BREAKS THIS FIRST.
-        if (sq->negated && has_null) {
-            // never TRUE: FALSE where the operand matches, UNKNOWN elsewhere.
-            // This is the classic NOT-IN defect; returning rows here is wrong.
-            return std::make_unique<Literal>(Value(int64_t(0)));
-        }
-        if (values.empty()) {
-            // x IN () is FALSE. x NOT IN () is TRUE — even for a NULL x, since
-            // there is nothing to compare against. (A set of only NULLs lands
-            // here for the positive form: UNKNOWN, which collapses to FALSE.)
-            return std::make_unique<Literal>(
-                Value(static_cast<int64_t>(sq->negated ? 1 : 0)));
-        }
-
-        auto in = std::make_unique<InExpr>();
-        in->operand = std::move(sq->operand);   // this block's, already bound and folded
-        in->values  = std::move(values);
-        in->negated = sq->negated;              // InExpr implements it; do not pre-apply
-        return in;
+        // The three-valued IN reasoning this branch used to carry moved WITH the
+        // rule, to the probe loops of VecHashJoinNode and HashJoinNode: `x NOT
+        // IN S` is never TRUE when S holds a NULL, and a semi-join has no
+        // substitution site, so that fact is carried out of the build phase as a
+        // flag. See docs/week-32-plan.md §8.
+        throw std::runtime_error(
+            "internal: an IN subquery reached materialization (Week 32 lowers "
+            "it to a semi-join)");
     }
     }
     throw std::runtime_error("internal: unknown SubqueryExpr::Kind");
@@ -308,9 +252,16 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     if (!stmt.has_subquery) return;
 
     ResultCache cache;
+    // Week 32: a Kind::IN node SURVIVES this pass. It is the one shape lowered
+    // to a plan node (a semi/anti join) rather than substituted with a
+    // constant, and a plan node cannot be produced from an AST rewrite — see
+    // subquery_lowering.h for the routing and for why keeping both productions
+    // for one shape was rejected.
+    bool in_survives = false;
     auto visit = [&](std::unique_ptr<Expr>& slot) {
         auto* sq = dynamic_cast<SubqueryExpr*>(slot.get());
         if (!sq) return;
+        if (sq->kind == SubqueryExpr::Kind::IN) { in_survives = true; return; }
         const SubqueryResult& res = runOnce(sq, run, cache);
         std::unique_ptr<Expr> replacement = buildReplacement(sq, res);
         // An aliased constant keeps its name, for the same reason foldNode
@@ -345,12 +296,15 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
         g.expr = std::shared_ptr<Expr>(std::move(slot));
     }
 
-    // The flag means "a SubqueryExpr is still in this tree", and none is. This
+    // The flag means "a SubqueryExpr is still in this tree". Week 32: an IN node
+    // may still be one, and the flag MUST stay set while it is — buildScanSchema
+    // widens to the full schema for as long as it is set, and the semi-join's
+    // probe key is the IN operand, which narrowing would otherwise drop. This
     // is what returns projection pushdown to a subquery query: buildScanSchema
     // widens to the full schema for as long as the flag is set (Week 30), which
     // Week 30's own hand-forward note predicted would otherwise show up as a
     // surprise in this week's first benchmark.
-    stmt.has_subquery = false;
+    stmt.has_subquery = in_survives;
 
     // A substituted constant can sit under arithmetic — `> (SELECT ...) * 2` —
     // and three fast paths pattern-match on ColumnRef op Literal. Folding
