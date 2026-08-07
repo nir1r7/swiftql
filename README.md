@@ -1228,6 +1228,59 @@ first week the SQLite harness can act as a NULL oracle at all.
 > (`AVG(laps.speed)` → `AVG(l.speed)`). That is a schema-visible change and wants
 > the gate a binder week already has.
 
+> **Starting notes, from Week 29's foundations.** Two findings from Week 29's
+> third audit, both about the *safety argument* for the shared pruning-hint rule
+> rather than its behaviour — the rule itself is correct and measured. Week 29's
+> own hand-forward notes (the forced build side, the blunt reorder decline, the
+> unbound-key throw, the residual's scalar evaluation, the outer-join estimate,
+> and the NULL oracle) are at the end of that section and are not repeated here.
+> - **`predicate_pushdown.h` justifies its fail-closed empty-slot branch with a
+>   claim about the other callers that is false, and it is exactly the claim that
+>   stops anyone checking them.** The header says "every other caller treats empty
+>   as the conservative answer". That is true of `soleSlot`
+>   (`predicate_pushdown.cc`, empty → `-1` → the conjunct is not pushed) and
+>   **false of `classifyJoinCondition`** (`join_condition.cc`), where an empty
+>   slot set means the forward-reference loop has nothing to iterate and the
+>   conjunct is **accepted** — which that file's own comment states in as many
+>   words ("a missed subtype makes a forward reference invisible rather than
+>   loud"). Two files now say opposite things about one walker. **Week 30 is the
+>   week this becomes live**, because a subquery expression is the first realistic
+>   tenth `Expr` subtype: miss it at dispatch site 8 and
+>   `ON b.k = c.k AND <new node naming a later relation>` stops throwing "is
+>   joined later", becomes an `on_residual` over a relation absent from that
+>   join's merged schema, and is then evaluated against a schema that has no such
+>   column (`plan_nodes.cc`, `vec_hash_join_node.cc`). Three things to do, none of
+>   them a weakening of the guard, whose behaviour is right: restate the
+>   justification as the one that is actually load-bearing — *this* caller is the
+>   only one where an empty set reads as "mentions nothing unpreserved", so it
+>   must withhold; correct the caller count the walker's own comments still give
+>   — `predicate_pushdown.cc` says "Two callers, one walker" and
+>   `predicate_pushdown.h` names `classifyJoinCondition` as "the second caller",
+>   while there are three, which `development.md`'s checklist was corrected to say
+>   in Week 29 and these two were not, so a reader who follows the "dispatch site
+>   8" pointer lands on the stale count; and when the subquery node lands, handle
+>   it at site 8 in the same commit.
+> - **The extraction shared the rule and left the input duplicated, so the two
+>   engines can still diverge on the one axis it exists to close.**
+>   `Planner::plan` passes a hard-coded `preserved_slots{0}` to
+>   `pruningHintForPreservedSide` while `VectorizedPlanBuilder` derives the set
+>   from `join->children[0]->output_schema`. Volcano's constant is correct **only**
+>   because of the `stmt.joins.size() > 1` refusal at the top of the same
+>   function — the identical undocumented coupling Week 29's round-1 audit found
+>   for `outer` and fixed by naming the clause `jc` once, re-introduced four
+>   commits later at a new site, with the comment stating the conclusion
+>   ("Volcano builds exactly one join") and not the refusal that guarantees it.
+>   Relax that refusal — which its own comment invites a later week to reconsider
+>   — and `FROM a JOIN b ON k1 LEFT JOIN c ON k2 WHERE b.x = 5` gives the two
+>   engines different preserved sets: same rows, different work per mode, with
+>   nothing to catch it, which is the failure mode Week 27 moved the ON
+>   decomposition above the scan construction to prevent. Unreachable today and
+>   safe in both spellings (one is merely more conservative). The fix is three
+>   lines and stops the constant being something a future change can invalidate
+>   silently: build the set from the FROM scan's own schema, which is already in
+>   scope at the call site. Failing that, state the dependency on the refusal in
+>   the comment, in the shape the `jc` fix used.
+
 ### Week 31 — Scalar + Uncorrelated Subqueries
 
 - Execute scalar subqueries and materialized uncorrelated subqueries
@@ -1241,6 +1294,16 @@ first week the SQLite harness can act as a NULL oracle at all.
 - Lower `IN`, `NOT IN`, `EXISTS`, and `NOT EXISTS` where applicable
 
 **Checkpoint:** Set-membership subqueries avoid nested-loop execution.
+
+> **Starting note, from Week 29's foundations.** A semi-join and an anti-join
+> need their **own** cardinality rule rather than a reuse of the outer join's:
+> their outputs are bounded by the preserved side but never null-extend it, so
+> `max(selectivity(residual) * matches, left_rows)` is the wrong shape for both.
+> The full note, including the discipline any new rule inherits — a
+> non-multiplicative rule lives at the stamping site and never inside
+> `joinCardinality`, or the join search's optimal substructure goes with it — is
+> in Week 29's starting notes; it is pointed at from here rather than restated so
+> the two cannot drift.
 
 ### Week 33 — Correlated Subqueries
 
