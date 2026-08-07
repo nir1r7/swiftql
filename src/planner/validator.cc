@@ -112,31 +112,44 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     validateQuery(stmt, catalog);
 
-    // Week 30 — LAST, after every semantic check, including the nested query's
-    // own (validateQuery runs those through validateExpr). A genuine query
-    // defect outranks a temporary engine limitation, which is the discipline
-    // that placed Week 26's multi-key refusal past the plan-time type checks.
+    // Week 30, NARROWED IN WEEK 31 — LAST, after every semantic check, including
+    // the nested query's own (validateQuery runs those through validateExpr). A
+    // genuine query defect outranks a temporary engine limitation, which is the
+    // discipline that placed Week 26's multi-key refusal past the plan-time type
+    // checks. Nothing about the PLACEMENT changed this week; only the condition
+    // and the message did.
     //
-    // Unlike Week 26, both engines are equally incapable here: neither can
-    // lower a subquery, so there is no capability difference to preserve and no
-    // reason for two failure points. ONE check, four modes, one message —
-    // Planner::plan and LogicalPlanBuilder::build both call validate() first,
-    // so the two engines are equivalent BY CONSTRUCTION rather than by two
-    // copies of a guard that can drift, which is what Week 29's audit rounds
-    // were about.
+    // Week 31 narrowed the CONDITION. An UNCORRELATED subquery is
+    // loop-invariant — its value cannot depend on the outer row — so
+    // materializeSubqueries runs it once and substitutes a constant before
+    // either planner sees the statement (subquery_materialization.h). A
+    // CORRELATED one has a different value per outer row, which is
+    // decorrelation, and that is Week 33.
+    //
+    // Still ONE check, four modes, one message. Planner::plan and
+    // LogicalPlanBuilder::build both call validate() first, and the
+    // materialization pass sits ABOVE both engines, so the four modes are
+    // equivalent BY CONSTRUCTION rather than by copies of a guard that can drift
+    // — which is what Week 29's audit rounds were about.
     //
     // What this placement guarantees: every PARSE, BIND and VALIDATE error a
     // query is entitled to fires first — a bad nested table, a bad nested
-    // column, an ungrouped reference, a wrong arity, a disallowed position.
-    // What it does not: a PLAN-TIME type check (inferExprType on the WHERE,
-    // buildProjectSchema on the select list) runs later than Validator, so for
-    // a query that is both a subquery query and ill-typed, this message wins.
-    // The wording is the same either way — dispatch site 12 emits this exact
-    // string — so the only difference is which fault the user fixes first, and
-    // the alternative is a second refusal site in each planner.
-    if (stmt.has_subquery) {
+    // column, an ungrouped reference, a wrong arity, a disallowed position. It
+    // is also what the materialization pass relies on: the pass TRUSTS the arity
+    // rule (it reads column 0 of the result) and this refusal (it never has to
+    // ask a scope question), and main.cc therefore calls validate() before it.
+    //
+    // This condition is also the containment development.md's slot-consumer
+    // table now rests on. It used to be "no statement with a subquery is
+    // planned"; it is now: a ColumnRef with query_level > 0 exists ONLY inside a
+    // correlated subquery, and those are refused here — while an UNCORRELATED
+    // body is handed to the planner as its own top-level statement, where every
+    // ref is level 0 against that statement's own range table. Either way every
+    // consumer below still sees level-0 refs from ONE range table, which is why
+    // both of Week 30's tripwires stay armed and unreached.
+    if (stmt.has_correlated_subquery) {
         throw std::runtime_error(
-            "subqueries are parsed and bound but not yet executable (Week 31)");
+            "correlated subqueries are not yet executable (Week 33)");
     }
 }
 
@@ -402,8 +415,8 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         // It runs AFTER the bare-ColumnRef check above so that check keeps
         // owning its message; for anything else, validateExpr's recursion is
         // what makes the rule actually hold. This week the hole only changed
-        // which message the user got; from Week 31 the blanket refusal is gone
-        // and nothing else enforces the restriction ast.h justifies.
+        // which message the user got; since Week 31 the blanket refusal is
+        // gone and nothing else enforces the restriction ast.h justifies.
         validateExpr(item.expr.get(), schema, "ORDER BY", catalog,
                      /*allow_aggregates=*/true, /*allow_subqueries=*/false);
     }
@@ -503,8 +516,10 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
         if (!sq->subquery) return;
 
         // ARITY is decidable now, from the select list alone; CARDINALITY is
-        // not — "scalar subquery returned more than one row" is Week 31's
-        // runtime check. EXISTS has no arity rule at all: TPC-H Q4 and Q21 both
+        // not — "scalar subquery returned more than one row" needs data, and is
+        // raised where the subquery runs (subquery_materialization.cc, Week 31).
+        // This check is that one's precondition: it reads column 0 of the
+        // result and would read it from a two-column subquery otherwise. EXISTS has no arity rule at all: TPC-H Q4 and Q21 both
         // write `select *`, and EXISTS never reads the values.
         if (sq->kind != SubqueryExpr::Kind::EXISTS) {
             if (sq->subquery->select_star || sq->subquery->select_list.size() != 1) {

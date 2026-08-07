@@ -253,6 +253,20 @@ void Binder::bindExpr(Expr* expr, Scope& scope, const Catalog& catalog) {
         // A shared statement (cloneExpr shares the shared_ptr) can arrive here
         // twice; that is safe because resolveColumnRef is idempotent.
         if (sq->subquery) sq->correlated = bindQuery(*sq->subquery, catalog, &scope);
+
+        // Week 31. AFTER bindQuery, which sets both inputs: this node's own
+        // correlation, and the body's own flag for anything correlated deeper
+        // in. Reading either before would see a default-constructed false.
+        //
+        // has_subquery needs no propagation (a statement containing a subquery
+        // at any depth contains one directly); correlation does. In Q20's shape
+        // the inner subquery is correlated to the MIDDLE block, so the top
+        // block's node is uncorrelated and a test on sq->correlated alone would
+        // accept the query and refuse it later from a depth the user cannot see.
+        if (scope.stmt && sq->subquery
+            && (sq->correlated || sq->subquery->has_correlated_subquery)) {
+            scope.stmt->has_correlated_subquery = true;
+        }
     }
     // literal / interval, nothing to bind
 }

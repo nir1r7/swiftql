@@ -101,6 +101,13 @@ static TypeId specArgType(const AggregateSpec& spec, const Schema& table_schema)
 
 TypeId inferExprType(const Expr* expr, const Schema& schema) {
     if (auto* lit = dynamic_cast<const Literal*>(expr)) {
+        // Week 31. A null Literal is a materialized scalar subquery that
+        // returned zero rows, or one NULL row — the first constant NULL this
+        // engine has ever had, since the grammar has no NULL literal and
+        // foldNode declines to produce one. Value::type() throws on null and
+        // there is nothing here to re-derive the type from, so the node carries
+        // the type the subquery's own output schema gave it (ast.h).
+        if (lit->value.isNull()) return lit->null_type;
         return lit->value.type();
     }
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
@@ -234,15 +241,23 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
             "e.g. date '1994-01-01' + interval '1' year");
     }
     if (dynamic_cast<const SubqueryExpr*>(expr)) {
-        // Week 30 — DISPATCH SITE 12. Unreachable from the CLI: Validator's
-        // refusal fires before any logical plan is built. Named rather than
-        // left to the generic throw below, because the real rule (a scalar
-        // subquery's type is its single output column's) needs the subquery's
-        // projection schema and is Week 31's first job — and this site is the
-        // contract the vectorized path pre-allocates output columns from, so
-        // it must not be reached by accident.
+        // DISPATCH SITE 12, closed in Week 31 — as an INTERNAL invariant, not as
+        // a feature. Every subquery is replaced by a constant before planning
+        // (materializeSubqueries, run by main.cc after Validator::validate), and
+        // a correlated one is refused by the Validator. Reaching this therefore
+        // means the materialization walker (dispatch site 19) missed an Expr
+        // subtype, or the pass was not run at all.
+        //
+        // That throw is exactly what makes site 19 a LOUD dispatch site instead
+        // of the eleventh silent one — do not delete it. This site is also the
+        // contract the vectorized path pre-allocates output columns from, so it
+        // must never be reached by accident.
+        //
+        // The real type rule a scalar subquery needed turned out to live on the
+        // Literal it becomes: see the null_type branch above.
         throw std::runtime_error(
-            "subqueries are parsed and bound but not yet executable (Week 31)");
+            "internal: a subquery reached type inference without being "
+            "materialized (materializeSubqueries must run before planning)");
     }
     throw std::runtime_error("inferExprType(): unknown Expr subtype");
 }

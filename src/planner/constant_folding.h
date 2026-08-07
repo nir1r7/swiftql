@@ -21,9 +21,18 @@
 // them buys nothing here and would change predicate shapes the pushdown and join
 // classification passes inspect.
 //
-// A fold that evaluates to NULL (`1 / 0`) is skipped: there is no NULL literal in
-// the grammar, and a Literal holding a null Value has no type() for
-// inferExprType to report.
+// A fold that evaluates to NULL (`1 / 0`) is skipped. There is no NULL literal
+// in the grammar, so this pass has never needed to make one — and it still does
+// not, which is the point of keeping the rule.
+//
+// Week 31 note: a null Literal is no longer impossible in a bound tree. A
+// materialized scalar subquery that returned zero rows (or one NULL row)
+// substitutes one, and it carries its type on Literal::null_type so
+// inferExprType can still answer. Nothing here changes: folding declines any
+// fold that evaluates to NULL, so a null constant is never propagated by this
+// pass, only carried past it. materializeSubqueries re-runs foldConstants after
+// substitution, which is what restores the `ColumnRef op Literal` shape for
+// `WHERE speed > (SELECT AVG(speed) FROM laps) * 2`.
 //
 // Runs before Validator::validate, so validation and every later pass see the
 // folded tree. Folding cannot change results — it computes the same value the

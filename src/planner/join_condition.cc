@@ -71,8 +71,11 @@ JoinCondition classifyJoinCondition(const Expr* condition, int right_slot) {
             // JoinKey{driver_id, driver_id, from_slot=0}, joining the inner `d`
             // to `p` on a predicate the user never wrote. keys was non-empty,
             // so the refusal never fired and the cartesian product validated.
-            // Today the Week 31 refusal hides it; from Week 31 it is a plan
-            // built from an invented key: wrong rows, no error.
+            // Week 30's blanket refusal hid it; from Week 31 the refusal is
+            // correlated-only, so this branch is what stands between a
+            // correlated ref and a plan built from an invented key: wrong rows,
+            // no error. (An uncorrelated subquery's body is planned as its own
+            // top-level query, where its ON refs are ordinary level-0 ones.)
             //
             // The forward-reference check above needs no change: collectSlots
             // already maps a query_level > 0 ref to -1, and -1 <= right_slot,

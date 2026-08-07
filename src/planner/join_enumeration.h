@@ -64,8 +64,11 @@
 //
 // It also declines, silently, any tree carrying a relation slot outside the
 // range table (hasSlotOutsideRangeTable, Week 30): an unbound key (from_slot -1)
-// or — from Week 31/34 on — a scan belonging to a subquery rather than to this
-// query's range table. This USED to throw, which made it the one place the
+// or — from Week 34 on — a scan belonging to a subquery rather than to this
+// query's range table. Week 31 was expected to make that second case live and
+// did not: an uncorrelated subquery is materialized before planning, so its
+// scans form their own plan with their own range table and never enter this
+// tree. Derived tables (Week 34) are where a nested scan genuinely joins. This USED to throw, which made it the one place the
 // optimized path could fail on input `--no-optimize` accepts; declining keeps
 // optimized ≡ --no-optimize, which is what makes the fourth harness mode a
 // differential oracle rather than a duplicate run.

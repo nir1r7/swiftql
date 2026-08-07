@@ -74,10 +74,12 @@ bool containsOuterJoin(const LogicalPlanNode* node) {
 // positional-routing path for callers that skip the Binder) can never satisfy
 // keysBetween's placed-set test, so the key would vanish from the rebuilt tree:
 // a missing conjunct and therefore MORE rows if the join had a second key, or a
-// spurious "produced a cross product" throw if it did not. And, from Week 31/34
+// spurious "produced a cross product" throw if it did not. And, from Week 34
 // on, a SCAN THAT IS NOT A RANGE-TABLE ENTRY of the query being planned, because
 // it belongs to a subquery — at which point `slot >= countRelations()` stops
-// meaning "unbound key" and starts firing on legitimate plans.
+// meaning "unbound key" and starts firing on legitimate plans. (Week 31 was
+// expected to make that live and did not: a materialized subquery's scans form
+// their own plan, with their own range table.)
 //
 // DECLINE, do not throw. Volcano and the written-order vectorized path never
 // consult from_slot for placement, so a throw here is the one place the
