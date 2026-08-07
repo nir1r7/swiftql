@@ -109,8 +109,27 @@ inline std::string literalKey(const Value& v) {
 inline std::string exprKey(const Expr* expr) {
     if (!expr) return "?";
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        if (col->relation_slot >= 0)
-            return std::to_string(col->relation_slot) + "#" + col->column_name;
+        if (col->relation_slot >= 0) {
+            // Week 30 round 2: the LEVEL is part of the identity. A slot is a
+            // position in the range table of the scope query_level blocks out,
+            // so `0#driver_id` meant two different columns and two refs
+            // differing only in level hashed alike. checkGroupedRefs matches
+            // expression group keys through this function BEFORE its
+            // query_level guard, so `EXISTS (SELECT driver_id + 1 FROM drivers d
+            // GROUP BY l.driver_id + 1)` accepted an ungrouped LOCAL column
+            // against a CORRELATED group key — and substituteInto rewrites on
+            // the same key, so it would also have replaced the local subtree
+            // with a ref to the correlated group column.
+            //
+            // Prefixed only above level 0, so every pre-existing key — and
+            // therefore every aggregate-spec dedupe and group-key match in a
+            // query with no subquery — is byte-identical. This text is for
+            // MATCHING, never display, so widening it costs nothing visible.
+            std::string key = std::to_string(col->relation_slot) + "#" + col->column_name;
+            return col->query_level > 0
+                ? "^" + std::to_string(col->query_level) + key
+                : key;
+        }
         return col->table_name.empty()
             ? col->column_name
             : col->table_name + "." + col->column_name;
