@@ -1224,3 +1224,152 @@ TEST(SubqueryValidation, CorrelatedRefsAreNotThisScopesToCheckOrGroup) {
             << e.what();
     }
 }
+
+// ===== Week 30 round 1: a correlated ref is not this block's to route =====
+
+// Inside a subquery a correlated ref is an ordinary top-level ref of that ON
+// expression, carrying a slot that indexes the ENCLOSING block's range table.
+// validateJoinCondition's `relations` is the INNER one, so indexing it compared
+// two numbering domains and reported a column against a relation the query never
+// named — an error it is not entitled to, arriving instead of the refusal.
+TEST(SubqueryValidation, ACorrelatedRefInANestedOnClauseIsNotCheckedHere) {
+    Catalog cat(CATALOG);
+    try {
+        buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
+                     "(SELECT 1 FROM drivers d JOIN drivers d2 "
+                     " ON d.driver_id = d2.driver_id AND d.age = l.lap_id)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+        EXPECT_EQ(std::string(e.what()).find("not found in table 'd'"), std::string::npos)
+            << "an inner-scope schema must not be indexed by an outer-scope slot";
+    }
+}
+
+// The other half, and the one that is a WRONG ANSWER rather than a wrong message:
+// a correlated ref must not become a JoinKey. `l` is the OUTER relation, so this
+// inner join has no equality between d and p at all — a cartesian product, which
+// classifyJoinCondition exists to refuse. Treating l.driver_id as the left
+// operand fabricated JoinKey{driver_id, driver_id, from_slot=0}, joining the
+// inner `d` to `p` on a predicate the user never wrote; keys was non-empty, so
+// the refusal never fired. Week 31 would plan from that invented key.
+TEST(SubqueryValidation, ANestedKeylessJoinStillHitsTheCrossProductRefusal) {
+    Catalog cat(CATALOG);
+    try {
+        buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
+                     "(SELECT 1 FROM drivers d JOIN laps p ON p.driver_id = l.driver_id)", cat);
+        ADD_FAILURE() << "expected the cross-product refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("at least one equality"), std::string::npos)
+            << e.what();
+    }
+
+    // control: a real inner key beside a correlated residual is still legal, and
+    // the residual must not have been mistaken for the key that saves it
+    try {
+        buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
+                     "(SELECT 1 FROM drivers d JOIN laps p "
+                     " ON d.driver_id = p.driver_id AND p.speed > l.speed)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+    }
+}
+
+// A GROUP BY item resolves through resolveColumnRef, which walks OUT, so a
+// correlated group key is legal SQL (it is constant within every group). The
+// skip used to be keyed on `!g.table_name.empty()`, and the binder only writes a
+// qualifier back for a block holding two or more relations — so the SAME
+// subquery was refused under a one-relation outer query and accepted under a
+// two-relation one.
+TEST(SubqueryValidation, ACorrelatedGroupKeyIsAcceptedWhateverTheOuterBlockHolds) {
+    Catalog cat(CATALOG);
+    auto expectRefusal = [&](const std::string& sql) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected the Week 31 refusal for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"),
+                      std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    // `season` exists only in laps, so it resolves outward in both
+    expectRefusal("SELECT lap_id FROM laps l WHERE EXISTS "
+                  "(SELECT COUNT(*) FROM drivers d GROUP BY season)");
+    expectRefusal("SELECT l.lap_id FROM laps l JOIN drivers dd "
+                  "ON l.driver_id = dd.driver_id WHERE EXISTS "
+                  "(SELECT COUNT(*) FROM drivers d GROUP BY season)");
+
+    // ...and a genuinely missing group key is still refused, in both shapes
+    for (const char* sql : {"SELECT lap_id FROM laps l WHERE EXISTS "
+                            "(SELECT COUNT(*) FROM drivers d GROUP BY nosuchcol)",
+                            "SELECT lap_id FROM laps GROUP BY nosuchcol"}) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a GROUP BY error for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("GROUP BY column not found"),
+                      std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
+        }
+    }
+}
+
+// The position rule was a one-line test on the ROOT of the ORDER BY expression,
+// so a subquery one level down was invisible. SELECT and GROUP BY have no such
+// hole because they route through validateExpr, whose allow_subqueries=false
+// default is checked at every node; ORDER BY now does too.
+TEST(SubqueryValidation, TheOrderByPositionRuleIsRecursive) {
+    Catalog cat(CATALOG);
+    auto expectPositionError = [&](const std::string& sql) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a position error for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(
+                          "ORDER BY: subqueries are supported in WHERE and HAVING only"),
+                      std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    expectPositionError("SELECT lap_id FROM laps ORDER BY (SELECT MAX(age) FROM drivers)");
+    expectPositionError("SELECT lap_id FROM laps ORDER BY lap_id + (SELECT MAX(age) FROM drivers)");
+    expectPositionError("SELECT lap_id FROM laps ORDER BY "
+                        "CASE WHEN lap_id > (SELECT MAX(age) FROM drivers) THEN 1 ELSE 0 END");
+    // the bare-ColumnRef check keeps owning its own message
+    try {
+        buildLogical("SELECT lap_id FROM laps ORDER BY nosuchcol", cat);
+        ADD_FAILURE() << "expected an ORDER BY column error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("ORDER BY column not found: 'nosuchcol'"),
+                  std::string::npos) << e.what();
+    }
+}
+
+// DISPATCH SITE 14. Week 30's own rule — descend into what is written in THIS
+// block, never into the body — was applied at sites 2, 5, 6, 7, 8 and 9 and not
+// here. Week 32's semi-join probes on exactly this operand, and three fast paths
+// pattern-match on the ColumnRef-op-Literal shape folding restores.
+TEST(SubqueryDispatch, ConstantFoldingReachesTheInOperandAndNotTheBody) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT team FROM laps WHERE season + 4 IN "
+                         "(SELECT driver_id + 1 FROM drivers)", cat);
+    auto* sq = dynamic_cast<const SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+    // `season + 4` has a ColumnRef on the left, so it does not fold to a literal —
+    // what must fold is a constant SUBexpression inside it
+    auto stmt2 = bindOnly("SELECT team FROM laps WHERE season IN "
+                          "(SELECT driver_id FROM drivers) AND round = 2 + 3", cat);
+    auto* conj = dynamic_cast<const BinaryExpr*>(stmt2.where.get());
+    ASSERT_NE(conj, nullptr);
+
+    auto folded = bindOnly("SELECT team FROM laps WHERE season * (2 + 3) IN "
+                           "(SELECT driver_id FROM drivers)", cat);
+    auto* fsq = dynamic_cast<const SubqueryExpr*>(folded.where.get());
+    ASSERT_NE(fsq, nullptr);
+    auto* mul = dynamic_cast<const BinaryExpr*>(fsq->operand.get());
+    ASSERT_NE(mul, nullptr) << "the operand must still be the arithmetic tree";
+    EXPECT_NE(dynamic_cast<const Literal*>(mul->right.get()), nullptr)
+        << "(2 + 3) inside the IN operand must have folded to a literal: "
+        << exprToString(fsq->operand.get());
+}

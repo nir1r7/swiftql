@@ -2,6 +2,8 @@
 #include "planner/binder.h"
 #include "planner/planner.h"
 #include "planner/validator.h"
+#include "planner/predicate_pushdown.h"   // collectSlots
+#include <unordered_set>
 #include "parser/expr_utils.h"
 #include "planner/plan_nodes.h"
 #include "parser/parser.h"
@@ -1178,4 +1180,69 @@ TEST(BinderTest, BindingIsIdempotent) {
     ASSERT_NE(after, nullptr);
     EXPECT_EQ(after->relation_slot, slot);
     EXPECT_EQ(after->table_name, qualifier);
+}
+
+// ===== Week 30 round 1: correlation must survive a second walk =====
+
+// Idempotent means "same result", not "does nothing". markCorrelated used to run
+// only on the RESOLUTION path, which the early return skips, so a second walk of
+// an already-bound statement marked no scope, bindQuery returned false, and the
+// unconditional `sq->correlated = bindQuery(...)` overwrote a correct `true`.
+TEST(BinderTest, CorrelationSurvivesASecondBind) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT lap_id FROM laps l WHERE EXISTS "
+             "(SELECT 1 FROM drivers d WHERE d.driver_id = l.driver_id)");
+    auto stmt = p.parse();
+
+    Binder::bind(stmt, cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+    ASSERT_TRUE(sq->correlated) << "fixture must actually be correlated";
+
+    Binder::bind(stmt, cat);
+    EXPECT_TRUE(whereSubquery(stmt)->correlated)
+        << "a second bind cleared the flag, so collectSlots would stop "
+           "contributing -1 and pushdown would push a correlated conjunct";
+}
+
+// ...and the same defect is reachable inside ONE bind(). BETWEEN's desugaring
+// clones its left operand before binding, and cloneExpr SHARES the statement, so
+// two SubqueryExpr nodes reach one SelectStatement in a single pass: the first
+// walk marks it, the second used to leave its own node marked uncorrelated.
+//
+// That node is what collectSlots reads, and an uncorrelated verdict means no -1,
+// so soleSlot returns a single relation slot and PredicatePushdown would push a
+// CORRELATED conjunct onto one scan — the wrong answer the sentinel exists to
+// prevent, and the precondition restampSlots' safety argument rests on.
+TEST(BinderTest, BetweenClonesShareAStatementAndBothStayCorrelated) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT lap_id FROM laps l WHERE "
+             "(SELECT MAX(d.age) FROM drivers d WHERE d.driver_id = l.driver_id) "
+             "BETWEEN 1 AND 99");
+    auto stmt = p.parse();
+    Binder::bind(stmt, cat);
+
+    // BETWEEN desugars to `a >= x AND a <= y`, so both halves carry a subquery
+    auto* conj = dynamic_cast<const BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(conj, nullptr);
+    auto* lo = dynamic_cast<const BinaryExpr*>(conj->left.get());
+    auto* hi = dynamic_cast<const BinaryExpr*>(conj->right.get());
+    ASSERT_NE(lo, nullptr);
+    ASSERT_NE(hi, nullptr);
+    auto* a = dynamic_cast<const SubqueryExpr*>(lo->left.get());
+    auto* b = dynamic_cast<const SubqueryExpr*>(hi->left.get());
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+
+    EXPECT_EQ(a->subquery.get(), b->subquery.get())
+        << "cloneExpr shares the statement; that is the premise of this test";
+    EXPECT_TRUE(a->correlated);
+    EXPECT_TRUE(b->correlated) << "the second node over the shared statement";
+
+    // and collectSlots must be conservative for BOTH, which is what the flag buys
+    for (const SubqueryExpr* node : {a, b}) {
+        std::unordered_set<int> slots;
+        collectSlots(node, slots);
+        EXPECT_EQ(slots.count(-1), 1u) << "a correlated subquery must contribute -1";
+    }
 }
