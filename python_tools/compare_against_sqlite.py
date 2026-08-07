@@ -463,10 +463,22 @@ WEEK30_SUBQUERY_BINDS = [
     "SELECT lap_id FROM laps l WHERE "
     "(SELECT MAX(d.age) FROM drivers d WHERE d.driver_id = l.driver_id) "
     "BETWEEN 1 AND 99",
-    # the IN operand is folded (dispatch site 14) — Week 32 probes a semi-join on
-    # exactly this expression, and the fast paths pattern-match on
-    # ColumnRef-op-Literal
+    # the IN operand reaches constant folding (dispatch site 14). NOTE: this
+    # suite only asserts the query reaches the refusal, which it would do either
+    # way — the folding itself is pinned by
+    # SubqueryDispatch.ConstantFoldingReachesTheInOperandAndNotTheBody
     "SELECT team FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
+
+    # --- round 2 ---
+    # a LEGAL correlated aggregate argument. The type check for it moved to the
+    # Binder, which is the only layer holding the scope chain, so this is the
+    # control that it did not become a blanket refusal
+    "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "WHERE EXISTS (SELECT SUM(d.age) FROM drivers x)",
+    # a LOCAL expression group key must still satisfy its own select item, or
+    # adding the query level to exprKey has simply broken expression grouping
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)",
 ]
 
 # Each of these must fail EARLIER than the refusal above, and for its own stated
@@ -530,6 +542,33 @@ WEEK30_REJECTED_QUERIES = [
     ("SELECT lap_id FROM laps ORDER BY "
      "CASE WHEN lap_id > (SELECT MAX(age) FROM drivers) THEN 1 ELSE 0 END",
      "ORDER BY: subqueries are supported in WHERE and HAVING only"),
+
+    # --- round 2 ---
+    # the SUM/AVG type check indexed THIS statement's join list with a slot that
+    # belongs to the enclosing one, so the same illegal aggregate was caught or
+    # skipped depending on the INNER query's own join order. All three spellings
+    # must now give the same answer
+    ("SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE EXISTS (SELECT SUM(d.name) FROM laps y JOIN drivers x "
+     "ON x.driver_id = y.driver_id)",
+     "SUM() requires a numeric column, but 'name' is of type STRING"),
+    ("SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE EXISTS (SELECT SUM(d.name) FROM drivers x JOIN laps y "
+     "ON x.driver_id = y.driver_id)",
+     "SUM() requires a numeric column, but 'name' is of type STRING"),
+    ("SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE EXISTS (SELECT SUM(d.name) FROM drivers x)",
+     "SUM() requires a numeric column, but 'name' is of type STRING"),
+    # exprKey encoded a ColumnRef as slot#name with no level, so a CORRELATED
+    # expression group key satisfied an ungrouped LOCAL reference. The
+    # plain-column spelling below is round 1's fix; adding `+ 1` to both sides
+    # routed the identical pair through exprKey and the refusal disappeared
+    ("SELECT lap_id FROM laps l WHERE EXISTS "
+     "(SELECT driver_id + 1 FROM drivers d GROUP BY l.driver_id + 1)",
+     "SELECT column 'driver_id' must appear in GROUP BY"),
+    ("SELECT lap_id FROM laps l WHERE EXISTS "
+     "(SELECT driver_id FROM drivers d GROUP BY l.driver_id)",
+     "SELECT column 'driver_id' must appear in GROUP BY"),
 ]
 
 # Week 27 (multi-way join execution). Shapes that Week 26 could only bind now

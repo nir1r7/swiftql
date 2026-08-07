@@ -1373,3 +1373,110 @@ TEST(SubqueryDispatch, ConstantFoldingReachesTheInOperandAndNotTheBody) {
         << "(2 + 3) inside the IN operand must have folded to a literal: "
         << exprToString(fsq->operand.get());
 }
+
+// ===== Week 30 round 2: two more (level, slot) collapses =====
+
+// The SUM/AVG argument type check indexes `stmt.joins` — THIS statement's join
+// list — by the argument's slot, and validateQuery recurses into every nested
+// statement. A correlated argument therefore indexed the INNER list with an
+// OUTER slot, so the same illegal aggregate was caught or silently skipped
+// depending on the order of the inner query's own joins. Both orders, plus the
+// no-inner-join case, must now agree.
+TEST(SubqueryValidation, ACorrelatedAggregateArgumentIsTypedWhereItResolved) {
+    Catalog cat(CATALOG);
+    auto expectStringRefusal = [&](const std::string& sql) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected the SUM type error for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(
+                          "SUM() requires a numeric column, but 'name' is of type STRING"),
+                      std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    const std::string outer =
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id WHERE EXISTS ";
+    // inner joins[0] is `drivers`, which happens to hold `name` — the case that
+    // reported the right answer for the wrong reason
+    expectStringRefusal(outer + "(SELECT SUM(d.name) FROM laps y JOIN drivers x "
+                                "ON x.driver_id = y.driver_id)");
+    // inner joins[0] is `laps`, which does not — the case that was skipped
+    expectStringRefusal(outer + "(SELECT SUM(d.name) FROM drivers x JOIN laps y "
+                                "ON x.driver_id = y.driver_id)");
+    // no inner join at all: the slot fell past joins.size() and the qualifier was
+    // an outer alias matching nothing inner
+    expectStringRefusal(outer + "(SELECT SUM(d.name) FROM drivers x)");
+    // control: the local rule is untouched
+    expectStringRefusal("SELECT SUM(d.name) FROM laps l JOIN drivers d "
+                        "ON l.driver_id = d.driver_id");
+
+    // ...and a LEGAL correlated numeric argument must still bind
+    try {
+        buildLogical(outer + "(SELECT SUM(d.age) FROM drivers x)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+    }
+}
+
+// exprKey encoded a ColumnRef as `slot#name` with no level, so two refs
+// differing only in level hashed identically. checkGroupedRefs matches
+// EXPRESSION group keys through exprKey before its own query_level guard, so a
+// CORRELATED group key satisfied an ungrouped LOCAL reference. Round 1 fixed the
+// plain-column path and stopped exactly there — adding `+ 1` to both sides
+// routed the identical pair through exprKey and the refusal disappeared.
+TEST(SubqueryValidation, ACorrelatedExpressionGroupKeyDoesNotSatisfyALocalColumn) {
+    Catalog cat(CATALOG);
+    auto expectUngrouped = [&](const std::string& sql) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected an ungrouped-column error for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(
+                          "SELECT column 'driver_id' must appear in GROUP BY"),
+                      std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    // the expression path — the finding
+    expectUngrouped("SELECT lap_id FROM laps l WHERE EXISTS "
+                    "(SELECT driver_id + 1 FROM drivers d GROUP BY l.driver_id + 1)");
+    // the plain-column path — round 1's fix, kept as the contrast that shows the
+    // two halves of one rule
+    expectUngrouped("SELECT lap_id FROM laps l WHERE EXISTS "
+                    "(SELECT driver_id FROM drivers d GROUP BY l.driver_id)");
+
+    // control: a LOCAL expression group key must still satisfy the same
+    // reference, or the fix has simply broken expression grouping
+    try {
+        buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
+                     "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+    }
+}
+
+// exprKey is prefixed only above level 0, so every key in a query with no
+// subquery is byte-identical to what it was — which is what keeps aggregate-spec
+// dedupe and group-key matching unchanged for the whole pre-Week-30 surface.
+TEST(SubqueryDispatch, ExprKeyIsUnchangedAtLevelZeroAndDistinctAbove) {
+    Catalog cat(CATALOG);
+    auto local = bindOnly("SELECT driver_id FROM drivers d GROUP BY driver_id", cat);
+    auto* lref = dynamic_cast<const ColumnRef*>(local.select_list[0].get());
+    ASSERT_NE(lref, nullptr);
+    EXPECT_EQ(exprKey(lref), "0#driver_id") << "level 0 keys must not move";
+
+    auto corr = bindOnly("SELECT lap_id FROM laps l WHERE EXISTS "
+                         "(SELECT COUNT(*) FROM drivers d WHERE d.age > l.driver_id)", cat);
+    auto* sq = dynamic_cast<const SubqueryExpr*>(corr.where.get());
+    ASSERT_NE(sq, nullptr);
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* outer_ref = dynamic_cast<const ColumnRef*>(cmp->right.get());
+    ASSERT_NE(outer_ref, nullptr);
+    ASSERT_EQ(outer_ref->query_level, 1);
+    EXPECT_NE(exprKey(outer_ref), "0#driver_id")
+        << "a correlated ref must not key the same as a local one at the same slot";
+}
