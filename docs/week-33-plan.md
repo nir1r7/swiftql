@@ -1132,6 +1132,25 @@ asserts exactly the conjunction it replaced; a **lone** slot assertion →
 strengthening it into a level assertion the test never made. No assertion was
 removed or weakened.
 
+### Tasks 2-9
+
+- [x] Task 3 machinery: `src/planner/subquery_decorrelation.{h,cc}`, wired into
+      `LogicalPlanBuilder::build` beside Week 32's `lowerInSubqueries`. Landed
+      FIRST, with the refusal still armed, so the tree stays coherent: the code
+      is compiled and unreachable until Task 2 flips the refusal.
+- [ ] Task 2: remove `Validator::validate`'s `has_correlated_subquery` refusal;
+      restate both Week 30 tripwires.
+- [ ] Task 5: Volcano refusal (capability difference -> `Planner::plan`), README
+      dialect rows, rejection-suite entries.
+- [ ] Tasks 4, 6, 7, 8, 9.
+
+**Next concrete step:** Task 2 — delete the refusal in `src/planner/validator.cc`
+(~line 150), restate `chunk_pruner.h`'s decline and `buildAggregateSchema`'s
+throw for a world where they are reachable, and add the Volcano refusal in
+`Planner::plan` (that path runs no `LogicalPlanBuilder`, so it cannot
+decorrelate). Then run every query in `WEEK33_CORRELATED_BINDS` and split it
+into diffed vs rejected.
+
 **Task 1 is code-complete.** `grep -rn "query_level" src/ tests/` returns only
 comments; `grep -rn "relation_slot" src/ tests/` returns only `ColumnDef` and
 `ColumnStatsEntry` readers, which are schema slots and out of scope by design.

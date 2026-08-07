@@ -2,6 +2,7 @@
 #include "join_condition.h"
 #include "validator.h"
 #include "subquery_lowering.h"
+#include "subquery_decorrelation.h"
 #include "parser/expr_utils.h"
 #include <unordered_set>
 
@@ -780,12 +781,19 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         std::vector<std::unique_ptr<Expr>> conjuncts;
         splitConjuncts(std::move(stmt.where), conjuncts);
         InLoweringResult lowered = lowerInSubqueries(std::move(node), conjuncts, catalog);
-        node = std::move(lowered.plan);
+        // Week 33 — decorrelation, at the SAME site and on the same conjunct
+        // vector, for the same two reasons: the semi-join's probe input must be
+        // the whole FROM/JOIN spine, and the node must leave the predicate
+        // before inferExprType walks it below.
+        ExistsLoweringResult decorrelated =
+            lowerExistsSubqueries(std::move(lowered.plan), conjuncts, catalog);
+        node = std::move(decorrelated.plan);
         stmt.where = conjoinAll(std::move(conjuncts));
         // Anything left holding an IN node is a shape lowering cannot express —
         // an IN under an OR, most of all. Refuse by name here rather than let
         // site 12 report it as a materialization defect.
         refuseUnloweredIn(stmt.where.get(), "a non-top-level position");
+        refuseUnloweredCorrelated(stmt.where.get(), "a non-top-level position");
     }
 
     // filter (WHERE)
@@ -820,6 +828,7 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         // the rejection suite, because the diffed oracle cannot hold a query
         // that errors.
         refuseUnloweredIn(stmt.having.get(), "HAVING");
+        refuseUnloweredCorrelated(stmt.having.get(), "HAVING");
         inferExprType(stmt.having.get(), node->output_schema);
         node = std::make_unique<LogicalFilter>(std::move(node), std::move(stmt.having));
     }
