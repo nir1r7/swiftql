@@ -1278,7 +1278,7 @@ TEST(VecPlanBuilder, TwoInConjunctsLowerToTwoStackedSemiJoins) {
 // ---------------------------------------------------------------------------
 // Week 34 — the derived-table COLUMN ALIAS LIST, at EXECUTION level.
 //
-// These two tests are the feature's ENTIRE possible coverage, and the reason is
+// These three tests are the feature's ENTIRE possible coverage, and the reason is
 // worth stating rather than assuming: SQLite does not parse `AS d (a, b)` at all
 // (`near "(": syntax error`), so compare_against_sqlite.py can hold such a query
 // in NEITHER direction — it is not diffable, and it is not refusable either,
@@ -1323,14 +1323,30 @@ TEST(DerivedTableAliasList, RenamedColumnsCarryTheOriginalColumnsValues) {
 // test cannot see this at all, because the schema is right either way.
 TEST(DerivedTableAliasList, ThePreRenameNameNoLongerResolves) {
     Catalog cat(CATALOG);
-    EXPECT_THROW(buildVec(
-        "SELECT d.team FROM (SELECT team, speed FROM laps) AS d (a, b)", cat),
-        std::runtime_error);
+    // The MESSAGE is asserted, not merely that something threw. A bare
+    // EXPECT_THROW(..., std::runtime_error) accepts any failure, so a mutant
+    // that made derivedRelationSchema throw on every alias list -- the feature
+    // entirely dead -- would leave this test green. That is the leniency
+    // run_rejection_suite explicitly refuses, and the rest of this project's
+    // tests refuse it the same way (test_binder.cc, test_logical_plan.cc).
+    auto expectMessage = [&](const std::string& sql, const std::string& needle) {
+        try {
+            buildVec(sql, cat);
+            ADD_FAILURE() << "expected a rejection for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+                << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    expectMessage("SELECT d.team FROM (SELECT team, speed FROM laps) AS d (a, b)",
+                  "column 'team' not found in 'd'");
     // Unqualified, too: the bare name must not fall through to the body's
-    // pre-rename schema by any path.
-    EXPECT_THROW(buildVec(
-        "SELECT team FROM (SELECT team, speed FROM laps) AS d (a, b)", cat),
-        std::runtime_error);
+    // pre-rename schema by any path. It fails on a DIFFERENT path from the
+    // qualified form -- no qualifier to check the relation against -- so the
+    // message differs, and pinning both is what shows the two paths are
+    // separately closed.
+    expectMessage("SELECT team FROM (SELECT team, speed FROM laps) AS d (a, b)",
+                  "column not found: 'team'");
 }
 
 // SELECT * over an aliased derived relation expands to the NEW names, and to
