@@ -7,6 +7,7 @@ Usage: python3 compare_against_sqlite.py
 import subprocess
 import sqlite3
 import csv
+import json
 import sys
 import os
 
@@ -977,6 +978,57 @@ WEEK33_CORRELATED_BINDS = [
 #
 # Every output column is ALIASED — see WEEK34_DISTINCT_AGG_QUERIES for why
 # (parse_swiftql_output splits the header line on whitespace).
+# Week 35 — a SUBQUERY INSIDE A DERIVED-TABLE BODY. Found by the TPC-H harness
+# on Q22, which is the first query in the project with this shape.
+#
+# materializeSubqueries never descended into a derived body, and main.cc guarded
+# the whole materialization block with `stmt.has_subquery` -- a PER-BLOCK flag
+# (ast.h documents why it must stay per-block: propagating it would turn
+# projection pushdown off for every derived-table query and give the wrong
+# Volcano refusal message). So an outer query whose only subquery lived inside a
+# derived body had the flag clear, skipped materialization entirely, and the node
+# reached inferExprType and raised
+#   "internal: a subquery reached type inference without being materialized".
+# An INTERNAL error surfaced to the user on a legitimate query.
+#
+# Two walkers over one structure, one of them updated when Week 34 landed derived
+# tables: collectQueryTables, ten lines above materializeSubqueries in the SAME
+# FILE, WAS extended to recurse into a body. That is the exact shape the standing
+# sweep rule exists for.
+#
+# Vectorized-only, like every derived-table query, and diffed rather than pinned:
+# the fix must produce the RIGHT ROWS, not merely stop throwing.
+WEEK35_SUBQUERY_IN_DERIVED_BODY = [
+    # the minimal repro: an uncorrelated scalar subquery in the body's WHERE
+    "SELECT d.c AS c FROM (SELECT driver_id AS c FROM drivers "
+    "WHERE age > (SELECT AVG(age) FROM drivers)) AS d ORDER BY c",
+    # in the body's HAVING, so the materialized constant has to survive
+    # aggregation rather than just a scan filter
+    "SELECT d.t AS t, d.n AS n FROM (SELECT team AS t, COUNT(*) AS n FROM laps "
+    "GROUP BY team HAVING COUNT(*) > (SELECT COUNT(*) / 20 FROM laps)) AS d "
+    "ORDER BY t",
+    # an EXISTS in the body: a different Kind, same walk
+    "SELECT d.c AS c FROM (SELECT driver_id AS c FROM drivers "
+    "WHERE EXISTS (SELECT * FROM laps WHERE speed > 340)) AS d ORDER BY c",
+    # the derived table in a JOIN position rather than FROM -- stmt.joins is a
+    # separate recursion site and a fix that only handled `from` would pass the
+    # three above and still fail this one
+    "SELECT l.lap_id AS lid FROM laps l "
+    "JOIN (SELECT driver_id AS c FROM drivers "
+    "WHERE age > (SELECT AVG(age) FROM drivers)) AS d ON l.driver_id = d.c "
+    "WHERE l.lap_id < 40 ORDER BY lid",
+    # TWO derived relations, only the second holding a subquery: proves the walk
+    # does not stop at the first body
+    "SELECT a.c AS ac, b.c AS bc FROM (SELECT driver_id AS c FROM drivers) AS a "
+    "JOIN (SELECT driver_id AS c FROM drivers "
+    "WHERE age > (SELECT MIN(age) FROM drivers)) AS b ON a.c = b.c ORDER BY ac",
+]
+
+WEEK35_SUBQUERY_IN_DERIVED_BODY_VOLCANO_REJECTED = [
+    (q, "not supported on the Volcano path")
+    for q in WEEK35_SUBQUERY_IN_DERIVED_BODY
+]
+
 WEEK34_DERIVED_TABLE_VEC_ONLY = [
     # the plain shape: a derived relation as the only relation
     "SELECT d.team AS t FROM (SELECT team FROM laps) AS d ORDER BY t LIMIT 5",
@@ -1641,43 +1693,82 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + WEEK34_DISTINCT_AGG_QUERIES
 
 # SQLite setup
-def load_sqlite():
-    """Load CSVs into an in-memory SQLite database."""
+#
+# Week 35: CATALOG-DRIVEN. This used to be literal CREATE TABLE / INSERT text for
+# laps and drivers, with the CSV paths as module constants. Two hand-maintained
+# copies of one schema disagree eventually, and a disagreement HERE reads as an
+# engine bug rather than as a harness bug. Now both sides of the diff derive
+# from the same catalog.json the engine reads -- including the Week 35 "format"
+# object, so the oracle splits a .tbl on the same delimiter, skips the same
+# header (none) and drops the same trailing field the C++ loader does.
+SQLITE_TYPE = {"INT": "INTEGER", "DOUBLE": "REAL", "STRING": "TEXT"}
+
+
+def _coerce_field(text, swiftql_type):
+    """Type one raw field the way CSVLoader::parseField does.
+
+    Deliberately NOT tolerant: parseField now requires full consumption of a
+    numeric field, so a mistyped column throws there. If it threw there and
+    quietly became a string here, the two sides would disagree about what the
+    data even is.
+    """
+    if swiftql_type == "INT":
+        return int(text)
+    if swiftql_type == "DOUBLE":
+        return float(text)
+    return text
+
+
+def load_from_catalog(catalog_path):
+    """Build an in-memory SQLite mirror of whatever catalog.json describes."""
+    base = os.path.dirname(os.path.abspath(catalog_path))
+    with open(catalog_path) as f:
+        spec = json.load(f)
+
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
 
-    # create and load laps
-    conn.execute("""
-        CREATE TABLE laps (
-            lap_id INTEGER, driver_id INTEGER, team TEXT, speed REAL,
-            sector_1 REAL, sector_2 REAL, sector_3 REAL, season INTEGER, round INTEGER
-        )
-    """)
-    with open(LAPS_CSV) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            conn.execute("INSERT INTO laps VALUES (?,?,?,?,?,?,?,?,?)", (
-                int(row['lap_id']), int(row['driver_id']), row['team'],
-                float(row['speed']), float(row['sector_1']),
-                float(row['sector_2']), float(row['sector_3']),
-                int(row['season']), int(row['round'])
-            ))
+    for t in spec["tables"]:
+        cols = t["columns"]
+        conn.execute("CREATE TABLE {} ({})".format(
+            t["name"],
+            ", ".join("{} {}".format(c["name"], SQLITE_TYPE[c["type"]]) for c in cols)))
 
-    # create and load drivers
-    conn.execute("""
-        CREATE TABLE drivers (
-            driver_id INTEGER, name TEXT, nationality TEXT, team TEXT, age INTEGER
-        )
-    """)
-    with open(DRIVERS_CSV) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            conn.execute("INSERT INTO drivers VALUES (?,?,?,?,?)", (
-                int(row['driver_id']), row['name'], row['nationality'],
-                row['team'], int(row['age'])
-            ))
+        fmt = t.get("format", {})
+        delim = fmt.get("delimiter", ",")
+        header = fmt.get("header", True)
+        trailer = fmt.get("trailing_delimiter", False)
+
+        path = os.path.join(base, t["file"])
+        placeholders = ",".join("?" * len(cols))
+        rows = []
+        with open(path) as f:
+            if header:
+                next(f, None)
+            for line_no, line in enumerate(f, start=2 if header else 1):
+                line = line.rstrip("\n").rstrip("\r")
+                if not line:
+                    continue
+                fields = line.split(delim)
+                if trailer and fields and fields[-1] == "":
+                    fields.pop()
+                if len(fields) != len(cols):
+                    raise ValueError(
+                        "{} line {}: expected {} fields, got {}".format(
+                            path, line_no, len(cols), len(fields)))
+                rows.append([_coerce_field(v, c["type"])
+                             for v, c in zip(fields, cols)])
+        # executemany in one transaction: the old per-row execute was fine for
+        # 10k laps and is not for 60k+ lineitem rows at even a small scale factor.
+        conn.executemany("INSERT INTO {} VALUES ({})".format(t["name"], placeholders),
+                         rows)
     conn.commit()
     return conn
+
+
+def load_sqlite():
+    """Load the default F1 catalog. Kept as the name every caller here uses."""
+    return load_from_catalog(CATALOG_PATH)
 
 
 def parse_swiftql_output(output: str):
@@ -1738,8 +1829,33 @@ def normalize(rows, preserve_order=False):
     return normalized if preserve_order else sorted(normalized)
 
 
-def rows_equal(a, b):
-    """Compare two normalized row lists, using epsilon tolerance for floats."""
+def rows_equal(a, b, rel_tol=0.0, abs_tol=1e-5):
+    """Compare two normalized row lists, using epsilon tolerance for floats.
+
+    The DEFAULT is unchanged: absolute 1e-5, no relative component. Every one of
+    this file's ~500 existing diffs passes at it, and loosening it globally to
+    accommodate TPC-H would silently weaken all of them.
+
+    Week 35 -- why TPC-H callers must pass rel_tol. An absolute 1e-5 fails Q1 on
+    a CORRECT answer, for two independent and measurable reasons:
+
+      * PRINTING. Value::toString formats a DOUBLE with "%.15g"
+        (src/common/value.cc), one digit short of a round trip, so the text this
+        harness receives already carries ~1e-15 RELATIVE error. On a revenue sum
+        near 1e9 that alone is ~1e-6 absolute.
+      * SUMMATION ORDER. SwiftQL and SQLite accumulate the same sum in different
+        orders over tens of thousands of rows, differing by roughly n*eps
+        relative -- on that same sum, order 1e-2 absolute.
+
+    1e-2 > 1e-5, so the comparison would reject a correct engine.
+
+    The TPC-H setting is rel_tol=1e-9, abs_tol=1e-6: four orders of magnitude
+    above both noise sources, so it never fires spuriously, and many orders below
+    any arithmetic defect this engine could have -- a wrong `1 - l_discount` is a
+    percent-level error, not a 1e-9 one. That derivation is written down here
+    because a tolerance without one gets loosened by the next person who sees a
+    red test.
+    """
     if len(a) != len(b):
         return False
     for row_a, row_b in zip(a, b):
@@ -1747,7 +1863,7 @@ def rows_equal(a, b):
             return False
         for x, y in zip(row_a, row_b):
             if isinstance(x, float) and isinstance(y, float):
-                if abs(x - y) > 1e-5:
+                if abs(x - y) > max(abs_tol, rel_tol * max(abs(x), abs(y))):
                     return False
             else:
                 if x != y:
@@ -1978,6 +2094,25 @@ def main():
         r_passed += rp
         r_failed += rf
         r_errors += re_
+
+    # Week 35 — a subquery inside a derived-table body. Diffed, not pinned: the
+    # bug was an INTERNAL error, and the fix has to produce the right rows rather
+    # than merely stop throwing. Same two-mode split as every derived-table query.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK35_SUBQUERY_IN_DERIVED_BODY,
+            f"Week 35 subquery inside a derived body — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK35_SUBQUERY_IN_DERIVED_BODY_VOLCANO_REJECTED,
+            f"Week 35 subquery inside a derived body refused — {label}",
+            extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
 
     # Week 34 — derived tables. Same split, same reason as Weeks 32 and 33: the
     # capability difference is real, so BOTH halves are asserted and the boundary

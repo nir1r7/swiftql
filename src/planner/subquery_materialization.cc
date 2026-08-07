@@ -265,7 +265,52 @@ std::unique_ptr<Expr> buildReplacement(SubqueryExpr* sq, const SubqueryResult& r
 
 } // namespace
 
+bool needsSubqueryMaterialization(const SelectStatement& stmt) {
+    if (stmt.has_subquery) return true;
+    // Recurse into derived bodies only — the same structure collectQueryTables
+    // walks, and for the same reason. A SubqueryExpr's own body is not walked
+    // here: a statement holding one has has_subquery set directly.
+    if (stmt.from.isDerived() && stmt.from.body()
+        && needsSubqueryMaterialization(*stmt.from.body())) {
+        return true;
+    }
+    for (const auto& j : stmt.joins) {
+        if (j.relation.isDerived() && j.relation.body()
+            && needsSubqueryMaterialization(*j.relation.body())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
+    // Week 35 — A DERIVED TABLE'S BODY IS A STATEMENT, and its subqueries are as
+    // unmaterialized as any other. `collectQueryTables`, ten lines above in this
+    // same file, WAS extended to descend into a body when Week 34 landed derived
+    // tables (`if (!stmt.from.isDerived()) ... else collectQueryTables(*body)`).
+    // This pass was not. So a scalar subquery inside `FROM (SELECT ...)` reached
+    // type inference unsubstituted and tripped the internal guard with
+    // "a subquery reached type inference without being materialized" — an
+    // INTERNAL error surfaced to the user, on TPC-H Q22.
+    //
+    // Two walkers over the same structure, one updated: exactly the shape the
+    // standing sweep rule exists for. Found by the Week 35 TPC-H harness, which
+    // is the first thing in the project that runs a query of this shape.
+    //
+    // The recursion runs BEFORE the has_subquery fast path on purpose: that flag
+    // describes THIS statement's own expression slots, and an outer query whose
+    // only subquery lives inside a derived body has it clear. Putting the
+    // recursion after it would leave the bug in place for precisely the failing
+    // case.
+    if (stmt.from.isDerived() && stmt.from.body()) {
+        materializeSubqueries(*stmt.from.body(), run);
+    }
+    for (auto& j : stmt.joins) {
+        if (j.relation.isDerived() && j.relation.body()) {
+            materializeSubqueries(*j.relation.body(), run);
+        }
+    }
+
     // One bool for the 99% case: every query in the engine calls this.
     if (!stmt.has_subquery) return;
 

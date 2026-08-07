@@ -492,7 +492,12 @@ int main(int argc, char* argv[]) {
             // vanishing between the clocks the way the CSV load deliberately
             // does. Week 37 must be able to see it.
             double subquery_us = 0.0;
-            if (stmt.has_subquery) {
+            // Week 35: needsSubqueryMaterialization, not stmt.has_subquery.
+            // The flag is per-BLOCK by design (see its comment in ast.h), so a
+            // query whose only subquery sits inside a derived-table body has it
+            // clear and used to skip this block entirely — the node then reached
+            // type inference and raised an INTERNAL error. TPC-H Q22.
+            if (needsSubqueryMaterialization(stmt)) {
                 auto sub_start = std::chrono::high_resolution_clock::now();
                 // Inside the guard: an ordinary query would otherwise validate
                 // twice (here and inside its planner) for no benefit, and the

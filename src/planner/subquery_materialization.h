@@ -119,4 +119,20 @@ void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& o
 // `WHERE speed > (SELECT speed, team FROM laps)` silently materializes column 0
 // of a query the Validator was about to reject — a wrong answer instead of a
 // diagnostic. The check belongs to the layer that owns the message.
+// Week 35 — "does this statement, or any derived-table body inside it, still
+// hold a SubqueryExpr?"
+//
+// SelectStatement::has_subquery answers that for ONE BLOCK ONLY, deliberately:
+// its own comment records that it drives buildScanSchema's conservative
+// widening and Planner::plan's refusal message, so propagating it upward would
+// turn projection pushdown off for every derived-table query and produce the
+// wrong Volcano refusal. So the flag must stay per-block, and the caller that
+// needs the WHOLE-TREE question needs a different question.
+//
+// Without it, main.cc's `if (stmt.has_subquery)` guard skipped materialization
+// entirely for a query whose only subquery lives inside a derived body, and the
+// node reached type inference and tripped the internal guard in
+// logical_plan.cc. TPC-H Q22 is that shape; the Week 35 harness found it.
+bool needsSubqueryMaterialization(const SelectStatement& stmt);
+
 void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run);

@@ -212,6 +212,19 @@ def gen_customer(rng, n):
     return rows
 
 
+def _customer_with_orders(rng, customers_n):
+    """Draw a custkey from the two thirds of customers that have orders.
+
+    dbgen's rule is that keys where (key % 4) is 0 are skipped; the exact
+    residue does not matter here, only that a stable third of customers is
+    excluded so Q22's NOT EXISTS has a non-empty answer.
+    """
+    while True:
+        k = rng.randint(1, customers_n)
+        if k % 3 != 0:
+            return k
+
+
 def gen_orders_and_lineitem(rng, n_orders, customers_n, partsupp_rows, parts):
     import datetime
     base = datetime.date.fromisoformat(ORDERDATE_START).toordinal()
@@ -253,7 +266,13 @@ def gen_orders_and_lineitem(rng, n_orders, customers_n, partsupp_rows, parts):
 
         orders.append([
             ok,
-            rng.randint(1, customers_n),
+            # dbgen gives orders to only TWO THIRDS of customers, and Q22 depends
+            # on it: its NOT EXISTS selects customers with no orders at all. A
+            # uniform draw over every customer makes that set empty, Q22 returns
+            # zero rows on both engines, and the harness reports a PASS that
+            # asserted nothing. run_tpch.py names such vacuous passes; this is
+            # the generator side of not manufacturing them.
+            _customer_with_orders(rng, customers_n),
             rng.choice(["F", "O", "P"]),
             round(total, 2),
             orderdate,

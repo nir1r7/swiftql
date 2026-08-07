@@ -27,16 +27,60 @@ written-down capability boundaries into an unqualified pass.
 
 | Task | State |
 |---|---|
-| 1 — TPC-H schema | not started |
-| 2 — pipe-delimited loader | not started |
-| 3 — scale-factor workflow | not started |
-| 4 — parameterized queries / runner | not started |
-| 5 — reference comparison | not started |
-| 6 — mode-coverage report | not started |
+| 1 — TPC-H schema | **done** — `python_tools/tpch_schema.py` |
+| 2 — pipe-delimited loader | **done** — `FileFormat` on `TableMetadata`, `parseField` full-consumption, 5 new `TblLoaderTest` |
+| 3 — scale-factor workflow | **done** — `generate_tpch.py`, seeded `generate_data.py`, `data/f1/sf-small` |
+| 4 — parameterized queries / runner | **done** — `tpch_queries.py` (22 templates + validation params), `run_tpch.py` |
+| 5 — reference comparison | **done** — `--format tsv`, catalog-driven `load_from_catalog`, `rows_equal(rel_tol=)` |
+| 6 — mode-coverage report | **done** — 22x4 cell matrix, computed census, Q22 plan fingerprint |
 | 7 — randomized result differencing | not started |
 | 8 — behavioural rejection sweep | not started |
 
-**Next concrete step:** write `python_tools/tpch_schema.py` (Task 1).
+**Next concrete step:** Task 7 — `python_tools/random_diff.py` against
+`data/f1/sf-small/catalog.json`, both legs (optimized vs `--no-optimize`, and vs
+SQLite), with the two named traps built in.
+
+### Measured this week
+
+TPC-H at SF=0.01, synthetic data (see `data/tpch/sf0.01/PROVENANCE.txt`):
+
+- **answered correctly: 20/22** — **5 in all four modes** (q1, q6, q12, q14, q19)
+  and **15 in the two vectorized modes only**. 34 of the 88 query x mode cells
+  are Volcano refusals pinned by message.
+- **2 not answered**, both refused BY NAME for documented reasons rather than
+  failing: q17 (`a correlated scalar subquery is decorrelated only when its
+  select list is a single aggregate` — the standard text is
+  `0.2 * AVG(l_quantity)`), q21 (`only an equality between two columns can
+  become a join key` — a correlated inequality).
+- **1 vacuous pass named** (q18: `SUM(l_quantity) > 300` is unreachable at
+  SF=0.01, so both engines return zero rows and the match asserts nothing).
+- **Q22's provenance, read off a plan rather than argued**:
+  `{'LogicalDerived': 2, 'LogicalAntiJoin': 2}` — the correlated half IS Week
+  33's `NOT EXISTS` anti-join, the `custsale` half IS Week 34's derived table,
+  and **no** correlated-scalar LEFT-join rewrite is present. That settles Week
+  34's hand-forward mechanically.
+- Peak child RSS at SF=0.01: ~65 MB (row/Volcano), ~83 MB (columnar/vectorized).
+  `lineitem` columnar: 24.8 MB raw -> 10.7 MB encoded (ratio 0.43).
+
+### Defect found and fixed
+
+**A subquery inside a derived-table body reached type inference unmaterialized**
+— an `internal:` error surfaced to the user on TPC-H Q22. Two causes, both the
+standing rule's shape:
+
+1. `materializeSubqueries` never recursed into a derived body, while
+   `collectQueryTables` — ten lines above it in the same file — *was* extended
+   to when Week 34 landed derived tables.
+2. `main.cc` guarded the whole materialization block with `stmt.has_subquery`,
+   which is per-BLOCK by design (`ast.h` records that propagating it upward
+   would turn projection pushdown off for every derived-table query and give the
+   wrong Volcano refusal message). A new predicate,
+   `needsSubqueryMaterialization`, asks the whole-tree question without
+   disturbing the flag.
+
+Five diffed regression queries in `WEEK35_SUBQUERY_IN_DERIVED_BODY` (both `FROM`
+and `JOIN` positions, scalar and `EXISTS` bodies, and two derived relations where
+only the second holds a subquery), plus their Volcano refusals.
 
 ---
 

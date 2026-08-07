@@ -1,0 +1,302 @@
+{
+  "catalog": "data/tpch/sf0.01/catalog.json",
+  "cells": {
+    "q10|col-vec": "MATCH",
+    "q10|col-vec-noopt": "MATCH",
+    "q10|col-volcano": "REFUSED_EXPECTED",
+    "q10|row-volcano": "REFUSED_EXPECTED",
+    "q11|col-vec": "MATCH",
+    "q11|col-vec-noopt": "MATCH",
+    "q11|col-volcano": "REFUSED_EXPECTED",
+    "q11|row-volcano": "REFUSED_EXPECTED",
+    "q12|col-vec": "MATCH",
+    "q12|col-vec-noopt": "MATCH",
+    "q12|col-volcano": "MATCH",
+    "q12|row-volcano": "MATCH",
+    "q13|col-vec": "MATCH",
+    "q13|col-vec-noopt": "MATCH",
+    "q13|col-volcano": "REFUSED_EXPECTED",
+    "q13|row-volcano": "REFUSED_EXPECTED",
+    "q14|col-vec": "MATCH",
+    "q14|col-vec-noopt": "MATCH",
+    "q14|col-volcano": "MATCH",
+    "q14|row-volcano": "MATCH",
+    "q15|col-vec": "MATCH",
+    "q15|col-vec-noopt": "MATCH",
+    "q15|col-volcano": "REFUSED_EXPECTED",
+    "q15|row-volcano": "REFUSED_EXPECTED",
+    "q16|col-vec": "MATCH",
+    "q16|col-vec-noopt": "MATCH",
+    "q16|col-volcano": "REFUSED_EXPECTED",
+    "q16|row-volcano": "REFUSED_EXPECTED",
+    "q17|col-vec": "UNPORTED",
+    "q17|col-vec-noopt": "UNPORTED",
+    "q17|col-volcano": "REFUSED_EXPECTED",
+    "q17|row-volcano": "REFUSED_EXPECTED",
+    "q18|col-vec": "MATCH",
+    "q18|col-vec-noopt": "MATCH",
+    "q18|col-volcano": "REFUSED_EXPECTED",
+    "q18|row-volcano": "REFUSED_EXPECTED",
+    "q19|col-vec": "MATCH",
+    "q19|col-vec-noopt": "MATCH",
+    "q19|col-volcano": "MATCH",
+    "q19|row-volcano": "MATCH",
+    "q1|col-vec": "MATCH",
+    "q1|col-vec-noopt": "MATCH",
+    "q1|col-volcano": "MATCH",
+    "q1|row-volcano": "MATCH",
+    "q20|col-vec": "MATCH",
+    "q20|col-vec-noopt": "MATCH",
+    "q20|col-volcano": "REFUSED_EXPECTED",
+    "q20|row-volcano": "REFUSED_EXPECTED",
+    "q21|col-vec": "UNPORTED",
+    "q21|col-vec-noopt": "UNPORTED",
+    "q21|col-volcano": "REFUSED_EXPECTED",
+    "q21|row-volcano": "REFUSED_EXPECTED",
+    "q22|col-vec": "MATCH",
+    "q22|col-vec-noopt": "MATCH",
+    "q22|col-volcano": "REFUSED_EXPECTED",
+    "q22|row-volcano": "REFUSED_EXPECTED",
+    "q2|col-vec": "MATCH",
+    "q2|col-vec-noopt": "MATCH",
+    "q2|col-volcano": "REFUSED_EXPECTED",
+    "q2|row-volcano": "REFUSED_EXPECTED",
+    "q3|col-vec": "MATCH",
+    "q3|col-vec-noopt": "MATCH",
+    "q3|col-volcano": "REFUSED_EXPECTED",
+    "q3|row-volcano": "REFUSED_EXPECTED",
+    "q4|col-vec": "MATCH",
+    "q4|col-vec-noopt": "MATCH",
+    "q4|col-volcano": "REFUSED_EXPECTED",
+    "q4|row-volcano": "REFUSED_EXPECTED",
+    "q5|col-vec": "MATCH",
+    "q5|col-vec-noopt": "MATCH",
+    "q5|col-volcano": "REFUSED_EXPECTED",
+    "q5|row-volcano": "REFUSED_EXPECTED",
+    "q6|col-vec": "MATCH",
+    "q6|col-vec-noopt": "MATCH",
+    "q6|col-volcano": "MATCH",
+    "q6|row-volcano": "MATCH",
+    "q7|col-vec": "MATCH",
+    "q7|col-vec-noopt": "MATCH",
+    "q7|col-volcano": "REFUSED_EXPECTED",
+    "q7|row-volcano": "REFUSED_EXPECTED",
+    "q8|col-vec": "MATCH",
+    "q8|col-vec-noopt": "MATCH",
+    "q8|col-volcano": "REFUSED_EXPECTED",
+    "q8|row-volcano": "REFUSED_EXPECTED",
+    "q9|col-vec": "MATCH",
+    "q9|col-vec-noopt": "MATCH",
+    "q9|col-volcano": "REFUSED_EXPECTED",
+    "q9|row-volcano": "REFUSED_EXPECTED"
+  },
+  "details": {
+    "q10|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q10|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q11|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q11|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q13|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q13|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q15|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q15|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q16|col-volcano": "not supported on the Volcano path",
+    "q16|row-volcano": "not supported on the Volcano path",
+    "q17|col-vec": "correlated subquery: a correlated scalar subquery is decorrelated only when its select list is a single aggregate (a non-aggregate body has no one-row-per-key guarantee, so 'returned more than one row",
+    "q17|col-vec-noopt": "correlated subquery: a correlated scalar subquery is decorrelated only when its select list is a single aggregate (a non-aggregate body has no one-row-per-key guarantee, so 'returned more than one row",
+    "q17|col-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q17|row-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q18|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q18|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q20|col-volcano": "not supported on the Volcano path",
+    "q20|row-volcano": "not supported on the Volcano path",
+    "q21|col-vec": "correlated subquery: only an equality between two columns can become a join key (a correlated inequality has no equi-join to lower to)",
+    "q21|col-vec-noopt": "correlated subquery: only an equality between two columns can become a join key (a correlated inequality has no equi-join to lower to)",
+    "q21|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q21|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q22|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q22|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q2|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q2|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q3|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q3|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q4|col-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q4|row-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q5|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q5|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q7|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q7|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q8|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q8|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q9|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q9|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path"
+  },
+  "fingerprints": {
+    "q10|col-vec": {
+      "LogicalJoin": 6
+    },
+    "q10|col-vec-noopt": {
+      "LogicalJoin": 3
+    },
+    "q11|col-vec": {
+      "LogicalJoin": 4
+    },
+    "q11|col-vec-noopt": {
+      "LogicalJoin": 2
+    },
+    "q12|col-vec": {
+      "LogicalJoin": 2
+    },
+    "q12|col-vec-noopt": {
+      "LogicalJoin": 1
+    },
+    "q12|col-volcano": {},
+    "q12|row-volcano": {},
+    "q13|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalLeftJoin": 2
+    },
+    "q13|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalLeftJoin": 1
+    },
+    "q14|col-vec": {
+      "LogicalJoin": 2
+    },
+    "q14|col-vec-noopt": {
+      "LogicalJoin": 1
+    },
+    "q14|col-volcano": {},
+    "q14|row-volcano": {},
+    "q15|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalJoin": 2
+    },
+    "q15|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalJoin": 1
+    },
+    "q16|col-vec": {
+      "LogicalAntiJoin": 2,
+      "LogicalJoin": 2
+    },
+    "q16|col-vec-noopt": {
+      "LogicalAntiJoin": 1,
+      "LogicalJoin": 1
+    },
+    "q18|col-vec": {
+      "LogicalJoin": 4,
+      "LogicalSemiJoin": 2
+    },
+    "q18|col-vec-noopt": {
+      "LogicalJoin": 2,
+      "LogicalSemiJoin": 1
+    },
+    "q19|col-vec": {
+      "LogicalJoin": 2
+    },
+    "q19|col-vec-noopt": {
+      "LogicalJoin": 1
+    },
+    "q19|col-volcano": {},
+    "q19|row-volcano": {},
+    "q1|col-vec": {},
+    "q1|col-vec-noopt": {},
+    "q1|col-volcano": {},
+    "q1|row-volcano": {},
+    "q20|col-vec": {
+      "LogicalJoin": 2,
+      "LogicalSemiJoin": 4
+    },
+    "q20|col-vec-noopt": {
+      "LogicalJoin": 1,
+      "LogicalSemiJoin": 2
+    },
+    "q22|col-vec": {
+      "LogicalAntiJoin": 2,
+      "LogicalDerived": 2
+    },
+    "q22|col-vec-noopt": {
+      "LogicalAntiJoin": 1,
+      "LogicalDerived": 1
+    },
+    "q2|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalJoin": 14,
+      "LogicalLeftJoin": 2
+    },
+    "q2|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalJoin": 7,
+      "LogicalLeftJoin": 1
+    },
+    "q3|col-vec": {
+      "LogicalJoin": 4
+    },
+    "q3|col-vec-noopt": {
+      "LogicalJoin": 2
+    },
+    "q4|col-vec": {
+      "LogicalSemiJoin": 2
+    },
+    "q4|col-vec-noopt": {
+      "LogicalSemiJoin": 1
+    },
+    "q5|col-vec": {
+      "LogicalJoin": 10
+    },
+    "q5|col-vec-noopt": {
+      "LogicalJoin": 5
+    },
+    "q6|col-vec": {},
+    "q6|col-vec-noopt": {},
+    "q6|col-volcano": {},
+    "q6|row-volcano": {},
+    "q7|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalJoin": 10
+    },
+    "q7|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalJoin": 5
+    },
+    "q8|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalJoin": 14
+    },
+    "q8|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalJoin": 7
+    },
+    "q9|col-vec": {
+      "LogicalDerived": 2,
+      "LogicalJoin": 10
+    },
+    "q9|col-vec-noopt": {
+      "LogicalDerived": 1,
+      "LogicalJoin": 5
+    }
+  },
+  "modes": [
+    "row-volcano",
+    "col-volcano",
+    "col-vec",
+    "col-vec-noopt"
+  ],
+  "provenance": [
+    "generator: python_tools/generate_tpch.py (NOT the official dbgen)",
+    "scale:     0.01",
+    "seed:      20250101",
+    "The schema, column order, referential integrity and value domains",
+    "are the TPC-H spec's. The value DISTRIBUTIONS are not, so the",
+    "published TPC-H answer set DOES NOT APPLY to this data. The only",
+    "valid oracle here is SQLite over these same files."
+  ],
+  "timings": {},
+  "tolerance": {
+    "abs": 1e-06,
+    "rel": 1e-09
+  },
+  "vacuous": [
+    "q18"
+  ]
+}
