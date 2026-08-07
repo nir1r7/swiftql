@@ -1036,9 +1036,33 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "SELECT l.team AS t, COUNT(*) AS n FROM laps l WHERE l.speed > 1.05 * "
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) "
     "GROUP BY l.team ORDER BY t",
-    # TWO correlation keys, and MAX rather than AVG
-    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > (SELECT MAX(l2.speed) FROM laps l2 "
-    "WHERE l2.driver_id = l.driver_id AND l2.team = l.team)",
+    # TWO correlation keys, and MAX rather than AVG. Both halves of this entry are
+    # load-bearing and neither is obvious, so both are stated.
+    #
+    # (a) The keys must be INDEPENDENT. `driver_id AND team` — the shape that
+    # shipped — cannot discriminate on this data at all: in laps, driver_id
+    # functionally determines team (20 drivers, one team each), so the team key is
+    # redundant and dropping it changes no answer. `driver_id AND season` is the
+    # nearest genuinely two-dimensional key: 20 drivers x 4 seasons = 80 groups,
+    # none of them derivable from the other key.
+    #
+    # (b) The comparison must not be self-satisfying. `l.speed > MAX(...)` over a
+    # group that CONTAINS the outer row is false for every row by construction, so
+    # it answers 0 whatever the join does — and 0 is also what a total failure
+    # answers. The 0.99 coefficient breaks the tie: the outer row's own speed no
+    # longer bounds the predicate, so the answer tracks the GROUP the keys select.
+    # (Excluding the outer row instead — `AND l2.lap_id <> l.lap_id` — is not
+    # available: splitCorrelation refuses a correlated inequality, by design.)
+    #
+    # Verified against sqlite3 on the shipped data, SwiftQL == SQLite on all three:
+    #   both keys (this entry)        n = 623
+    #   l2.driver_id = l.driver_id    n = 553
+    #   l2.season = l.season          n = 533
+    # so losing EITHER key is visible here. This is the only two-key entry in the
+    # week, i.e. the only place a splitCorrelation that emitted one join key
+    # instead of two would be caught.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > 0.99 * (SELECT MAX(l2.speed) "
+    "FROM laps l2 WHERE l2.driver_id = l.driver_id AND l2.season = l.season)",
     # THE ZERO-ROW CASE, and the reason the join is LEFT rather than INNER. The
     # body's filter leaves many correlation keys with no group at all; SQL says
     # the scalar subquery is NULL there, so the comparison is UNKNOWN and the row
