@@ -41,7 +41,21 @@ Current: SEAM AUDIT PASS 1 — five auditors launched 23:41 UTC, each committing
   own audit warned that a cost model picking a bad plan fails no test.
   2 low: unfloored semi/anti zero estimate; have_ndv set from EITHER side, which falsifies the
   invariant claim written at join_enumeration.cc:454-462.
-  WAITING on two (optimizer preservation, storage) (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
+  4 of 5 REPORTED. Storage (seam-storage-pass-1.md): 0 blockers, 0 high, 0 medium.
+  !! S-0 (informational, but it changes what a clean storage report MEANS): THE ROW/COLUMNAR
+  ORACLE DOES NOT EXIST FOR ANY PHASE 5 PLAN SHAPE. Vectorized requires columnar; Volcano
+  refuses derived tables, multi-way joins, semi/anti and correlated subqueries. So the two
+  storage modes NEVER execute the same Phase 5 query, and all storage safety for this phase
+  rests on HAND-COMPUTED answers. I had told that auditor "row/columnar comparison is the only
+  thing that catches a wrong prune" — it checked, and for every feature this phase built, that
+  comparison is not running at all. No defect found, but the confidence a clean storage report
+  would normally carry is partly unearned. RECORD THIS FOR WEEK 37.
+  Out of scope, pre-existing, noted not fixed: columnar_table.h:31 keys columns by NAME and
+  catalog.cc:22 does not reject duplicate column names.
+  Not reached there: the full TPC-H-scale zone-map boundary sweep (timed out; no divergence in
+  the completed portion, and an equivalent 84/84 sweep on a purpose-built 3-chunk clustered
+  table DID complete), DOUBLE-typed boundary literals, RLE/dictionary unit invariants.
+  WAITING on one (optimizer preservation) (optimizer preservation, storage) (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
   before dispatching fixes, so they batch into one round rather than racing the tree.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
