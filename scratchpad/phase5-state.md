@@ -1,10 +1,18 @@
 # Phase 5 orchestrator state
-Current: week 34 CLOSED. Audit r2 + week 35 teach launching ~15:53 UTC.
-  Audit r2 covers what NOBODY has read: the harness suite definitions in
-  compare_against_sqlite.py, whether each DIFFED suite query still tests what its comment
-  claims, and the fix rounds as new code (CASE-wrapper for COUNT bodies, VecDerivedNode
-  surviving-row-count fix, the 3 derived-table alias execution tests).
-  Week 35 is TPC-H DATA + HARNESS — the week that makes 22/22 measurable at week 36.
+Current: week 34 cleanup (a91a1c6f7778b58f5, 15:53 UTC) running alongside week 35 teach
+  (ace28f349cf48c3b7). Different files; if a push is rejected, pull --rebase, never force.
+  Audit r2: 0 blockers, 1 medium, 2 low. Q17 verified vs SQLite across all 22 suite entries and
+  every aggregate kind — the week-33 handover is genuinely delivered.
+  MEDIUM is the class worth remembering: compare_against_sqlite.py:1042, the ONLY
+  two-correlation-key oracle entry, returns n=0 whether one key or both are used — it cannot
+  detect a lost join key. A query that passes regardless of whether the feature works.
+  OWED, not approved: per-entry discriminating-power re-derivation for the WEEK 26-32 rejection
+  suites (wiring checked, content not) — a sampled pass this round, remainder to week 35 notes.
+  Audit target 4 ("anything else risky") never ran as its own pass; recorded as unrun.
+!! GIT IDENTITY: env vars GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL override git config, so every
+  commit must be prefixed with the four overrides to be attributed to the bot. Verified working
+  (be6dbe2). ~300 existing commits carry the owner's identity; NOT rewriting — raised with the
+  user, awaiting their preference.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
