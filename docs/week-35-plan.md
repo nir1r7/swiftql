@@ -1064,3 +1064,554 @@ person who sees a red test.
   tolerance that passes everything is not a tolerance.
 - Point the oracle at the root catalog and at the TPC-H catalog in the same
   session; neither run may alter the other's result.
+
+---
+
+## Task 6 — Reporting mode coverage honestly
+
+### Why it matters
+
+This is the task the week exists for. Week 36 will produce a number, that number
+will go in the README, and it will be read as the phase's headline result. Three
+facts already on the page make an unqualified "22/22" false:
+
+1. **Two capability boundaries are open.** `IN (subquery)` (Week 32), correlated
+   subqueries (Weeks 33/34) and derived tables (Week 34) are **refused on the
+   Volcano path** — `Planner::plan` builds exactly one `HashJoinNode` out of
+   `stmt.joins` and runs no `LogicalPlanBuilder`, so it can hold neither a second
+   join nor a relation that is a plan. Multi-way joins have the same shape. The
+   README already counts the cost: **56 queries diffed in two modes against 168
+   in four**. Most TPC-H queries are multi-way joins, so *most of the 22 will be
+   two-mode queries*. A report that says "22/22" without saying "in how many
+   modes" converts a documented, deliberate limitation into a silent claim of
+   full coverage.
+2. **A refusal is not a pass and not a failure.** The oracle cannot hold a query
+   that errors; `run_swiftql` raises. So "SwiftQL refused it on Volcano" has to be
+   a *third* outcome, and it only counts as coverage when the refusal was
+   asserted **by message** — which is precisely the discipline
+   `run_rejection_suite` already enforces and the reason every capability
+   boundary in `main()` is asserted on both halves.
+3. **Q22 is not claimed closed.** Week 34's note is explicit: Q22's correlated
+   component is a `NOT EXISTS` that Week 33 already decorrelated, while what
+   Q22 additionally needs is a derived table; Q22 is "**not** claimed closed on
+   the strength of the correlated-scalar rewrite alone: verify it against the
+   ported query in Week 36 and record which half was which." Making that
+   verifiable rather than assumed is this task's second half.
+
+### Conceptual explanation
+
+**Model the outcome as a per-(query, mode) cell, not a per-query boolean.** Four
+modes, named exactly as `compare_against_sqlite.py::main` names them, so the two
+files agree:
+
+| mode key | flags |
+|---|---|
+| `row-volcano` | *(none — the defaults)* |
+| `col-volcano` | `--storage columnar` |
+| `col-vec` | `--execution vectorized --storage columnar` |
+| `col-vec-noopt` | `--execution vectorized --storage columnar --no-optimize` |
+
+and six outcomes, each with a distinct meaning:
+
+| outcome | meaning | counts toward coverage? |
+|---|---|---|
+| `MATCH` | rows equal the oracle within tolerance | **yes** |
+| `MISMATCH` | rows differ | no — a defect |
+| `REFUSED_EXPECTED` | errored, and the message contains the boundary's expected substring | **yes** — the boundary is under test |
+| `REFUSED_UNEXPECTED` | errored with a message nobody predicted | no — either a defect or a stale expectation |
+| `UNPORTED` | the dialect cannot express this query yet | no — Week 36 work, recorded not hidden |
+| `ORACLE_BLIND` | SwiftQL answered but SQLite cannot express the query | no — see Task 5's blind spots |
+
+The rules that make the report honest fall straight out:
+
+- A query is **"correct in mode M"** only on `MATCH`. `REFUSED_EXPECTED` is
+  *boundary* coverage, not correctness coverage, and the two are reported on
+  separate lines. Collapsing them is exactly how "22/22 in four modes" gets
+  written down.
+- The headline is a **pair**: how many queries answered correctly, and in how
+  many modes each. Never one number.
+- **The 56 / 168 counts are computed, not typed.** The README states them today
+  as prose; once the harness computes the mode census, the prose can cite the
+  harness and stop going stale. That is the same argument Week 34 used for
+  counting the deferral cost rather than describing it.
+
+**Q22's provenance, made mechanical.** `--explain` prints the logical plan, and
+the node *names* carry the semantics on purpose — `LogicalJoin::explain` returns
+`LogicalSemiJoin [`, `LogicalAntiJoin [`, `LogicalAntiJoin [NOT IN, `,
+`LogicalLeftJoin [` or `LogicalJoin [`, and a derived relation prints
+`LogicalDerived [<alias>, ...]`. So "which half was which" is a **plan
+fingerprint**, not a judgement call. Capture `--explain` once per query
+alongside the result, extract the multiset of node kinds, and store it in the
+per-query record. For Q22 that record should show an **`LogicalAntiJoin`** (Week
+33's `NOT EXISTS` decorrelation) *and* a **`LogicalDerived`** (the `custsale`
+relation), and **no** `LogicalLeftJoin` from a correlated-scalar rewrite. If it
+shows something else, Week 34's note was wrong about which half is which and you
+have found that out mechanically instead of by argument.
+
+That fingerprint pays twice: it is also the raw material for Week 37's
+optimizer-impact numbers and for the `join-ordering=skipped (outer join)`
+accounting, since Week 34's LEFT-join rewrite turns reordering off for the whole
+tree.
+
+### Code snippets
+
+```python
+# python_tools/tpch_report.py
+MODES = [
+    ("row-volcano",    []),
+    ("col-volcano",    ["--storage", "columnar"]),
+    ("col-vec",        ["--execution", "vectorized", "--storage", "columnar"]),
+    ("col-vec-noopt",  ["--execution", "vectorized", "--storage", "columnar",
+                        "--no-optimize"]),
+]
+
+# Boundaries this project has already decided and already pins by message.
+# Substrings, matched the way run_rejection_suite matches them -- "it failed" is
+# not the property under test; "it failed for the stated reason" is.
+VOLCANO_BOUNDARIES = [
+    "multi-way joins are not supported on the Volcano path",
+    "IN (subquery)",                       # Week 32's message, exact text at the call site
+    "correlated subqueries are decorrelated to a semi-join",
+    "derived tables (FROM (subquery)) are not supported on the Volcano path",
+]
+
+def classify(qid, mode_key, rc, stdout, stderr, oracle_rows, tol):
+    if rc != 0:
+        # A refusal counts as coverage ONLY when it is the refusal we predicted.
+        # An unexplained error is not "the boundary working"; it is unknown.
+        for msg in VOLCANO_BOUNDARIES:
+            if msg in stderr:
+                return ("REFUSED_EXPECTED", msg)
+        return ("REFUSED_UNEXPECTED", stderr.strip().splitlines()[0][:120])
+    rows = parse_tsv(stdout)               # Task 5's --format tsv
+    if oracle_rows is None:
+        return ("ORACLE_BLIND", None)      # SQLite cannot express this query
+    ordered = "ORDER BY" in qid_sql(qid).upper()
+    ok = rows_equal(normalize(rows, ordered),
+                    normalize(oracle_rows, ordered),
+                    rel_tol=tol.rel, abs_tol=tol.abs)
+    return (("MATCH" if ok else "MISMATCH"), None)
+```
+
+```python
+# The report. Note what it REFUSES to print: a bare "22/22".
+def render_summary(cells):
+    """cells: {(qid, mode_key): (outcome, detail)}"""
+    correct_modes = {q: sum(1 for m, _ in MODES
+                            if cells[(q, m)][0] == "MATCH")
+                     for q in QUERY_IDS}
+
+    answered   = [q for q, n in correct_modes.items() if n > 0]
+    four_mode  = [q for q, n in correct_modes.items() if n == 4]
+    two_mode   = [q for q, n in correct_modes.items() if n == 2]
+    unported   = [q for q in QUERY_IDS
+                  if any(cells[(q, m)][0] == "UNPORTED" for m, _ in MODES)]
+
+    # Boundary coverage is counted SEPARATELY from correctness. A refusal is
+    # the boundary working, not the query answering, and merging the two is
+    # exactly how "22/22 in four modes" gets written down.
+    pinned = sum(1 for c, _ in cells.values() if c == "REFUSED_EXPECTED")
+    unknown = [k for k, (c, _) in cells.items() if c == "REFUSED_UNEXPECTED"]
+
+    print(f"TPC-H correctness @ {SCALE}, oracle = SQLite over the same data")
+    print(f"  answered correctly:        {len(answered)}/22")
+    print(f"    in all four modes:       {len(four_mode)}")
+    print(f"    in the two vectorized modes only: {len(two_mode)}")
+    print(f"  not yet ported:            {len(unported)}  {unported}")
+    print(f"  query x mode cells:        {4 * len(QUERY_IDS)}")
+    print(f"    Volcano refusals pinned by message: {pinned}")
+    if unknown:
+        print(f"  !! unexplained errors:     {unknown}")   # never silent
+```
+
+### Implementation guidance
+
+1. Build the cell matrix first and print it raw (a 22 × 4 grid of outcome
+   names). Read it before writing any summary line — the summary is a lossy view
+   and you want to see the loss.
+2. Take the `VOLCANO_BOUNDARIES` substrings from the **actual message strings in
+   the source**, not from this document. They are pinned in
+   `compare_against_sqlite.py`'s `WEEK32_SEMI_JOIN_VOLCANO_REJECTED`,
+   `WEEK33_DECORRELATED_VOLCANO_REJECTED`, `WEEK34_DERIVED_TABLE_VOLCANO_REJECTED`
+   and `MULTIWAY_VOLCANO_REJECTED`; reuse those lists rather than retyping them,
+   so a message change breaks one place.
+3. Capture `--explain` per (query, mode) into the record. Extract node kinds by
+   the exact prefixes `LogicalSemiJoin`, `LogicalAntiJoin`, `LogicalLeftJoin`,
+   `LogicalDerived`, `LogicalJoin`.
+4. Add an explicit Q22 assertion using that fingerprint, with a comment quoting
+   Week 34's note so the next reader knows why it exists.
+5. Emit both the human table and the JSON. Week 37 wants the JSON.
+
+**Mistakes specific to this codebase:**
+
+- **Counting `REFUSED_EXPECTED` as a pass.** The single failure mode this whole
+  task exists to prevent.
+- **Treating any non-zero exit as a refusal.** A segfault, a missing catalog and
+  a `Table not found` all exit non-zero. `REFUSED_UNEXPECTED` must be loud.
+- **Assuming a query refused on Volcano is refused for the reason you think.**
+  Week 34's harness already documents the ordering hazard: on the Volcano path
+  the *capability* refusal fires before the shape-specific one, which is why
+  `WEEK34_CORRELATED_SCALAR_REFUSED` runs in the vectorized modes only. Match the
+  message; do not infer it.
+- **Hard-coding "56 queries in two modes".** Compute it. The number moves the
+  moment a suite grows, and a stale number in a report about honesty is a bad
+  look.
+- **Reporting a mode count for `UNPORTED` queries.** They have no modes; they
+  have a reason. Print the reason.
+
+### Verification
+
+- Feed the reporter a synthetic cell matrix where one query matches in two modes
+  and is refused-with-the-expected-message in the other two. The summary must
+  say "two-mode", must not say "four", and must count two pinned refusals.
+- Flip one of those refusals to an unexpected message. The `!! unexplained
+  errors` line must appear and the exit code must be non-zero.
+- Run against the F1 dataset with a query set that includes a known
+  vectorized-only shape (any `WEEK32_SEMI_JOIN_VEC_ONLY` entry). The report must
+  independently rediscover the two-mode classification the existing suite already
+  encodes by hand — that agreement is the proof the classifier is right.
+- Q22, once ported: the fingerprint contains `LogicalAntiJoin` and
+  `LogicalDerived`. Record it in the run report verbatim.
+
+---
+
+## Task 7 — Randomized result differencing at SF-small
+
+### Why it matters
+
+Week 28 deferred this here by name, with the diagnosis already done: its
+randomized coverage is at **plan** level (300 shapes checked for a legal
+`order=`, `cost <= written`, no negative `est=`), and randomized **result**
+differencing never completed because the `--no-optimize` leg of a multi-way
+self-join over 10k `laps` rows took tens of seconds — 35.6 s measured on one
+query — so batches of 100, 40 and 14 all timed out. Every optimizer week from 29
+onward inherited that shape of coverage: result preservation rests on
+hand-written differentials (44 queries in one audit round, 9 in the next), not
+on a generator.
+
+The blocker was data size, not budget, which is why it lands in the week that
+owns the data. With Task 3's 500-row fixture, `--no-optimize`'s dominant term —
+the unfiltered scan — shrinks by ~20×, and a 40-query differential should run in
+well under a minute over the same join shapes.
+
+### Conceptual explanation
+
+**What is being differenced.** Two legs, and they answer different questions:
+
+1. **Optimized ≡ `--no-optimize`, both on `col-vec`.** This is the *result
+   preservation* property Week 28 wanted: the optimizer must not change an
+   answer. It needs no oracle, so it works for every shape the engine can run —
+   including ones SQLite would be awkward about.
+2. **Optimized ≡ SQLite.** The correctness leg. It is bounded by the oracle's
+   blind spots (Task 5), so it runs on the subset SQLite can express.
+
+Run both. Leg 1 alone can pass on two identically-wrong plans; leg 2 alone
+cannot isolate the optimizer.
+
+**The two traps the Week 28 note names, and what they actually mean:**
+
+**Trap 1 — sort before diffing, but understand *when*.** A query with no
+`ORDER BY` has no specified row order, and reordering a join legitimately changes
+physical emission order; that is not a result difference. So the unordered
+comparison must sort both sides — which `normalize(preserve_order=False)`
+already does. The subtle half is the *other* direction, and it is the one that
+will bite: if the generator emits an `ORDER BY`, `run_query_suite`'s heuristic
+(`"ORDER BY" in query.upper()`) switches to **ordered** comparison, and then a
+sort key with **ties** makes the comparison order-sensitive on rows whose order
+SQL does not specify. A reordered join breaks those ties differently and the diff
+reports a false failure. Rule for the generator: either emit **no** `ORDER BY`,
+or emit one that is a **total** order (append a unique column such as
+`lap_id`). Do not emit a partial `ORDER BY`.
+
+**Trap 2 — `normalize()` keys rows by column *name*.** Its docstring says so
+plainly: rows arrive as dicts keyed by column name, so duplicate names collapse,
+and a merged join schema legally carries several columns of the same name (two
+`driver_id`, two `team` on a `laps`/`drivers` join or any self-join). Both
+engines collapse identically, so the file **cannot see** a column-identity or
+column-order regression in a `SELECT *` multi-way join. A generator that emits
+`SELECT *` over a multi-way join is therefore diffing a *narrower* row than it
+thinks it is — and self-joins are exactly what a multi-relation generator
+produces most of.
+
+Two ways out, and take both: have the generator project **named, distinctly
+aliased** columns rather than `SELECT *`; and compare **raw sorted output**
+(Task 5's `--format tsv`, split positionally, never through a dict) so column
+count and order survive the comparison. The C++ side already covers the
+`SELECT *` case — `JoinEnumeration.ReorderedPlansReturnTheWrittenOrdersRows`
+diffs raw chunk values — so this is about not *believing* the Python side covers
+it.
+
+**Shape of the generator.** Reuse Week 28's plan-level shape vocabulary: 3–8
+relations drawn from `laps` and `drivers` with distinct aliases, an equi-join
+chain on real key columns, an optional `WHERE` of one or two conjuncts, an
+optional `GROUP BY` over a low-cardinality column. Seed it and **print the seed
+in the failure message** — an unreproducible randomized failure is not a bug
+report.
+
+### Code snippets
+
+```python
+# python_tools/random_diff.py
+def generate_query(rng, n_relations):
+    """A 3-8 relation equi-join chain over aliased laps/drivers.
+
+    Two rules encode the traps:
+      * project NAMED, DISTINCTLY ALIASED columns -- never SELECT *. normalize()
+        keys rows by column name, so duplicate names from a merged join schema
+        collapse on BOTH sides and the diff silently narrows.
+      * either no ORDER BY, or a TOTAL one. A partial ORDER BY makes the
+        comparison order-sensitive on rows whose order SQL does not specify, and
+        a reordered join breaks those ties differently -- a false failure.
+    """
+    aliases = [f"l{i}" for i in range(n_relations)]
+    froms   = f"laps {aliases[0]}"
+    for a, b in zip(aliases, aliases[1:]):
+        froms += f" JOIN laps {b} ON {a}.driver_id = {b}.driver_id"
+
+    # distinct output names, so nothing collapses
+    projection = ", ".join(f"{a}.speed AS s_{a}" for a in aliases[:3])
+    where = f" WHERE {aliases[0]}.season = {rng.choice([2022, 2023, 2024, 2025])}"
+    return f"SELECT {projection} FROM {froms}{where}"
+
+
+def diff_one(catalog, sql, seed):
+    opt   = run_tsv(catalog, VEC, sql)                    # optimized
+    noopt = run_tsv(catalog, VEC + ["--no-optimize"], sql)
+    # Positional, raw, sorted. NOT normalize(): its dict keying is the blind
+    # spot this leg exists to avoid.
+    if sorted(opt) != sorted(noopt):
+        raise AssertionError(
+            f"optimizer changed the result\n  seed={seed}\n  sql={sql}")
+```
+
+### Implementation guidance
+
+1. Generate against `data/f1/sf-small/catalog.json`. Confirm the budget with a
+   single 8-relation `--no-optimize` run before generating 40 of them.
+2. Leg 1 (optimized ≡ `--no-optimize`) first — it needs no SQLite and it is the
+   property Week 28 actually deferred.
+3. Add leg 2 (≡ SQLite) for the shapes SQLite accepts. Reuse Task 5's
+   catalog-driven `load_sqlite` pointed at the `sf-small` catalog.
+4. Fix the seed by default so a scheduled run is reproducible; allow
+   `--seed random` explicitly for exploration, and print the seed on every
+   failure either way.
+
+**Mistakes specific to this codebase:**
+
+- **Using `normalize()` for this leg.** It is the documented blind spot. Compare
+  raw positional output.
+- **Emitting `SELECT *`.** Same reason, from the other end.
+- **Emitting a partial `ORDER BY`.** False failures that look like optimizer
+  bugs, which is the worst possible false positive to hand a future week.
+- **Generating shapes the vectorized path refuses.** A 3+ relation join is
+  vectorized-only; that is fine because both legs run on `col-vec`. But a
+  generated correlated or `IN` shape run on Volcano would refuse, and a refusal
+  in a *result* differ is an error, not a data point. Keep the generator to
+  shapes both legs can run.
+- **Forgetting that `data/f1/sf-small` sorts `laps` by season.** Keep it; the
+  clustered-season assumption is what the rest of the project's zone-map
+  behaviour is measured under.
+
+### Verification
+
+- **Budget:** 40 generated queries, both legs, complete in under a minute. That
+  is the number Week 28's note predicts; if it does not hold, say so rather than
+  quietly shrinking the batch.
+- **The differ can fail.** Run one query with a deliberately corrupted expected
+  value, or temporarily force a wrong build side, and confirm a red result. A
+  differential that has never failed has not been shown to work — Week 33's
+  dead-assertion finding is the same lesson.
+- **Trap 2 is really closed:** generate one `SELECT *` self-join by hand, run it
+  through `normalize()` and through the positional comparison, and confirm the
+  two see a different number of columns. Keep that as a regression test with a
+  comment pointing at `normalize()`'s docstring.
+- Record the batch size, the seed and the wall time in the run report, so Week 36
+  and Week 37 inherit a number rather than an impression.
+
+---
+
+## Task 8 — The behavioural rejection sweep and the standing sweep rule
+
+### Why it matters
+
+Week 34 recorded the lesson directly: **a textual cross-check cannot detect a
+suite entry whose move half-landed.** A rejection entry that was moved out of one
+list and not into another, or whose expected message drifted, still *reads*
+correct. Two stale rejection entries were caught in Week 34 and retired; the
+check that found them was behavioural — *run every rejection entry and assert it
+still errors* — not textual. Week 34's own commit history names it as the
+replacement for a half-check.
+
+That matters more this week than in any prior one, because Week 35 rewrites the
+loader and adds a second dataset, and Task 6's whole report is built on the
+premise that a pinned refusal means what it says. If a refusal has gone stale —
+the query now *answers* — Task 6 will classify it `REFUSED_UNEXPECTED` at best,
+and at worst the boundary will have moved without anyone noticing and the
+two-mode/four-mode census will be wrong.
+
+### Conceptual explanation
+
+Three checks, cheap, and they compose:
+
+1. **Structural.** Every suite named `*_REJECTED` / `*_REFUSED` in the module is
+   a non-empty list of `(query, expected_substring)` 2-tuples with a non-empty
+   expected substring. Catches a half-landed move where a bare string was
+   appended to a list of pairs.
+2. **Disjointness.** No query text appears in both a positive suite (one fed to
+   `run_query_suite`) and a rejection suite. That *is* the half-landed-move
+   signature: the entry was added to its new home and not removed from its old
+   one, so the same SQL is simultaneously asserted to return rows and to error.
+   Textual review will not see it; set intersection will.
+3. **Behavioural.** Every rejection entry is executed and must still error, with
+   the expected substring present, in at least the modes its suite is run in.
+   This is the check Week 34 identified as the one that works. Note the harness
+   *already* does this as a side effect for every suite `main()` runs — the value
+   of making it explicit is that it covers suites `main()` has stopped running,
+   which is exactly the half-landed case.
+
+Discover the suites by **name convention over `globals()`**, not by a
+hand-maintained list. A hand-maintained list of suites is one more thing a move
+can half-land in.
+
+### Code snippets
+
+```python
+# python_tools/compare_against_sqlite.py — the meta-check.
+# Week 34's lesson, automated: a TEXTUAL cross-check cannot see a suite entry
+# whose move half-landed. Running every entry can.
+def sweep_rejection_suites(modes):
+    """Structural + disjointness + behavioural sweep over every *_REJECTED /
+    *_REFUSED suite in this module. Discovered by NAME, never by a curated list:
+    a curated list is one more place a half-landed move can hide."""
+    suites = {name: obj for name, obj in globals().items()
+              if (name.endswith("_REJECTED") or name.endswith("_REFUSED"))
+              and isinstance(obj, list)}
+
+    failures = []
+
+    # (1) structural
+    for name, suite in suites.items():
+        if not suite:
+            failures.append(f"{name}: empty suite")
+        for entry in suite:
+            if not (isinstance(entry, tuple) and len(entry) == 2
+                    and isinstance(entry[1], str) and entry[1]):
+                failures.append(f"{name}: malformed entry {entry!r}")
+
+    # (2) disjointness -- the half-landed-move signature
+    positive = set()
+    for name, obj in globals().items():
+        if name.endswith("_QUERIES") or name.endswith("_VEC_ONLY"):
+            if isinstance(obj, list) and all(isinstance(q, str) for q in obj):
+                positive |= set(obj)
+    for name, suite in suites.items():
+        overlap = positive & {q for q, _ in suite}
+        for q in overlap:
+            failures.append(
+                f"{name}: also in a positive suite -- a move half-landed: {q[:70]}")
+
+    # (3) behavioural -- the check that actually works
+    for name, suite in suites.items():
+        for query, expected in suite:
+            if not any(_errors_with(query, expected, extra) for _, extra in modes):
+                failures.append(
+                    f"{name}: no longer errors with {expected!r}: {query[:70]}")
+    return failures
+```
+
+### Implementation guidance
+
+1. Write the structural and disjointness checks first — they are pure and run in
+   milliseconds, and disjointness alone would have caught Week 34's two entries.
+2. Add the behavioural leg, and run it over the four modes. Expect it to be the
+   slowest part of the file; that is acceptable for what it buys, but gate it
+   behind a flag if the full suite's runtime matters.
+3. Wire it into `main()` and into the exit code. A sweep whose findings are
+   printed but do not fail the run is a sweep nobody reads.
+
+**Mistakes specific to this codebase:**
+
+- **Requiring an entry to error in *all* modes.** Several suites deliberately
+  run in two modes only, and several assert *different* messages per path — the
+  Volcano capability refusal fires before the shape-specific one
+  (`WEEK32_LOWERING_REFUSED` vs `WEEK32_LOWERING_REFUSED_VOLCANO`,
+  `WEEK34_CORRELATED_SCALAR_REFUSED` vectorized-only). "Errors with the expected
+  message in at least one mode" is the correct assertion for a generic sweep;
+  the per-mode precision stays in `main()` where the mode split is explicit.
+- **Name-convention drift.** `WEEK33_CORRELATED_BINDS` is a rejection suite
+  whose name ends in neither `_REJECTED` nor `_REFUSED` — `main()` zips it with
+  `WEEK33_CORRELATED_EXPECT` to make the pairs. Either rename it or add it
+  explicitly, and leave a comment saying which, or the sweep silently skips it.
+- **`WEEK33_CORRELATED_EXPECT` is a prefix, not a message.** Week 33 recorded
+  this: the suite asserts only the shared `correlated subquer`, so per-shape
+  drift is invisible. The sweep will report those entries green. That is a known
+  weakness, not a fix this week owes — but say so, because a green sweep that
+  quietly under-asserts is the failure mode the sweep exists to prevent.
+
+### The standing rule, applied to this week
+
+> When a refusal, guard or invariant is removed or changed, sweep every comment,
+> precondition, assertion and header citing it. Three silent wrong answers came
+> from that shape in Week 33 alone.
+
+Week 35's own list, to work through before closing the week:
+
+- **`CSVLoader::load`'s header assumption.** Its comment says `// skip header
+  line`. After Task 2 it is conditional. `csv_loader.h`'s declaration comment
+  ("split a CSV line into raw string fields") now describes a delimiter that is
+  a parameter.
+- **The `Commas inside string values not supported in CSV input` limitation.**
+  Still true for CSV, now sidestepped for `.tbl` — which is *why* TPC-H comments
+  load. Say both halves.
+- **The NaN limitation's "belongs to Week 35, which rewrites the loader
+  anyway".** Task 2 re-declines it. That sentence must be replaced with what
+  Week 35 actually did and why, or it reads as a promise the week broke.
+- **`rows_equal`'s tolerance docstring.** It now takes `rel_tol`; the docstring
+  must say which callers use which and why the default did not move.
+- **`normalize()`'s blind-spot comment.** It says "Read this file's silence on
+  `SELECT *` joins as absence of coverage, not as coverage." Task 7 adds a
+  positional comparison path that *does* see it — for the randomized differ
+  only. Update the comment to say which of the two comparisons is which, or the
+  next reader will assume the blind spot is closed everywhere.
+- **The README's `56 queries in two modes against 168 in four`.** Once Task 6
+  computes the census, cite the harness rather than the prose.
+- **`benchmark.py`'s `avg of 5`** if Task 4 adopts the median. Either both or
+  neither.
+
+### Verification
+
+- Introduce a deliberate half-landed move locally: copy one entry from a
+  rejection suite into a positive suite without removing it. The disjointness
+  check must fail. Revert.
+- Introduce a deliberate stale expectation: change one expected substring to
+  something the engine never emits. The behavioural check must fail. Revert.
+- Run the full `compare_against_sqlite.py` with the sweep enabled and confirm it
+  is green *and* that the sweep actually visited every suite — print the suite
+  count and the entry count, and eyeball them against the file. A sweep that
+  discovers zero suites is green too.
+- Walk the standing-rule list above and tick each item in the week's closing
+  commit message.
+
+---
+
+## Closing note — what Week 36 inherits, and what it must not assume
+
+- **A number with conditions attached.** The harness reports correctness *and*
+  the mode census, separately. Week 36's checkpoint sentence must carry the mode
+  count with it.
+- **A stated oracle.** Whether the data came from official `dbgen` or from the
+  Python generator decides whether "reference results" can mean the published
+  answer set or only SQLite-over-the-same-data. Week 35 records which; Week 36
+  must not upgrade the claim.
+- **Three named things the oracle cannot check**: a query that errors, a
+  derived-table column alias list, and (until Task 5's `--format tsv` lands) a
+  zero-row result versus a parse failure.
+- **A measured scale ceiling**, from Task 3's memory ladder — which is exactly
+  what Week 36's "Document supported scale and memory limits" bullet is waiting
+  for.
+- **Q22's plan fingerprint**, so "which half was which" is read off a plan
+  rather than argued from the query text.
+- **Not built here, deliberately:** the dialect port itself, the
+  `extract(year from d)` decision (Week 25 assigned it to Week 36 — Task 5 only
+  records that the harness currently normalizes it *by accident*), and any
+  performance conclusion, which is Week 37's.
