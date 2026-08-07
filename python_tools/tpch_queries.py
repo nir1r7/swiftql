@@ -421,10 +421,32 @@ TEMPLATES = {
 }
 
 # The spec's validation parameters, adjusted only where a date had to be
-# pre-computed because a placeholder cannot sit inside a date literal.
+# pre-computed because a placeholder cannot sit inside a date literal, or where
+# the spec's own value does not DISCRIMINATE on this data -- see below.
+#
+# WHY A PARAMETER IS EVER CHANGED HERE. The spec's validation parameters were
+# chosen against `dbgen` at SF=1. This data comes from python_tools/generate_tpch.py
+# at SF=0.01, which reproduces the spec's value DOMAINS but not its distributions
+# (PROVENANCE.txt). A parameter selective at SF=1 can therefore narrow to one row
+# -- or to none -- here, and the mutation check then correctly reports the query
+# as INERT / EMPTY / ALL_NULL: it matched SQLite while asserting nothing.
+#
+# That is a fault in the PARAMETER, not in the query, and writing the query off as
+# vacuous UNDERSTATES the engine. Where a re-chosen parameter makes the query's
+# characteristic feature selective again, it is re-chosen here, the smallest
+# possible deviation from the spec value, and the deviation is recorded on the
+# line. Where no parameter helps, the vacuity verdict stands (q18 -- see MUTATIONS).
 VALIDATION_PARAMS = {
     "q1":  {"DELTA_DATE": "1998-09-02"},
-    "q2":  {"SIZE": "15", "TYPE": "BRASS", "REGION": "EUROPE"},
+    # SIZE: spec 15 -> 1. DEVIATION, measured, not preference. At SIZE=15 the
+    # outer filter p_size = 15 AND p_type LIKE '%BRASS' AND r_name = 'EUROPE'
+    # narrows to exactly ONE (part, supplier) pair on this data, so the
+    # correlated MIN(ps_supplycost) subquery -- the entire point of Q2 -- has
+    # nothing left to eliminate and deleting it changes no byte (INERT).
+    # Swept all 50 sizes x 5 regions: 172 of 250 combinations DISCRIMINATE.
+    # SIZE=1 keeps TYPE and REGION at their spec values and gives base 7 rows
+    # -> mutant 8, so the subquery is now exercised.
+    "q2":  {"SIZE": "1", "TYPE": "BRASS", "REGION": "EUROPE"},
     "q3":  {"SEGMENT": "BUILDING", "DATE": "1995-03-15"},
     "q4":  {"DATE": "1993-07-01", "DATE_PLUS_3M": "1993-10-01"},
     "q5":  {"REGION": "ASIA", "DATE": "1994-01-01", "DATE_PLUS_1Y": "1995-01-01"},

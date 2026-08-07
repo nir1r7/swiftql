@@ -41,7 +41,7 @@ written-down capability boundaries into an unqualified pass.
 | Fix | State |
 |---|---|
 | 1 — the gate step that cannot fail (`--baseline` + `--write-baseline` on one path) | **done** — the write moved after the comparison and is refused unless the run passed; proved on a synthetic regression |
-| 2 — q2's INERT is a parameter artifact | pending |
+| 2 — q2's INERT is a parameter artifact | **done** — `SIZE` 15 -> 1 (172/250 combos discriminate); q2 is now DISCRIMINATING (7 rows -> 8) and still matches SQLite in both vectorized modes |
 | 3 — q19's ALL_NULL is a parameter artifact | pending |
 | 4 — a narrowed `--queries` run prints a full-shaped PASS | pending |
 | 5 — README records Q17 as supported; the spec's Q17 text is refused | pending |
