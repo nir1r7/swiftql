@@ -343,7 +343,21 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     if (n > 32) return node;   // uint32_t subset masks; unreachable in practice
     // Week 29 — BEFORE decompose(), which moves subtrees out of the tree: a
     // decline discovered afterwards would have nothing clean to return.
-    if (containsOuterJoin(node.get())) return node;
+    //
+    // Unlike the two declines above, this one is REPORTED. Below three relations
+    // there is no decision to make and above 32 the pass does not exist, so
+    // silence is honest there; here a decision was available and was refused, and
+    // the cost is real — one outer join switches ordering off for the query's
+    // fully inner block too, which the README records as deliberate. A declined
+    // tree printing nothing at all made that loss invisible on the one surface a
+    // reader consults. It is deliberately NOT spelled `order=`: no order was
+    // chosen, and the token `--explain` readers and the harness grep for must keep
+    // meaning "the search ran".
+    if (containsOuterJoin(node.get())) {
+        static_cast<LogicalJoin*>(node.get())->order_decision =
+            "join-ordering=skipped (outer join)";
+        return node;
+    }
 
     std::vector<std::unique_ptr<LogicalPlanNode>> leaves(n);
     std::vector<Edge> edges;

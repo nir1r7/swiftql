@@ -50,10 +50,13 @@
 //      dp / greedy / written-floor / written-fallback produced the printed order.
 //   5. Outer joins are not reordered AT ALL. R ⟕ S ≠ S ⟕ R and associativity
 //      fails, so any tree containing one is declined whole (containsOuterJoin,
-//      Week 29) and --explain shows no order= line for it — there was no
-//      decision. The outer-join cardinality rule (max(rows, left_rows)) lives at
-//      the STAMPING site for the same reason the ≥1 floor does: it is not
-//      multiplicative, so the search must never meet it.
+//      Week 29). --explain reports `join-ordering=skipped (outer join)` and no
+//      order= line: a decision was available and was refused (unlike the two
+//      declines below, where there is none to make), and one outer join costs the
+//      query's inner block its ordering too. The outer-join cardinality rule —
+//      max(selectivity(ON residual) * matches, left_rows) — lives at the STAMPING
+//      site for the same reason the ≥1 floor does: neither term is multiplicative,
+//      so the search must never meet it.
 //
 // Above 32 relations the pass declines entirely (uint32_t subset masks) and
 // --explain shows no order= line, because there is no decision to show. No TPC-H
