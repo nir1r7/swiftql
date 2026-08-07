@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "planner/subquery_materialization.h"
+#include "planner/subquery_lowering.h"
 #include "planner/logical_plan.h"
 #include "planner/binder.h"
 #include "planner/validator.h"
@@ -536,6 +537,43 @@ TEST(SemiJoinLowering, ExistsStillMaterializesAndAddsNoJoin) {
     EXPECT_FALSE(stmt.has_subquery);
     auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
     EXPECT_EQ(countJoins(plan.get()), 0);
+}
+
+// THE FOURTH REFUSAL, and the reason it is asserted here and nowhere else.
+// planBody MOVES the statement out of the shared_ptr, so two SubqueryExpr nodes
+// naming one body would leave the second planning an emptied statement — a
+// wrong answer, not an error. The guard is correct; what it lacked was any
+// proof that it fires, because no SQL text reaches it: cloneExpr
+// (parser/expr_utils.h) is the only producer of a shared body, and no pass in
+// the WHERE path clones a conjunct before lowering runs. That makes it
+// unreachable TODAY and reachable the moment one does — exactly the guard that
+// silently stops guarding if nothing pins it. So the test drives
+// lowerInSubqueries directly, building the sharing cloneExpr would build, and
+// deliberately does NOT go through planLowered: there is no SQL to write.
+TEST(SemiJoinLowering, RefusesABodySharedByTwoExpressions) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT lap_id FROM laps WHERE driver_id IN "
+                         "(SELECT driver_id FROM drivers)", cat);
+    Validator::validate(stmt, cat);
+    ASSERT_NE(dynamic_cast<SubqueryExpr*>(stmt.where.get()), nullptr);
+
+    // cloneExpr copies the shared_ptr, not the statement — SelectStatement holds
+    // unique_ptr members and is move-only. Two Exprs, one body, use_count 2.
+    std::vector<std::unique_ptr<Expr>> conjuncts;
+    conjuncts.push_back(cloneExpr(stmt.where.get()));
+    conjuncts.push_back(std::move(stmt.where));
+    ASSERT_EQ(static_cast<SubqueryExpr*>(conjuncts[0].get())->subquery.use_count(), 2u);
+
+    // the spine is irrelevant to this refusal: it fires before any key is built
+    auto spine = std::make_unique<LogicalScan>(
+        "laps", Schema({ColumnDef{"driver_id", TypeId::INT, 0, false}}));
+    try {
+        lowerInSubqueries(std::move(spine), conjuncts, cat);
+        ADD_FAILURE() << "expected a refusal for a body shared by two expressions";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("shared by two expressions"),
+                  std::string::npos) << e.what();
+    }
 }
 
 // The refusals. Each is a stated README dialect-table row and a rejection-suite
