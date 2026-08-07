@@ -499,6 +499,28 @@ WEEK31_SUBQUERY_VOLCANO_REJECTED = [
     (query, "not supported on the Volcano path") for query in WEEK31_SUBQUERY_VEC_ONLY
 ]
 
+# The two queries where materialization DIVERGES FROM SQLITE. Both are legal SQL
+# that SQLite answers, so they cannot live in the diffed suite above — but a
+# divergence the oracle never executes is one nobody notices going wrong. Pinning
+# them here makes each a recorded decision with a message under test, in exactly
+# the shape WEEK30_REJECTED_QUERIES already uses for "SQLite answers it; the
+# property under test is SwiftQL's own refusal". Both are stated in README ->
+# Syntax Deliberately Not Supported.
+WEEK31_MATERIALIZATION_REFUSED = [
+    # CARDINALITY. SQLite returns the FIRST row of a multi-row scalar subquery
+    # (verified: `SELECT (SELECT a FROM t)` over 1,2,3 gives 1); SwiftQL raises,
+    # which is what standard SQL requires and what a materialized constant can
+    # honestly represent — there is no "first row" without an ORDER BY, so
+    # SQLite's answer depends on a scan order this engine is free to change.
+    ("SELECT COUNT(*) FROM laps WHERE speed > (SELECT speed FROM laps)",
+     "scalar subquery returned more than one row"),
+    # THE IN CAP. The most obvious IN subquery a user can write against the
+    # shipped dataset is over the cap, so the refusal must be asserted rather
+    # than assumed absent from the suite. Week 32's semi-join deletes this row.
+    ("SELECT COUNT(*) FROM laps WHERE lap_id IN (SELECT lap_id FROM laps)",
+     "above the materialization limit of 1024"),
+]
+
 # Correlated subqueries are Week 33: their value depends on the outer row, so
 # there is no constant to substitute. Reaching THIS refusal still asserts
 # everything Week 30 built — nested scopes, correlation detection, per-scope
@@ -1185,6 +1207,8 @@ def main():
     week33_binds = [(q, WEEK33_CORRELATED_EXPECT) for q in WEEK33_CORRELATED_BINDS]
     for label, extra in modes:
         for suite, name in ((week33_binds, "Week 33 correlated subqueries refused"),
+                            (WEEK31_MATERIALIZATION_REFUSED,
+                             "Week 31 materialization divergences from SQLite"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
             rp, rf, re_ = run_rejection_suite(
                 suite, f"{name} — {label}", extra_args=extra)
