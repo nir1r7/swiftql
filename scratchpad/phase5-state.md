@@ -1,17 +1,26 @@
 # Phase 5 orchestrator state
-Current: week 34, fix round 1 (agent a4e5229d58781224a, launched ~14:52 UTC).
-  !! BLOCKER F1 IN Q17 — the deliverable week 33 handed here. The correlated-scalar rewrite's
-  LEFT join yields NULL for a zero-row group, but SQL requires 0 when the body's aggregate is
-  COUNT. Verified as a wrong answer against the shipped binary AND SQLite.
-  The LEFT join itself was right (SUM/AVG/MIN/MAX over an empty set ARE NULL, so INNER would
-  have dropped the outer row). COUNT is the exception, and COUNT(DISTINCT) — added this week —
-  has the same 0-over-empty rule. Fix must depend on the body's aggregate FUNCTION, and pin
-  EVERY aggregate kind over a zero-row group in the oracle, so the whole rule is visible.
-  F2 (low): the two derived-table column-alias tests pin only the logical schema, not the
-  resolution behaviour they cite. Matters more than a normal low — SQLite cannot parse that
-  syntax, so those two tests are the feature's ENTIRE possible coverage.
-  NOT REACHED by audit r1, do not treat as approved: the harness suite definitions in
-  compare_against_sqlite.py, Scope::owned_schemas lifetime, VecDerivedNode's operator lifecycle.
+Current: week 34 — F1 BLOCKER FIXED and pushed through c5b4567. Waiting on gate r1
+  (ab12a3af1f893a53d, launched 14:46) to report before starting gate r2 — never two gates at
+  once, they contend on build/. Gate r1's verdict is STALE either way: it measured the pre-fix
+  tree. If it has not reported by ~15:10, treat it as dead and launch gate r2 directly.
+  F1 reproduced first: COUNT body over a zero-row group returned 0 rows vs SQLite's 20.
+  Fixed by wrapping a COUNT body's ColumnRef in CASE WHEN ref IS NULL THEN 0 ELSE ref END —
+  COALESCE spelled in the dialect that exists — keyed on the FUNCTION so COUNT(DISTINCT) is
+  covered. The agent DECLINED the audit's offered minimum (refuse COUNT bodies) with a reason:
+  it would cost TPC-H a correlated shape for something the dialect can express. Cost stated at
+  the site (CASE has no vectorized kernel, so that predicate falls back to scalar evaluate()).
+  Oracle now pins EVERY aggregate kind over a zero-row group, including the NEGATIVE cases
+  (SUM/AVG/MIN/MAX -> NULL) so the fix cannot be over-applied, a mixed case (19 vs 20 pre-fix),
+  and an all-groups-present COUNT pinning the wrapper as a no-op.
+  F2 fixed with MUTANT PROOF: making the DERIVED lowering report the child's schema leaves both
+  old schema-only tests passing while 2 of 3 new ones fail.
+  Bonus real defect found and fixed: VecDerivedNode counted chunk->num_rows (buffer width)
+  instead of the surviving count, over-reporting --explain-analyze for any derived body with a
+  WHERE.
+  Swept: "a scalar subquery over zero rows is NULL" appeared in 3 places and is FALSE for
+  COUNT in all of them — corrected in subquery_decorrelation.h, README week 34 table, and
+  Limitations.
+  STILL UNAUDITED: the harness suite definitions in compare_against_sqlite.py.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
