@@ -1255,7 +1255,7 @@ All four items are dispositioned below rather than carried forward silently.
    named in the README dialect table.
 2. **Task 6, Volcano semi/anti parity — RE-DECLINED, and the cost is now
    COUNTED.** Week 34 made the gap larger, adding derived tables as a third
-   vectorized-only family. The number is in README Limitations: 55 queries
+   vectorized-only family. The number is in README Limitations: 56 queries
    diffed in two modes against 168 in four. A count is falsifiable where "some
    queries" is not, so the week it stops being worth deferring is visible.
 3. **Tasks 4, 7, 8 — Task 4 DONE (Q17 executes), Task 7 was already closed in

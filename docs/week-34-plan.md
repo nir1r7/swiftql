@@ -2063,7 +2063,7 @@ from the diff. A successor agent resumes from this section.)*
       `docs/week-33-plan.md` → *Handed to Week 34*. The dependent-join fallback
       stays a refusal, but the refused set **shrank** (Q17's shape now executes).
       Volcano parity again not attempted, and the cost is now **counted** rather
-      than described: 55 queries diffed in two modes against 168 in four, stated
+      than described: 56 queries diffed in two modes against 168 in four, stated
       in README Limitations.
 - [x] Task 9 — harness suites for all three families, diffed and rejected, plus
       11 C++ tests pinning the decisions the oracle structurally cannot see (the
