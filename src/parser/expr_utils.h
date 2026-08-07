@@ -303,7 +303,13 @@ inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         out = std::make_unique<ColumnRef>(*col);   // memberwise: keeps relation_slot
     } else if (auto* lit = dynamic_cast<const Literal*>(expr)) {
-        out = std::make_unique<Literal>(lit->value);
+        auto l = std::make_unique<Literal>(lit->value);
+        // Week 31: null_type is the type of a NULL constant, which only a
+        // materialized scalar subquery produces. It is part of the node's
+        // meaning, not a cache — dropping it here would retype a cloned NULL as
+        // INT and make inferExprType disagree with itself across a clone.
+        l->null_type = lit->null_type;
+        out = std::move(l);
     } else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
         auto b = std::make_unique<BinaryExpr>();
         b->op = bin->op;

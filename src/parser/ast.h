@@ -39,6 +39,20 @@ struct ColumnRef : Expr {
 // literal or constant
 struct Literal : Expr {
     Value value;
+    // Week 31. Only meaningful when `value` is null, which the grammar cannot
+    // produce (there is no NULL literal) and which constant folding refuses to
+    // produce for exactly that reason. The sole source is a materialized
+    // UNCORRELATED SCALAR SUBQUERY that returned zero rows, or one NULL row.
+    //
+    // Value has no typed null — Value::type() throws when is_null_ — and
+    // inferExprType must answer for every node, so carry the type the
+    // subquery's own output schema already gave us instead of inventing a
+    // convention. Typing it INT unconditionally is one line shorter and wrong in
+    // a reachable place: SUBSTRING((SELECT name FROM drivers WHERE id = -1),1,2)
+    // would fail plan-time typing on a query whose answer is NULL.
+    //
+    // Defaulted and last, so every existing construction is unchanged.
+    TypeId null_type = TypeId::INT;
     explicit Literal(Value v) : value(std::move(v)) {}
 };
 
@@ -258,5 +272,24 @@ struct SelectStatement {
     // the statement to find out. Any statement containing a subquery at any
     // depth contains one DIRECTLY, so the top-level flag is always the right
     // test for "this query uses a subquery".
+    //
+    // Week 31: it also means "a SubqueryExpr is STILL in this tree".
+    // materializeSubqueries clears it once every node has been replaced by a
+    // constant, which is what gives a subquery query its projection pushdown
+    // back (buildScanSchema widens to the full schema while the flag is set).
     bool has_subquery = false;
+
+    // Week 31. Set by the Binder when THIS statement contains a correlated
+    // SubqueryExpr *or* when one of its subqueries does — propagated UPWARD,
+    // unlike has_subquery. Correlation is RELATIVE to a block, so a node
+    // correlated to a MIDDLE block leaves the top block's node uncorrelated
+    // (Q20's two-deep shape). Without the propagation the top-level refusal
+    // accepts such a query and a nested block refuses it later, after the outer
+    // levels have already been materialized and run.
+    //
+    // It is the condition of the only refusal left at the end of
+    // Validator::validate, and therefore the containment development.md's
+    // slot-consumer table now rests on: a ColumnRef with query_level > 0 exists
+    // only inside a correlated subquery.
+    bool has_correlated_subquery = false;
 };
