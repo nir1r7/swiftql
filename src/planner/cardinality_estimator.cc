@@ -373,9 +373,28 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 const int left_slot = node.output_schema.column(0).relation_slot;
                 for (ColumnStatsEntry& e : out.entries) e.relation_slot = left_slot;
             }
-            for (ColumnStatsEntry e : right.entries) {
-                e.relation_slot = join.join_slot;
-                out.entries.push_back(std::move(e));
+            // Week 32 — STANDARD ONLY. A semi/anti join's output schema IS the
+            // left child's: children[1] contributes no columns, so merging its
+            // stats would hand the parent entries for columns that are not in
+            // the node's schema, stamped with `join.join_slot` == -1, i.e. the
+            // body's identity crossing into the outer plan's numbering domain.
+            // That is the one thing the -1 slot exists to prevent, and it is the
+            // rule PredicatePushdown::pushIntoJoin already enforces for the same
+            // reason. It is also what development.md's consumer table says this
+            // function does — reads `join.join_slot` only on the STANDARD path.
+            //
+            // Not merely untidy: StatsContext::find's bare-name fallback scans
+            // ALL entries, so any lookup above the join that misses on the left
+            // could land on a body column and cost the parent off a relation
+            // that is not there. No query written today takes that path (every
+            // outer ref above the join carries a real slot), which is exactly
+            // why it has to be closed now rather than after a derived table
+            // makes it a wrong answer.
+            if (join.semantics == JoinSemantics::STANDARD) {
+                for (ColumnStatsEntry e : right.entries) {
+                    e.relation_slot = join.join_slot;
+                    out.entries.push_back(std::move(e));
+                }
             }
 
             // Week 29: a LEFT join emits every preserved-side row at least once,

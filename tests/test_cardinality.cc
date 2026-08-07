@@ -687,6 +687,42 @@ TEST(Cardinality, SemiJoinClampsAtTheLeftRowCountAndAntiNeverGoesNegative) {
     EXPECT_GE(anti->estimated_rows, 0.0);
 }
 
+// The CONTEXT the semi/anti join hands upward, not the row count. Its output
+// schema is the left child's, so children[1] contributes no columns — and the
+// stats context must say the same thing the schema does. Merging the body's
+// entries would stamp them with `join.join_slot`, which is -1 here, putting a
+// body column into the outer plan's slot numbering: the exact crossing the -1
+// slot exists to forbid, and what PredicatePushdown already declines for.
+//
+// It matters beyond tidiness because StatsContext::find falls back to a bare
+// name across ALL entries, so a lookup above the join that misses on the left
+// can land on a body column of the same name — `driver_id` on both sides here,
+// which is the collision an IN subquery naturally produces.
+TEST(Cardinality, SemiJoinContextCarriesNoBodyColumns) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat, /*driver_id_ndv=*/50);
+    seedDriversStatsWithDuplicateKeys(cat);
+    auto join = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    StatsContext out = CardinalityEstimator::estimateSubtree(*join, cat);
+
+    // one entry per output column, and every one of them at a real slot
+    EXPECT_EQ(out.entries.size(), join->output_schema.size());
+    for (const auto& e : out.entries)
+        EXPECT_GE(e.relation_slot, 0) << "body column " << e.name << " escaped at slot -1";
+
+    // the surviving driver_id is the LEFT one: laps' 1000 rows, not drivers' 20
+    const ColumnStatsEntry* l = out.findExact("driver_id", 0);
+    ASSERT_NE(l, nullptr);
+    EXPECT_EQ(l->table_rows, 1000);
+    // and the bare-name fallback cannot reach the body's entry either
+    const ColumnStatsEntry* bare = out.find("driver_id", 7);
+    ASSERT_NE(bare, nullptr);
+    EXPECT_EQ(bare->table_rows, 1000);
+
+    // the estimate itself is unchanged by the containment
+    EXPECT_DOUBLE_EQ(join->estimated_rows, 200.0);
+}
+
 // A semi/anti join carries no ON residual — the lowering pass builds none — and
 // the estimator asserts that rather than quietly handling a case that cannot
 // occur. An assertion that never fires is only worth keeping if something
