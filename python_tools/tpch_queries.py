@@ -468,7 +468,18 @@ VALIDATION_PARAMS = {
             "S5": "19", "S6": "3", "S7": "36", "S8": "9"},
     "q17": {"BRAND": "Brand#23", "CONTAINER": "MED BOX"},
     "q18": {"QUANTITY": "300"},
-    "q19": {"BRAND1": "Brand#12", "BRAND2": "Brand#23", "BRAND3": "Brand#34",
+    # BRANDs: spec 12/23/34 -> 14/34/23. DEVIATION, measured. At the spec brands
+    # NO row matches ANY of the three OR arms on this data, so the query is a SUM
+    # over nothing and the check reports ALL_NULL before the mutant is even run --
+    # the three-valued OR chain this query exists to exercise asserts nothing.
+    # Measured per arm over all 25 generated brands: arm 1 (SM containers, size
+    # 1-5) is non-empty for 4 brands, arm 2 (MED, 1-10) for 8, arm 3 (LG, 1-15)
+    # for 14. Brand#14 / Brand#34 / Brand#23 is the smallest deviation that makes
+    # ALL THREE arms contribute: only BRAND1 leaves the spec's value set, and
+    # BRAND2/BRAND3 are the spec's own 23 and 34 with the arms swapped. Result:
+    # base revenue 56323.29 (three arms) vs mutant 8473.82 (arm 1 alone), so
+    # arms 2 and 3 carry 85% of the answer and neutering them is now visible.
+    "q19": {"BRAND1": "Brand#14", "BRAND2": "Brand#34", "BRAND3": "Brand#23",
             "QTY1": "1", "QTY2": "10", "QTY3": "20"},
     "q20": {"COLOR": "forest", "NATION": "CANADA"},
     "q21": {"NATION": "SAUDI ARABIA"},
