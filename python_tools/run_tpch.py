@@ -525,6 +525,66 @@ def compare_baseline(summary, baseline_path):
     return ok, lines
 
 
+def gate_line(summary, qids, ok, baseline_lines):
+    """The ONE line the `verify` skill's fifth gate reports. Returns a string.
+
+    Everything render_report prints above is for a human reading a failure. This
+    is what a verifier copies into its verdict block, so it carries the honest
+    census rather than a bare pass/fail: how many queries MATCH SQLITE
+    meaningfully out of how many attempted, the mode split, and vacuous and
+    unported counted SEPARATELY -- never folded into the headline. A bare count
+    is exactly what lets a drop pass unnoticed.
+
+    "matches SQLite" is the only claim available: dbgen was unavailable, the
+    generator reproduces the spec's value domains but not its distributions, and
+    PROVENANCE.txt records that the published TPC-H answer set does not apply.
+
+    baseline_lines is None when no baseline was compared -- said out loud,
+    because an unchecked run cannot detect a regression and must not read as one
+    that found none.
+    """
+    modes = summary["modes"]
+    split = {}
+    for q in summary["meaningful"]:
+        split.setdefault(modes[q], []).append(q)
+    parts = []
+    for n in sorted(split, reverse=True):
+        label = {4: "in all four modes", 2: "vectorized-only"}.get(n, f"in {n} modes")
+        parts.append(f"{len(split[n])} {label}")
+
+    shape = (f"{len(summary['meaningful'])}/{len(qids)} meaningful vs SQLite"
+             + (f": {', '.join(parts)}" if parts else "")
+             + f"; {len(summary['vacuous'])} vacuous"
+             + f"; {len(summary['unported'])} unported")
+
+    fails = []
+    if summary["mismatched"]:
+        fails.append(f"WRONG ANSWERS {summary['mismatched']}")
+    if summary["unexplained"]:
+        fails.append(f"UNEXPLAINED {summary['unexplained']}")
+    if summary["mutation_broken"]:
+        fails.append(f"MUTATION BROKEN {summary['mutation_broken']}")
+    if baseline_lines is not None:
+        fails += [l for l in baseline_lines if l.startswith("REGRESSION")]
+    gained = [] if baseline_lines is None else [
+        l for l in baseline_lines if l.startswith("IMPROVED")]
+
+    # Three verdicts, not two. A run with no baseline cannot see a regression,
+    # so calling it PASS is the false certainty this gate exists to remove --
+    # and calling it FAIL would make --write-baseline regeneration look broken.
+    # It says what it is. The verdict always agrees with the exit code.
+    verdict = ("NO-BASELINE" if baseline_lines is None else
+               ("PASS" if ok else "FAIL"))
+    line = f"tpch:       {verdict} ({shape})"
+    if verdict == "NO-BASELINE":
+        line += " -- rerun with --baseline docs/tpch-baseline.json to gate it"
+    if fails:
+        line += " -- " + "; ".join(fails)
+    elif gained:
+        line += " -- IMPROVED, refresh the baseline (--write-baseline)"
+    return line
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -547,6 +607,19 @@ def main():
     args = ap.parse_args()
 
     qids = [q.strip() for q in args.queries.split(",") if q.strip()] or QUERY_IDS
+
+    # data/tpch/ is gitignored, so a fresh clone reaches the fifth gate with no
+    # data. Say so and name the command, rather than letting load_from_catalog
+    # raise a traceback a verifier would report as a TPC-H failure. Still exits
+    # non-zero: a gate that could not run is not a gate that passed. The
+    # generator is seeded, so regenerating reproduces the baselined files.
+    if not os.path.exists(args.catalog):
+        sys.exit(
+            f"catalog not found: {args.catalog}\n"
+            "data/tpch/ is gitignored and regenerated deterministically:\n"
+            "  python3 python_tools/generate_tpch.py --scale 0.01 "
+            "--out-dir data/tpch/sf0.01\n"
+            "This is NOT a TPC-H result -- the gate did not run.")
 
     provenance = []
     prov_path = os.path.join(os.path.dirname(os.path.abspath(args.catalog)),
@@ -625,13 +698,18 @@ def main():
             f.write("\n")
         print(f"wrote baseline {args.write_baseline}")
 
+    baseline_lines = None
     if args.baseline:
-        base_ok, lines = compare_baseline(summary, args.baseline)
+        base_ok, baseline_lines = compare_baseline(summary, args.baseline)
         print(f"\nBASELINE {args.baseline}: "
               f"{'OK' if base_ok else 'REGRESSION'}")
-        for line in lines:
+        for line in baseline_lines:
             print(f"  {line}")
         ok = ok and base_ok
+
+    # LAST line of the run, on purpose: it is what the `verify` skill's fifth
+    # gate reports, and a verifier should not have to scroll for it.
+    print(f"\nGATE {gate_line(summary, qids, ok, baseline_lines)}")
 
     # A wrong answer, an unexplained error, a broken mutation check or a
     # regression against the baseline fails the run. A dialect gap does not: it

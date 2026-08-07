@@ -219,9 +219,23 @@ Fresh agent, no shared context with A. It has one job and no authority to fix an
 > unit:       PASS (<passed>/<total>) | FAIL (<n> failed: <test names>)
 > sqlite:     PASS (<n> queries) | FAIL (<query>, mode <mode>)
 > regression: PASS (<n> queries, all modes) | FAIL (<query>, mode <mode>)
+> tpch:       <the harness's final `GATE tpch:` line, copied verbatim>
 > VERDICT:    GREEN | RED
 > log:        scratchpad/gates/week-<y>-round-<n>.log
 > ```
+>
+> The `tpch:` line is copied, never composed: `run_tpch.py` prints it as its last line
+> and it already carries the honest shape — meaningful out of 22, the mode split, and
+> vacuous and unported counted separately. `FAIL` or `NO-BASELINE` there is RED like any
+> other gate. Never quote the count as "correct" or "TPC-H compliant"; the oracle is
+> SQLite over synthetic data, so the only available claim is "matches SQLite".
+
+The `tpch:` line is why the block is five gates and not four. Phase 5's deliverable IS the
+TPC-H figure, and until Week 35 no gate looked at it — a verifier could report GREEN over a
+broken or regressed TPC-H run in perfect good faith. Baseline at the end of Week 35: **17/22
+meaningful (4 in all four modes, 13 vectorized-only), 3 vacuous, 2 unported**, recorded in
+`docs/tpch-baseline.json`. Week 36's job is to raise the 17; an improvement passes the gate
+and says so, and the improving commit must carry the refreshed baseline with it.
 
 Then snapshot, yourself — it is two cheap commands:
 
@@ -247,8 +261,9 @@ Fresh agent, no shared context with A.
 > - Manually trace through the code to look for issues
 > - Report all issues with severity markings
 >
-> This tree has already passed the full gate — build, unit tests, the SQLite oracle, and the
-> regression harness in every mode. Running the tests tells you nothing you do not already
+> This tree has already passed the full gate — build, unit tests, the SQLite oracle, the
+> regression harness in every mode, and the TPC-H harness against its recorded baseline.
+> Running the tests tells you nothing you do not already
 > know, and a green suite is not evidence of correctness. Your job is to find what the tests
 > do not catch: read the code and trace it by hand. Do not run the test suite as a substitute
 > for reading.

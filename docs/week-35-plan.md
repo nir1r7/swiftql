@@ -47,20 +47,35 @@ note.
 
 ### Next, for a successor — in this order, one commit each
 
-1. **Wire `run_tpch.py` into the `verify` skill as a fifth gate step.**
-   `.claude/skills/verify/SKILL.md` runs four gates (build, C++ tests,
-   `compare_against_sqlite.py`, the regression harness) and **none of them
-   mentions TPC-H**, so a GREEN gate today says nothing whatever about the 22
-   queries — which is Week 36's entire deliverable. The step to add is
+1. ~~**Wire `run_tpch.py` into the `verify` skill as a fifth gate step.**~~
+   **DONE.** `.claude/skills/verify/SKILL.md` now runs five gates; gate 5 is
    `python3 python_tools/run_tpch.py --catalog data/tpch/sf0.01/catalog.json
-   --baseline docs/tpch-baseline.json`; `compare_baseline` already exits non-zero
-   when a query stops answering, becomes vacuous, or answers in fewer modes, and
-   prints `IMPROVED` with the `--write-baseline` instruction when the figure
-   rises. Two things to decide rather than assume: the gate needs
-   `data/tpch/sf0.01` to exist (it is gitignored — the step must generate it, or
-   skip loudly rather than silently), and a full run took ~25 minutes here, most
-   of it SQLite's q21 mutation, so a fast subset plus a full nightly may be the
-   right shape. State whichever you choose in the skill.
+   --baseline docs/tpch-baseline.json`. The two open decisions were settled:
+   - **Missing data fails loudly.** `run_tpch.py` checks the catalog exists
+     before anything else and exits non-zero naming
+     `generate_tpch.py --scale 0.01 --out-dir data/tpch/sf0.01`, with the words
+     "the gate did not run". It does **not** generate the data itself: a gate
+     that silently manufactures its own inputs can regenerate them differently
+     and invalidate the baseline it is checking. The generator is seeded, so a
+     manual regeneration reproduces the baselined files.
+   - **No subset, no nightly.** A full 22×4 run measured **5m08s here** (not the
+     ~25 min recorded above — that figure was from a different machine or a
+     colder cache; both are real observations, this one is what the skill
+     quotes). Five minutes runs every time. `--queries` narrows it while
+     iterating and the baseline comparison scopes itself to the queries that
+     ran, but a verdict block may only report a full run — stated in the skill.
+   - `run_tpch.py` gained one function, `gate_line()`, printed as the run's last
+     line: `GATE tpch: PASS (17/22 meaningful vs SQLite: 4 in all four modes, 13
+     vectorized-only; 3 vacuous; 2 unported)`. The verifier copies it rather
+     than composing a count, so the mode split and the separate vacuous/unported
+     tallies cannot be dropped on the way into the block. Three verdicts, always
+     agreeing with the exit code: `PASS`, `FAIL`, and `NO-BASELINE` for a run
+     invoked without `--baseline`, which is not a pass because it cannot see a
+     regression. Regression detection itself was already there
+     (`compare_baseline`) and was not changed.
+   - `.claude/skills/phase5-week/SKILL.md`'s verdict block is five gate lines
+     plus `VERDICT`, and the README (Layer 9 table + Week 35 section) records
+     that the gate has five steps.
 2. **The two lesser round-1 audit findings**, both recorded in
    `scratchpad/audits/week-35-round-1.md` and neither yet touched:
    - `compare_against_sqlite.py:1874` compares floats as `abs(x-y) > tol`, so two

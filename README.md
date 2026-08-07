@@ -451,6 +451,8 @@ Directly analogous to Snowflake's result cache.
 | `run_queries.py` | Runs a query file against SwiftQL and captures output |
 | `compare_against_sqlite.py` | Runs same queries against SQLite, diffs results — correctness oracle |
 | `benchmark.py` | Automates benchmark runs across all modes, generates results table and matplotlib plots |
+| `generate_tpch.py` | Generates TPC-H-shaped data at a scale factor, plus its self-contained `catalog.json`. **Not `dbgen`** — the spec's value domains, not its distributions |
+| `run_tpch.py` | Runs the 22 TPC-H queries × 4 modes against SQLite, mutation-checks each for vacuity, and gates the result against `docs/tpch-baseline.json`. Step 5 of the quality gate |
 
 ---
 
@@ -1957,6 +1959,31 @@ Volcano refusal message), so an outer query whose only subquery lived inside a
 derived body skipped materialization entirely. A new
 `needsSubqueryMaterialization` asks the whole-tree question without disturbing
 the flag; five diffed regression queries cover both `FROM` and `JOIN` positions.
+
+**The quality gate is now FIVE steps, not four.** Build, `swiftql_tests`,
+`compare_against_sqlite.py`, `test_new_queries.py` — and, added at the end of
+Week 35, `run_tpch.py` against a recorded baseline:
+
+```bash
+python3 python_tools/run_tpch.py \
+    --catalog data/tpch/sf0.01/catalog.json \
+    --baseline docs/tpch-baseline.json
+```
+
+None of the first four ever invoke the TPC-H harness, so until this step existed
+a verifier could report the tree green while TPC-H was broken or had regressed —
+the gate simply never looked, which is exactly the false certainty this week's
+harness was built to remove. It is the fifth line of the verdict block and it
+reports the shape rather than a count: the harness's own last line is
+`GATE tpch: PASS (17/22 meaningful vs SQLite: 4 in all four modes, 13
+vectorized-only; 3 vacuous; 2 unported)`, copied verbatim. A query that stops
+answering, becomes vacuous, or answers in fewer modes than
+`docs/tpch-baseline.json` records exits non-zero; an improvement passes, says so,
+and asks for the baseline to be refreshed in the same commit. **It costs ~5
+minutes** on sf0.01 (88 `swiftql` invocations, each reloading a 9 MB
+`lineitem.tbl`) and is not parallelised — sf0.01 is the default and
+`data/tpch/sf0.1` is opt-in via `--catalog`. Full detail, including why the claim
+is "matches SQLite" and never "correct", is in `.claude/skills/verify/SKILL.md`.
 
 > **Carried forward, not judged unnecessary.** Two items inherited from earlier
 > weeks were **not** absorbed here and are re-declined with reasons rather than
