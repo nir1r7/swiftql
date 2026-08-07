@@ -63,15 +63,34 @@
 // query comes close — Q9 and Q21 top out at 6 relations.
 //
 // It also declines, silently, any tree carrying a relation slot outside the
-// range table (hasSlotOutsideRangeTable, Week 30): an unbound key (from_slot -1)
-// or — from Week 34 on — a scan belonging to a subquery rather than to this
-// query's range table. Week 31 was expected to make that second case live and
-// did not: an uncorrelated subquery is materialized before planning, so its
-// scans form their own plan with their own range table and never enter this
-// tree. Derived tables (Week 34) are where a nested scan genuinely joins. This USED to throw, which made it the one place the
-// optimized path could fail on input `--no-optimize` accepts; declining keeps
-// optimized ≡ --no-optimize, which is what makes the fourth harness mode a
-// differential oracle rather than a duplicate run.
+// range table (hasSlotOutsideRangeTable, Week 30). What reaches it, as of Week
+// 34, is exactly two things: an unbound key (from_slot -1), and a SEMI/ANTI
+// join, whose join_slot is -1 because children[1] is a subquery BODY and not a
+// relation of this block.
+//
+// !! DERIVED TABLES DO NOT REACH IT, contrary to what Weeks 28, 29, 30 and 31
+// each predicted for "the week a nested scan genuinely joins the outer one".
+// They are ordinary relations of this block's range table with in-range slots:
+// decompose takes a LogicalDerived as a leaf, rebuild re-merges its schema, and
+// the search reorders it like any other relation (verified at three relations,
+// method=dp, optimized == --no-optimize). What was actually wrong was
+// countRelations, which counted SCANS and so over-counted a derived body's —
+// making `slot >= n` too permissive rather than too strict. It counts the spine
+// now. No reported decline was added because no supported query pays a
+// plan-quality cost, which is the condition Week 30 set for earning one.
+//
+// What IS new, and is a different consumer: a derived relation has no
+// TableStats, so joinCardinality's non-multiplicative max(l, r) branch runs on a
+// query the CLI can type. Optimal substructure does not hold for a subset
+// containing one; the containment is the written-order bound in reorder(),
+// exactly as Week 28 specified, and this is the first time that bound is
+// load-bearing outside a C++ fixture. Week 28 recorded that method=written-floor
+// had never executed — it is reachable now.
+//
+// This USED to throw, which made it the one place the optimized path could fail
+// on input `--no-optimize` accepts; declining keeps optimized == --no-optimize,
+// which is what makes the fourth harness mode a differential oracle rather than
+// a duplicate run.
 
 // No-op below three relations: with one join there is no ordering decision.
 // Which side builds is Week 22's decision, made at lowering from the same

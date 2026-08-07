@@ -35,7 +35,13 @@
 //      enclosing block). JoinKey holds column NAMES, so an inequality or a
 //      computed side has no key to become — and there is no cross-product
 //      operator to run the residual on;
-//   3. the body has NO GROUP BY / HAVING / aggregate / LIMIT / DISTINCT. Those
+//   3. the body has NO GROUP BY / HAVING / aggregate / LIMIT / DISTINCT. THIS
+//      CONDITION IS THIS FUNCTION'S, NOT THE FILE'S — Week 34's
+//      lowerCorrelatedScalars below REQUIRES an aggregate and ADDS a GROUP BY,
+//      and has its own guard saying so. Do not widen requireDecorrelatableBody
+//      with a flag to serve both: a header stating a rule it no longer enforces
+//      for half its callers is the shape that produced three silent wrong
+//      answers in Week 33. Those
 //      make the body's row set depend on which outer row selected it, so
 //      evaluating the body ONCE and probing it is not the same query. This is
 //      the condition that is easiest to forget and impossible to see in the

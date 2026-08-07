@@ -182,14 +182,22 @@ void collectSlotTables(const LogicalPlanNode* node,
     // this is a contract repair, not a corrected cost decision.
     //
     // An earlier rationale said instead "the widths computed here are discarded
-    // before setCostDecision". Do not rely on that one. It is true today only
-    // because a semi/anti join returns from lowerNode() before from_w/join_w
-    // are read, AND because no STANDARD join is ever built above a semi join —
-    // which is a build-order fact in logical_plan.cc (the join spine is built,
-    // then lowerInSubqueries stacks semi joins on top of it), stated in another
-    // file and enforced nowhere. Any week that plans a join above a semi join
-    // dissolves that argument and would have made the -1 entry live. The map
-    // argument above does not depend on it.
+    // before setCostDecision". Do not rely on that one — and as of Week 34 it is
+    // not merely unreliable, it is FALSE. It rested on a build-order fact stated
+    // in another file and enforced nowhere: that no STANDARD join is ever built
+    // above a semi join. Week 34's correlated-scalar rewrite
+    // (lowerCorrelatedScalars) runs AFTER lowerInSubqueries and
+    // lowerExistsSubqueries on the same spine, so a STANDARD LEFT join over a
+    // LogicalDerived is now routinely built above a semi join, and the
+    // discarded-widths argument is dissolved exactly as that comment predicted.
+    //
+    // Nothing to fix, because the guard was never resting on it: the argument
+    // above — every column of a semi/anti join's output schema comes from the
+    // outer spine and carries a real binder slot, so nothing ever looks up -1 —
+    // is independent and still holds. This is what the earlier comment meant by
+    // "the map argument above does not depend on it", now that the dependent
+    // argument has actually died. Fourth time this block has had to be corrected;
+    // stating which argument is load-bearing is the only thing that has helped.
     if (join->semantics == JoinSemantics::STANDARD) {
         // Week 34: a DERIVED children[1] names no catalog table, so the entry is
         // SKIPPED rather than filled with the body's base table. rowWidth's

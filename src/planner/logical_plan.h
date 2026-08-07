@@ -180,8 +180,26 @@ struct LogicalJoin : LogicalPlanNode {
     // construction, like order_decision and join_type, so the five-argument
     // constructor and every hand-built test tree are byte-identical.
     //
-    // !! INVARIANT, and the whole containment for the two-range-table problem
-    // this node introduces (development.md -> Relation slots and query levels):
+    // !! INVARIANT. Week 32 called this "the whole containment for the
+    // two-range-table problem this node introduces". Week 34 made it ONE OF TWO,
+    // and a reader must know both or they will draw the wrong conclusion from
+    // either. The two are not alternatives; they cover different constructs:
+    //
+    //   (a) THIS one, for a semi/anti join: nothing from children[1] is ever in
+    //       scope above the node, so the body's slot numbering never meets the
+    //       outer one. Still exactly true, unchanged, and enforced below.
+    //   (b) NORMALIZATION, for a derived relation (LogicalDerived, Week 34),
+    //       whose columns ARE in scope above it and therefore cannot be kept
+    //       out. derivedRelationSchema stamps every one of them slot 0 — like a
+    //       leaf scan's own schema — and the merged join schema applies the outer
+    //       slot, so what enters the outer plan carries OUTER numbering only.
+    //
+    // (a) keeps two domains apart; (b) converts one into the other. A STANDARD
+    // join over a LogicalDerived (which Week 34's correlated-scalar rewrite
+    // builds) relies on (b) and would be a wrong answer under (a) alone.
+    //
+    // The rest of this comment is (a), and is unchanged
+    // (development.md -> Relation slots and query levels):
     // when semantics != STANDARD, output_schema IS children[0]->output_schema,
     // NOT a merged schema. children[1] is the plan of a subquery BODY, whose
     // relation slots are numbered against the BODY's range table — a second

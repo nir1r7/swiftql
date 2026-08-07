@@ -169,7 +169,13 @@ struct SelectStatement;
 // query puts a subquery anywhere else, and allowing one in the select list
 // would mean buildProjectSchema must type it and aggregateOutputName must name
 // an output column after it. That is a restriction on POSITION, not on
-// representation: all three kinds are represented. FROM is Week 34.
+// representation: all three kinds are represented.
+//
+// Week 34: a subquery in FROM is NOT this node. It is a TableRef (above) holding
+// a whole SelectStatement, because a derived table is a RELATION of the enclosing
+// block — it gets a range-table slot, its columns are in scope above it, and
+// nothing about it is an expression. The two constructs share only the word
+// "subquery".
 struct SubqueryExpr : Expr {
     enum class Kind {
         SCALAR,   // (SELECT one_column FROM ...) — a value
