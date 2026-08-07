@@ -1130,6 +1130,68 @@ as read, not re-derived. Its own caveat still stands — **the new C++ test bodi
 in `test_vectorized.cc` / `test_cardinality.cc` / `test_vec_plan_builder.cc`
 were never read line by line by that audit**, so a later round still owes them.
 
+### Done in the fourth run — audit rounds 2 and 3 fixes
+
+Audits: `scratchpad/audits/week-32-round-2.md` (0 blockers, 2 medium, 3 low) and
+`scratchpad/audits/week-32-round-3.md` (0 blockers, 1 high, 2 medium, 3 low).
+All eight findings actioned; nothing rejected. Three commits, each pushed on
+landing.
+
+- **HIGH (r3) — a subquery nested inside an `IN` body stopped materializing.**
+  The `Kind::IN` early return in `materializeSubqueries`'s `visit` sits *above*
+  `runOnce`, which is where the "innermost first" recursion into a body lives,
+  so `x IN (SELECT k FROM t WHERE c > (SELECT AVG(c) FROM t))` — legal SQL Week
+  31 answered — reached `inferExprType` with a live `SubqueryExpr` and died at
+  dispatch site 12, whose message reports an internal walker defect rather than
+  an unsupported query. **The IN arm now recurses into the body before
+  returning**; nothing else of `runOnce` applies (the body is not moved, not
+  limit-capped, not cached, because the semi-join's build side plans it rather
+  than running it for a value). The covering test had been rewritten to a scalar
+  outer form, which is why the regression shipped green — it is restored as
+  `SubqueryMaterialization.MaterializesASubqueryNestedInsideAnInBody` against
+  the real shape, confirmed failing pre-fix (`runs == 0`, the body's scalar
+  still a `SubqueryExpr`), and the query is added to
+  `WEEK32_SEMI_JOIN_VEC_ONLY`. SwiftQL and SQLite both answer 20.
+- **MEDIUM (r2) — `collectSlotTables` read `join_slot` unguarded.** It stamped
+  the body's table at key `-1`, reachable via two `IN` conjuncts (the cost
+  block's `rowWidth()` on the outer semi join's left child walks the inner one).
+  Now stamps only on `semantics == STANDARD` while still walking the left side,
+  so `logical_plan.h`'s contract holds by construction. **Latent, not live** —
+  the widths are discarded before `setCostDecision` and no spine column carries
+  slot `-1` — which is why there is no behavioural test to fail pre-fix; that is
+  stated in the commit rather than papered over.
+- **MEDIUM (r3) — `development.md`'s Week 32 consumer table** said the
+  `VectorizedPlanBuilder` row was "safe by domain" while naming only the two
+  `*KeyIndices` calls. It now names both readers and records the guard. Third
+  time that row was wrong by omission.
+- **MEDIUM (r2) — `VecSemiJoin.RefusesEveryIllegalCombination`** asserted only
+  the exception *type* across four guards that emit four distinct messages, so
+  merging or reordering them stayed green. It compares each message now;
+  confirmed failing when the `swapped_` and `left_outer_` guards are merged into
+  one — a perturbation the `EXPECT_THROW` version passed.
+- **MEDIUM (r3) — `NoLongerRefusesALargeInSet`** fed an *empty* canned result
+  and asserted `EXPECT_NO_THROW`, which could not fail for two independent
+  reasons. Folded into `LeavesAnInNodeForSemiJoinLowering`, which now cans 4096
+  rows behind its `runs == 0` assertion — the strongest statement this layer can
+  make about the cap's removal, with the executable proof staying the
+  10 000-distinct-value oracle query.
+- **LOWs.** `NotInBecomesAnAntiJoin`'s `find("")` (true for every string)
+  replaced with a one-join count — the whole-plan needle it implied does not
+  exist, since `explain()` prints one node. The subsumed schema loop and the
+  semi+anti tautology are annotated as restatements rather than left reading as
+  independent checks. `build_had_null_key_` renamed to
+  `build_had_unmatchable_key_`: `isUnmatchableKey` counts NaN too, so ANTI
+  collapses on a NaN in the build set — unreachable through the oracle (SQLite
+  stores NaN as NULL), so the name was what was wrong. The oracle gains the
+  NULL-probe-against-empty-build query its empty-build comment claimed but did
+  not cover.
+- **Not a finding.** Round 2's LOW-2 (the `VecPlanBuilder` tests load the body
+  table by hand) was already checked and recorded by that audit as *not* an
+  engine bug — `src/cli/main.cc:355-375` collects nested-query tables on the
+  real path. No change.
+- Unit suite after the three commits: **770 tests, green** (one added, one
+  folded away). The full gate is a verifier's, not run here.
+
 ### Not done — the next concrete steps, in order
 
 1. **Run the `verify` gate.** Build + `compare_against_sqlite.py` + the
