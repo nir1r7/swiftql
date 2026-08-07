@@ -1,22 +1,20 @@
 # Phase 5 orchestrator state
-Current: week 33 — TASK 1 (ColumnId migration) CODE-COMPLETE and pushed (5 commits).
-  Gate a4bfd1f5e6181c723 launched 11:09 UTC to verify the migration ALONE before feature work.
-  Log: scratchpad/gates/week-33-round-1.log. May be cut short by the ~11:30 reclaim — if so,
-  relaunch it right after; do NOT start tasks 2-9 until a gate on the migration is GREEN.
-  The migration achieved its purpose: ColumnId's slot is PRIVATE with no implicit int
-  conversion, so a bare integer cannot reach a qualified position. Reads go through
-  localSlot() (throws on a correlated id) or the documented escape hatch slotInOwnScope(),
-  which has exactly two justified users.
-  NOT converted, deliberately: ColumnDef::relation_slot, Schema::indexOf(name, slot),
-  ColumnStatsEntry::relation_slot — schema slots, one query block, no level to lose.
-  NEXT after a green gate: an audit of the migration (read-only, launch right after a reclaim
-  so it gets a full window), then tasks 2-9 (remove the refusal, decorrelate EXISTS/NOT EXISTS
-  into the Week 32 semi/anti join, correlated scalar subqueries, Volcano parity, the three
-  unreached surfaces).
+Current: week 33, TASKS 2-9 (agent aa6b3121eb7ae18de, launched 11:13 UTC) — correlation
+  proper. Task 1 (ColumnId migration) is CLOSED: gated GREEN on its own, 775/775 unit,
+  996 sqlite, 318 regression, 0 warnings. Representation change altered no behaviour.
+  ON RECLAIM: resume from ## Progress in docs/week-33-plan.md. Never restart the week.
+  !! OPEN GAP TO CLOSE LATER: no AUDITOR has read the ColumnId migration — only the gate
+  measured it. The week's audits must cover it, since it is in the week's diff. Do not let it
+  slip past on the grounds that it was "already verified"; a gate proves behaviour unchanged,
+  not that the representation is sound.
+  Task 2 must REPLACE both Week 30 tripwires, not delete them (ChunkPruner declines a
+  query_level>0 ref; buildAggregateSchema throws). Removing a tripwire without a replacement
+  is how a silent wrong answer ships.
+  NOT EXISTS + NULLs is the same trap NOT IN was in Week 32 — must be diffed against SQLite.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
-Last gate: GREEN (week 32 round 4, closing) — 0 warnings, unit 770/770, sqlite 996, regression 318 all modes
+Last gate: GREEN (week 33 round 1, ColumnId migration alone) — 0 warnings, unit 775/775, sqlite 996, regression 318 all modes
 Week 32 verdict: checkpoint met. 4 gates / 4 audits; 1 blocker, 1 high, 6 medium, 8 low.
   The HIGH was a REGRESSION a green 988-query oracle could not see, because the test guarding
   that capability had been narrowed to a scalar stand-in.
