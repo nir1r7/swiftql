@@ -1,32 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 36 fix round — BOTH closing items DONE (F1 + full sweep); needs a verifier pass,
-  then close. NOTE FOR THE VERIFIER: the closing round edited a COMMENT in
-  src/planner/subquery_decorrelation.cc (a stale "17-site checklist" cross-reference), so the
-  build is stale and must be rebuilt. No behaviour changed.
-  Audit r1 verdict: "20/22 is HONEST AS A CAPABILITY CLAIM, UNPROVEN AS A MEASUREMENT" — and
-  the gate has since PROVEN the measurement. Q17 runs the spec's own unaltered text, matches
-  SQLite (2732.80428571429 vs 2732.804285714286), is byte-identical in --explain to the
-  already-verified constant-outside form, DISCRIMINATES under mutation, and still refuses every
-  shape it should (two-aggregate, CASE wrapper, non-aggregate body, non-constant wrapper,
-  nested aggregate). So the lift was CORRECT, not merely permissive.
-  F1 (medium-high) — CLOSED. docs/tpch-sf0.01-report.json regenerated from a full 22x4 run
-  (--json + --baseline; BASELINE OK, no IMPROVED line, so the baseline was not rewritten).
-  report["summary"] is now byte-equal to docs/tpch-baseline.json. The flag independence is
-  fixed at the root: --write-baseline WITHOUT --json is now REFUSED up front, because the
-  baseline IS the report's "summary" key. The documented refresh path (verify/SKILL.md and the
-  plan's step 3) named only --write-baseline, so following the instructions produced the drift;
-  both now carry --json, as does the harness's own IMPROVED suffix.
-  SWEEP — CLOSED. All cited sites walked: FIFTEEN, not eleven (8 changed + 7 checked, matching
-  README's "eight rewritten, seven checked"). 13 already correct, 2 stale and both COUNTS:
-  "17-site checklist" (development.md's has NINETEEN) and "7 new diffed entries" (ffab914 adds
-  SIX). No lifted restriction is described as still in force anywhere — the Week 33 failure mode
-  did not recur, confirmed by an independent grep as well as by walking the list. Behavioural
-  rows RUN against the committed binary, not read. Left deliberately: the pre-existing
-  "BetweenExpr would cost 17 dispatch sites" in 3 files (a2fc0c2), same drift, not Week 36's.
-  Verified clean by the audit: q21's blocker accurate and refused by name and pinned; both
-  harness fixes close their holes (the NaN comparator, random_diff's projection).
-  AFTER THIS: close week 36, then THE FIVE-WAY SEAM AUDIT — join chain 26-29, subquery chain
-  30-34, engine divergence, optimizer preservation, storage — then stop. Week 37 is the user's.
+Current: week 36 CLOSING GATE (a2057acdd1ff64b82, launched 23:25 UTC). Told it the build is
+  stale — a comment edit in subquery_decorrelation.cc — so a no-op build must not be read as
+  fresh. After GREEN: close week 36, then THE FIVE-WAY SEAM AUDIT, then stop.
+  F1 fixed and its ROOT CAUSE fixed with it: docs/tpch-sf0.01-report.json regenerated from a
+  full 22x4 run and now BYTE-EQUAL to the baseline's summary. run_tpch.py now REFUSES
+  --write-baseline without --json, because the baseline IS the report's summary key and the
+  documented refresh path (verify/SKILL.md, plan step 3, the harness's own IMPROVED suffix)
+  named only --write-baseline — so FOLLOWING THE INSTRUCTIONS produced the drift. All three
+  now carry both flags. Only that direction is coupled: a --json run with no baseline write
+  publishes no figure it can contradict.
+  SWEEP COMPLETE: 15 cited sites, not the 11 the audit believed. 13 ALREADY CORRECT, verified
+  BEHAVIOURALLY against the committed binary (6 refusal needles, 3 residual pins, 6 Volcano
+  entries reaching VOLCANO_CORRELATED, --explain byte-identical across the two Q17 forms).
+  2 stale, both count drift, both introduced by week 36's own ffab914, both fixed. No lifted
+  restriction is stated as still in force anywhere — the week 33 failure mode did NOT recur.
+  A pre-existing drift in three files ("BetweenExpr would cost 17 dispatch sites", from a2fc0c2)
+  was left deliberately and recorded as NOT this week's.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
