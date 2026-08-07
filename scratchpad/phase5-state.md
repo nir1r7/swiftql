@@ -1,62 +1,33 @@
 # Phase 5 orchestrator state
-Current: SEAM AUDIT PASS 1 — five auditors launched 23:41 UTC, each committing its own file.
-  1 of 5 REPORTED: engine divergence (seam-engine-divergence-pass-1.md) — 0 high, 1 medium,
-  1 low.
-  !! THE MEDIUM IS A REAL CROSS-ENGINE WRONG ANSWER that survived 14 weeks and ~30 audits:
-  plan_nodes.cc:317 emits GROUP BY results in unordered_map HASH order while
-  vec_hash_aggregate_node.cc:243 emits in INSERTION order. Under ORDER BY <agg> LIMIT n WITH A
-  TIE AT THE CUT (suite query compare_against_sqlite.py:53) the two engines return different
-  row SETS, and normalize()'s sort cannot mask it because the sets differ. It survived because
-  it only manifests when a tie straddles the LIMIT boundary — every "do both engines agree"
-  check got yes.
-  LOW/latent: vectorized_plan_builder.cc:486-493 passes on_residual=nullptr for semi/anti
-  instead of forwarding it, defeating the constructor guard at vec_hash_join_node.cc:31.
-  Verified in agreement: all three refusals total and correctly ordered; outer joins; the six
-  key serializers; COUNT(DISTINCT); sort; DISTINCT; the week 32 semi-join row path.
-  NOT REACHED by that auditor: VecDerivedNode re-entry under a derived-table self-join;
-  Volcano columnar scan vs VecScanNode zone-map pruning; checked_arith.h/columnar_eval.cc vs
-  scalar evaluator.cc.
-  2 of 5 REPORTED. Subquery chain (seam-subquery-chain-pass-1.md): 0 blockers, 0 high,
-  1 medium, 1 low — and they are COUPLED, which is the point.
-  F1 subquery_decorrelation.cc:390-396 + logical_plan.cc:494-501: two correlated equalities on
-  ONE body column make $scalar0 carry a DUPLICATE COLUMN NAME, so
-  `SELECT COUNT(*) FROM drivers d WHERE d.age > (SELECT COUNT(*) FROM laps l
-   WHERE l.driver_id = d.driver_id AND l.driver_id = d.age)`
-  errors with "give one of them an alias" — naming a relation the user never wrote.
-  F2: correlated-scalar lowering is the ONLY one of four that resolves build-side keys BY BARE
-  NAME, and it is safe ONLY BECAUSE F1 REFUSES THE COLLISION.
-  >> SO THE OBVIOUS FIX FOR F1 (relax the duplicate check) OPENS A SILENT WRONG ANSWER VIA F2.
-  The auditor said so explicitly. Any fix must address F2 first or fix F1 another way.
-  Not reached there: the three-valued NOT IN probe loop in VecHashJoinNode (no NULL INT key in
-  the shipped catalog), Volcano HashJoinNode semi/anti (refused on that path anyway), and an
-  optimized-vs---no-optimize diff of the new LEFT-join shape.
-  3 of 5 REPORTED. Join chain (seam-join-chain-pass-1.md): 1 HIGH, 2 low. All five targets
-  reached; T1-T5 otherwise clean, T2/T3 verified empirically against the pre-built binary.
-  !! H-1 IS THE ARCHETYPAL SEAM DEFECT: CardinalityEstimator::estimateNode has NO DERIVED CASE
-  (cardinality_estimator.cc:308-532). Week 34 added the node type; week 28's estimator was
-  written before it existed and never learned. So join_enumeration.cc:490 costs a derived
-  relation at 0 ROWS and the DP REORDERS ON IT — cost=1525 vs written=4216 on a 3-relation
-  sf0.01 query — while the -1 propagates up and SILENTLY DISABLES the week 22 build-side choice
-  and SIMD eligibility. RESULTS UNAFFECTED, which is exactly why nothing caught it: week 28's
-  own audit warned that a cost model picking a bad plan fails no test.
-  2 low: unfloored semi/anti zero estimate; have_ndv set from EITHER side, which falsifies the
-  invariant claim written at join_enumeration.cc:454-462.
-  4 of 5 REPORTED. Storage (seam-storage-pass-1.md): 0 blockers, 0 high, 0 medium.
-  !! S-0 (informational, but it changes what a clean storage report MEANS): THE ROW/COLUMNAR
-  ORACLE DOES NOT EXIST FOR ANY PHASE 5 PLAN SHAPE. Vectorized requires columnar; Volcano
-  refuses derived tables, multi-way joins, semi/anti and correlated subqueries. So the two
-  storage modes NEVER execute the same Phase 5 query, and all storage safety for this phase
-  rests on HAND-COMPUTED answers. I had told that auditor "row/columnar comparison is the only
-  thing that catches a wrong prune" — it checked, and for every feature this phase built, that
-  comparison is not running at all. No defect found, but the confidence a clean storage report
-  would normally carry is partly unearned. RECORD THIS FOR WEEK 37.
-  Out of scope, pre-existing, noted not fixed: columnar_table.h:31 keys columns by NAME and
-  catalog.cc:22 does not reject duplicate column names.
-  Not reached there: the full TPC-H-scale zone-map boundary sweep (timed out; no divergence in
-  the completed portion, and an equivalent 84/84 sweep on a purpose-built 3-chunk clustered
-  table DID complete), DOUBLE-typed boundary literals, RLE/dictionary unit invariants.
-  WAITING on one (optimizer preservation) (optimizer preservation, storage) (join chain, optimizer preservation, storage) (join chain, subquery chain, optimizer preservation, storage)
-  before dispatching fixes, so they batch into one round rather than racing the tree.
+Current: SEAM AUDIT PASS 1 COMPLETE — all five reported. FIX ROUND running (a5417885c9b568585,
+  launched ~23:58 UTC), one agent for all findings since none are blockers and they span
+  different files.
+  RESULT INVARIANT IS CLEAN — do not trade it away: 0 result divergences. 1326/1326 SQLite
+  harness, TPC-H clean, 15 hand-built cross-week shapes all agree optimized == --no-optimize
+  == SQLite.
+  Findings, in the order the fix round takes them:
+  1. CROSS-ENGINE WRONG ANSWER (medium, engine-divergence). Volcano emits GROUP BY in
+     unordered_map HASH order (plan_nodes.cc:317), vectorized in INSERTION order
+     (vec_hash_aggregate_node.cc:243). Under ORDER BY <agg> LIMIT n WITH A TIE AT THE CUT
+     (compare_against_sqlite.py:53) the engines return different row SETS; normalize()'s sort
+     cannot mask it. The only finding that produces a wrong answer.
+  2. HIGH, FOUND INDEPENDENTLY BY TWO AUDITORS: no DERIVED case in
+     cardinality_estimator.cc:308-533, so estimated_rows stays -1, join_enumeration.cc:490
+     clamps to 0, and the DP prices a derived relation as FREE — measured cost=1525 vs
+     written=4216 by one, a 2500x-larger intermediate by the other. The -1 also propagates up
+     and silently disables the week 22 build-side choice and SIMD eligibility. Results
+     unaffected, which is why 14 weeks missed it.
+  3. COUPLED PAIR (subquery chain). F1 duplicate $scalar0 column name errors on a legal query;
+     F2 correlated-scalar lowering resolves build-side keys BY BARE NAME and is safe ONLY
+     because F1 refuses the collision. FIXING F1 THE OBVIOUS WAY OPENS A WRONG ANSWER.
+  4. Lows: unfloored semi/anti zero estimate; have_ndv from either side falsifying the claim at
+     join_enumeration.cc:454-462; join_enumeration.cc:463 declining SILENTLY so a fully-inner
+     3-way block under an IN subquery loses ordering with nothing printed;
+     vectorized_plan_builder.cc:486-493 passing on_residual=nullptr for semi/anti.
+  S-0 (storage, informational, FOR WEEK 37): the row/columnar oracle does NOT span any Phase 5
+  shape — vectorized needs columnar, Volcano refuses everything this phase built, so the two
+  modes never run the same query. Phase 5 storage safety rests on hand-computed answers.
+  AFTER THE FIX: gate, then seam pass 2. Stop as soon as a pass returns no blockers.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅ 36 ✅ — WEEK PLAN COMPLETE
