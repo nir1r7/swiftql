@@ -52,6 +52,16 @@ static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
         collectCols(sub->length.get(), out);   // nullptr-safe
         return;
     }
+    // Week 30 — DISPATCH SITE 2. Descend into the IN operand, which is written
+    // in THIS query, and not into the body: those names are a different scope's
+    // range table, and narrowing here is by BARE NAME against one flat schema.
+    // A CORRELATED ref inside the body does name an outer column that must
+    // survive narrowing, and buildScanSchema handles that conservatively by
+    // declining to narrow at all when the statement uses a subquery (see there).
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)){
+        collectCols(sq->operand.get(), out);
+        return;
+    }
     // IntervalLiteral: a constant, and folded away before this runs
 }
 
@@ -223,12 +233,31 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
             "INTERVAL is only valid in constant date arithmetic, "
             "e.g. date '1994-01-01' + interval '1' year");
     }
+    if (dynamic_cast<const SubqueryExpr*>(expr)) {
+        // Week 30 — DISPATCH SITE 12. Unreachable from the CLI: Validator's
+        // refusal fires before any logical plan is built. Named rather than
+        // left to the generic throw below, because the real rule (a scalar
+        // subquery's type is its single output column's) needs the subquery's
+        // projection schema and is Week 31's first job — and this site is the
+        // contract the vectorized path pre-allocates output columns from, so
+        // it must not be reached by accident.
+        throw std::runtime_error(
+            "subqueries are parsed and bound but not yet executable (Week 31)");
+    }
     throw std::runtime_error("inferExprType(): unknown Expr subtype");
 }
 
 
 Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     if (stmt.select_star) return full_schema;
+    // Week 30. Narrowing is by bare name over one flat schema, and a CORRELATED
+    // reference inside a subquery names an outer column that collectCols
+    // deliberately does not descend into (dispatch site 2: the body's names
+    // belong to another scope's range table). Widening is the safe direction —
+    // a narrowed-away column dies later with "column not found", far from the
+    // cause. Costs projection pushdown for subquery queries; Week 33 replaces
+    // this with the correlated columns actually referenced.
+    if (stmt.has_subquery) return full_schema;
     std::unordered_set<std::string> required;
     for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
     collectCols(stmt.where.get(), required);
@@ -463,6 +492,15 @@ static void substituteInto(std::unique_ptr<Expr>& expr,
         substituteInto(sub->operand, keys);
         substituteInto(sub->start, keys);
         substituteInto(sub->length, keys);   // nullptr-safe
+        return;
+    }
+    // Week 30 — DISPATCH SITE 6. The IN operand is this query's and is
+    // rewritten; the body is NOT. A post-aggregate group-key rewrite is
+    // scope-local, so pointing an inner reference at an outer aggregate's
+    // output column would be a wrong answer with no error.
+    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr.get())) {
+        substituteInto(sq->operand, keys);
+        return;
     }
 }
 

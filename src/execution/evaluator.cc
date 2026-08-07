@@ -240,6 +240,16 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
             "e.g. date '1994-01-01' + interval '1' year");
     }
 
+    // Week 30 — DISPATCH SITE 13. Unreachable from the CLI (Validator refuses a
+    // bound subquery before either engine plans), and named rather than left to
+    // the generic throw below so that if it ever IS reached the message says
+    // which week owns it. evaluate() is the semantic reference, so this is the
+    // site Week 31 must close in the same commit that lowers a subquery.
+    if (dynamic_cast<const SubqueryExpr*>(expr)) {
+        throw std::runtime_error(
+            "subqueries are parsed and bound but not yet executable (Week 31)");
+    }
+
     throw std::runtime_error("evaluate(): unknown Expr subtype");
 }
 
