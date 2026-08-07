@@ -1077,3 +1077,37 @@ impossible when done at the end.
 The `verify` skill runs 1-3 as one gate; run it before claiming any task done,
 and re-run it between Task 1 and Task 2 specifically, because that boundary is
 the one the README requires to be independently green.
+
+---
+
+## Progress
+
+Task 1 (`ColumnId { level, slot }`) implementation log. A successor agent resumes
+from here.
+
+**Representation chosen.** `src/common/column_id.h` — a class with **private**
+`level_` / `slot_`, no implicit conversion to `int`, and no public slot member.
+The integer is reachable only through `localSlot(site)` (throws when
+`level != 0`) or the documented escape hatch `slotInOwnScope(site)` (the Binder
+walking the scope chain, and `exprKey`'s identity encoding). A public `int slot`
+would have left the collapse expressible, which is the one thing the change
+exists to prevent.
+
+**Explicitly NOT migrated:** `ColumnDef::relation_slot` (`common/schema.h`),
+`Schema::indexOf(name, slot)`, and `ColumnStatsEntry::relation_slot`
+(`cardinality_estimator.h`) — those are *schema* slots, built for one query
+block, with no level to lose. Narrowing happens where a *binder* slot is handed
+to them.
+
+### State
+
+- [x] `src/common/column_id.h` added.
+- [ ] `ColumnRef` (parser/ast.h) + consumers.
+- [ ] `GroupByColumn` (parser/ast.h) + consumers.
+- [ ] `AggregateSpec` (planner/logical_plan.h) + consumers.
+- [ ] Tests (9 files hand-build these types).
+- [ ] `development.md` → *Relation slots and query levels*.
+
+**Next concrete step:** replace `ColumnRef::relation_slot` + `query_level` with
+`ColumnId id`, then work the compiler's error list, classifying each site against
+`development.md`'s consumer table before fixing it.
