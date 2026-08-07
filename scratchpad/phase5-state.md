@@ -1,31 +1,32 @@
 # Phase 5 orchestrator state
-Current: week 36 CLOSING GATE (a2057acdd1ff64b82, launched 23:25 UTC). Told it the build is
-  stale — a comment edit in subquery_decorrelation.cc — so a no-op build must not be read as
-  fresh. After GREEN: close week 36, then THE FIVE-WAY SEAM AUDIT, then stop.
-  F1 fixed and its ROOT CAUSE fixed with it: docs/tpch-sf0.01-report.json regenerated from a
-  full 22x4 run and now BYTE-EQUAL to the baseline's summary. run_tpch.py now REFUSES
-  --write-baseline without --json, because the baseline IS the report's summary key and the
-  documented refresh path (verify/SKILL.md, plan step 3, the harness's own IMPROVED suffix)
-  named only --write-baseline — so FOLLOWING THE INSTRUCTIONS produced the drift. All three
-  now carry both flags. Only that direction is coupled: a --json run with no baseline write
-  publishes no figure it can contradict.
-  SWEEP COMPLETE: 15 cited sites, not the 11 the audit believed. 13 ALREADY CORRECT, verified
-  BEHAVIOURALLY against the committed binary (6 refusal needles, 3 residual pins, 6 Volcano
-  entries reaching VOLCANO_CORRELATED, --explain byte-identical across the two Q17 forms).
-  2 stale, both count drift, both introduced by week 36's own ffab914, both fixed. No lifted
-  restriction is stated as still in force anywhere — the week 33 failure mode did NOT recur.
-  A pre-existing drift in three files ("BetweenExpr would cost 17 dispatch sites", from a2fc0c2)
-  was left deliberately and recorded as NOT this week's.
+Current: THE FIVE-WAY SEAM AUDIT — the last step before the user's week 37.
+  Five auditors in parallel, each with its matching project skill, each writing to
+  scratchpad/audits/seam-<name>-pass-1.md and COMMITTING IT ITSELF (scratchpad does not survive
+  a reclaim, and an audit file is the input to its fix round):
+    join chain      weeks 26-29  skill: invariants
+    subquery chain  weeks 30-34  skill: operator-correctness
+    engine divergence            skill: vectorized-audit
+    optimizer preservation       skill: optimizer-diff
+    storage                      skill: storage-verify
+  Then: fix blockers (one agent per auditor that found any), gate, repeat up to 5 passes,
+  stopping as soon as a pass returns no blockers. Then STOP and report. Week 37 is the user's.
+  FINAL PHASE 5 NUMBERS: unit 550 -> 805, oracle 476 -> 1290 checks, regression 231 -> 318,
+  TPC-H not measurable -> 20/22 meaningful vs SQLite (5 four-mode, 15 vec-only; 1 vacuous;
+  1 unported; 34 of 88 cells Volcano refusals pinned by message).
+  PROVENANCE stands: dbgen unavailable, the generator reproduces value DOMAINS not
+  distributions, the published answer set does NOT apply. "matches SQLite", never "correct".
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
-Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
-Last gate: GREEN (week 36 round 1) — build PASS (rebuilt, warning-free), unit 805/805,
-  sqlite 169 queries / 1326 comparisons, regression 318 all modes,
+Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅ 36 ✅ — WEEK PLAN COMPLETE
+Last gate: GREEN (week 36 round 2, closing) — build PASS (CONFIRMED stale then genuinely
+  rebuilt, zero warnings), unit 805/805, sqlite 169 queries, regression 119 queries all modes,
   tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous; 1 unported).
-  BASELINE MD5 UNCHANGED across the run (7cee17da...), write path inert, BASELINE OK with no
-  IMPROVED suffix — so the implementer's 19->20 refresh is CONFIRMED BY INDEPENDENT
-  MEASUREMENT, not merely asserted. Staleness disproved; tree fingerprint identical before and
-  after; the concurrent auditor did not perturb it.
+  Baseline md5 unchanged; report md5 unchanged; REPORT/BASELINE EQUALITY VERIFIED by deep JSON
+  comparison across all seven keys. Tree fingerprint identical before and after.
+Week 36 verdict: checkpoint met. The figure moved 19 -> 20 and the move is independently
+  confirmed. Q17 runs TPC-H's own unaltered text, discriminates under mutation, and still
+  refuses every shape it should. q18 stays vacuous BY CHOICE; q21 is declined in the open with
+  its blocker recorded (a correlated inequality has no equi-join to lower to).
 Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
   2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
   and one stale-rejection pair, both fixed.
