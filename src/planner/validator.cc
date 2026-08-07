@@ -36,7 +36,13 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
             // name match plus slot compatibility: SELECT a.grp with
             // GROUP BY b.grp is a different column, not a match.
             // Unbound slots (-1) stay name-only for direct-validate callers.
+            // Week 30: the LEVEL is part of the identity — a slot compared
+            // across two levels is a slot compared across two range tables.
+            // `col` is always level 0 here (the guard above returns for a
+            // correlated ref), so this rejects a correlated GROUP BY key as a
+            // match for a local column of the same name.
             if (g.column_name == col->column_name &&
+                g.query_level == col->query_level &&
                 (col->relation_slot < 0 || g.relation_slot < 0 ||
                  col->relation_slot == g.relation_slot)) {
                 return;
@@ -303,6 +309,19 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
             validateExpr(g.expr.get(), schema, "GROUP BY", catalog, /*allow_aggregates=*/true);
             continue;
         }
+        // Week 30 round 1. A group key the Binder resolved to an ENCLOSING block
+        // is not this scope's to check: its slot indexes that block's range
+        // table, and the Binder verified the column there. Grouping by a
+        // correlated constant is legal SQL.
+        //
+        // This has to be tested on the LEVEL, not on `!g.table_name.empty()`
+        // below: the binder only writes a qualifier back for a block holding two
+        // or more relations, so keying the skip on the qualifier made the
+        // outcome depend on how many relations the ENCLOSING query has —
+        // `EXISTS (SELECT COUNT(*) FROM drivers d GROUP BY season)` was refused
+        // with "GROUP BY column not found: 'season'" under a one-relation outer
+        // query and accepted under a two-relation one, for the same subquery.
+        if (g.query_level > 0) continue;
         if (g.relation_slot >= 0 && !g.table_name.empty()) continue; // binder verified
         bool found;
         if (!g.table_name.empty()) {
@@ -357,18 +376,27 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
     // Aggregate expressions (e.g. COUNT(*)) resolve against the post-aggregate
     // output schema at execution time and are not checked here.
     for (const auto& item : stmt.order_by) {
-        // Week 30. ORDER BY is not routed through validateExpr (only its
-        // ColumnRef nodes are checked), so the WHERE/HAVING-only position rule
-        // needs its own line here rather than an allow_subqueries flag.
-        if (dynamic_cast<const SubqueryExpr*>(item.expr.get())) {
-            throw std::runtime_error(
-                "ORDER BY: subqueries are supported in WHERE and HAVING only");
-        }
         if (auto* col = dynamic_cast<const ColumnRef*>(item.expr.get())) {
-            if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
+            if (col->query_level == 0 && col->table_name.empty()
+                && !schema.hasColumn(col->column_name)) {
                 throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
             }
         }
+        // Week 30 round 1. The WHERE/HAVING-only position rule was a one-line
+        // test on the ROOT node, so `ORDER BY lap_id + (SELECT ...)` slipped
+        // through — SELECT and GROUP BY have no such hole because they route
+        // through validateExpr, whose allow_subqueries=false default is checked
+        // at EVERY node. Route ORDER BY through it too rather than growing a
+        // bespoke recursive walker, which would be a nineteenth dispatch site
+        // and silent on a subtype it missed.
+        //
+        // It runs AFTER the bare-ColumnRef check above so that check keeps
+        // owning its message; for anything else, validateExpr's recursion is
+        // what makes the rule actually hold. This week the hole only changed
+        // which message the user got; from Week 31 the blanket refusal is gone
+        // and nothing else enforces the restriction ast.h justifies.
+        validateExpr(item.expr.get(), schema, "ORDER BY", catalog,
+                     /*allow_aggregates=*/true, /*allow_subqueries=*/false);
     }
 
     // an ORDER BY aggregate needs an aggregation context to be computed in
@@ -497,6 +525,22 @@ void Validator::validateJoinCondition(const Expr* expr,
     if (!expr) return;
 
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        // Week 30 round 1. A ref the Binder resolved to an ENCLOSING query
+        // carries a slot that is a position in THAT scope's range table, while
+        // `relations` is this one's — indexing it compares two numbering
+        // domains, which is what ast.h says every slot consumer must not do.
+        // The Binder already verified the column against the scope that
+        // supplies it, so there is nothing to check here.
+        //
+        // Reachable because validateQuery recurses into a nested statement's
+        // own ON clauses: inside a subquery a correlated ref is an ordinary
+        // top-level ref of that expression. Without this,
+        // `... EXISTS (SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id =
+        // d2.driver_id AND d.age = l.lap_id)` reported
+        // "JOIN ON: column 'lap_id' not found in table 'd'" — an error the
+        // query is not entitled to, against a relation it never named.
+        if (col->query_level > 0) return;
+
         // A BOUND ref carries the relation the Binder resolved it against, so
         // check that relation by slot. `relations` is built in range-table
         // order, so index == slot.

@@ -196,6 +196,12 @@ struct GroupByColumn {
     std::string table_name;   // as typed; empty if unqualified
     std::string column_name;
     int relation_slot = -1;   // range-table position (0 = FROM); -1 = unresolved
+    // Week 30. The scope `relation_slot` is a position in, exactly as on
+    // ColumnRef: 0 = this query block, >= 1 = an enclosing one. A GROUP BY item
+    // resolves through resolveColumnRef, which walks OUT, so without this field
+    // the slot of a correlated group key was stored in an inner-scope struct
+    // with nothing to say which range table it indexed.
+    int query_level = 0;
     // non-null for expression grouping (GROUP BY season - 1): the group key
     // is evaluate(expr) per row instead of a column read. shared_ptr (not
     // unique_ptr) keeps the struct copyable — planner/test sites copy

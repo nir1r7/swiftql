@@ -20,6 +20,11 @@
 // enumeration (Week 28) can put any relation at the bottom of the spine, so
 // JoinEnumeration::rebuild sets from_slot = 0 on the FIRST join's keys
 // deliberately. Slot 0 is unambiguous there: exactly one relation is present.
+// !! from_slot carries NO query level, so it is only meaningful while every key
+// operand belongs to the query block being planned. classifyJoinCondition
+// enforces that by refusing to make a key out of a ref with query_level > 0
+// (Week 30): such a ref names a relation of an enclosing block, whose slot
+// numbering is a different domain. A correlated conjunct becomes a residual.
 struct JoinKey {
     std::string from_col;
     std::string join_col;

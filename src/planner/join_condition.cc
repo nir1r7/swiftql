@@ -59,6 +59,28 @@ JoinCondition classifyJoinCondition(const Expr* condition, int right_slot) {
         const ColumnRef* lc = bin ? dynamic_cast<const ColumnRef*>(bin->left.get())  : nullptr;
         const ColumnRef* rc = bin ? dynamic_cast<const ColumnRef*>(bin->right.get()) : nullptr;
         if (bin && bin->op == "=" && lc && rc) {
+            // Week 30 round 1. A ref the Binder resolved to an ENCLOSING query
+            // is not a relation of this join at all: its slot is a position in
+            // another scope's range table, and JoinKey carries no level. Treat
+            // the conjunct as an ordinary residual so a genuinely key-less
+            // inner join still reaches the cross-product refusal below.
+            //
+            // Without this, `EXISTS (SELECT 1 FROM drivers d JOIN laps p
+            // ON p.driver_id = l.driver_id)` — where `l` is the OUTER relation,
+            // so the inner join has no equality between d and p — fabricated
+            // JoinKey{driver_id, driver_id, from_slot=0}, joining the inner `d`
+            // to `p` on a predicate the user never wrote. keys was non-empty,
+            // so the refusal never fired and the cartesian product validated.
+            // Today the Week 31 refusal hides it; from Week 31 it is a plan
+            // built from an invented key: wrong rows, no error.
+            //
+            // The forward-reference check above needs no change: collectSlots
+            // already maps a query_level > 0 ref to -1, and -1 <= right_slot,
+            // so a correlated ref is correctly not a forward reference.
+            if (lc->query_level > 0 || rc->query_level > 0) {
+                out.residuals.push_back(c);
+                continue;
+            }
             if (lc->relation_slot < 0 || rc->relation_slot < 0) {
                 // unbound: positional routing, as documented in the header
                 out.keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
