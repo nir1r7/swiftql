@@ -2019,12 +2019,16 @@ anything cut or re-declined — is recorded here rather than left to be inferred
 from the diff. A successor agent resumes from this section.)*
 
 - [x] Task 1 — refusal inventory and sweep checklist (below)
-- [ ] Task 2 — `TableRef` (own commit, derived form still refused)
+- [ ] Task 2 — `TableRef` (own commit, derived form still refused) — IN PROGRESS
 - [ ] Task 3 — Binder: derived range-table entries
 - [ ] Task 4 — `LogicalPlanBuilder`: graft and normalize
 - [ ] Task 5 — the three synthetic-slot consumers, slot-table sweep
 - [ ] Task 6 — Q17 / correlated scalar decorrelation
-- [ ] Task 7 — `COUNT(DISTINCT ...)`
+- [x] Task 7 — `COUNT(DISTINCT ...)` — landed. Both engines; keyed through
+      `key_encoding.h`; `DISTINCT` reaches `exprToString`/`exprKey`/`cloneExpr`;
+      `DISTINCT` on the other four aggregates and `COUNT(DISTINCT *)` refused at
+      the parser. Harness: `WEEK34_DISTINCT_AGG_QUERIES` (all four modes) and
+      `WEEK34_DISTINCT_AGG_REFUSED`.
 - [ ] Task 8 — capability boundaries: fallback, Volcano parity
 - [ ] Task 9 — harness and tests
 - [ ] Task 10 — closing sweep
