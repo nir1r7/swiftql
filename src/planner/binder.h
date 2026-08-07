@@ -41,9 +41,28 @@ class Binder {
             // Week 34. Stable storage for a DERIVED entry's schema. A catalog
             // table's Schema outlives the query, so RangeEntry can hold a raw
             // pointer at it; a derived table's is computed here and must be
-            // OWNED. unique_ptr, never vector<Schema>: a reallocation on the
-            // SECOND derived table in one block would dangle every earlier
-            // entry's pointer, and only then.
+            // OWNED. unique_ptr, never vector<Schema>: growing the vector moves
+            // the POINTERS, not the Schema objects, so every earlier entry stays
+            // valid — with `vector<Schema>` a reallocation on the SECOND derived
+            // table in one block would dangle every earlier entry, and only then.
+            //
+            // LIFETIME, traced end to end (Week 34 audit round 1 left this
+            // unreached, so it is written down rather than assumed):
+            //   - a Scope is a stack local of bindQuery and nothing stores a
+            //     Scope* beyond that frame; resolveColumnRef and
+            //     checkCorrelatedAggregateArg walk the `parent` chain, and every
+            //     link in it is a caller's live frame;
+            //   - RangeEntry::schema is read only through range_table, which is a
+            //     member of the same Scope, so it cannot outlive its owner;
+            //   - a DERIVED body's own Scope dies inside relationSchema, but the
+            //     schema handed back was pushed onto the ENCLOSING scope's
+            //     owned_schemas, which outlives it. A nested derived table
+            //     therefore stores its schema one level out from where it was
+            //     computed, deliberately;
+            //   - a ColumnRef keeps only a ColumnId (two ints), never a pointer,
+            //     so nothing survives binding at all.
+            // Exercised: two derived relations in one FROM/JOIN list (the
+            // reallocation case) and a derived table nested inside another.
             std::vector<std::unique_ptr<Schema>> owned_schemas;
             Scope* parent = nullptr;
             SelectStatement* stmt = nullptr;  // to set has_subquery

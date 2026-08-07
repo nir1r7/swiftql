@@ -25,11 +25,20 @@ DataChunk* VecDerivedNode::nextChunk() {
     auto t0 = std::chrono::high_resolution_clock::now();
     DataChunk* chunk = child_->nextChunk();
     // Rows in == rows out, always: this node selects nothing and computes
-    // nothing. Reporting both keeps --explain-analyze's per-node accounting
-    // honest rather than showing a node with no rows.
+    // nothing. What it must NOT do is count the chunk's WIDTH when the body
+    // applied a filter — `num_rows` is the buffer size and `sel.indices.size()`
+    // is the surviving count, and a derived body with a WHERE reaches here with
+    // filter_applied set. Counting num_rows over-reported both figures on
+    // --explain-analyze for exactly the shape derived tables are used for. This
+    // is the convention VecLimitNode and VecFilterNode already share; found by
+    // reading them rather than by a failing test, because it is a reporting
+    // defect and no assertion covers per-node row counts.
     if (chunk) {
-        stats.rows_in += chunk->num_rows;
-        stats.rows_out += chunk->num_rows;
+        const int rows = chunk->filter_applied
+            ? static_cast<int>(chunk->sel.indices.size())
+            : chunk->num_rows;
+        stats.rows_in += rows;
+        stats.rows_out += rows;
     }
     stats.elapsed_us += std::chrono::duration<double, std::micro>(
         std::chrono::high_resolution_clock::now() - t0).count();
