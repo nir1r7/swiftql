@@ -4165,3 +4165,153 @@ TEST(ThreeValuedLogic, MatchesSqlTruthTables) {
         expectExecutorMatchesEvaluate(schema, input, c.e.get(), c.label);
     }
 }
+
+// ===== Week 32: semi-join and anti-join =====
+//
+// Hand-simulated on concrete rows, because the failure mode of this operator
+// produces PLAUSIBLE output: a semi-join implemented as an inner join with a
+// projection on top returns the right columns and the wrong row count.
+
+namespace {
+// probe: pid 1..4. build: bid with 1 appearing TWICE, 2 once, 9 unrelated.
+std::unique_ptr<VecHashJoinNode> semiJoin(JoinSemantics sem,
+                                          std::vector<Row> build_rows) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value(int64_t(2))},
+                                   {Value(int64_t(3))}, {Value(int64_t(4))}};
+    return std::make_unique<VecHashJoinNode>(
+        makeScan(probe_schema, probe_rows), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0},
+        probe_schema,            // !! the PROBE schema, unmerged: that is the invariant
+        /*swapped=*/false, /*left_outer=*/false, /*on_residual=*/nullptr, sem);
+}
+std::vector<int64_t> pids(const std::vector<Row>& rows) {
+    std::vector<int64_t> out;
+    for (const Row& r : rows) out.push_back(r[0].asInt());
+    return out;
+}
+
+// !! Every NULL case below MUST go through NullableSourceNode, never makeScan.
+// makeScan builds a ColumnarTable, which cannot express a SQL NULL (invariant
+// 14): a Value::null() handed to it comes back out as a plain 0, so a test
+// written with makeScan asserts the NULL rule against data that holds no NULL
+// and passes for the wrong reason. That is the trap this whole section exists
+// to catch, so it is worth its own helper rather than a comment at each site.
+std::unique_ptr<VecHashJoinNode> nullableSemiJoin(JoinSemantics sem,
+                                                  std::vector<Row> probe_rows,
+                                                  std::vector<Row> build_rows) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    return std::make_unique<VecHashJoinNode>(
+        std::make_unique<NullableSourceNode>(probe_schema, std::move(probe_rows)),
+        std::make_unique<NullableSourceNode>(build_schema, std::move(build_rows)),
+        std::vector<int>{0}, std::vector<int>{0},
+        probe_schema,
+        /*swapped=*/false, /*left_outer=*/false, /*on_residual=*/nullptr, sem);
+}
+const std::vector<Row> kFourProbeRows = {
+    {Value(int64_t(1))}, {Value(int64_t(2))},
+    {Value(int64_t(3))}, {Value(int64_t(4))}};
+} // namespace
+
+// THE test of the week. A duplicate build key must NOT duplicate the probe row:
+// R semi S is pi_R(R join S) with duplicates COLLAPSED. An inner join with a
+// projection on top emits pid=1 twice and passes every other test in this file.
+TEST(VecSemiJoin, ADuplicateBuildKeyEmitsTheProbeRowExactlyOnce) {
+    auto join = semiJoin(JoinSemantics::SEMI,
+                         {{Value(int64_t(1))}, {Value(int64_t(1))},
+                          {Value(int64_t(2))}, {Value(int64_t(9))}});
+    auto rows = drainRows(*join);
+    EXPECT_EQ(pids(rows), (std::vector<int64_t>{1, 2}));
+    // and the output is the probe schema: one column, not two
+    ASSERT_FALSE(rows.empty());
+    EXPECT_EQ(rows[0].size(), 1u);
+}
+
+TEST(VecAntiJoin, EmitsTheComplement) {
+    auto join = semiJoin(JoinSemantics::ANTI,
+                         {{Value(int64_t(1))}, {Value(int64_t(1))},
+                          {Value(int64_t(2))}, {Value(int64_t(9))}});
+    EXPECT_EQ(pids(drainRows(*join)), (std::vector<int64_t>{3, 4}));
+}
+
+// An empty build side: `x IN ()` is FALSE for every x, `x NOT IN ()` is TRUE for
+// every x. The two halves have to be checked together — an ANTI implementation
+// that short-circuits on "no keys" the way it does on "a NULL key" would return
+// nothing here, which is the opposite answer.
+TEST(VecSemiJoin, AnEmptyBuildSideEmitsNothingAndAntiEmitsEverything) {
+    EXPECT_TRUE(drainRows(*semiJoin(JoinSemantics::SEMI, {})).empty());
+    EXPECT_EQ(pids(drainRows(*semiJoin(JoinSemantics::ANTI, {}))),
+              (std::vector<int64_t>{1, 2, 3, 4}));
+}
+
+// !! The sharpest correctness item in the week. `x NOT IN S` is never TRUE when
+// S holds a NULL: FALSE where x matches, UNKNOWN elsewhere, and a WHERE keeps
+// neither. So the ANTI join emits NOTHING AT ALL — not "everything that did not
+// match". Without the flag carried out of the build phase, this returns rows
+// 3 and 4 and SQLite disagrees the moment a NULL appears.
+TEST(VecAntiJoin, ANullOnTheBuildSideEmitsNothingAtAll) {
+    auto join = nullableSemiJoin(JoinSemantics::ANTI, kFourProbeRows,
+                                 {{Value(int64_t(1))}, {Value::null()}});
+    EXPECT_TRUE(drainRows(*join).empty());
+}
+
+// The positive form is unaffected: a NULL simply never matches, so the non-null
+// keys behave normally. The rule is NOT symmetric, which is why both halves are
+// pinned.
+TEST(VecSemiJoin, ANullOnTheBuildSideIsJustAnUnmatchableKey) {
+    auto join = nullableSemiJoin(JoinSemantics::SEMI, kFourProbeRows,
+                                 {{Value(int64_t(1))}, {Value::null()}});
+    EXPECT_EQ(pids(drainRows(*join)), (std::vector<int64_t>{1}));
+}
+
+// A NULL probe key emits nothing for SEMI or ANTI alike against a non-empty
+// build side: both `NULL IN S` and `NULL NOT IN S` are UNKNOWN, and a WHERE
+// drops UNKNOWN. Against an EMPTY build side `NULL NOT IN ()` is TRUE, which is
+// the one asymmetry.
+TEST(VecSemiJoin, ANullProbeKeyIsDroppedUnlessTheBuildSideIsEmpty) {
+    const std::vector<Row> probe_rows = {{Value::null()}, {Value(int64_t(1))}};
+    // `NULL IN (1)` is UNKNOWN -> only pid=1 survives.
+    EXPECT_EQ(pids(drainRows(*nullableSemiJoin(JoinSemantics::SEMI, probe_rows,
+                                               {{Value(int64_t(1))}}))),
+              (std::vector<int64_t>{1}));
+    // `NULL NOT IN (1)` is UNKNOWN and `1 NOT IN (1)` is FALSE -> nothing.
+    EXPECT_TRUE(drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows,
+                                            {{Value(int64_t(1))}})).empty());
+    // ...and the one asymmetry: `x NOT IN ()` is TRUE even for a NULL x, since
+    // there is nothing to compare against. Both rows survive, NULL included.
+    auto empty_build = drainRows(*nullableSemiJoin(JoinSemantics::ANTI, probe_rows, {}));
+    ASSERT_EQ(empty_build.size(), 2u);
+    EXPECT_TRUE(empty_build[0][0].isNull());
+    EXPECT_EQ(empty_build[1][0].asInt(), 1);
+}
+
+// The surviving side must be the probe input and the output schema must be the
+// probe schema. VectorizedPlanBuilder forces both, so every one of these is the
+// shape of a planner bug and is loud rather than latent.
+TEST(VecSemiJoin, RefusesEveryIllegalCombination) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema merged       = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> rows_a = {{Value(int64_t(1))}};
+    auto make = [&](Schema out, bool swapped, bool left_outer,
+                    std::unique_ptr<Expr> resid) {
+        return VecHashJoinNode(makeScan(probe_schema, rows_a), makeScan(build_schema, rows_a),
+                               std::vector<int>{0}, std::vector<int>{0}, std::move(out),
+                               swapped, left_outer, std::move(resid),
+                               JoinSemantics::SEMI);
+    };
+    EXPECT_THROW(make(probe_schema, true,  false, nullptr), std::runtime_error);
+    EXPECT_THROW(make(probe_schema, false, true,  nullptr), std::runtime_error);
+    EXPECT_THROW(make(probe_schema, false, false, col("pid")), std::runtime_error);
+    EXPECT_THROW(make(merged,       false, false, nullptr), std::runtime_error);
+    EXPECT_NO_THROW(make(probe_schema, false, false, nullptr));
+}
+
+TEST(VecSemiJoin, ExplainNamesTheKind) {
+    EXPECT_NE(semiJoin(JoinSemantics::SEMI, {})->explain().find("VecSemiHashJoin"),
+              std::string::npos);
+    EXPECT_NE(semiJoin(JoinSemantics::ANTI, {})->explain().find("VecAntiHashJoin"),
+              std::string::npos);
+}
