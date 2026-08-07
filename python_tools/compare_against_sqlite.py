@@ -433,6 +433,40 @@ WEEK30_SUBQUERY_BINDS = [
     # on the same tree
     "SELECT d.name FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
     "WHERE d.age IN (SELECT season FROM laps l2)",
+
+    # --- round 1 ---
+    # a correlated ref inside the NESTED query's own ON clause. Its slot indexes
+    # the OUTER range table, and validateJoinCondition's `relations` is the inner
+    # one, so indexing it reported "column 'lap_id' not found in table 'd'" — an
+    # error the query is not entitled to, against a relation it never named
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
+    " AND d.age = l.lap_id)",
+    # the control for the cross-product refusal below: a REAL inner key beside a
+    # correlated residual is legal, and the residual must not be what saves it
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM drivers d JOIN laps p ON d.driver_id = p.driver_id "
+    " AND p.speed > l.speed)",
+    # a correlated GROUP BY key is legal SQL — it is constant within every group.
+    # Both spellings must behave the same: the skip used to key on whether the
+    # binder had written a qualifier back, which it only does for a block holding
+    # two or more relations, so the SAME subquery was refused under a
+    # one-relation outer query and accepted under a two-relation one
+    "SELECT lap_id FROM laps l WHERE EXISTS "
+    "(SELECT COUNT(*) FROM drivers d GROUP BY season)",
+    "SELECT l.lap_id FROM laps l JOIN drivers dd ON l.driver_id = dd.driver_id "
+    "WHERE EXISTS (SELECT COUNT(*) FROM drivers d GROUP BY season)",
+    # BETWEEN clones its left operand before binding and cloneExpr SHARES the
+    # statement, so two SubqueryExpr nodes reach one SelectStatement in a single
+    # bind. Both must stay marked correlated, or collectSlots stops contributing
+    # -1 for the second and pushdown pushes a correlated conjunct onto one scan
+    "SELECT lap_id FROM laps l WHERE "
+    "(SELECT MAX(d.age) FROM drivers d WHERE d.driver_id = l.driver_id) "
+    "BETWEEN 1 AND 99",
+    # the IN operand is folded (dispatch site 14) — Week 32 probes a semi-join on
+    # exactly this expression, and the fast paths pattern-match on
+    # ColumnRef-op-Literal
+    "SELECT team FROM laps WHERE season * (2 + 3) IN (SELECT driver_id FROM drivers)",
 ]
 
 # Each of these must fail EARLIER than the refusal above, and for its own stated
@@ -476,6 +510,26 @@ WEEK30_REJECTED_QUERIES = [
     # different production
     ("SELECT team FROM laps WHERE season IN (speed)",
      "IN accepts a list of constant values only"),
+
+    # --- round 1 ---
+    # a NESTED key-less inner join. `l` is the OUTER relation, so there is no
+    # equality between d and p at all — a cartesian product, which
+    # classifyJoinCondition exists to refuse. Treating the correlated ref as a
+    # key operand fabricated JoinKey{driver_id, driver_id, from_slot=0}, joining
+    # the inner `d` to `p` on a predicate the user never wrote, and a non-empty
+    # key list bypassed the refusal. SQLite answers it; the property under test is
+    # SwiftQL's own refusal, and from Week 31 the alternative is wrong rows
+    ("SELECT lap_id FROM laps l WHERE EXISTS "
+     "(SELECT 1 FROM drivers d JOIN laps p ON p.driver_id = l.driver_id)",
+     "at least one equality"),
+    # the ORDER BY position rule inspected only the ROOT of the expression, so a
+    # subquery one level down was invisible. It routes through validateExpr now,
+    # whose allow_subqueries=false default is checked at every node
+    ("SELECT lap_id FROM laps ORDER BY lap_id + (SELECT MAX(age) FROM drivers)",
+     "ORDER BY: subqueries are supported in WHERE and HAVING only"),
+    ("SELECT lap_id FROM laps ORDER BY "
+     "CASE WHEN lap_id > (SELECT MAX(age) FROM drivers) THEN 1 ELSE 0 END",
+     "ORDER BY: subqueries are supported in WHERE and HAVING only"),
 ]
 
 # Week 27 (multi-way join execution). Shapes that Week 26 could only bind now
