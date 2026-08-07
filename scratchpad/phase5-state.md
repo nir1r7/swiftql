@@ -1,18 +1,22 @@
 # Phase 5 orchestrator state
-Current: week 33 — implementation COMPLETE and pushed through ecee221. Gate r2
-  (a2b647beda9e39206) + audit r1 (a59512b5b5719b745) launched 11:22 UTC. Audit is told to
-  commit its file AS IT GOES, not just at the end (two audits have been lost this run).
-  AUDIT R1'S #1 TARGET IS THE ColumnId MIGRATION — no auditor has ever read it; a gate only
-  proved behaviour unchanged, not that the representation is sound. That gap is now closing.
-  Week 33 shipped: tasks 1,2,3,5,7,8,9. Task 4 is a RECORDED CHECKPOINT MISS (correlated
-  scalar / Q17 + Q22 need derived-table range-table entries = Week 34's core deliverable).
-  Task 6 (Volcano parity) is a stated gap. The "correct fallback" bullet ships as a REFUSAL,
-  written up as a conscious deviation.
-  Two stale rationales corrected this week: a Week 32 note pointed at src/execution/
-  hash_join_node.cc which DOES NOT EXIST (the Volcano hash join is HashJoinNode in
-  src/planner/plan_nodes.h, and its refusal is total STRUCTURALLY — no JoinSemantics
-  parameter); and a restampSlots unreachability argument rested on a refusal this week
-  removed, so it was re-derived rather than inherited.
+Current: week 33 CRITICAL FIX ROUND (agent a18b428befd1e3c84, launched ~11:31 UTC).
+  Audit r1: 2 CRITICAL, 2 HIGH, 5 MEDIUM, 1 LOW — the most severe tally of the phase.
+  C-1: NOT EXISTS is lowered to the SAME JoinSemantics::ANTI that carries NOT IN's three-valued
+  NULL rule, so a NULL build key empties the result and a NULL probe key drops a row the
+  standard requires. The header says the rule "must NOT be applied here" and NOTHING ENFORCES
+  IT. The implementer's reasoning last round was right; the code did the opposite. Fix must
+  carry the semantics IN THE TYPE, not a comment, so it cannot be re-merged.
+  C-2: a correlated ref in the body's JOIN ... ON becomes an inner-join residual after
+  splitCorrelation runs, then resolves BY BARE NAME against the body's own schema — wrong rows,
+  no error.
+  HIGH: rightKeyIndices matches the body key by bare name against a possibly-merged,
+  possibly-aliased body output schema (two silent wrong-answer shapes).
+  MEDIUM incl.: decorrelation in practice only supports SELECT * bodies (must be ENFORCED and
+  STATED if true); the containment assertion in subquery_decorrelation.cc and
+  subquery_lowering.cc is TAUTOLOGICAL — an assertion that cannot fail reads as a guarantee.
+  Audit could not run the oracle (gate owned build/), so C-1 is a code trace — fix round must
+  REPRODUCE it first.
+  Audit did NOT reach: the plan/README cross-check, compare_against_sqlite.py, the test diffs.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
