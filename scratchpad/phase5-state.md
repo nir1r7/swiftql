@@ -1,21 +1,20 @@
 # Phase 5 orchestrator state
-Current: week 33 — SECOND CRITICAL FIX ROUND (agent a18b428befd1e3c84, launched ~13:09 UTC).
-  !! R2-C1 is the THIRD silent wrong answer this week from ONE ROOT SHAPE: code trusting a
-  refusal that no longer exists. subquery_lowering.h:29 still cites the Week-33-deleted
-  Validator refusal, and lowerInSubqueries (logical_plan.cc:814) consumes a correlated IN
-  BEFORE refuseUnloweredCorrelated (:827) can see it. Reproduced on HEAD:
-    d.driver_id IN (SELECT l.lap_id FROM laps l WHERE l.team = d.team) -> 20 rows, SQLite 6
-    the NOT IN form -> 0 rows, SQLite 14
-  TWO of the three instances were in files whose HEADER COMMENTS cited the deleted refusal.
-  A stale precondition is not a docs problem in this codebase — it is how three wrong answers
-  shipped. The fix round is now sweeping the whole subquery/lowering/materialization
-  neighbourhood for the class, and must report "checked, still true" cases too.
-  Also owed: M-4 tautological containment assertions; M-5 site-12 comment +
-  refuseUnloweredCorrelated missing on SELECT list/ORDER BY; M-7 false predicate_pushdown
-  rationale; L-8 wrong cause named; append fix-round items 4-7 to the plan's ## Progress;
-  and two things audit r2 did not reach (is the ON-clause refusal narrower than necessary;
-  does body.order_by survive the select-list replacement).
-  THEN: closing gate, then week 33 closes with its partial checkpoint.
+Current: week 33 — CLOSING GATE running (abcb1040a09244085, launched 13:33 UTC) at faae614.
+  R2-C1 fixed two ways (lowerInSubqueries declines a correlated node by the Binder's FLAG, not
+  an inherited precondition; refuseUnloweredCorrelated now runs BEFORE refuseUnloweredIn at
+  both call sites). Unit test asserts NO PLAN IS BUILT, since a plan is the bug.
+  !! THE CLASS SWEEP IS THE WEEK'S BIGGEST RESULT: 7 MORE stale preconditions found and fixed
+  — including the HEADER OF THE VERY FILE the earlier fix repaired (same class, missed),
+  dispatch sites 12 and 13, predicate_pushdown.cc x2, ast.h, validator.h, and validator.cc
+  where the old containment stood in the PRESENT TENSE immediately above the note saying it
+  was removed. Plus 4 checked-and-still-true, which is what makes the sweep trustworthy.
+  M-5's second half was REJECTED BY RUNNING THE CODE: a subquery in SELECT list/ORDER BY is
+  refused by the position rule, so the guard there would be unreachable.
+  M-4 tautological loops DELETED (they compared a copy of an object with the object).
+  Nothing from either audit is open.
+  LESSON FOR EVERY REMAINING WEEK: after removing a refusal/guard/invariant, sweep every
+  comment, precondition, assertion and header that cites it. Three wrong answers this week
+  came from that one shape, and two of them lived in header comments.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
