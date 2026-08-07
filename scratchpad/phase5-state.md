@@ -1,36 +1,30 @@
 # Phase 5 orchestrator state
-Current: week 36 — implementation is COMPLETE and pushed through d57d740, and the agent
-  COMMITTED "close week 36 ... 20/22" AND REFRESHED docs/tpch-baseline.json ITSELF.
-  !! WEEK 36 IS NOT CLOSED. There is NO week-36 gate log and NO week-36 audit. The implementer
-  declared its own work done and moved the baseline the gate compares against — the exact
-  failure this cycle exists to prevent. Not the agent's fault: a container restart broke my
-  loop and it was never told a verifier would follow. Do not treat 20/22 as established until
-  a verifier has measured it.
-  Gate + audit launching 22:47 UTC. The audit's first job is whether the figure rose HONESTLY:
-  the lift of `found[0] == select_list[0]`, the refusal sweep that lift obliges, and whether
-  the re-baseline is justified by a run rather than by assertion.
-  Week 36 shipped, per its own commits: the Q17 constant-wrapper lift (TPC-H's own Q17 text
-  now runs), q21 DECLINED IN THE OPEN with its blocker recorded, the NaN oracle fix (a NaN
-  compared EQUAL to anything), the random_diff projection fix (it named the join key, so it
-  could not see a wrong relation), scale/memory limits, the STRING-year contract, and the
-  correctness report.
-  AFTER week 36 closes: the FIVE-WAY SEAM AUDIT (join chain 26-29, subquery chain 30-34,
-  engine divergence, optimizer preservation, storage), then stop. Week 37 is the user's.
+Current: week 36 fix round — ONE item outstanding, then close.
+  Audit r1 verdict: "20/22 is HONEST AS A CAPABILITY CLAIM, UNPROVEN AS A MEASUREMENT" — and
+  the gate has since PROVEN the measurement. Q17 runs the spec's own unaltered text, matches
+  SQLite (2732.80428571429 vs 2732.804285714286), is byte-identical in --explain to the
+  already-verified constant-outside form, DISCRIMINATES under mutation, and still refuses every
+  shape it should (two-aggregate, CASE wrapper, non-aggregate body, non-constant wrapper,
+  nested aggregate). So the lift was CORRECT, not merely permissive.
+  F1 (medium-high, outstanding): docs/tpch-sf0.01-report.json was NEVER REGENERATED — it still
+  publishes 19/22 with q17 UNPORTED, contradicting the baseline beside it. run_tpch.py's --json
+  and --write-baseline are separate flags and only the latter was passed. It is also a site the
+  obligatory refusal sweep MISSED.
+  ALSO OWED: target 2's sweep was only SPOT-CHECKED — 11 cited sites, not independently walked.
+  Verified clean by the audit: q21's blocker accurate and refused by name and pinned; both
+  harness fixes close their holes (the NaN comparator, random_diff's projection).
+  AFTER THIS: close week 36, then THE FIVE-WAY SEAM AUDIT — join chain 26-29, subquery chain
+  30-34, engine divergence, optimizer preservation, storage — then stop. Week 37 is the user's.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅
-Last gate: GREEN (week 35 round 3, closing) — build PASS, unit 805/805, sqlite 1290,
-  regression 318, tpch PASS (19/22 meaningful: 5 four-mode, 14 vec-only; 1 vacuous; 2 unported).
-  Baseline md5 and mtime UNCHANGED across the run, so the write path stayed inert on a passing
-  --baseline-only run, as designed. Staleness disproved.
-Week 35 verdict: checkpoint met. 3 gates, 2 audits, 2 fix rounds, and four agents killed by
-  container restarts mid-round — every one resumed from a handoff instead of restarting.
-  The phase goal is now MEASURED rather than asserted, and the gate that measures it cannot
-  silently pass.
-THE GATE NOW COVERS TPC-H (fifth step, c7b8262). It reports meaningfully-answered with the
-  mode split, counts vacuous and unported APART from the headline, fails on a regression
-  (stops answering / becomes vacuous / answers in fewer modes), and reports NO-BASELINE when
-  --baseline is omitted, since a run that cannot see a regression must not report PASS.
+Last gate: GREEN (week 36 round 1) — build PASS (rebuilt, warning-free), unit 805/805,
+  sqlite 169 queries / 1326 comparisons, regression 318 all modes,
+  tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous; 1 unported).
+  BASELINE MD5 UNCHANGED across the run (7cee17da...), write path inert, BASELINE OK with no
+  IMPROVED suffix — so the implementer's 19->20 refresh is CONFIRMED BY INDEPENDENT
+  MEASUREMENT, not merely asserted. Staleness disproved; tree fingerprint identical before and
+  after; the concurrent auditor did not perturb it.
 Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
   2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
   and one stale-rejection pair, both fixed.
