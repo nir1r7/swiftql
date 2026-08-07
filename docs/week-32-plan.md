@@ -1157,9 +1157,17 @@ landing.
   block's `rowWidth()` on the outer semi join's left child walks the inner one).
   Now stamps only on `semantics == STANDARD` while still walking the left side,
   so `logical_plan.h`'s contract holds by construction. **Latent, not live** —
-  the widths are discarded before `setCostDecision` and no spine column carries
-  slot `-1` — which is why there is no behavioural test to fail pre-fix; that is
-  stated in the commit rather than papered over.
+  and round 4 established that the reason first recorded for that verdict is
+  not the one that makes it true. The reason is the **map**: the only read is
+  `slot_tables.find(col.relation_slot)` over the child's `output_schema`, which
+  for a semi/anti join *is its left child's* (asserted in
+  `subquery_lowering.cc`), so every column carries a real binder slot and the
+  `out[-1]` entry was written and never read. The width is bit-identical either
+  way, which is why there is no behavioural test to fail pre-fix. The original
+  reason — "the widths are discarded before `setCostDecision`" — holds today
+  only via a build-order fact in `logical_plan.cc` (no STANDARD join is ever
+  built above a semi join) that nothing in the cost block enforces; it is not
+  load-bearing and must not be inherited as verified.
 - **MEDIUM (r3) — `development.md`'s Week 32 consumer table** said the
   `VectorizedPlanBuilder` row was "safe by domain" while naming only the two
   `*KeyIndices` calls. It now names both readers and records the guard. Third

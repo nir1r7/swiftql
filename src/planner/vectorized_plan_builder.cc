@@ -124,9 +124,30 @@ void collectSlotTables(const LogicalPlanNode* node,
     // this walk over the inner one. Without the decline it stamps the BODY's
     // table at key -1 — a slot that names no relation of this block — and the
     // body contributes nothing to a semi join's output schema, so there is no
-    // entry to make. Latent today (the widths computed there are discarded
-    // before setCostDecision, and no spine column carries slot -1); declined
-    // here so the contract holds by construction rather than by luck.
+    // entry to make.
+    //
+    // Why it was latent and never a wrong width — the reason is the map, not
+    // the cost block. The ONLY read of this map is
+    // slot_tables.find(col.relation_slot) over child->output_schema.columns()
+    // (rowWidth, below). When child is a semi/anti join that schema IS its left
+    // child's — asserted, not observed, at subquery_lowering.cc's
+    // "output schema must be its left child's" check — so every column in it
+    // comes from the outer spine and carries a real binder slot; ColumnDef::
+    // relation_slot defaults to 0 and the binder stamps the rest, so no column
+    // anywhere can carry -1. The out[-1] entry was therefore written and never
+    // read, and the width rowWidth returns is bit-identical before and after
+    // this decline. That is why no behavioural test can tell the two apart:
+    // this is a contract repair, not a corrected cost decision.
+    //
+    // An earlier rationale said instead "the widths computed here are discarded
+    // before setCostDecision". Do not rely on that one. It is true today only
+    // because a semi/anti join returns from lowerNode() before from_w/join_w
+    // are read, AND because no STANDARD join is ever built above a semi join —
+    // which is a build-order fact in logical_plan.cc (the join spine is built,
+    // then lowerInSubqueries stacks semi joins on top of it), stated in another
+    // file and enforced nowhere. Any week that plans a join above a semi join
+    // dissolves that argument and would have made the -1 entry live. The map
+    // argument above does not depend on it.
     if (join->semantics == JoinSemantics::STANDARD) {
         out[join->join_slot] = leafScanTable(join->children[1].get());
     }
