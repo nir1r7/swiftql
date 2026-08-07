@@ -1274,3 +1274,24 @@ Success criteria for the week, in the form the gate reports them:
 4. No count anywhere in the tree still says 19/22 as a current figure.
 5. Every claim in the report is of the form "matches SQLite", and the mode split
    accompanies every count.
+
+---
+
+## Progress
+
+*Kept current on every commit. A restarted agent resumes from here.*
+
+| Task | State | Note |
+|---|---|---|
+| 1 — lift the constant wrapper (Q17) | IN PROGRESS | — |
+| 2 — the sweep the lift obliges | not started | must land in the SAME commit as Task 1 |
+| 3 — Q21 | not started | 3a (establish + record) mandatory, 3b (implement) stretch |
+| 4 — Volcano breakdown | measured, unwritten | table is in Task 4 above; owed to the report |
+| 5 — inherited divergences | not started | — |
+| 6 — small items owed | not started | 6a (NaN) is a real oracle hole, do it early |
+| 7 — scale + memory | measured, unwritten | numbers in Task 7 above; owed to README |
+| 8 — re-baseline + report + gate | not started | full run, no `--queries` |
+
+**Next concrete step:** add `constantOnly` / `constantWrapperAggregateSlot` to
+`src/planner/subquery_decorrelation.cc`'s anonymous namespace and change
+`requireDecorrelatableScalarBody` to return the located slot.
