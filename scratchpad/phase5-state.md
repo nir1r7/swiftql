@@ -1,9 +1,12 @@
 # Phase 5 orchestrator state
-Current: week 31, round 1 — gate + audit to be run SYNCHRONOUSLY (see mitigation below)
+Current: week 31, round 1 — gate GREEN; audit running (launched 06:35 UTC, 40-min budget,
+  expect by ~07:15). NOTE: run_in_background:false is IGNORED by the harness — agents always
+  run in background. Best available mitigation is to launch right after a reclaim so the work
+  fits inside the ~60-min window.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅
-Last gate: GREEN (week 30 round 4, closing) — unit 726/726, sqlite 864, regression 296 all modes
+Last gate: GREEN (week 31 round 1) — unit 747/747, sqlite 932, regression 318 all modes
 Week 31 implementation is PUSHED (d99533a). Do not re-run it. It still needs gate + audit.
 
 ## !! Container reclaim — read this first after any reboot
