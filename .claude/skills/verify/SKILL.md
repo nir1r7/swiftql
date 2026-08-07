@@ -73,7 +73,7 @@ oracle. Write **"matches SQLite"** — never "correct", never "TPC-H compliant".
 
 | Verdict | Meaning |
 |---|---|
-| `PASS` | No regression against `docs/tpch-baseline.json`. An `-- IMPROVED` suffix also passes: something newly answers, so refresh the baseline with `--write-baseline docs/tpch-baseline.json` in the same commit as the improvement. |
+| `PASS` | No regression against `docs/tpch-baseline.json`. An `-- IMPROVED` suffix also passes: something newly answers, so refresh the baseline in the same commit as the improvement — a **second, separate run** with `--write-baseline docs/tpch-baseline.json` and *no* `--baseline`. The harness now writes the baseline only after the comparison and only when the run passed, so a regression can no longer be laundered into the file it was being gated against; a refresh run that also carries `--baseline` will simply refuse to write if anything failed. |
 | `FAIL` | **RED.** A wrong answer, an unexplained error, a broken mutation check, or a regression: a query that stopped answering, one that became vacuous, or one that answers in fewer modes than the baseline records. |
 | `NO-BASELINE` | `--baseline` was omitted. Not a pass — a run that cannot see a regression. Re-run it properly. |
 

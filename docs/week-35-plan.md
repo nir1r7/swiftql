@@ -36,6 +36,18 @@ written-down capability boundaries into an unqualified pass.
 | 7 — randomized result differencing | **done** — `python_tools/random_diff.py`, 40 shapes both legs in 61 s |
 | 8 — behavioural rejection sweep | **done** — 17 suites / 157 entries executed, plus a computed mode census |
 
+### Round-2 audit fixes (`scratchpad/audits/week-35-round-2.md`)
+
+| Fix | State |
+|---|---|
+| 1 — the gate step that cannot fail (`--baseline` + `--write-baseline` on one path) | **done** — the write moved after the comparison and is refused unless the run passed; proved on a synthetic regression |
+| 2 — q2's INERT is a parameter artifact | pending |
+| 3 — q19's ALL_NULL is a parameter artifact | pending |
+| 4 — a narrowed `--queries` run prints a full-shaped PASS | pending |
+| 5 — README records Q17 as supported; the spec's Q17 text is refused | pending |
+| 6 — q18's "unreachable" holds only at threshold 300 | pending |
+| after 2+3 — regenerate `docs/tpch-baseline.json` from a full run | pending |
+
 **All eight tasks are implemented.** The standing-rule sweep is done (README
 Limitations on NaN, commas-in-CSV and the stale 56/168 census; `normalize()`'s
 blind-spot comment; `CSVLoader`'s header comment; the README Week 35 section).

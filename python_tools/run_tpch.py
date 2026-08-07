@@ -692,12 +692,6 @@ def main():
             json.dump(record, f, indent=2, sort_keys=True)
         print(f"\nwrote {args.json}")
 
-    if args.write_baseline:
-        with open(args.write_baseline, "w") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-            f.write("\n")
-        print(f"wrote baseline {args.write_baseline}")
-
     baseline_lines = None
     if args.baseline:
         base_ok, baseline_lines = compare_baseline(summary, args.baseline)
@@ -706,6 +700,35 @@ def main():
         for line in baseline_lines:
             print(f"  {line}")
         ok = ok and base_ok
+
+    # AFTER the comparison, and only for a run that passed everything else.
+    #
+    # Written before the comparison -- as it was -- `--baseline X --write-baseline X`
+    # overwrote X with this run's summary and then compared that summary against
+    # the file it had just written, so `lost`/`gained` were empty by construction
+    # and EVERY run reported PASS, including one where half the queries stopped
+    # answering. A step that cannot fail is worse than no step, because it reads
+    # as verification. Both of the harness's own instructions point at that
+    # combination (compare_baseline's IMPROVED line and the `verify` skill's
+    # standing invocation), so it is operator-reachable by following the docs.
+    #
+    # Ordering alone fixes the same-path case; the `ok` guard closes the same
+    # hole one step removed -- `--baseline old.json --write-baseline
+    # docs/tpch-baseline.json` would otherwise launder a detected regression into
+    # the recorded baseline while printing FAIL. A deliberate refresh that accepts
+    # a regression is still available: run WITHOUT `--baseline`, which is the
+    # rerun the IMPROVED line already asks for.
+    if args.write_baseline:
+        if not ok:
+            print(f"\nREFUSED to write baseline {args.write_baseline}: this run "
+                  "did not pass. A baseline recorded from a failing run erases "
+                  "the failure it should have gated. Fix the failure, or rerun "
+                  "WITHOUT --baseline to refresh deliberately.")
+        else:
+            with open(args.write_baseline, "w") as f:
+                json.dump(summary, f, indent=2, sort_keys=True)
+                f.write("\n")
+            print(f"wrote baseline {args.write_baseline}")
 
     # LAST line of the run, on purpose: it is what the `verify` skill's fifth
     # gate reports, and a verifier should not have to scroll for it.
