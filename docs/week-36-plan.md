@@ -1286,11 +1286,11 @@ Success criteria for the week, in the form the gate reports them:
 | 1 — lift the constant wrapper (Q17) | **DONE** | spec form runs; plan byte-identical to the constant-outside form |
 | 2 — the sweep the lift obliges | **DONE** | landed in the same commit; sweep report below |
 | 3 — Q21 | **3a DONE, 3b DECLINED** | requirement established and pinned; see the decision below |
-| 4 — Volcano breakdown | measured, unwritten | table is in Task 4 above; owed to the report |
-| 5 — inherited divergences | not started | — |
-| 6 — small items owed | 6a DONE (uncommitted) | 6b/6c/6d not started |
-| 7 — scale + memory | measured, unwritten | numbers in Task 7 above; owed to README |
-| 8 — re-baseline + report + gate | not started | full run, no `--queries` |
+| 4 — Volcano breakdown | **DONE** | written into `planner.cc`, README Limitations and the report |
+| 5 — inherited divergences | **DONE** | 5a closed as a decision + asserted; 5b declared with the reason; 5c/5d declared |
+| 6 — small items owed | **DONE** | 6a NaN hole fixed + asserted; 6b projection widened + demonstrated; 6c `--time` and `--fingerprint-all` exercised; 6d recorded honestly |
+| 7 — scale + memory | **DONE** | in README Limitations, with the columnar-peaks-higher finding |
+| 8 — re-baseline + report + gate | IN PROGRESS | report written; full `--fingerprint-all` run under way, baseline refresh pending its result |
 
 ### Task 2 sweep report — checked, not only hit
 
@@ -1392,8 +1392,10 @@ deliberately.
 - README's dialect row now carries the requirement, so the next reader inherits
   the four facts above rather than re-deriving them.
 
-**Next concrete step:** Task 4 — write the Volcano breakdown into the README and
-`planner.cc`'s cost paragraph.
+**Next concrete step:** read the finished `run_tpch.py` gate line, refresh
+`docs/tpch-baseline.json` with `--write-baseline` in a commit carrying the
+per-query deltas, and re-run to confirm the gate is green against the new
+baseline.
 
 ---
 
