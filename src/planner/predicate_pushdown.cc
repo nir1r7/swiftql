@@ -7,15 +7,30 @@
 #include <unordered_set>
 #include <vector>
 
-// Collect the set of relation slots a predicate's columns reference. Same
-// dispatch as collectCols(), reading relation_slot instead of name.
+// Collect the set of relation slots a predicate's columns reference, IN THIS
+// QUERY BLOCK. Same dispatch as collectCols(), reading relation_slot instead of
+// name.
 //
 // Declared in the header since Week 27: classifyJoinCondition uses it to spot a
-// forward reference inside a residual ON conjunct of any shape. Two callers, one
-// walker — a private copy would be an eleventh silent dispatch site.
+// forward reference inside a residual ON conjunct of any shape. THREE callers,
+// one walker — soleSlot (here), classifyJoinCondition (join_condition.cc,
+// Week 27) and pruningHintForPreservedSide (below, Week 29). A private copy
+// would be an eleventh silent dispatch site. The three do NOT agree on what an
+// EMPTY set means; the header says which one is which and why only one of them
+// can fail closed on its own account.
 void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     if (!expr) return;
-    if (auto* cr = dynamic_cast<const ColumnRef*>(expr)) { out.insert(cr->relation_slot); return; }
+    if (auto* cr = dynamic_cast<const ColumnRef*>(expr)) {
+        // Week 30: a slot is a position in the range table of the scope
+        // query_level steps out, so a ref belonging to an ENCLOSING block is
+        // not one of this block's relations. It is not nothing either — a
+        // correlated conjunct cannot be routed to one relation of this block —
+        // so contribute -1, this walker's existing "unresolved, be
+        // conservative" value. Reached only through the SubqueryExpr branch
+        // below; a top-level ref always has query_level 0.
+        out.insert(cr->query_level > 0 ? -1 : cr->relation_slot);
+        return;
+    }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
         collectSlots(bin->left.get(), out);
         collectSlots(bin->right.get(), out);
@@ -51,6 +66,35 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     // later masks the difference, so it cannot be relied on to cover this.
     if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         collectSlots(agg->argument.get(), out);   // nullptr-safe: COUNT(*)
+        return;
+    }
+    // Week 30 — the tenth Expr subtype, and the one readme.md's site-8 note
+    // names. A subquery's OWN refs (query_level 0 inside it) are positions in a
+    // DIFFERENT scope's range table; contributing them would name this block's
+    // relations by another block's numbering. Its CORRELATED refs DO reference
+    // this block — that is what correlation means — so they must contribute
+    // something, and the conservative form is -1:
+    //
+    //   soleSlot                    -> -1, so the conjunct is never pushed. Right:
+    //                                  a correlated conjunct owns no single relation.
+    //   pruningHintForPreservedSide -> -1 is not in preserved_slots, so the hint
+    //                                  is withheld. Right: fail closed.
+    //   classifyJoinCondition       -> -1 <= right_slot, so no forward-reference
+    //                                  throw. Moot: validateJoinCondition
+    //                                  (site 18) refuses a subquery in ON.
+    //
+    // An UNCORRELATED subquery contributes nothing, which is also right: it is
+    // a constant with respect to this block, so `WHERE r1.x = (SELECT ...)`
+    // keeps soleSlot == 1 and still pushes onto relation 1's scan.
+    //
+    // The exact set (correlated refs' slots, level-decremented) buys pushdown
+    // for a correlated conjunct, which nothing can execute until Week 33
+    // decorrelates it; land it there. NOT reachable from the CLI this week —
+    // Validator refuses a bound subquery before any logical plan exists — but
+    // the branch ships with the node, and is unit-tested directly.
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        collectSlots(sq->operand.get(), out);   // IN's operand is THIS block's
+        if (sq->correlated) out.insert(-1);
         return;
     }
     // Literal / IntervalLiteral: no slot.
@@ -143,6 +187,15 @@ void restampSlots(Expr* expr, int slot) {
     // keeps its own relation's slot below a join whose scan schema stamps 0.
     if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
         restampSlots(agg->argument.get(), slot);
+        return;
+    }
+    // Week 30, in lockstep with collectSlots: the IN operand is this block's
+    // and is restamped; the BODY is another scope and must not be touched —
+    // rewriting its slots would renumber a different range table. Provably
+    // never reached with a CORRELATED subquery: that contributes -1 above, so
+    // soleSlot is -1 and the conjunct is never pushed.
+    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr)) {
+        restampSlots(sq->operand.get(), slot);
     }
 }
 

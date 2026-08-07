@@ -43,19 +43,44 @@ class PredicatePushdown {
 //
 // The test is `slots ⊆ preserved_slots` and NOT `slots ⊆ {0}`: in `(A ⋈ B) ⟕ C`
 // relation B is preserved too, and testing slot 0 alone withheld a hint over B
-// from a scan that is entitled to it. An EMPTY slot set withholds, deliberately:
-// collectSlots is dispatch site 8, where a missed Expr subtype yields an empty
-// set, and every other caller treats empty as the conservative answer. Reading it
-// as permissive here would let a future node type turn this guard off silently.
-// A genuinely constant predicate (`WHERE 1 = 1`) carries no ColumnRef, so
-// collectSimplePredicates can make nothing prunable of it either way.
+// from a scan that is entitled to it.
+//
+// An EMPTY slot set withholds, deliberately, and the reason is specific to THIS
+// caller rather than shared with the other two (corrected in Week 30; the claim
+// here used to be "every other caller treats empty as the conservative answer",
+// which is false and is exactly the claim that stopped anyone checking them):
+//
+//   soleSlot                -> empty gives -1, so the conjunct is not pushed.
+//                              CONSERVATIVE: right answers, lost pushdown.
+//   classifyJoinCondition   -> empty means the forward-reference loop has
+//                              nothing to iterate, so the conjunct is ACCEPTED.
+//                              PERMISSIVE — join_condition.cc says so in as
+//                              many words ("a missed subtype makes a forward
+//                              reference invisible rather than loud").
+//   here                    -> empty would read as "mentions nothing
+//                              unpreserved" and turn the guard OFF.
+//
+// So this caller must fail closed on its own account, not on a property of the
+// others. collectSlots is dispatch site 8, where a missed Expr subtype yields
+// an empty set. A genuinely constant predicate (`WHERE 1 = 1`) carries no
+// ColumnRef, so collectSimplePredicates can make nothing prunable of it either
+// way.
 const Expr* pruningHintForPreservedSide(const Expr* hint, JoinType join_type,
                                         const std::unordered_set<int>& preserved_slots);
 
-// The set of relation slots a predicate's columns reference. DISPATCH SITE 8 —
-// an unhandled Expr subtype yields an empty slot set, which costs pushdown
-// silently here and, since Week 27, makes a forward reference invisible in
-// classifyJoinCondition (the second caller). Declared rather than file-local so
-// join_condition.cc shares this one walker instead of growing an eleventh
-// silent site; keep it in lockstep with restampSlots.
+// The set of relation slots a predicate's columns reference, IN THE QUERY BLOCK
+// the predicate is written in. DISPATCH SITE 8 — an unhandled Expr subtype
+// yields an empty slot set, which costs pushdown silently at soleSlot and,
+// since Week 27, makes a forward reference invisible in classifyJoinCondition.
+// Declared rather than file-local so join_condition.cc shares this one walker
+// instead of growing an eleventh silent site; keep it in lockstep with
+// restampSlots.
+//
+// THREE callers since Week 29, not two: soleSlot, classifyJoinCondition and
+// pruningHintForPreservedSide above. They disagree about an empty set — see the
+// list at that function, and development.md's site-8 row.
+//
+// Week 30: -1 means "references something this block cannot name" — an
+// unresolved ref, or a correlated reference inside a subquery, whose slot is a
+// position in another block's range table.
 void collectSlots(const Expr* expr, std::unordered_set<int>& out);
