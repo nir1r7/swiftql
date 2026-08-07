@@ -1,15 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 33 — gate r3 GREEN. Audit r2 running (aee0d3c8966e1a6f1, 13:00 UTC, 30-min
-  budget), auditing THE FIX ROUND AS NEW CODE. Its target #1 is to hunt the same shape of bug
-  elsewhere: any code whose comments or preconditions cite a refusal/guard/invariant that
-  week 33 removed. That pattern has now caused a SILENT WRONG ANSWER TWICE in this project.
-  STILL OPEN, to do after the audit lands (one combined cleanup round, then a closing gate):
-  M-4 tautological containment assertion in both lowerings; M-5 site-12 comment cites the
-  deleted refusal + refuseUnloweredCorrelated missing on SELECT list and ORDER BY; M-7 false
-  predicate_pushdown.cc rationale; L-8 refusal names the wrong cause; and appending the fix
-  round's items 4-7 to docs/week-33-plan.md's ## Progress.
-  Then: week 33 closes with a partial checkpoint (EXISTS/NOT EXISTS met; correlated scalar
-  Q17/Q22 missed and owned by week 34), and week 34 begins.
+Current: week 33 — SECOND CRITICAL FIX ROUND (agent a18b428befd1e3c84, launched ~13:09 UTC).
+  !! R2-C1 is the THIRD silent wrong answer this week from ONE ROOT SHAPE: code trusting a
+  refusal that no longer exists. subquery_lowering.h:29 still cites the Week-33-deleted
+  Validator refusal, and lowerInSubqueries (logical_plan.cc:814) consumes a correlated IN
+  BEFORE refuseUnloweredCorrelated (:827) can see it. Reproduced on HEAD:
+    d.driver_id IN (SELECT l.lap_id FROM laps l WHERE l.team = d.team) -> 20 rows, SQLite 6
+    the NOT IN form -> 0 rows, SQLite 14
+  TWO of the three instances were in files whose HEADER COMMENTS cited the deleted refusal.
+  A stale precondition is not a docs problem in this codebase — it is how three wrong answers
+  shipped. The fix round is now sweeping the whole subquery/lowering/materialization
+  neighbourhood for the class, and must report "checked, still true" cases too.
+  Also owed: M-4 tautological containment assertions; M-5 site-12 comment +
+  refuseUnloweredCorrelated missing on SELECT list/ORDER BY; M-7 false predicate_pushdown
+  rationale; L-8 wrong cause named; append fix-round items 4-7 to the plan's ## Progress;
+  and two things audit r2 did not reach (is the ON-clause refusal narrower than necessary;
+  does body.order_by survive the select-list replacement).
+  THEN: closing gate, then week 33 closes with its partial checkpoint.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
