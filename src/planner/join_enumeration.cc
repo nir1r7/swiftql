@@ -65,6 +65,37 @@ bool containsOuterJoin(const LogicalPlanNode* node) {
     return false;
 }
 
+// Week 30. Every slot this pass will use, checked against the range table
+// BEFORE decompose() moves any subtree out — a decline discovered afterwards
+// would have nothing clean to return, which is the same reason containsOuterJoin
+// runs where it does.
+//
+// Two ways in. An UNBOUND key (from_slot -1, join_condition.h's
+// positional-routing path for callers that skip the Binder) can never satisfy
+// keysBetween's placed-set test, so the key would vanish from the rebuilt tree:
+// a missing conjunct and therefore MORE rows if the join had a second key, or a
+// spurious "produced a cross product" throw if it did not. And, from Week 31/34
+// on, a SCAN THAT IS NOT A RANGE-TABLE ENTRY of the query being planned, because
+// it belongs to a subquery — at which point `slot >= countRelations()` stops
+// meaning "unbound key" and starts firing on legitimate plans.
+//
+// DECLINE, do not throw. Volcano and the written-order vectorized path never
+// consult from_slot for placement, so a throw here is the one place the
+// optimized path can fail on input `--no-optimize` accepts, and that
+// equivalence is the differential oracle compare_against_sqlite.py's fourth mode
+// exists to be. Same shape as containsOuterJoin's decline, and silent like the
+// <3-relation and >32-relation ones: no ordering decision was available to
+// report, so an `order=` line would claim a search that never ran.
+bool hasSlotOutsideRangeTable(const LogicalPlanNode* node, int n) {
+    if (node->type != LogicalNodeType::JOIN) return false;
+    const auto* join = static_cast<const LogicalJoin*>(node);
+    if (join->join_slot < 1 || join->join_slot >= n) return true;
+    for (const JoinKey& k : join->keys) {
+        if (k.from_slot < 0 || k.from_slot >= n) return true;
+    }
+    return hasSlotOutsideRangeTable(join->children[0].get(), n);
+}
+
 // Per-relation row width, the same rule VectorizedPlanBuilder's rowWidth uses on
 // a single-relation input: real per-column avg_width, 8 bytes per column where
 // statistics are absent.
@@ -358,6 +389,8 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
             "join-ordering=skipped (outer join)";
         return node;
     }
+    // Week 30 — also BEFORE decompose(), and silent. See the function.
+    if (hasSlotOutsideRangeTable(node.get(), n)) return node;
 
     std::vector<std::unique_ptr<LogicalPlanNode>> leaves(n);
     std::vector<Edge> edges;
@@ -386,15 +419,12 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
 
     std::vector<uint32_t> adj(n, 0u);
     for (const Edge& e : edges) {
-        // An endpoint outside the range table can only be an unbound key
-        // (from_slot -1, join_condition.h's positional-routing path for callers
-        // that skip the Binder). Skipping it here while leaving it in `edges`
-        // would drop the key from the rebuilt tree entirely — a missing conjunct
-        // and therefore MORE rows if the join had another key, or a spurious
-        // "produced a cross product" throw if it did not, on a query that runs
-        // fine under --no-optimize. Unreachable from the CLI (Binder stamps every
-        // ref and Validator rejects any it leaves unresolved), so this is the
-        // shape of a planner bug: say so, like every other check in this file.
+        // DEAD since Week 30: hasSlotOutsideRangeTable declines the whole tree
+        // before decompose() runs, which is the only point at which returning
+        // it untouched is still possible. Kept as the invariant it always was —
+        // an endpoint outside the range table means the rebuilt tree would drop
+        // a key, and a dropped key is MORE rows, not an error — so that
+        // reordering these two passes fails loudly instead of silently.
         if (e.slot_a < 0 || e.slot_a >= n || e.slot_b < 0 || e.slot_b >= n) {
             throw std::runtime_error(
                 "internal: join enumeration cannot reorder a tree with an unbound "

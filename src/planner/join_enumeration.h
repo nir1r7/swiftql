@@ -61,6 +61,14 @@
 // Above 32 relations the pass declines entirely (uint32_t subset masks) and
 // --explain shows no order= line, because there is no decision to show. No TPC-H
 // query comes close — Q9 and Q21 top out at 6 relations.
+//
+// It also declines, silently, any tree carrying a relation slot outside the
+// range table (hasSlotOutsideRangeTable, Week 30): an unbound key (from_slot -1)
+// or — from Week 31/34 on — a scan belonging to a subquery rather than to this
+// query's range table. This USED to throw, which made it the one place the
+// optimized path could fail on input `--no-optimize` accepts; declining keeps
+// optimized ≡ --no-optimize, which is what makes the fourth harness mode a
+// differential oracle rather than a duplicate run.
 
 // No-op below three relations: with one join there is no ordering decision.
 // Which side builds is Week 22's decision, made at lowering from the same
