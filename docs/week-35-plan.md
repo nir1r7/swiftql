@@ -33,12 +33,12 @@ written-down capability boundaries into an unqualified pass.
 | 4 — parameterized queries / runner | **done** — `tpch_queries.py` (22 templates + validation params), `run_tpch.py` |
 | 5 — reference comparison | **done** — `--format tsv`, catalog-driven `load_from_catalog`, `rows_equal(rel_tol=)` |
 | 6 — mode-coverage report | **done** — 22x4 cell matrix, computed census, Q22 plan fingerprint |
-| 7 — randomized result differencing | not started |
+| 7 — randomized result differencing | **done** — `python_tools/random_diff.py`, 40 shapes both legs in 61 s |
 | 8 — behavioural rejection sweep | not started |
 
-**Next concrete step:** Task 7 — `python_tools/random_diff.py` against
-`data/f1/sf-small/catalog.json`, both legs (optimized vs `--no-optimize`, and vs
-SQLite), with the two named traps built in.
+**Next concrete step:** Task 8 — the behavioural rejection sweep in
+`compare_against_sqlite.py` (structural, disjointness, behavioural), then the
+standing-rule sweep list at the end of this document.
 
 ### Measured this week
 
@@ -61,6 +61,29 @@ TPC-H at SF=0.01, synthetic data (see `data/tpch/sf0.01/PROVENANCE.txt`):
   34's hand-forward mechanically.
 - Peak child RSS at SF=0.01: ~65 MB (row/Volcano), ~83 MB (columnar/vectorized).
   `lineitem` columnar: 24.8 MB raw -> 10.7 MB encoded (ratio 0.43).
+- **Randomized result differencing (Week 28's deferred gap): 40 generated
+  3-8 relation shapes, both legs, in 61 s** against `data/f1/sf-small` — 40/40
+  result-preserving (optimized ≡ `--no-optimize`) and 40/40 matching SQLite.
+  Week 28's note predicted "a 40-query randomized differential [could] run in
+  under a minute"; 61 s is that prediction, met.
+
+### A third form of trap 1, found rather than anticipated
+
+Week 28 named two traps (sort before diffing; `normalize()`'s name-keying). A
+third has the same shape and the generator's first run walked straight into it:
+**`LIMIT n` with no `ORDER BY` selects an unspecified `n` rows**, so a reordered
+join legitimately returns a *different subset of the same answer*. The first
+batch reported four `OPTIMIZER CHANGED THE RESULT` failures, every one of them
+`500 rows vs 500` — same count, different rows, both correct. A `LIMIT` is only
+comparable under a **total** order; the generator now emits neither, and bounds
+result size by cardinality instead.
+
+Cardinality is the real budget, and the `--no-optimize` leg spends it: that leg
+runs the filter *above* the joins, so it materializes the unfiltered product —
+which is exactly the 35.6 s Week 28 measured. Measured here: at three `laps`
+relations a batch runs 12.7 s per query; at two it is well under a second, and
+every further relation is `drivers` (unique `driver_id`, so a 1:1 lookup that
+adds a join for the enumerator to reorder without multiplying rows).
 
 ### Defect found and fixed
 
