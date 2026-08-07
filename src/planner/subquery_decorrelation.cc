@@ -232,8 +232,11 @@ bool constantOnly(const Expr* e) {
 //
 // NOT A DISPATCH SITE. It walks only BinaryExpr and UnaryExpr and refuses every
 // other node type, so a new expression node owes it nothing -- see
-// development.md's 17-site checklist, which this deliberately does not join. If
-// it is ever widened to more node types, it DOES join that list.
+// development.md's "Extending the expression language" checklist -- NINETEEN
+// sites, ten of them silent -- which this deliberately does not join. If it is
+// ever widened to more node types, it DOES join that list. (Named rather than
+// numbered on purpose: an earlier form of this comment said "17-site" and was
+// already two behind the table it points at.)
 std::unique_ptr<Expr>* constantWrapperAggregateSlot(std::unique_ptr<Expr>& item) {
     if (dynamic_cast<AggregateExpr*>(item.get())) return &item;
 

@@ -1300,7 +1300,7 @@ Success criteria for the week, in the form the gate reports them:
 | Item | State | Note |
 |---|---|---|
 | F1 — `docs/tpch-sf0.01-report.json` stale at 19/22 | **DONE** | regenerated from a full 22×4 run; `summary` now byte-equal to `docs/tpch-baseline.json`; `--write-baseline` now **refuses without `--json`** so the pair cannot drift again |
-| Full refusal sweep (all 11 cited sites) | in progress | table below |
+| Full refusal sweep — every cited site walked | **DONE** | 15 sites, not 11: 13 already correct, 2 stale (both counts, both fixed). Table below |
 
 **F1 — regenerated, and the flag coupling closed.** The run
 (`--json docs/tpch-sf0.01-report.json --baseline docs/tpch-baseline.json`)
@@ -1328,6 +1328,59 @@ Verdict figure, unchanged and now published in both artifacts:
 vectorized-only; 1 vacuous; 1 unported)` — matches SQLite over the same `.tbl`
 files; not a TPC-H result (`PROVENANCE.txt`).
 
+### The refusal sweep, walked in full
+
+The round-1 audit could only spot-check this: it walked the sites F1 and Q17
+happened to touch. Every cited site is now walked. **The count itself was the
+first correction — the brief said eleven, the two tables above cite fifteen**
+(8 changed + 7 checked), which is what README's "eight rewritten, seven checked"
+also says. All fifteen below, correct ones included, because a sweep that lists
+only hits is not evidence it was thorough.
+
+Behavioural rows were **run against the committed `build/swiftql`** on the F1
+catalog, not read. No build was performed; the gate owns the build directory.
+
+| # | Site | Verdict | Evidence |
+|---|---|---|---|
+| 1 | `subquery_decorrelation.cc` — the load-bearing refusal | **already correct** | comment reads "narrowed but not removed"; the message it emits ends "…optionally wrapped in constant arithmetic … a non-constant wrapper cannot be lifted out of the body". All 6 `WEEK34_CORRELATED_SCALAR_REFUSED` needles hit on the vec path |
+| 1b | same file, the `constantWrapperAggregateSlot` header | **STALE → fixed** | it pointed at "development.md's **17**-site checklist". That checklist opens "**Nineteen** functions dispatch on `Expr` subtype" and its table runs 1–19. Introduced by `ffab914` — Week 36's own commit, so Week 36's to fix. Now cites the section **by name** rather than by a number that drifts |
+| 2 | `subquery_decorrelation.h` — the Week 36 block | **already correct** | states the wrapper rule, why lifting beats pushing (the COUNT rule), and that point 2's refusal *narrowed*; names all three surviving refusals |
+| 3 | `README.md` Feature Scope (subqueries bullet) | **already correct** | claims the two forms produce the same plan. Re-verified: `--explain` for `0.5 * (SELECT AVG…)` and `(SELECT 0.5 * AVG…)` is **byte-identical** (`diff` empty) |
+| 4 | `README.md` dialect refusal table | **already correct** | quotes two messages; both appear verbatim in `subquery_decorrelation.cc` and both are pinned. The row was rewritten to the new boundary, not deleted |
+| 5 | `README.md` Week 34 section | **already correct** | the ⚠️ Week 35 correction closes "✅ **Closed in Week 36**"; the stale present-tense "`lowerCorrelatedScalars` refuses" now sits inside that superseded narrative and is resolved two sentences later |
+| 6 | `README.md` Limitations (correlated bullet) | **already correct** | same claim as #3, with the COUNT reason; same plan-equality evidence |
+| 7 | `python_tools/tpch_queries.py` | **already correct** | docstring says the worklist WAS Week 36's and the template is unchanged. Verified: `git diff 374b958..HEAD` on this file touches **only** comments and the docstring — no SQL text moved |
+| 8 | `python_tools/compare_against_sqlite.py` | **STALE (count) → fixed** | the sweep row claimed "7 new diffed entries"; `ffab914` adds **6**. The 3 new refusals are right. All 6 new diffed entries answer on the vec path; all 3 residual pins hit |
+| 9 | `logical_plan.cc:1021` call site | **already correct** | its comment is about pass order and `range_table_size = joins.size() + 1`; the wrapper changes neither |
+| 10 | `subquery_decorrelation.h` points 1 and 3 | **already correct** | point 1 (LEFT join + COUNT exception) unchanged and now *depended on* by the lift; point 3 (`forEachSubquery`, not a whole conjunct) unchanged |
+| 11 | `requireDecorrelatableBody` (the EXISTS guard) + header | **already correct** | still not shared, not widened; the `!!` block spelling out why it must not be flag-widened is intact |
+| 12 | `development.md` relation-slot table | **already correct** | the `derivedRelationSchema` row describes the derived (right) child's schema. The lift moves the wrapper *out*, so the body still selects the bare aggregate and that schema is unchanged |
+| 13 | `tests/test_subquery.cc:460` | **already correct** | its message is about the scalar node *surviving materialization*, not about select-list shape |
+| 14 | `WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED` | **already correct** | a comprehension over the vec-only list, so the 6 new entries generated 6 new Volcano entries automatically. Re-ran all six: each errors with `correlated subqueries are decorrelated to a semi-join…`, i.e. `VOLCANO_CORRELATED`, not `VOLCANO_IN`. Structurally too — 29 entries, exactly 3 contain `" IN ("`, and none of them are new |
+| 15 | `WEEK34_CORRELATED_SCALAR_REFUSED[0]` (non-aggregate body) | **already correct** | `(SELECT l2.speed …)` has no aggregate, still refuses, and its needle `single aggregate` still matches the *narrowed* message — the pin did not go slack when the rule moved |
+
+Plus the site the sweep never cited: **`docs/tpch-sf0.01-report.json`** (F1), now
+regenerated and structurally prevented from drifting again.
+
+**Score: 13 of 15 already correct; 2 stale, both of them counts** — "17-site"
+and "7 new entries". Neither was a lifted restriction described as still in
+force, which is the Week 33 failure mode this sweep exists to catch: no site
+anywhere states the old `found[0] == select_list[0]` rule in the present tense.
+An independent grep for `must be the aggregate` / `IS the aggregate` /
+`found[0]` / `select_list[0]` / `select-list item` across `src/`, `tests/`,
+`python_tools/`, `README.md` and `development.md` returns only past-tense
+narrative ("Week 34 enforced …", "Week 34 required …") and unrelated test code.
+
+**The pattern in what did go stale is worth keeping.** Both misses are numbers
+copied into prose beside the thing they count, exactly like F1's 19/22 — and
+exactly like the sweep's own note that "published counts" are the category most
+likely to go stale. Two of the three were caught by counting rather than by
+reading. One pre-existing instance is left deliberately: `development.md:436`,
+`README.md:781` and `compare_against_sqlite.py:1925` each say a `BetweenExpr`
+node "would cost 17 dispatch sites", from `a2fc0c2` — the same drift, but not
+Week 36's and not this sweep's subject. Recorded here rather than silently
+fixed.
+
 ### Task 2 sweep report — checked, not only hit
 
 A sweep that lists only its hits is not evidence it was thorough, so both columns
@@ -1344,7 +1397,7 @@ are recorded.
 | `README.md` Week 34 section | the "Corrected in Week 35" paragraph now closes with ✅ Week 36 |
 | `README.md` Limitations (correlated bullet) | same rewrite as Feature Scope, with the COUNT reason |
 | `python_tools/tpch_queries.py` | module docstring ("the list of them IS Week 36's worklist" → WAS, worked, and **the template was not altered**) and q17's own comment |
-| `python_tools/compare_against_sqlite.py` | 7 new diffed entries in `WEEK34_CORRELATED_SCALAR_VEC_ONLY`; 3 new pinned refusals in `WEEK34_CORRELATED_SCALAR_REFUSED`, with the header rewritten to say the rule narrowed |
+| `python_tools/compare_against_sqlite.py` | **6** new diffed entries in `WEEK34_CORRELATED_SCALAR_VEC_ONLY` (this row said 7 until the closing round counted them: `git show ffab914` adds six); 3 new pinned refusals in `WEEK34_CORRELATED_SCALAR_REFUSED`, with the header rewritten to say the rule narrowed |
 
 **Checked and still true (no edit needed) — recorded so the sweep is auditable:**
 
