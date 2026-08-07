@@ -689,12 +689,18 @@ Row* HashJoinNode::next() {
 
     while (true){
         if (current_probe_row_ != nullptr){
+            // One t0 for the whole branch. The lookup is real work on every call
+            // and was outside the timer since Week 11, and Week 29 then added a
+            // second exit (the null-extended row) with its own t0 while the
+            // matched-bucket-drained exit had none — so EXPLAIN ANALYZE's self
+            // time for this node was biased low in proportion to how often a probe
+            // row matched. Row counts were never affected; this is the timer only.
+            auto t0 = std::chrono::high_resolution_clock::now();
+
             // check if there are more matches in the current probe row's bucket
             auto it = hash_table_.find(probe_key_);
 
             if (it != hash_table_.end() && bucket_idx_ < static_cast<int>(it->second.size())){
-                auto t0 = std::chrono::high_resolution_clock::now();
-
                 const Row& build_row = it->second[bucket_idx_++];
 
                 current_row_.clear();
@@ -722,7 +728,6 @@ Row* HashJoinNode::next() {
                 // Bucket exhausted. Assemble the null-extended row BEFORE clearing
                 // current_probe_row_ — it is the source of the preserved half.
                 if (left_outer_ && !probe_matched_) {
-                    auto t0 = std::chrono::high_resolution_clock::now();
                     nullExtend(*current_probe_row_);
                     current_probe_row_ = nullptr;
                     stats.rows_out++;
@@ -730,6 +735,7 @@ Row* HashJoinNode::next() {
                     return &current_row_;
                 }
                 current_probe_row_ = nullptr;
+                stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             }
         } else {
             // fetch next probe row
