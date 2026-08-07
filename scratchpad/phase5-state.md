@@ -1,16 +1,11 @@
 # Phase 5 orchestrator state
-Current: week 31, round 2 — audit came back CLEAN (0/0/0/0, all 5 targets, first fully clean
-  audit of the run). Waiting on the round-2 gate to close the week.
-  r1's 4 findings all actioned. Both mediums kept as DOCUMENTED divergences from SQLite
-  (multi-row scalar errors where SQLite takes the first row; IN caps at 1024 — Week 32's to
-  remove), pinned by WEEK31_MATERIALIZATION_REFUSED in all four modes.
-  STRUCTURAL INSIGHT worth carrying: the diffed oracle suite CANNOT HOLD A QUERY THAT ERRORS,
-  so any refusal diverging from SQLite is invisible to it. Refusals need their own suite.
+Current: week 32, round 1, step 1 (teach) — launched ~08:06 UTC.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
-Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅
-Last gate: GREEN (week 31 round 1) — unit 747/747, sqlite 932, regression 318 all modes
-Week 31 implementation is PUSHED (d99533a). Do not re-run it. It still needs gate + audit.
+Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
+Last gate: GREEN (week 31 round 2, closing) — unit 748/748, sqlite 940, regression 318 all modes
+Week 31 verdict: checkpoint met. 2 gates / 2 audits; round 2 audit was CLEAN (0/0/0/0).
+
 
 ## !! Container reclaim — read this first after any reboot
 The container is reclaimed ON THE HOUR, EVERY HOUR (05:31, 06:31, 07:31 UTC observed) and comes
@@ -33,11 +28,12 @@ a reclaim when possible.
   block so they still run concurrently. A blocked turn keeps the container alive. Reserve
   background for work you can afford to lose.
 
-## Week 31 as pushed (needs verification)
+## Week 31 as shipped
 Uncorrelated + scalar subqueries by materialize-then-substitute; refusal NARROWED to correlated
-subqueries only, not lifted; both Week 30 tripwires stay armed (ChunkPruner declines
-query_level>0, buildAggregateSchema throws); week 31 lowers NO correlated ref, so the ColumnId
-prerequisite did not trigger.
+subqueries only; both Week 30 tripwires stay armed. Two divergences from SQLite are DOCUMENTED,
+not fixed: multi-row scalar errors (SQLite takes the first row) and IN caps at 1024 distinct
+values — WEEK 32 OWNS REMOVING THE CAP. Structural insight: the diffed oracle suite cannot hold
+a query that errors, so refusals need their own rejection suite.
 
 ## Deferred
 - `ColumnId {level, slot}` — DEFERRED BY DECISION. Standalone change in whichever of Weeks 32/34
