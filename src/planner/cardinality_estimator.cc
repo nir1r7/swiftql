@@ -345,20 +345,6 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             double rows = flooredJoinCardinality(
                 l_rows, r_rows,
                 joinCardinality(l_rows, r_rows, join.keys, left, right));
-            // Week 29: a LEFT join emits every preserved-side row at least once,
-            // so its output is |R ⋈ S| + |unmatched R|. There is no statistic for
-            // the second term; max() is the standard containment. Applied HERE, at
-            // the stamp, and deliberately NOT inside joinCardinality: max() is not
-            // multiplicative, so a subset's row count would depend on the path that
-            // reached it and the DP's optimal substructure would be gone — the same
-            // reason the ≥1-row floor moved out in Week 28. (JoinEnumeration
-            // declines outer-join trees entirely, so the search never meets this
-            // rule; both facts have to stay true.) The ON residual's selectivity is
-            // ignored: it can only remove MATCHES, and the output is floored at
-            // l_rows regardless.
-            if (join.join_type == JoinType::LEFT) rows = std::max(rows, l_rows);
-            node.estimated_rows = rows;
-
             // merge contexts [left ++ added relation], restamping each block to
             // the slot the MERGED SCHEMA gives it — must stay in lockstep with
             // the merged-schema construction in LogicalPlanBuilder::build and in
@@ -378,6 +364,36 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 e.relation_slot = join.join_slot;
                 out.entries.push_back(std::move(e));
             }
+
+            // Week 29: a LEFT join emits every preserved-side row at least once,
+            // so its output is |R ⋈ S| + |unmatched R|. There is no statistic for
+            // the second term; max() is the standard containment.
+            //
+            // The ON residual narrows the MATCH term and nothing else, so it is
+            // applied INSIDE the max rather than ignored. Ignoring it is unsafe in
+            // exactly the direction the floor exposes: a highly selective residual
+            // drives the true answer down TO the floor, while the unadjusted
+            // estimate stays at the ceiling — measured est=10000 against
+            // rows_out=20 on `d LEFT JOIN l ON k AND l.speed > 349`, a value the
+            // max() clamp already knows as l_rows. It is not cosmetic: the parent
+            // join of a mixed query reads this number as `from_est` for its
+            // build-side and algorithm choice. Scored against the MERGED context,
+            // which is why this sits below the merge — the residual may reference
+            // either side, and the merged context is the one where both resolve.
+            //
+            // All of it stays at the STAMP and out of joinCardinality: neither
+            // max() nor a residual selectivity is multiplicative, so a subset's row
+            // count would depend on the path that reached it and the DP's optimal
+            // substructure would be gone — the same reason the ≥1-row floor moved
+            // out in Week 28. JoinEnumeration declines outer-join trees entirely,
+            // so the search never meets either; both facts have to stay true.
+            if (join.join_type == JoinType::LEFT) {
+                if (join.on_residual) {
+                    rows *= selectivity(join.on_residual.get(), out);
+                }
+                rows = std::max(rows, l_rows);
+            }
+            node.estimated_rows = rows;
             return out;
         }
 
