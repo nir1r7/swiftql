@@ -497,11 +497,20 @@ WEEK32_SEMI_JOIN_VEC_ONLY = [
 
     # --- EMPTY BUILD SIDE, both polarities ---
     #   x IN ()     is FALSE for every x       -> no rows
-    #   x NOT IN () is TRUE for every x        -> every row, NULL x included
+    #   x NOT IN () is TRUE for every x        -> every row
+    # Both probe drivers.driver_id, which is never NULL over the shipped data —
+    # so these two do NOT cover the "NULL x included" asymmetry. That needs a
+    # NULL probe key AND an empty build at once, which is the third query.
     "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
     "(SELECT driver_id FROM laps WHERE speed > 99999)",
     "SELECT COUNT(*) FROM drivers WHERE driver_id NOT IN "
     "(SELECT driver_id FROM laps WHERE speed > 99999)",
+    # `NULL NOT IN ()` is TRUE — the one asymmetry in the whole NULL table, and
+    # the branch VecHashJoinNode reaches by testing build_keys_.empty() INSIDE
+    # the failed-key path. Held only by a unit test until now.
+    "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
+    "ON d.driver_id = l.driver_id AND l.speed > 99999 "
+    "WHERE l.driver_id NOT IN (SELECT driver_id FROM laps WHERE speed > 99999)",
 
     # --- THREE-VALUED IN: a NULL on the BUILD side ---
     # The sharpest correctness item in the week, and the one the shipped CSVs
@@ -521,8 +530,10 @@ WEEK32_SEMI_JOIN_VEC_ONLY = [
 
     # --- a NULL on the PROBE side ---
     # `NULL IN S` and `NULL NOT IN S` are both UNKNOWN for a non-empty S, and a
-    # WHERE keeps neither — but `NULL NOT IN ()` is TRUE, which is the case the
-    # empty-build branch is tested separately for.
+    # WHERE keeps neither. The ANTI leg is the discriminating one — a naive
+    # "no match, so emit" gives every row instead of none. The SEMI leg answers
+    # 0 whichever way a plausible implementation gets there, so it is a
+    # consistency check rather than a trap; kept as the pair's other half.
     "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
     "AND l.speed > 99999 WHERE l.driver_id IN (SELECT driver_id FROM laps)",
     "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "

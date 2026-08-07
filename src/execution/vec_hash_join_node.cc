@@ -81,7 +81,7 @@ void VecHashJoinNode::open() {
 
     hash_table_.clear();
     build_keys_.clear();
-    build_had_null_key_ = false;
+    build_had_unmatchable_key_ = false;
     output_buffer_.clear();
     output_cursor_ = 0;
 
@@ -103,10 +103,19 @@ void VecHashJoinNode::open() {
             // serialize the key tuple with the same '\x01' sentinel Volcano's
             // HashJoinNode uses; a NULL member makes the row unmatchable
             if (!serializeKey(*chunk, build_key_idx_, r, key_buf_)) {
-                // Week 32: for ANTI this is not merely "unmatchable" — it is the
-                // NULL that makes `x NOT IN S` never TRUE. Record it; the probe
-                // loop short-circuits on it.
-                build_had_null_key_ = true;
+                // Week 32: for ANTI, a NULL here is what makes `x NOT IN S`
+                // never TRUE, so record it and short-circuit the probe.
+                //
+                // The flag is named for what it actually holds: serializeKey
+                // fails on any UNMATCHABLE key, and isUnmatchableKey
+                // (key_encoding.h) counts NaN as well as NULL. The ANTI collapse
+                // is only justified for the NULL half — a NaN in S is a value
+                // that simply never compares equal, so `3.0 NOT IN {1.0, NaN}`
+                // is relationally TRUE while this branch drops it. Deliberately
+                // not special-cased: key_encoding.h records that SQLite converts
+                // NaN to NULL on storage, so the oracle agrees with this
+                // engine's answer and there is no reachable divergence to fix.
+                build_had_unmatchable_key_ = true;
                 continue;
             }
 
@@ -206,7 +215,7 @@ DataChunk* VecHashJoinNode::nextChunk() {
         // substitution site: UNKNOWN and FALSE are indistinguishable to every
         // consumer reachable from a WHERE, and nothing this week adds a general
         // NOT. See docs/week-32-plan.md 8.
-        if (semantics_ == JoinSemantics::ANTI && build_had_null_key_) {
+        if (semantics_ == JoinSemantics::ANTI && build_had_unmatchable_key_) {
             stats.rows_in += static_cast<int>(indices_ptr->size());
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             continue;   // pull the next probe chunk; this one contributes nothing
@@ -227,7 +236,7 @@ DataChunk* VecHashJoinNode::nextChunk() {
                 // tested on build_keys_ rather than folded in here.
                 if (!serializeKey(*probe_chunk, probe_key_idx_, r, key_buf_)) {
                     if (semantics_ == JoinSemantics::ANTI && build_keys_.empty()
-                        && !build_had_null_key_) {
+                        && !build_had_unmatchable_key_) {
                         Row out_row;
                         out_row.reserve(output_schema_.size());
                         for (const auto& cv : probe_chunk->columns) out_row.push_back(valueAt(cv, r));

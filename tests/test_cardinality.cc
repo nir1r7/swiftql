@@ -655,8 +655,15 @@ TEST(Cardinality, SemiJoinIsALeftSideSelectivityFromTheNdvRatio) {
 }
 
 // Semi + anti = the left side exactly. The two are complements by construction
-// (R ▷ S is R − (R ⋉ S)), so any drift between them is a rule that stopped
-// being a partition of the left input.
+// (R ▷ S is R − (R ⋉ S)).
+//
+// Be honest about which line carries this test: the SUM is a tautology of the
+// code under test — cardinality_estimator.cc computes anti as `l_rows - semi`
+// from that same semi, and the clamp below it is a no-op while frac is in
+// [0,1], which std::min(1.0, ...) guarantees. It cannot fail unless the
+// subtraction itself is rewritten, which is the only thing it is here to pin.
+// EXPECT_DOUBLE_EQ(anti, 600.0) is the assertion with real content: it is the
+// arithmetic (1000 - 1000*10/50), and it fails if the rule drifts.
 TEST(Cardinality, SemiAndAntiEstimatesPartitionTheLeftSide) {
     Catalog cat(CATALOG);
     seedLapsStats(cat, /*driver_id_ndv=*/50);

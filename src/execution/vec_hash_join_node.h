@@ -94,7 +94,12 @@ private:
     // the build side held a NULL must be CARRIED OUT of the build phase as a
     // flag and short-circuit the whole ANTI probe. Without it, NOT IN over a
     // nullable column returns rows SQLite does not. See docs/week-32-plan.md 8.
-    bool build_had_null_key_ = false;
+    //
+    // Named UNMATCHABLE, not NULL: it is set wherever serializeKey fails, and
+    // isUnmatchableKey (key_encoding.h) counts NaN too. The over-collapse that
+    // gives is unreachable through the oracle — SQLite stores NaN as NULL — and
+    // the reasoning is at the set site.
+    bool build_had_unmatchable_key_ = false;
     // width of the NULL block, read off build_child_'s schema in open()
     int build_width_ = 0;
 

@@ -499,6 +499,13 @@ TEST(SemiJoinLowering, OutputSchemaIsTheLeftChildsAndTheSlotIsMinusOne) {
     // -1 means "children[1] is not a relation of this block's range table".
     EXPECT_EQ(j->join_slot, -1);
 
+    // The per-column loop below is a RESTATEMENT, not the enforcement: the same
+    // comparison (plus `type`) is asserted inside lowerInSubqueries at
+    // construction, so any divergence throws out of planLowered above and this
+    // test reports an uncaught std::runtime_error rather than a schema diff. It
+    // is kept because it documents the invariant at the layer that reads it; the
+    // assertions here that can actually fail are join_slot, join_type and the
+    // no-body-slot check at the end.
     const auto& out = j->output_schema.columns();
     const auto& left = j->children[0]->output_schema.columns();
     ASSERT_EQ(out.size(), left.size());
@@ -517,7 +524,14 @@ TEST(SemiJoinLowering, NotInBecomesAnAntiJoin) {
     const LogicalJoin* j = findJoin(plan.get());
     ASSERT_NE(j, nullptr);
     EXPECT_EQ(j->semantics, JoinSemantics::ANTI);
-    EXPECT_NE(plan->explain().find(""), std::string::npos);
+    // This line was `EXPECT_NE(plan->explain().find(""), npos)` — find("")
+    // returns 0 for every string, so it read as a check and could not fail. The
+    // whole-plan needle it implies does not exist either: LogicalPlanNode's
+    // explain() prints ONE node, and the CLI is what walks the tree. What is
+    // actually worth pinning here is that the negated conjunct produced exactly
+    // one join and left nothing else behind; the node's name is
+    // ExplainNamesTheKind's.
+    EXPECT_EQ(countJoins(plan.get()), 1);
 }
 
 // The node NAME carries the kind, so every pre-existing plan string stays
