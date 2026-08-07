@@ -34,11 +34,16 @@ written-down capability boundaries into an unqualified pass.
 | 5 — reference comparison | **done** — `--format tsv`, catalog-driven `load_from_catalog`, `rows_equal(rel_tol=)` |
 | 6 — mode-coverage report | **done** — 22x4 cell matrix, computed census, Q22 plan fingerprint |
 | 7 — randomized result differencing | **done** — `python_tools/random_diff.py`, 40 shapes both legs in 61 s |
-| 8 — behavioural rejection sweep | not started |
+| 8 — behavioural rejection sweep | **done** — 17 suites / 157 entries executed, plus a computed mode census |
 
-**Next concrete step:** Task 8 — the behavioural rejection sweep in
-`compare_against_sqlite.py` (structural, disjointness, behavioural), then the
-standing-rule sweep list at the end of this document.
+**All eight tasks are implemented.** The standing-rule sweep is done (README
+Limitations on NaN, commas-in-CSV and the stale 56/168 census; `normalize()`'s
+blind-spot comment; `CSVLoader`'s header comment; the README Week 35 section).
+
+**Owed and carried forward, explicitly:** per-guard mutation coverage for the
+other 25 guards, and per-entry query-shape re-derivation. Both re-declined with
+reasons in the README rather than dropped — see the Week 35 section's closing
+note.
 
 ### Measured this week
 
@@ -101,9 +106,23 @@ standing rule's shape:
    `needsSubqueryMaterialization`, asks the whole-tree question without
    disturbing the flag.
 
-Five diffed regression queries in `WEEK35_SUBQUERY_IN_DERIVED_BODY` (both `FROM`
-and `JOIN` positions, scalar and `EXISTS` bodies, and two derived relations where
-only the second holds a subquery), plus their Volcano refusals.
+Five diffed regression queries in `WEEK35_SUBQUERY_IN_DERIVED_BODY_VEC_ONLY`
+(both `FROM` and `JOIN` positions, scalar and `EXISTS` bodies, and two derived
+relations where only the second holds a subquery), plus their Volcano refusals.
+
+### The sweep found its own blind spot
+
+Matching `_REJECTED` / `_REFUSED` as a **suffix** silently skipped
+`WEEK26_REJECTED_QUERIES` and `WEEK30_REJECTED_QUERIES`, whose names end in
+`_QUERIES`. It was found by deliberately injecting a stale expectation into one
+of them and watching the sweep report *clean* — the exact failure the plan's own
+"a sweep that discovers zero suites is green too" warning describes. Substring
+matching took the sweep from 14 suites to **17, 157 entries executed**.
+
+The computed census then contradicted the README's prose immediately: the stated
+figure was **56** queries diffed in two modes; the computed figure is **93**
+(the correlated-scalar suite alone grew from 8 to 23). The README now cites the
+harness instead of carrying the number.
 
 ---
 

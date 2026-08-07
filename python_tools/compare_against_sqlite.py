@@ -998,7 +998,7 @@ WEEK33_CORRELATED_BINDS = [
 #
 # Vectorized-only, like every derived-table query, and diffed rather than pinned:
 # the fix must produce the RIGHT ROWS, not merely stop throwing.
-WEEK35_SUBQUERY_IN_DERIVED_BODY = [
+WEEK35_SUBQUERY_IN_DERIVED_BODY_VEC_ONLY = [
     # the minimal repro: an uncorrelated scalar subquery in the body's WHERE
     "SELECT d.c AS c FROM (SELECT driver_id AS c FROM drivers "
     "WHERE age > (SELECT AVG(age) FROM drivers)) AS d ORDER BY c",
@@ -1026,7 +1026,7 @@ WEEK35_SUBQUERY_IN_DERIVED_BODY = [
 
 WEEK35_SUBQUERY_IN_DERIVED_BODY_VOLCANO_REJECTED = [
     (q, "not supported on the Volcano path")
-    for q in WEEK35_SUBQUERY_IN_DERIVED_BODY
+    for q in WEEK35_SUBQUERY_IN_DERIVED_BODY_VEC_ONLY
 ]
 
 WEEK34_DERIVED_TABLE_VEC_ONLY = [
@@ -1823,6 +1823,14 @@ def normalize(rows, preserve_order=False):
     # on the C++ side by JoinEnumeration.ReorderedPlansReturnTheWrittenOrdersRows,
     # which diffs raw chunk values and therefore does see column order. Read this
     # file's silence on `SELECT *` joins as absence of coverage, not as coverage.
+    #
+    # Week 35: the blind spot is UNCHANGED HERE and closed ELSEWHERE, and the two
+    # must not be confused. python_tools/random_diff.py compares raw --format tsv
+    # output POSITIONALLY, never through this dict, precisely so a column-identity
+    # or column-order regression in a generated multi-way join is visible to it.
+    # That covers the randomized differ only. Every suite in THIS file still goes
+    # through the keying above, so the sentence before this one still holds for
+    # them.
     normalized = []
     for row in rows:
         normalized.append(tuple(coerce(v) for v in row.values()))
@@ -1937,6 +1945,156 @@ def run_query_suite(conn, queries, label: str, extra_args: list = None):
             errors += 1
     print(f"{passed} passed, {failed} failed, {errors} errors")
     return passed, failed, errors
+
+
+# Week 35, Task 8 — THE BEHAVIOURAL REJECTION SWEEP.
+#
+# Week 34's lesson, recorded in its own commits: A TEXTUAL CROSS-CHECK CANNOT
+# DETECT A SUITE ENTRY WHOSE MOVE HALF-LANDED. An entry moved out of one list and
+# not into another, or whose expected message has drifted, still READS correct.
+# Two stale entries were caught that week, and the check that found them was
+# behavioural -- run every rejection entry and assert it still errors.
+#
+# Three checks, cheap, composing:
+#   1. STRUCTURAL   -- every *_REJECTED / *_REFUSED suite is a non-empty list of
+#                      (query, expected_substring) pairs with a non-empty
+#                      expectation. Catches a bare string appended to a list of
+#                      pairs.
+#   2. DISJOINTNESS -- no query text is in both a positive suite and a rejection
+#                      suite. THAT IS the half-landed-move signature: the entry
+#                      reached its new home and never left its old one, so the
+#                      same SQL is asserted both to return rows and to error.
+#                      Review will not see it; set intersection will.
+#   3. BEHAVIOURAL  -- every entry is EXECUTED and must still error with its
+#                      expected substring in at least one mode.
+#
+# Suites are discovered BY NAME over globals(), never from a curated list: a
+# curated list is one more place a half-landed move can hide.
+SWEEP_MODES = [
+    ("row-volcano", None),
+    ("col-volcano", ["--storage", "columnar"]),
+    ("col-vec", ["--execution", "vectorized", "--storage", "columnar"]),
+]
+
+# Rejection suites whose NAME does not end in _REJECTED / _REFUSED. Listed here
+# rather than renamed so the sweep does not silently skip them; each entry is
+# (name_of_query_list, name_of_expected_message).
+UNCONVENTIONALLY_NAMED_REJECTIONS = [
+    ("WEEK33_CORRELATED_BINDS", "WEEK33_CORRELATED_EXPECT"),
+]
+
+
+def _errors_with(query, expected, extra_args):
+    try:
+        run_swiftql(query, extra_args)
+        return False
+    except RuntimeError as e:
+        return expected in str(e)
+    except Exception:
+        return False
+
+
+def sweep_rejection_suites(behavioural=True):
+    """Return a list of findings; empty means the sweep is clean."""
+    # Match _REJECTED / _REFUSED ANYWHERE in the name, not as a suffix.
+    # WEEK26_REJECTED_QUERIES and WEEK30_REJECTED_QUERIES are rejection suites
+    # whose names end in _QUERIES, and a suffix test silently skipped both --
+    # found by deliberately injecting a stale expectation into one of them and
+    # watching this sweep report "clean". A sweep that discovers zero suites is
+    # green too, which is why the counts below are printed.
+    suites = {}
+    for name, obj in globals().items():
+        if ("_REJECTED" in name or "_REFUSED" in name) and isinstance(obj, list):
+            suites[name] = obj
+    for list_name, expect_name in UNCONVENTIONALLY_NAMED_REJECTIONS:
+        queries = globals().get(list_name)
+        expected = globals().get(expect_name)
+        if isinstance(queries, list) and isinstance(expected, str):
+            suites[list_name] = [(q, expected) for q in queries]
+
+    findings = []
+
+    # (1) structural
+    for name, suite in sorted(suites.items()):
+        if not suite:
+            findings.append(f"{name}: EMPTY suite")
+        for entry in suite:
+            if not (isinstance(entry, tuple) and len(entry) == 2
+                    and isinstance(entry[0], str) and isinstance(entry[1], str)
+                    and entry[1]):
+                findings.append(f"{name}: malformed entry {entry!r}")
+
+    # (2) disjointness, against QUERIES ONLY -- and the scope is the whole point.
+    #
+    # A _VEC_ONLY list and its _VOLCANO_REJECTED counterpart SHARE every query BY
+    # DESIGN: the counterpart is literally built from it
+    # (`[(q, "...") for q in MULTIWAY_QUERIES]`), because the same query is
+    # diffed in the two vectorized modes and asserted-refused in the two Volcano
+    # ones. Flagging that overlap would report 88 findings on a healthy tree and
+    # train the reader to ignore this check, which is worse than not having it.
+    #
+    # QUERIES is different: it runs in ALL FOUR modes. A query that is in QUERIES
+    # and in any rejection suite is therefore asserted both to return rows and to
+    # error IN THE SAME MODE -- a flat contradiction, and exactly the shape a
+    # half-landed move leaves behind.
+    #
+    # WHAT THIS DOES NOT COVER, stated rather than implied: a query moved between
+    # two VEC-ONLY suites, or between two rejection suites, is invisible here.
+    # Check (3) is what catches those, by running them.
+    for name, suite in sorted(suites.items()):
+        for q in sorted({q for q, _ in suite} & set(QUERIES)):
+            findings.append(
+                f"{name}: ALSO IN QUERIES (diffed in all four modes) -- "
+                f"a move half-landed: {q[:70]}")
+
+    # (3) behavioural
+    checked = 0
+    if behavioural:
+        for name, suite in sorted(suites.items()):
+            for query, expected in suite:
+                if not (isinstance(entry := (query, expected), tuple)
+                        and isinstance(expected, str) and expected):
+                    continue
+                checked += 1
+                if not any(_errors_with(query, expected, extra)
+                           for _, extra in SWEEP_MODES):
+                    findings.append(
+                        f"{name}: NO LONGER ERRORS with {expected!r}: {query[:70]}")
+
+    print(f"\n--- Rejection-suite sweep ---")
+    print(f"{len(suites)} suites, "
+          f"{sum(len(s) for s in suites.values())} entries"
+          + (f", {checked} executed" if behavioural else ", behavioural leg SKIPPED"))
+    for f in findings:
+        print(f"  FINDING  {f}")
+    if not findings:
+        print("  clean")
+    return findings
+
+
+def mode_census():
+    """Count what the README states in prose: how many queries are diffed in TWO
+    modes rather than four, and how many in all four.
+
+    Computed, never typed. The README's \"56 queries in two modes against 168 in
+    four\" was accurate when written and goes stale the moment a suite grows; a
+    number in a document about honesty is the worst place for one to rot.
+    """
+    vec_only = {name: len(obj) for name, obj in globals().items()
+                if name.endswith("_VEC_ONLY") and isinstance(obj, list)}
+    vec_only["MULTIWAY_QUERIES"] = len(MULTIWAY_QUERIES)
+    two_mode = sum(vec_only.values())
+    four_mode = len(QUERIES)
+    print(f"\n--- Mode census (computed) ---")
+    print(f"  diffed in all four modes           : {four_mode}")
+    print(f"  diffed in the two vectorized modes : {two_mode}")
+    for name in sorted(vec_only):
+        print(f"      {name:<44} {vec_only[name]:>4}")
+    print(f"    (Volcano refuses these: Planner::plan builds exactly one")
+    print(f"     HashJoinNode and runs no LogicalPlanBuilder, so it can hold")
+    print(f"     neither a second join nor a relation that is a plan. Both")
+    print(f"     halves are asserted, so the boundary cannot drift silently.)")
+    return four_mode, two_mode
 
 
 # main
@@ -2100,7 +2258,7 @@ def main():
     # than merely stop throwing. Same two-mode split as every derived-table query.
     for label, extra in vec_modes:
         mp, mf, me = run_query_suite(
-            conn, WEEK35_SUBQUERY_IN_DERIVED_BODY,
+            conn, WEEK35_SUBQUERY_IN_DERIVED_BODY_VEC_ONLY,
             f"Week 35 subquery inside a derived body — {label}", extra_args=extra)
         m_passed += mp
         m_failed += mf
@@ -2202,11 +2360,20 @@ def main():
         r_failed += rf
         r_errors += re_
 
+    # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
+    # suites, so a sweep finding is read alongside the run it describes.
+    findings = sweep_rejection_suites()
+    mode_census()
+
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
     total_failed = f1 + f2 + f3 + f4 + m_failed + r_failed
     total_errors = e1 + e2 + e3 + e4 + m_errors + r_errors
     print(f"\nTotal: {total_passed} passed, {total_failed} failed, {total_errors} errors")
-    if total_failed > 0 or total_errors > 0:
+    if findings:
+        # A sweep whose findings are printed but do not fail the run is a sweep
+        # nobody reads.
+        print(f"Rejection-suite sweep: {len(findings)} finding(s)")
+    if total_failed > 0 or total_errors > 0 or findings:
         sys.exit(1)
 
 if __name__ == "__main__":
