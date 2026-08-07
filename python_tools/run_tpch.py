@@ -350,7 +350,9 @@ def render_report(qids, cells, details, fingerprints, empties, catalog, provenan
     # ported query in Week 36 and record which half was which."
     fp = fingerprints.get(("q22", "col-vec"))
     print("Q22 PROVENANCE (Week 34 hand-forward: which half is which)")
-    if fp is None:
+    if "q22" not in qids:
+        print("  q22 was not in this run")
+    elif fp is None:
         print(f"  q22 does not plan in col-vec: {details.get(('q22','col-vec'))}")
     else:
         print(f"  plan fingerprint: {fp}")

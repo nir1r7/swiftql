@@ -30,8 +30,8 @@ literal values: `r_name = 'ASIA'`, `p_type like '%BRASS'`, `c_mktsegment =
 looking random strings makes every one of those predicates match nothing, both
 engines return zero rows, and the harness reports a PASS that tested nothing.
 Vacuous passes are the specific way a TPC-H harness lies, so the domains below
-are transcribed from the spec and the harness asserts non-emptiness separately
-(run_tpch.py --require-rows).
+are transcribed from the spec, and run_tpch.py names any query that still
+matched with zero rows on both sides as a VACUOUS PASS.
 
 Deterministic: --seed defaults to a fixed value and every table is generated
 from it, so two runs produce byte-identical files.
