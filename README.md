@@ -1950,6 +1950,41 @@ had **never executed**. It is reachable now.
 > difference; and `compare_against_sqlite.py`'s `normalize()` keys rows by column
 > *name*, so a generator emitting `SELECT *` over a multi-way join has to compare
 > raw sorted output instead — see the blind spot recorded at that function.
+>
+> **Starting note, from Week 34's closing cleanup — owed audit work, with what
+> was and was not done.** Week 34's round-2 audit recorded that the Week 26–32
+> rejection suites had been checked for *wiring* but not for *discriminating
+> power*. The closing round ran a sampled pass and it found a systematic
+> weakness rather than a per-entry one, now fixed: four Volcano capability guards
+> share the tail "not supported on the Volcano path", and every Volcano rejection
+> suite pinned only that tail, so 40 entries could not say which guard fired.
+>
+> What that pass **does** now establish, mechanically, over all 131 entries of
+> the twelve rejection suites: each reaches a refusal in every mode it runs in,
+> each matches the message it pins, and no needle is satisfied by any guard other
+> than its own (26 distinct guards reached). What it does **not** establish, and
+> what is therefore owed:
+>
+> - **Per-guard mutation coverage.** Exactly one guard was mutated (the Volcano
+>   `IN` one, to prove the tightened needles are a strengthening). Nothing shows
+>   that each of the other 25 guards has at least one entry that fails when *that*
+>   guard is disabled — an entry can pin the right message and still be redundant
+>   with a sibling. The cheap form is one mutant per guard.
+> - **Per-entry shape re-derivation.** Whether each entry's *query* still uniquely
+>   exercises the sub-property its comment names — e.g. whether the three
+>   `at least one equality` entries in `WEEK26_REJECTED_QUERIES` differ in any way
+>   that matters now, several weeks after the refusal was narrowed. The message
+>   check cannot see this: three entries reaching one guard look identical to it.
+>
+> Both were left because the message-level pass found a defect spanning four
+> suites and fixing it was the higher-value use of the round, not because they
+> were judged unnecessary.
+>
+> **Also unrun, stated so the week is not read as fully covered.** Week 34's
+> round-2 audit listed "anything else risky in the week" as its target 4 and
+> never worked it as its own pass — the parser/binder/validator diff was read
+> only where the three Week 34 fixes touch it. No finding is claimed there in
+> either direction.
 
 ### Week 36 — Query Coverage + Correctness
 

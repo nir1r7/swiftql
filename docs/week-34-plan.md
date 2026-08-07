@@ -2164,6 +2164,59 @@ that ignored the inner scalar entirely, so a 19-of-20 variant and the anti-join
 `NOT IN` form were added; (b) gained the scalar on the left of the comparison,
 inside a subtraction, and two correlated scalars in one predicate.
 
+### Audit round 2 — findings and disposition
+
+`scratchpad/audits/week-34-round-2.md`. Zero blockers, one medium, two lows; all
+three fixed in the closing round, plus one finding of the closing round's own.
+
+- **F1 (MEDIUM) — FIXED, and the audit's diagnosis extended.** The only
+  two-correlation-key oracle entry answered `n = 0` with one key or two, so a
+  `splitCorrelation` emitting one join key instead of two was invisible. The
+  audit named the self-satisfying comparison; there was a **second, independent**
+  reason the entry could not discriminate, which its suggested fix would not have
+  removed: `driver_id` functionally determines `team` in `laps` (20 drivers, one
+  team each), so the second key was redundant whatever the comparison did. Both
+  fixed — keys are now `driver_id AND season` (80 genuinely two-dimensional
+  groups) and a `0.99` coefficient stops the outer row bounding its own group.
+  The audit's other suggestion, `AND l2.lap_id <> l.lap_id`, is **not available**:
+  `splitCorrelation` refuses a correlated inequality by design. Discriminating
+  counts, SwiftQL == sqlite3: **both keys 623, `driver_id` alone 553, `season`
+  alone 533**. Confirmed failing pre-fix by mutating `splitCorrelation` to drop
+  every key after the first — the old entry still answers 0 and passes, the new
+  one answers 553 against SQLite's 623.
+- **F2 (LOW) — FIXED.** "two tests" → "three tests" in
+  `tests/test_vec_plan_builder.cc`.
+- **F3 (LOW) — FIXED.** `ThePreRenameNameNoLongerResolves` now asserts the
+  message. Confirmed lenient pre-fix with the audit's own named mutant: an
+  off-by-one in `derivedRelationSchema`'s arity check leaves the bare
+  `EXPECT_THROW` green with the feature entirely dead; with the message pinned it
+  fails. Both needles are asserted — the qualified and unqualified forms fail on
+  different paths with different messages, so pinning both is what shows the two
+  are separately closed.
+- **The audit's first unreached area — rejection-suite discriminating power:
+  sampled pass RUN, and it found a systematic weakness, not a per-entry one.**
+  Four Volcano capability guards in `planner.cc` end with the same tail, "not
+  supported on the Volcano path", and **every** Volcano rejection suite pinned
+  only that tail — 40 entries that could not say which guard fired. Fixed by
+  pinning the specific message per guard. Confirmed a strengthening by folding
+  the `IN` guard into the correlated one: the old needle passes all 26 affected
+  entries, the new one fails all 26. Two facts the tail had hidden, both correct
+  behaviour and neither previously visible: one `WEEK34_DERIVED_TABLE_VOLCANO_REJECTED`
+  entry joins twice and never reaches the derived-table guard, and three
+  `WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED` entries reach the `IN` guard rather
+  than the correlated one. Same defect inside one guard: the two
+  `WEEK32_LOWERING_REFUSED` entries for `IN`-under-`OR` and `IN`-in-`HAVING`
+  pinned one string both diagnostics satisfy, now split by parenthetical.
+  After this, all **131 entries across the twelve rejection suites** reach 26
+  distinct guards, each matches the message it pins in every mode it runs in, and
+  no needle is satisfied by a guard other than its own.
+- **What the sampled pass did NOT do, and Target 4, are written into the README's
+  Week 35 starting notes as owed work with the reason** — per-guard mutation
+  coverage (only one of 26 guards was mutated) and per-entry query-*shape*
+  re-derivation, which a message-level pass structurally cannot see. Target 4
+  ("anything else risky in the week") never ran as its own pass in either round;
+  it is recorded as unrun rather than as clean.
+
 ### Still open, handed to Week 35/36
 
 - **`buildScanSchema` narrowing** — still widens for a subquery query, and now
