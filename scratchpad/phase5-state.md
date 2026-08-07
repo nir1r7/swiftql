@@ -1,8 +1,6 @@
 # Phase 5 orchestrator state
-Current: week 31, round 1 — gate GREEN; audit running (launched 06:35 UTC, 40-min budget,
-  expect by ~07:15). NOTE: run_in_background:false is IGNORED by the harness — agents always
-  run in background. Best available mitigation is to launch right after a reclaim so the work
-  fits inside the ~60-min window.
+Current: week 31, round 1 — gate GREEN; audit RELAUNCHED 07:33 UTC with a 25-min budget,
+  expect by ~08:00. The first attempt died in the 07:31 reclaim having written nothing.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅
@@ -10,8 +8,14 @@ Last gate: GREEN (week 31 round 1) — unit 747/747, sqlite 932, regression 318 
 Week 31 implementation is PUSHED (d99533a). Do not re-run it. It still needs gate + audit.
 
 ## !! Container reclaim — read this first after any reboot
-The container is reclaimed roughly hourly (05:31, 06:31 UTC observed) and comes back rolled to
-a stale WEEK-28-ERA snapshot: HEAD a91c7f4, docs/ missing week 29+ plans, scratchpad wiped.
+The container is reclaimed ON THE HOUR, EVERY HOUR (05:31, 06:31, 07:31 UTC observed) and comes
+back rolled to a stale WEEK-28-ERA snapshot: HEAD a91c7f4, docs/ missing week 29+ plans,
+scratchpad wiped. Budget every agent to finish inside the current hour, and launch right after
+a reclaim when possible.
+- `run_in_background: false` is IGNORED by the harness — agents ALWAYS run in background, so a
+  blocked turn cannot be used to hold the container open. Short budgets are the only lever.
+- **Tell every long agent to write its artifact INCREMENTALLY**, not at the end. Whatever is on
+  disk when it dies is all that survives; a partial audit beats nothing.
 - **The git remote is the only durable store.** This file is force-added to git for that reason
   (`git add -f scratchpad/phase5-state.md`) despite the skill saying not to commit scratchpad —
   an uncommitted state file does not survive the exact event it exists for.
