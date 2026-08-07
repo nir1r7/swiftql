@@ -10,7 +10,20 @@ class Validator {
     public:
         static void validate(const SelectStatement& stmt, const Catalog& catalog);
     private:
-        static void validateExpr(const Expr* expr, const Schema& schema, const std::string& context, bool allow_aggregates = true);
+        // Week 30. The body of validate(), without the final "not yet
+        // executable" refusal. A NESTED query is validated through this, so a
+        // subquery inside a subquery does not fire the refusal from inside the
+        // recursion — the refusal belongs to the whole statement, once, and
+        // must be the last thing that runs.
+        static void validateQuery(const SelectStatement& stmt, const Catalog& catalog);
+        // `catalog` is needed since Week 30: a SubqueryExpr's body is a whole
+        // query and is validated against its own FROM schema.
+        // `allow_subqueries` defaults to FALSE — a new call site must opt in,
+        // the same fail-closed discipline distribute() uses with `== INNER`.
+        static void validateExpr(const Expr* expr, const Schema& schema, const std::string& context,
+                                 const Catalog& catalog,
+                                 bool allow_aggregates = true,
+                                 bool allow_subqueries = false);
         // `relations` is (ref table name, schema) for every relation in the
         // query, in range-table order — the N-relation replacement for the
         // (left, right) pair Phase 4 passed.

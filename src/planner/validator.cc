@@ -19,7 +19,18 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
     for (const auto& g : group_by) {
         if (g.expr && exprKey(g.expr.get()) == exprKey(expr)) return;
     }
+    // Week 30 — DISPATCH SITE 5. A subquery is refused in a select list by
+    // validateExpr, so this is unreachable from the outer query; it IS reachable
+    // inside a grouped subquery, via validateExpr's recursive validateQuery.
+    // Grouping is scope-local, so the body is not this query's to check.
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        checkGroupedRefs(sq->operand.get(), group_by);
+        return;
+    }
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        // Week 30. A correlated ref is supplied by an enclosing query, so it is
+        // constant within every group of THIS one and needs no GROUP BY entry.
+        if (col->query_level > 0) return;
         for (const auto& g : group_by) {
             if (g.expr) continue;
             // name match plus slot compatibility: SELECT a.grp with
@@ -93,6 +104,37 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
 } // namespace
 
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
+    validateQuery(stmt, catalog);
+
+    // Week 30 — LAST, after every semantic check, including the nested query's
+    // own (validateQuery runs those through validateExpr). A genuine query
+    // defect outranks a temporary engine limitation, which is the discipline
+    // that placed Week 26's multi-key refusal past the plan-time type checks.
+    //
+    // Unlike Week 26, both engines are equally incapable here: neither can
+    // lower a subquery, so there is no capability difference to preserve and no
+    // reason for two failure points. ONE check, four modes, one message —
+    // Planner::plan and LogicalPlanBuilder::build both call validate() first,
+    // so the two engines are equivalent BY CONSTRUCTION rather than by two
+    // copies of a guard that can drift, which is what Week 29's audit rounds
+    // were about.
+    //
+    // What this placement guarantees: every PARSE, BIND and VALIDATE error a
+    // query is entitled to fires first — a bad nested table, a bad nested
+    // column, an ungrouped reference, a wrong arity, a disallowed position.
+    // What it does not: a PLAN-TIME type check (inferExprType on the WHERE,
+    // buildProjectSchema on the select list) runs later than Validator, so for
+    // a query that is both a subquery query and ill-typed, this message wins.
+    // The wording is the same either way — dispatch site 12 emits this exact
+    // string — so the only difference is which fault the user fixes first, and
+    // the alternative is a second refusal site in each planner.
+    if (stmt.has_subquery) {
+        throw std::runtime_error(
+            "subqueries are parsed and bound but not yet executable (Week 31)");
+    }
+}
+
+void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalog){
     // FROM table must exist
     if (!catalog.hasTable(stmt.from_table)) {
         throw std::runtime_error(
@@ -103,7 +145,7 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // SELECT list columns must exist (skip for SELECT *)
     if (!stmt.select_star) {
         for (const auto& expr : stmt.select_list) {
-            validateExpr(expr.get(), schema, "SELECT");
+            validateExpr(expr.get(), schema, "SELECT", catalog);
         }
     }
 
@@ -217,7 +259,8 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
     // WHERE columns must exist; aggregates are not allowed in WHERE
     if (stmt.where) {
-        validateExpr(stmt.where.get(), schema, "WHERE", /*allow_aggregates=*/false);
+        validateExpr(stmt.where.get(), schema, "WHERE", catalog,
+                     /*allow_aggregates=*/false, /*allow_subqueries=*/true);
     }
 
     // Column ordinals (ORDER BY 1 / GROUP BY 2) are not supported. Rejecting is
@@ -257,7 +300,7 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
             if (!in_key.empty()) {
                 throw std::runtime_error("GROUP BY: aggregate functions are not allowed in GROUP BY");
             }
-            validateExpr(g.expr.get(), schema, "GROUP BY", /*allow_aggregates=*/true);
+            validateExpr(g.expr.get(), schema, "GROUP BY", catalog, /*allow_aggregates=*/true);
             continue;
         }
         if (g.relation_slot >= 0 && !g.table_name.empty()) continue; // binder verified
@@ -290,7 +333,8 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
     // HAVING columns (and aggregate arguments) must exist
     if (stmt.having) {
-        validateExpr(stmt.having.get(), schema, "HAVING", /*allow_aggregates=*/true);
+        validateExpr(stmt.having.get(), schema, "HAVING", catalog,
+                     /*allow_aggregates=*/true, /*allow_subqueries=*/true);
     }
 
     // non aggregated SELECT column references must appear in GROUP BY.
@@ -313,6 +357,13 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // Aggregate expressions (e.g. COUNT(*)) resolve against the post-aggregate
     // output schema at execution time and are not checked here.
     for (const auto& item : stmt.order_by) {
+        // Week 30. ORDER BY is not routed through validateExpr (only its
+        // ColumnRef nodes are checked), so the WHERE/HAVING-only position rule
+        // needs its own line here rather than an allow_subqueries flag.
+        if (dynamic_cast<const SubqueryExpr*>(item.expr.get())) {
+            throw std::runtime_error(
+                "ORDER BY: subqueries are supported in WHERE and HAVING only");
+        }
         if (auto* col = dynamic_cast<const ColumnRef*>(item.expr.get())) {
             if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
                 throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
@@ -335,8 +386,16 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
 
 
 // recursively validate an expression and its sub expressions
-void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::string& context, bool allow_aggregates) {
+void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::string& context,
+                             const Catalog& catalog, bool allow_aggregates, bool allow_subqueries) {
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
+        // Week 30. A ref the Binder resolved to an ENCLOSING query names a
+        // relation this scope's schema does not hold, so checking it here would
+        // be a false "column not found" on a legal correlated reference. The
+        // Binder already verified it against that scope's range table — the
+        // same reason validateJoinCondition trusts a bound ref's slot instead
+        // of re-deriving the relation from table_name.
+        if (col->query_level > 0) return;
         // skip validation for qualified refs (table.column)
         // full resolution handled when join schema is merged
         if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
@@ -344,14 +403,14 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
         }
     }
     else if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        validateExpr(bin->left.get(), schema, context, allow_aggregates);
-        validateExpr(bin->right.get(), schema, context, allow_aggregates);
+        validateExpr(bin->left.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
+        validateExpr(bin->right.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
-        validateExpr(isnull->operand.get(), schema, context, allow_aggregates);
+        validateExpr(isnull->operand.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
-        validateExpr(un->operand.get(), schema, context, allow_aggregates);
+        validateExpr(un->operand.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
         if (!allow_aggregates) {
@@ -370,26 +429,64 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
                     context + ": aggregate functions cannot be nested — '"
                     + agg->function_name + "(" + nested.front()->function_name + "(...))'");
             }
-            validateExpr(agg->argument.get(), schema, context, allow_aggregates);
+            validateExpr(agg->argument.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
         }
     }
     else if (auto* in = dynamic_cast<const InExpr*>(expr)) {
-        validateExpr(in->operand.get(), schema, context, allow_aggregates);
+        validateExpr(in->operand.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
-        validateExpr(lk->operand.get(), schema, context, allow_aggregates);
+        validateExpr(lk->operand.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
         for (const auto& w : c->when_clauses) {
-            validateExpr(w.condition.get(), schema, context, allow_aggregates);
-            validateExpr(w.result.get(), schema, context, allow_aggregates);
+            validateExpr(w.condition.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
+            validateExpr(w.result.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
         }
-        if (c->else_expr) validateExpr(c->else_expr.get(), schema, context, allow_aggregates);
+        if (c->else_expr) validateExpr(c->else_expr.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
     }
     else if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
-        validateExpr(sub->operand.get(), schema, context, allow_aggregates);
-        validateExpr(sub->start.get(), schema, context, allow_aggregates);
-        if (sub->length) validateExpr(sub->length.get(), schema, context, allow_aggregates);
+        validateExpr(sub->operand.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
+        validateExpr(sub->start.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
+        if (sub->length) validateExpr(sub->length.get(), schema, context, catalog, allow_aggregates, allow_subqueries);
+    }
+    // Week 30 — DISPATCH SITE 4.
+    else if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        if (!allow_subqueries) {
+            throw std::runtime_error(
+                context + ": subqueries are supported in WHERE and HAVING only");
+        }
+
+        // The IN operand is written in THIS query, so it is checked here,
+        // against this schema, under this clause's aggregate rule.
+        if (sq->operand) {
+            validateExpr(sq->operand.get(), schema, context, catalog,
+                         allow_aggregates, allow_subqueries);
+        }
+        if (!sq->subquery) return;
+
+        // ARITY is decidable now, from the select list alone; CARDINALITY is
+        // not — "scalar subquery returned more than one row" is Week 31's
+        // runtime check. EXISTS has no arity rule at all: TPC-H Q4 and Q21 both
+        // write `select *`, and EXISTS never reads the values.
+        if (sq->kind != SubqueryExpr::Kind::EXISTS) {
+            if (sq->subquery->select_star || sq->subquery->select_list.size() != 1) {
+                throw std::runtime_error(
+                    std::string(sq->kind == SubqueryExpr::Kind::IN ? "IN" : "scalar")
+                    + " subquery must return exactly one column");
+            }
+        }
+
+        // The body is a DIFFERENT scope: a different FROM schema, and its own
+        // aggregate rule — `WHERE x > (SELECT AVG(y) ...)` is legal SQL, but
+        // this walk carries allow_aggregates=false for a WHERE and would
+        // reject the subquery's own aggregate. So do NOT descend from here;
+        // hand the statement to a fresh validation against its own schema.
+        //
+        // validateQuery, not validate: the "not yet executable" refusal belongs
+        // to the whole statement once, at the very end, not to each nesting
+        // level on the way down.
+        validateQuery(*sq->subquery, catalog);
     }
     // literal / interval nodes need no validation
 }
@@ -472,6 +569,20 @@ void Validator::validateJoinCondition(const Expr* expr,
         validateJoinCondition(sub->start.get(), relations);
         validateJoinCondition(sub->length.get(), relations);    // nullptr-safe
         return;
+    }
+    if (dynamic_cast<const SubqueryExpr*>(expr)) {
+        // Week 30. No TPC-H query puts a subquery in an ON clause, and a
+        // residual carrying one would be handed to a probe loop that cannot
+        // evaluate it (an outer join) or folded into the WHERE conjunction and
+        // routed by a relation slot it does not have (an inner one). Decline,
+        // in the same shape as the AggregateExpr branch below.
+        //
+        // classifyJoinCondition runs one line EARLIER in validateQuery, so a
+        // subquery that ALSO forward-references a later relation reports the
+        // forward reference first. That is the stated order — shape before
+        // contents — not a defect.
+        throw std::runtime_error(
+            "JOIN ON: subqueries are not supported in a join condition");
     }
     if (dynamic_cast<const AggregateExpr*>(expr)) {
         // meaningless in a join condition, and loud beats silent
