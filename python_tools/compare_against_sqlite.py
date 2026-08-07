@@ -353,6 +353,131 @@ WEEK26_ALIAS_SHADOW_QUERIES = [
     "ON drivers.round = age ORDER BY n, lid LIMIT 10",
 ]
 
+# Week 30 (binder scope resolution). Both of these returned
+# `Error: unknown table qualifier: 'drivers'` on every path, at two relations:
+# Binder::resolveColumnRef rewrites an unqualified ref's table_name to the TABLE
+# name while the range table is keyed on the REF name, so re-binding an
+# already-bound clone — which is what GROUP BY <alias> and ORDER BY <alias> both
+# do — took the qualified path and looked for a relation called `drivers` among
+# `l` and `d`. Binding is idempotent now. SQLite answers both, so the rows are
+# the oracle; the fix must also NOT rename any output column, which is pinned on
+# the C++ side by BinderTest.AliasFixDoesNotMoveAggregateOutputNames (the harness
+# normalizes rows through a dict keyed by column name and would not notice).
+WEEK30_ALIAS_REBIND_QUERIES = [
+    "SELECT name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "ORDER BY n LIMIT 10",
+    "SELECT name AS n, COUNT(*) AS c FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id GROUP BY n ORDER BY n LIMIT 10",
+    # the same rebind through a GROUP BY alias beside an aggregate alias in
+    # ORDER BY. `nationality` and `speed` each live in exactly one relation, so
+    # the unqualified references are legal — `team` would be ambiguous
+    "SELECT nationality AS nat, AVG(speed) AS a FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id GROUP BY nat ORDER BY a DESC, nat LIMIT 5",
+]
+
+# Week 30 (subquery parsing + binding). NOTHING here executes: the week ends in a
+# refusal, and REACHING that refusal is the assertion — everything before it
+# (lex, parse, nested scope resolution, correlation detection, validation of the
+# nested query against its OWN schema) had to succeed to get there. SQLite
+# answers all of them, which is why this is a rejection suite rather than a diff
+# suite: the same stance Week 26 took when multi-way joins bound but did not
+# execute ("nothing new this week returns rows to diff").
+#
+# Run in all four modes. The refusal is engine-independent by construction — one
+# check at the end of Validator::validate, which both Planner::plan and
+# LogicalPlanBuilder::build call first — and running it everywhere is what proves
+# that rather than asserting it.
+WEEK30_SUBQUERY_BIND_EXPECT = "not yet executable (Week 31)"
+WEEK30_SUBQUERY_BINDS = [
+    # scalar, uncorrelated (TPC-H Q22's shape)
+    "SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)",
+    # scalar, correlated (Q17) — and the scalar form must compose with
+    # arithmetic, which is why it lives at the primary level
+    "SELECT l.lap_id FROM laps l WHERE l.speed > "
+    "0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    # scalar in HAVING, uncorrelated (Q11)
+    "SELECT team, AVG(speed) FROM laps GROUP BY team "
+    "HAVING AVG(speed) > (SELECT AVG(speed) FROM laps)",
+    # EXISTS, correlated (Q4/Q21) — `select *` inside must stay legal, so the
+    # arity rule cannot apply to EXISTS
+    "SELECT d.name FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 340)",
+    # NOT EXISTS (Q21): the leading-NOT production, which parseCompare's NOT
+    # lookahead cannot see because it fires only after a complete left operand
+    "SELECT d.name FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
+    # ...and in the middle of an AND chain
+    "SELECT d.name FROM drivers d WHERE d.age > 30 AND NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
+    # IN (subquery), uncorrelated (Q18/Q20) — a DIFFERENT production from the
+    # constant list, which still parses as an InExpr
+    "SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps)",
+    # NOT IN (subquery) (Q16)
+    "SELECT name FROM drivers WHERE driver_id NOT IN "
+    "(SELECT driver_id FROM laps WHERE speed > 340)",
+    # nested two deep, the inner one correlated to the MIDDLE block (Q20)
+    "SELECT name FROM drivers d WHERE d.driver_id IN "
+    "(SELECT l.driver_id FROM laps l WHERE l.speed > "
+    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
+    # correlated across a JOIN in the outer query: the ref names relation 1, so
+    # (query_level 1, relation_slot 1). This is the shape that binds to the wrong
+    # relation if the two numbering domains are conflated
+    "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team)",
+    # an inner alias shadowing an outer one, and an unqualified name present in
+    # both blocks: the inner block wins both times, and neither is an ambiguity
+    "SELECT x.team FROM laps x WHERE EXISTS (SELECT * FROM drivers x WHERE x.age > 30)",
+    "SELECT l.lap_id FROM laps l WHERE EXISTS "
+    "(SELECT * FROM drivers d WHERE team = 'Ferrari')",
+    # a subquery in a query that also uses a LEFT JOIN, so the Week 29 passes are
+    # on the same tree
+    "SELECT d.name FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE d.age IN (SELECT season FROM laps l2)",
+]
+
+# Each of these must fail EARLIER than the refusal above, and for its own stated
+# reason. Without them the Week 31 refusal becomes a catch-all that hides a real
+# defect behind a temporary one — the discipline that placed Week 26's multi-key
+# refusal past the plan-time type checks.
+WEEK30_REJECTED_QUERIES = [
+    # position: WHERE and HAVING only. All three are refused by the fail-closed
+    # allow_subqueries flag rather than by enumerating what is allowed
+    ("SELECT (SELECT AVG(speed) FROM laps) FROM drivers",
+     "SELECT: subqueries are supported in WHERE and HAVING only"),
+    ("SELECT team FROM laps GROUP BY (SELECT AVG(speed) FROM laps)",
+     "GROUP BY: subqueries are supported in WHERE and HAVING only"),
+    ("SELECT team FROM laps ORDER BY (SELECT AVG(speed) FROM laps)",
+     "ORDER BY: subqueries are supported in WHERE and HAVING only"),
+    # dispatch site 18, in the shape that file already uses for AggregateExpr
+    ("SELECT l.team FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND EXISTS (SELECT * FROM laps)",
+     "JOIN ON: subqueries are not supported in a join condition"),
+    # arity is decidable at bind time; cardinality ("more than one row") is
+    # Week 31's runtime check
+    ("SELECT team FROM laps WHERE speed > (SELECT speed, team FROM laps)",
+     "scalar subquery must return exactly one column"),
+    ("SELECT team FROM laps WHERE season IN (SELECT * FROM drivers)",
+     "IN subquery must return exactly one column"),
+    # the NESTED query's own faults outrank the refusal, which is what proves
+    # validateExpr handed the body to a fresh validation against its own schema
+    # instead of descending with the outer one
+    ("SELECT team FROM laps WHERE EXISTS (SELECT * FROM nosuchtable)",
+     "Table not found: 'nosuchtable'"),
+    ("SELECT team FROM laps WHERE EXISTS (SELECT * FROM drivers WHERE nosuchcol = 1)",
+     "column not found: 'nosuchcol'"),
+    ("SELECT team FROM laps WHERE EXISTS (SELECT name FROM drivers GROUP BY age)",
+     "must appear in GROUP BY"),
+    # ambiguity is still decided per scope
+    ("SELECT lap_id FROM laps l WHERE EXISTS "
+     "(SELECT * FROM laps l2 JOIN drivers d ON l2.driver_id = d.driver_id "
+     " WHERE team = 'Ferrari')",
+     "ambiguous column reference"),
+    # the constant-list IN is untouched: this is still a parse error, from a
+    # different production
+    ("SELECT team FROM laps WHERE season IN (speed)",
+     "IN accepts a list of constant values only"),
+]
+
 # Week 27 (multi-way join execution). Shapes that Week 26 could only bind now
 # return rows, so they move out of the rejection list and are diffed against
 # SQLite like everything else. These four run in ALL modes — multi-KEY joins and
@@ -616,7 +741,8 @@ QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
   + NULL_ORDERING_QUERIES + THREE_VALUED_LOGIC_QUERIES \
   + WEEK25_PREDICATE_QUERIES + WEEK25_CASE_QUERIES + WEEK25_SUBSTRING_QUERIES \
   + WEEK25_JOIN_QUERIES + WEEK26_ALIAS_SHADOW_QUERIES + WEEK27_JOIN_QUERIES \
-  + WEEK27_KEY_ENCODING_QUERIES + WEEK29_OUTER_JOIN_QUERIES
+  + WEEK27_KEY_ENCODING_QUERIES + WEEK29_OUTER_JOIN_QUERIES \
+  + WEEK30_ALIAS_REBIND_QUERIES
 
 # SQLite setup
 def load_sqlite():
@@ -868,6 +994,24 @@ def main():
         r_passed += rp
         r_failed += rf
         r_errors += re_
+
+    # Week 30. Two suites, two jobs. The BINDS suite asserts that each required
+    # TPC-H subquery form reaches the Week 31 refusal — nothing this week returns
+    # rows, so reaching the refusal is the only end-to-end evidence the
+    # checkpoint has. The REJECTED suite asserts that everything a query can get
+    # wrong earlier still outranks it, which is what stops the refusal becoming a
+    # catch-all. Both run in all four modes: the refusal is one check at the end
+    # of Validator::validate, and running it everywhere is what proves the two
+    # engines agree rather than asserting it.
+    week30_binds = [(q, WEEK30_SUBQUERY_BIND_EXPECT) for q in WEEK30_SUBQUERY_BINDS]
+    for label, extra in modes:
+        for suite, name in ((week30_binds, "Week 30 subqueries bind"),
+                            (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
+            rp, rf, re_ = run_rejection_suite(
+                suite, f"{name} — {label}", extra_args=extra)
+            r_passed += rp
+            r_failed += rf
+            r_errors += re_
 
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
     total_failed = f1 + f2 + f3 + f4 + m_failed + r_failed

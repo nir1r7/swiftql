@@ -839,6 +839,24 @@ def run_outer_join_decline(queries):
 #     puts a relation other than slot 0 at the bottom of the spine.
 #   selective_filter_keeps_written: lap_id < 30 pushes laps to ~29 rows, below
 #     drivers' 20+20 — so the written order is now the cheap one and is kept.
+# Week 30 (binder scope resolution). These shapes were REFUSED on every path
+# before this week — `Error: unknown table qualifier: 'drivers'` — because
+# re-binding an already-bound alias clone took the qualified path against a range
+# table keyed on ref names. They return rows now, so they belong in the oracle
+# suite AND in the optimizer invariant: both are joins, and the alias
+# substitution feeds the ORDER BY / GROUP BY that the optimizer reshapes under.
+WEEK30_QUERIES = [
+    ("w30_order_by_unqualified_select_alias",
+     "SELECT name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "ORDER BY n LIMIT 10"),
+    ("w30_group_by_unqualified_select_alias",
+     "SELECT name AS n, COUNT(*) AS c FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id GROUP BY n ORDER BY n LIMIT 10"),
+    ("w30_group_by_alias_beside_an_aggregate_alias",
+     "SELECT nationality AS nat, AVG(speed) AS a FROM laps l JOIN drivers d "
+     "ON l.driver_id = d.driver_id GROUP BY nat ORDER BY a DESC, nat LIMIT 5"),
+]
+
 WEEK28_EXPECTED_ORDER = {
     "w28_star_pivot_small": "laps@0,drivers@2,laps@1",
     "w28_star_written_good": "laps@0,drivers@1,laps@2",
@@ -1005,7 +1023,7 @@ def run_explain_estimate_format():
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES + WEEK29_QUERIES
+    all_queries = QUERIES + WEEK21_QUERIES + WEEK22_QUERIES + WEEK23_5_QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES + WEEK27_QUERIES + WEEK28_QUERIES + WEEK29_QUERIES + WEEK30_QUERIES
 
     # existing surface on the default row/Volcano path (audit fixes and
     # Week 24 expressions affected both engines, so they run here too)
