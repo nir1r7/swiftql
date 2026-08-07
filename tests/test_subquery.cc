@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <functional>
 #include <vector>
 
 // Week 31 — uncorrelated subqueries, materialized once and substituted.
@@ -165,105 +166,56 @@ TEST(SubqueryMaterialization, ExistsCapsTheBodyAtOneRowWithoutWideningAnExisting
 }
 
 // ===== IN, and the three-valued rule =====
+//
+// Week 32 DELETED this section's four tests rather than adapting them. They
+// asserted the shape of a materialized IN — an InExpr with deduped values, the
+// NOT-IN-over-a-NULL-set constant, the empty-set polarity — and materialization
+// no longer handles IN at all. The RULES did not go away; they moved into the
+// probe loops of VecHashJoinNode and HashJoinNode, where a semi-join can express
+// them, and they are asserted there and in the four-mode SQLite diff
+// (WEEK32_SEMI_JOIN_VEC_ONLY in python_tools/compare_against_sqlite.py). Keeping
+// them here against a canned runner would have tested a code path no query can
+// reach. What replaces them at THIS layer is the pair below: the node survives
+// the pass, and a large result is no longer a refusal.
 
-TEST(SubqueryMaterialization, InBecomesAConstantListAndDedupes) {
-    Catalog cat(CATALOG);
-    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
-                         "(SELECT driver_id FROM laps)", cat);
-    materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
-                                        {Row{Value(int64_t(3))}, Row{Value(int64_t(3))},
-                                         Row{Value(int64_t(7))}}}));
-    auto* in = dynamic_cast<const InExpr*>(whereOf(stmt));
-    ASSERT_NE(in, nullptr);
-    EXPECT_FALSE(in->negated);
-    // deduped: evaluate()'s InExpr scans this list LINEARLY per row
-    ASSERT_EQ(in->values.size(), 2u);
-    EXPECT_EQ(in->values[0].asInt(), 3);
-    EXPECT_EQ(in->values[1].asInt(), 7);
-}
-
-// THE classic NOT IN defect. `x NOT IN (S ∪ {NULL})` is FALSE where x matches
-// and UNKNOWN elsewhere — never TRUE — so the predicate selects nothing.
-// Returning rows here is a wrong answer SQLite disagrees with.
-TEST(SubqueryMaterialization, NotInWithANullInTheSetIsNeverTrue) {
-    Catalog cat(CATALOG);
-    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id NOT IN "
-                         "(SELECT driver_id FROM laps)", cat);
-    materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
-                                        {Row{Value(int64_t(3))}, Row{Value::null()}}}));
-    const Literal* lit = asLiteral(whereOf(stmt));
-    ASSERT_NE(lit, nullptr) << "a NOT IN over a NULL-bearing set is a constant, "
-                               "not an InExpr over the non-null values";
-    EXPECT_EQ(lit->value.asInt(), 0);
-}
-
-// The positive form is unaffected: a match is TRUE, and a non-match is UNKNOWN
-// rather than FALSE, which every consumer reachable from WHERE/HAVING treats
-// identically. So the NULL is simply dropped from the set.
-TEST(SubqueryMaterialization, InWithANullInTheSetKeepsTheNonNullValues) {
-    Catalog cat(CATALOG);
-    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
-                         "(SELECT driver_id FROM laps)", cat);
-    materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
-                                        {Row{Value(int64_t(3))}, Row{Value::null()}}}));
-    auto* in = dynamic_cast<const InExpr*>(whereOf(stmt));
-    ASSERT_NE(in, nullptr);
-    ASSERT_EQ(in->values.size(), 1u);
-    EXPECT_EQ(in->values[0].asInt(), 3);
-}
-
-// InExpr::values is documented non-empty, so an empty set cannot be represented
-// as one. x IN () is FALSE; x NOT IN () is TRUE even for a NULL x.
-TEST(SubqueryMaterialization, AnEmptySetBecomesAConstantOfTheRightPolarity) {
-    Catalog cat(CATALOG);
-    struct Case { const char* sql; int64_t expected; };
-    const Case cases[] = {
-        {"SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps)",     0},
-        {"SELECT name FROM drivers WHERE driver_id NOT IN (SELECT driver_id FROM laps)", 1},
-    };
-    for (const Case& c : cases) {
-        auto stmt = bindOnly(c.sql, cat);
-        materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT), {}}));
-        const Literal* lit = asLiteral(whereOf(stmt));
-        ASSERT_NE(lit, nullptr) << c.sql;
-        EXPECT_EQ(lit->value.asInt(), c.expected) << c.sql;
-    }
-}
-
-// A set of only NULLs is empty for the positive form (UNKNOWN, which collapses
-// to FALSE) and never-TRUE for the negated one. Both are constants, and neither
-// may become an InExpr with a NULL in `values`.
-TEST(SubqueryMaterialization, ASetOfOnlyNullsIsAConstantInBothPolarities) {
+// Week 32 — materializeSubqueries no longer consumes a Kind::IN node. The
+// set-membership form is the one shape lowered to a PLAN NODE (a semi/anti
+// join) rather than substituted with a constant, and a plan node cannot come
+// out of an AST rewrite. The node must therefore SURVIVE this pass...
+TEST(SubqueryMaterialization, LeavesAnInNodeForSemiJoinLowering) {
     Catalog cat(CATALOG);
     for (const char* sql : {"SELECT name FROM drivers WHERE driver_id IN "
                             "(SELECT driver_id FROM laps)",
                             "SELECT name FROM drivers WHERE driver_id NOT IN "
                             "(SELECT driver_id FROM laps)"}) {
         auto stmt = bindOnly(sql, cat);
+        int runs = 0;
         materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
-                                            {Row{Value::null()}}}));
-        const Literal* lit = asLiteral(whereOf(stmt));
-        ASSERT_NE(lit, nullptr) << sql;
-        EXPECT_EQ(lit->value.asInt(), 0) << sql;
+                                            {Row{Value(int64_t(1))}}}, &runs));
+        // ...unrun: the body is executed by the semi-join's build side, not here.
+        EXPECT_EQ(runs, 0) << sql;
+        const auto* sq = dynamic_cast<const SubqueryExpr*>(whereOf(stmt));
+        ASSERT_NE(sq, nullptr) << sql;
+        EXPECT_EQ(sq->kind, SubqueryExpr::Kind::IN) << sql;
+        // ...and has_subquery must stay SET while it does. The flag means "a
+        // SubqueryExpr is still in this tree", and buildScanSchema widens to the
+        // full schema while it is set — which is what keeps the IN operand, the
+        // semi-join's probe key, from being narrowed away.
+        EXPECT_TRUE(stmt.has_subquery) << sql;
     }
 }
 
-// evaluate()'s InExpr compares the list LINEARLY per row, so an unbounded
-// materialized set turns a subquery into an O(rows x |set|) scan on the
-// correctness baseline. Declining loudly names the week that removes the bound.
-TEST(SubqueryMaterialization, AnOversizedInSetIsRefusedAndNamesWeek32) {
+// The cap it replaces. Week 31 bounded the materialized set at 1024 distinct
+// values because evaluate()'s InExpr scans it LINEARLY per row; Week 32 removed
+// MAX_MATERIALIZED_IN_VALUES outright, because nothing is materialized. The
+// property under test is that a large result is no longer a refusal at all —
+// this is the query the README row and the rejection-suite entry both pinned.
+TEST(SubqueryMaterialization, NoLongerRefusesALargeInSet) {
     Catalog cat(CATALOG);
     auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
                          "(SELECT driver_id FROM laps)", cat);
-    std::vector<Row> rows;
-    for (int i = 0; i <= MAX_MATERIALIZED_IN_VALUES; ++i) rows.push_back(Row{Value(int64_t(i))});
-    try {
-        materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT), rows}));
-        ADD_FAILURE() << "expected the materialization-limit refusal";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("materialization limit"), std::string::npos) << e.what();
-        EXPECT_NE(std::string(e.what()).find("Week 32"), std::string::npos) << e.what();
-    }
+    EXPECT_NO_THROW(materializeSubqueries(
+        stmt, canned({oneCol("driver_id", TypeId::INT), {}})));
 }
 
 // ===== the walker, the cache, and the flag =====
@@ -288,8 +240,10 @@ TEST(SubqueryMaterialization, RunsASharedStatementExactlyOnce) {
 // so the statement handed to the runner must already be free of them.
 TEST(SubqueryMaterialization, MaterializesTheInnerBodyBeforeRunningTheOuterOne) {
     Catalog cat(CATALOG);
-    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
-                         "(SELECT driver_id FROM laps WHERE speed > "
+    // A SCALAR outer form since Week 32: an IN node is no longer materialized,
+    // so it would contribute no run and the ordering property would be untested.
+    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id > "
+                         "(SELECT MAX(driver_id) FROM laps WHERE speed > "
                          " (SELECT AVG(speed) FROM laps))", cat);
     std::vector<bool> nested_flag;
     materializeSubqueries(stmt, [&](SelectStatement body) {
@@ -455,4 +409,159 @@ TEST(SubqueryMaterialization, AnUncorrelatedQueryNoLongerCarriesTheFlag) {
     EXPECT_TRUE(stmt.has_subquery);
     EXPECT_FALSE(stmt.has_correlated_subquery);
     EXPECT_NO_THROW(Validator::validate(stmt, cat));
+}
+
+// ===== Week 32: set-membership lowering (subquery_lowering.h) =====
+
+namespace {
+
+// Plans a bound statement the way the CLI does — materialize first (which now
+// SKIPS the IN node), then build. The runner is never called for an IN-only
+// query, which is itself part of what these tests assert.
+std::unique_ptr<LogicalPlanNode> planLowered(const std::string& sql, Catalog& cat) {
+    auto stmt = bindOnly(sql, cat);
+    Validator::validate(stmt, cat);
+    materializeSubqueries(stmt, canned({oneCol("x", TypeId::INT), {}}));
+    return LogicalPlanBuilder::build(std::move(stmt), cat);
+}
+
+const LogicalJoin* findJoin(const LogicalPlanNode* n) {
+    if (n->type == LogicalNodeType::JOIN) return static_cast<const LogicalJoin*>(n);
+    for (const auto& c : n->children) if (const auto* j = findJoin(c.get())) return j;
+    return nullptr;
+}
+
+int countJoins(const LogicalPlanNode* n) {
+    int k = (n->type == LogicalNodeType::JOIN) ? 1 : 0;
+    for (const auto& c : n->children) k += countJoins(c.get());
+    return k;
+}
+
+} // namespace
+
+// THE invariant of the week. A SEMI/ANTI join emits only left-side columns, so
+// its output schema IS its left child's — not a merged one. That is the whole
+// containment for the two slot-numbering domains one plan now holds: nothing
+// from the body is in scope above the join, so no indexOf(name, slot) above it
+// can hit a body column at a body slot. See development.md -> Relation slots.
+TEST(SemiJoinLowering, OutputSchemaIsTheLeftChildsAndTheSlotIsMinusOne) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT lap_id FROM laps WHERE driver_id IN "
+                            "(SELECT driver_id FROM drivers)", cat);
+    const LogicalJoin* j = findJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    EXPECT_EQ(j->semantics, JoinSemantics::SEMI);
+    // join_type stays INNER: the two fields are read independently, and setting
+    // LEFT to get "preserve the left side" would drag in null-extension, the
+    // residual match test and the outer max() cardinality rule.
+    EXPECT_EQ(j->join_type, JoinType::INNER);
+    // -1 means "children[1] is not a relation of this block's range table".
+    EXPECT_EQ(j->join_slot, -1);
+
+    const auto& out = j->output_schema.columns();
+    const auto& left = j->children[0]->output_schema.columns();
+    ASSERT_EQ(out.size(), left.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        EXPECT_EQ(out[i].name, left[i].name);
+        EXPECT_EQ(out[i].relation_slot, left[i].relation_slot);
+    }
+    // and no body column leaked into it
+    for (const auto& c : out) EXPECT_NE(c.relation_slot, -1);
+}
+
+TEST(SemiJoinLowering, NotInBecomesAnAntiJoin) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT lap_id FROM laps WHERE driver_id NOT IN "
+                            "(SELECT driver_id FROM drivers)", cat);
+    const LogicalJoin* j = findJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    EXPECT_EQ(j->semantics, JoinSemantics::ANTI);
+    EXPECT_NE(plan->explain().find(""), std::string::npos);
+}
+
+// The node NAME carries the kind, so every pre-existing plan string stays
+// byte-identical and the substring "Join" survives for the python harness.
+TEST(SemiJoinLowering, ExplainNamesTheKind) {
+    Catalog cat(CATALOG);
+    EXPECT_NE(findJoin(planLowered(
+        "SELECT lap_id FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers)",
+        cat).get())->explain().find("LogicalSemiJoin ["), std::string::npos);
+    EXPECT_NE(findJoin(planLowered(
+        "SELECT lap_id FROM laps WHERE driver_id NOT IN (SELECT driver_id FROM drivers)",
+        cat).get())->explain().find("LogicalAntiJoin ["), std::string::npos);
+}
+
+// Two conjuncts means two semi-joins, and that is CORRECT — they are two
+// separate membership tests. Week 31's statement-keyed result cache is
+// deliberately not ported; there is nothing to share.
+TEST(SemiJoinLowering, TwoInConjunctsProduceTwoStackedJoins) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(
+        "SELECT lap_id FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
+        "AND season IN (SELECT season FROM laps l2)", cat);
+    EXPECT_EQ(countJoins(plan.get()), 2);
+}
+
+// The remaining conjuncts stay in the WHERE filter, and the IN conjunct is gone
+// from it — which is what keeps inferExprType (dispatch site 12) from throwing.
+TEST(SemiJoinLowering, TheOtherConjunctsSurviveInTheFilter) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT lap_id FROM laps WHERE speed > 300 AND driver_id IN "
+                            "(SELECT driver_id FROM drivers) AND season = 2024", cat);
+    const std::string s = plan->explain();
+    bool saw_filter = false;
+    std::function<void(const LogicalPlanNode*)> walk = [&](const LogicalPlanNode* n) {
+        if (n->type == LogicalNodeType::FILTER) {
+            saw_filter = true;
+            EXPECT_EQ(n->explain().find("IN"), std::string::npos) << n->explain();
+        }
+        for (const auto& c : n->children) walk(c.get());
+    };
+    walk(plan.get());
+    EXPECT_TRUE(saw_filter);
+}
+
+// An uncorrelated EXISTS is NOT re-routed: its value does not depend on the
+// outer row at all, so materialization is strictly better and a semi-join would
+// turn a foldable constant into a pipeline breaker. No join is added.
+TEST(SemiJoinLowering, ExistsStillMaterializesAndAddsNoJoin) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT lap_id FROM laps WHERE EXISTS "
+                         "(SELECT * FROM drivers WHERE age > 30)", cat);
+    Validator::validate(stmt, cat);
+    int runs = 0;
+    materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
+                                        {Row{Value(int64_t(1))}}}, &runs));
+    EXPECT_EQ(runs, 1);
+    EXPECT_FALSE(stmt.has_subquery);
+    auto plan = LogicalPlanBuilder::build(std::move(stmt), cat);
+    EXPECT_EQ(countJoins(plan.get()), 0);
+}
+
+// The refusals. Each is a stated README dialect-table row and a rejection-suite
+// entry, because the diffed oracle suite cannot hold a query that errors.
+TEST(SemiJoinLowering, RefusesTheShapesItCannotExpress) {
+    Catalog cat(CATALOG);
+    const std::pair<const char*, const char*> cases[] = {
+        // JoinKey holds column NAMES: there is no computed-key join here
+        {"SELECT lap_id FROM laps WHERE season * 5 IN (SELECT driver_id FROM drivers)",
+         "must be a column reference"},
+        // a semi-join is a whole-conjunct construct
+        {"SELECT lap_id FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
+         "OR speed > 340",
+         "whole top-level WHERE conjunct"},
+        // the join would have to sit above LogicalAggregate
+        {"SELECT team, COUNT(*) FROM laps GROUP BY team "
+         "HAVING COUNT(*) IN (SELECT driver_id FROM drivers)",
+         "whole top-level WHERE conjunct"},
+    };
+    for (const auto& [sql, needle] : cases) {
+        try {
+            planLowered(sql, cat);
+            ADD_FAILURE() << "expected a refusal for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+                << sql << " -> " << e.what();
+        }
+    }
 }
