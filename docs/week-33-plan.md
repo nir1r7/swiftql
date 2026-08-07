@@ -1153,7 +1153,65 @@ removed or weakened.
 - [x] Task 5: two README dialect rows (the Volcano capability refusal, and the
       shapes decorrelation declines). **Named a refusal, not a fallback** — see
       the hand-off below.
-- [ ] Tasks 4, 6, 7, 8, 9.
+- [!] **Task 4 (correlated scalar / Q17): BLOCKED, with the reason below.** Not
+      a deferral of convenience — the blocker is structural and named.
+- [ ] Tasks 6, 7, 8.
+
+### Task 4 — why the Q17 shape does not execute this week
+
+The rewrite itself is short and is not the problem. Group the body by its
+correlation key, LEFT-join the result back, replace the `SubqueryExpr` with a
+`ColumnRef` naming the aggregate output column:
+
+```
+outer  LEFT JOIN  ( SELECT team, AVG(speed) FROM laps l2 GROUP BY team )  ON team = team
+```
+
+**The blocker is the join's output schema, and it is the one thing Week 32 and
+Week 33 were both built to avoid.** A `SEMI`/`ANTI` join's `output_schema` **is**
+its left child's, which is what keeps the body's slot numbering out of the outer
+plan — `LogicalJoin`'s own header calls that invariant "the whole containment for
+the two-range-table problem this node introduces". Task 4's join is `STANDARD`:
+the aggregate's output column must be **in scope above the join**, because the
+outer `WHERE` reads it. So the schema must be MERGED, and merging requires the
+body's column to be stamped with a slot **in the outer range table** — a slot the
+outer Binder never issued, because the body is not a relation of the outer
+`FROM`/`JOIN` list.
+
+Three specific consumers break on a synthetic slot, and none of them fails
+loudly:
+
+1. `JoinEnumeration::hasSlotOutsideRangeTable` (`join_enumeration.cc:91`) tests
+   `join_slot < 1 || join_slot >= n` where `n` is the outer range table's size,
+   and **silently declines to reorder the whole tree**. Q17's outer query is a
+   multi-relation join, so this is a real plan-quality loss with no reported
+   decision — exactly the shape Week 30's hand-forward said must earn a
+   `join-ordering=skipped (...)` string before it is accepted.
+2. `Validator`'s SUM/AVG argument check indexes `stmt.joins[slot - 1]` with the
+   same arithmetic, and a synthetic slot is out of that vector's range.
+3. `buildAggregateSchema` / every `indexOf(name, slot)` above the join resolves
+   against a merged schema containing a column at a slot the range table cannot
+   explain — which is the wrong-relation class `ColumnId` made loud *inside* one
+   block, and which nothing checks *across* the range-table boundary.
+
+**This is Week 34's problem arriving early, not a new one.** The README already
+says it in as many words: the semi/anti containment "is what Week 34's derived
+tables genuinely do break, because a derived table's columns *are* in scope above
+it." A decorrelated scalar subquery is a derived table with an implicit join —
+the same shape, needing the same answer: a range-table entry for a plan subtree
+rather than for a catalog table.
+
+**What it would take**, so Week 34 does not re-derive it: extend the outer range
+table with an entry whose "schema" is a plan node's `output_schema` rather than a
+catalog table's, give it a real slot, and then re-check every consumer in
+`development.md`'s slot table against a slot that names a *derived* relation.
+`ColumnId` makes that sweep a compiler worklist rather than an audit round, which
+is the second thing Task 1 bought.
+
+**Consequence, stated rather than absorbed:** Week 33's checkpoint — "required
+correlated TPC-H queries execute correctly" — is met for the `EXISTS` /
+`NOT EXISTS` family (Q4, Q21) and **not** for the correlated-scalar family (Q17,
+and Q22's correlated half). That is a checkpoint miss, recorded as one.
 
 ### Handed to Week 34
 

@@ -1611,7 +1611,28 @@ re-derived.
 - Decorrelate the correlated patterns required by TPC-H
 - Retain a correct fallback for unsupported patterns
 
-**Checkpoint:** Required correlated TPC-H queries execute correctly.
+**Checkpoint:** Required correlated TPC-H queries execute correctly. ⚠️ **Partly
+met — recorded as a miss, not absorbed.** Correlated `EXISTS` / `NOT EXISTS`
+(Q4, Q21) decorrelate to the Week 32 semi/anti join and execute, diffed against
+SQLite. Correlated **scalar** subqueries (Q17, Q22's correlated half) do
+**not**: the rewrite needs a `STANDARD` join whose output schema is MERGED, which
+requires the body's aggregate column to carry a slot in the *outer* range table —
+a slot the Binder never issued, because the body is not a relation of the outer
+`FROM`. That is precisely the containment Week 34's derived tables break ("a
+derived table's columns *are* in scope above it"), arriving early. The three
+consumers that break on a synthetic slot, and what closing it takes, are in
+[docs/week-33-plan.md](docs/week-33-plan.md) → *Task 4*.
+
+> **Deviation from this week's second bullet.** "Retain a correct fallback for
+> unsupported patterns" was **consciously not met**. What shipped is a
+> **refusal** for every shape decorrelation cannot express — named as one in the
+> dialect table above, not dressed up as a fallback. A real fallback means a
+> dependent-join operator (re-execute the body per outer row), which this engine
+> has never had, and a second execution production that must agree with the first
+> on `NOT EXISTS`'s NULL semantics is the two-paths drift Weeks 26/28/30 each had
+> to undo. The judgement was to make the gap loud rather than answer differently
+> per shape; it is Week 34's deliverable, and a future reader should see it as
+> declined-with-reason rather than done.
 
 > **Starting note, from Week 32's semi-joins.** **Week 33 is the week the
 > `ColumnId { level, slot }` refactor fires**, and it fires *before* the feature
