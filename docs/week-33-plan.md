@@ -1380,3 +1380,58 @@ that was this defect, not C-1, so it proves nothing about C-1 and must be run
 again.
 
 Also open: H-1, H-2, M-3..M-7, L-8.
+
+### Round 2 fixes — the rest of round 1, and a third instance of the same shape
+
+**C-1 reproduced first, then fixed.** Through the CLI against real SQLite, both
+directions: a NULL in the body's key column returned 0 where SQLite returns 20;
+a NULL correlated key returned 0 where SQLite returns 16. Both were unreachable
+end-to-end until the materialization fix, because decorrelation never ran — so
+the audit's own repro shape proved nothing about C-1 until then. Fixed by
+splitting `JoinSemantics::ANTI`: `ANTI` keeps the textbook meaning (the pure
+anti-join, which is exactly `NOT EXISTS`) and the special case wears the special
+name, `ANTI_NOT_IN`, produced by `subquery_lowering.cc` only. The rule is in the
+type, so a reader who reaches for a negated join and writes `ANTI` gets
+relational algebra rather than a predicate's three-valued rule.
+
+**C-2 fixed, by refusal.** A correlated ref in the body's `JOIN ... ON` became an
+inner-join residual after `splitCorrelation` had run, then resolved by bare name:
+`d2.team = d.team` became `d2.team = laps.team`. Verified: 5 rows where SQLite
+returns 20. `refuseSurvivingCorrelatedRefs` now declines it by name, and covers
+the body's SELECT list and ORDER BY on the same walk.
+
+**H-1, H-2 and M-3 fixed by one change.** `rightKeyIndices` matched the body key
+by bare name against the body plan's *output* schema — a schema the name was
+never resolved in. Decorrelation now projects the body to exactly its key
+columns, in key order, and the build-side indices are positional; there is no
+name lookup left to shadow. H-2 reproduced (0 vs SQLite's 20) and M-3 reproduced
+(a loud error on `EXISTS (SELECT 1 ...)`, the most idiomatic EXISTS body in SQL).
+M-3's restriction is *removed* rather than documented.
+
+**R2-C1 — the third instance of one root shape.** `lowerInSubqueries` ran on the
+WHERE conjuncts thirteen lines before `refuseUnloweredCorrelated`, so it consumed
+a correlated `IN` the tripwire never saw and lowered it to a **one-key** semi-join,
+discarding the correlation: `l.team = d.team` was planned inside the body and
+became the tautology `laps.team = laps.team`. Measured: 20 where SQLite says 6,
+and 0 where it says 14. Fixed by routing (the pass declines a correlated node)
+plus ordering (`refuseUnloweredCorrelated` runs *before* `refuseUnloweredIn` at
+both call sites, because a correlated `IN` **is** a whole top-level conjunct and
+the IN refusal would have named the wrong cause).
+
+**The shape itself, stated once so it stops recurring.** Three silent wrong
+answers this week came from the same thing: *code trusting a refusal that no
+longer exists.* Task 2 deleted `Validator::validate`'s correlated refusal; the
+sentence describing it survived in `subquery_materialization.h`,
+`subquery_lowering.h`, both dispatch-site comments, `predicate_pushdown.cc`,
+`ast.h`, `validator.h` and `validator.cc` — and in two of those files the code
+still behaved as though it held. Every one has been corrected, and the two
+headers now record *what the bullet was and how it expired* rather than quietly
+dropping it. A deleted guard must be swept for its citations in the same commit
+that deletes it; that is the week's real lesson.
+
+**Rejected on inspection:** M-5's second half (add `refuseUnloweredCorrelated` to
+the SELECT list and ORDER BY). Those positions hold no subquery of any kind —
+the Validator's POSITION rule refuses them outright and Week 33 did not touch it.
+Verified by running, not by reading: the SELECT-list form reports "SELECT:
+subqueries are supported in WHERE and HAVING only". The calls would be
+unreachable code.
