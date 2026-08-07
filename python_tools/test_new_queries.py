@@ -808,16 +808,21 @@ def run_outer_join_decline(queries):
         order = re.search(r"order=(\S+)", section)
         # and the plan must actually BE an outer join, or this asserts nothing
         is_outer = "LogicalLeftJoin" in section
-        if result.returncode == 0 and order is None and is_outer:
-            print(f"  PASS  [{label}]  no order= decision, as required")
+        # the decline is REPORTED rather than silent (a decision was available and
+        # was refused), but deliberately not spelled `order=`: no order was chosen,
+        # and that token has to keep meaning "the search ran"
+        reported = "join-ordering=skipped (outer join)" in section
+        if result.returncode == 0 and order is None and is_outer and reported:
+            print(f"  PASS  [{label}]  skipped, reported, no order= decision")
             passed += 1
         else:
-            got = order.group(1) if order else ("no LogicalLeftJoin in plan"
-                                                if not is_outer else result.stderr.strip())
+            got = (order.group(1) if order else
+                   "no LogicalLeftJoin in plan" if not is_outer else
+                   "decline not reported" if not reported else result.stderr.strip())
             print(f"  FAIL  [{label}]  {got}")
             failed += 1
             fail_list.append((f"decline:{label}", query, got,
-                              "no order= line, on a LogicalLeftJoin plan"))
+                              "join-ordering=skipped and no order=, on a LogicalLeftJoin plan"))
     print(f"  {passed} passed, {failed} failed, 0 errors")
     return passed, failed, 0, fail_list
 
