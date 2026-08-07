@@ -561,9 +561,18 @@ WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
 # productions that must agree on NULL semantics is the drift this codebase has
 # had to undo three times.
 #
-# Run in ALL FOUR modes: these refusals come from LogicalPlanBuilder and from
-# Planner::plan's own guard, so asserting all four is what proves the engines
-# agree on the boundary rather than assuming it.
+# VECTORIZED MODES ONLY, and the message is why. These three diagnostics come
+# from the lowering (LogicalPlanBuilder), which the Volcano path never reaches:
+# Planner::plan refuses every IN subquery up front — not for a generic reason,
+# but *because it is an IN subquery* it has no second join node to hold. So on
+# Volcano these queries are refused for a genuinely different, and genuinely
+# correct, reason, and asserting the lowering's wording there would be asserting
+# a message the engine has no business producing.
+#
+# The four-mode coverage is NOT dropped: the same three queries are asserted in
+# the two Volcano modes via WEEK32_LOWERING_REFUSED_VOLCANO below, against the
+# message that path really emits. Each query is still pinned in all four modes —
+# each against the refusal that mode actually owns.
 WEEK32_LOWERING_REFUSED = [
     # A COMPUTED OPERAND. The grammar allows `additive [NOT] IN (select_stmt)`,
     # so this parses — but JoinKey holds column NAMES, and there is no
@@ -581,6 +590,18 @@ WEEK32_LOWERING_REFUSED = [
     ("SELECT team, COUNT(*) FROM laps GROUP BY team "
      "HAVING COUNT(*) IN (SELECT driver_id FROM drivers)",
      "whole top-level WHERE conjunct"),
+]
+
+# The Volcano half of the same three queries. Derived from the list above rather
+# than retyped, so a shape added there cannot quietly lose its Volcano coverage.
+# Note the ordering this pins: Planner::plan's IN guard fires BEFORE any
+# lowering-shape check, so an unlowerable shape is still refused as "no semi-join
+# on Volcano" — the capability boundary outranks the expressibility one. If a
+# later week gives Volcano a semi-join, these entries start failing, which is the
+# signal to move each query to whichever refusal then applies.
+WEEK32_LOWERING_REFUSED_VOLCANO = [
+    (query, "not supported on the Volcano path")
+    for query, _ in WEEK32_LOWERING_REFUSED
 ]
 
 WEEK31_SUBQUERY_VEC_ONLY = [
@@ -1346,10 +1367,20 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
-    for label, extra in modes:
+    # The shapes the lowering cannot express, asserted in all four modes but
+    # against two different messages — see WEEK32_LOWERING_REFUSED's comment.
+    for label, extra in vec_modes:
         rp, rf, re_ = run_rejection_suite(
             WEEK32_LOWERING_REFUSED,
             f"Week 32 shapes lowering cannot express — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            WEEK32_LOWERING_REFUSED_VOLCANO,
+            f"Week 32 shapes lowering cannot express, refused earlier — {label}",
+            extra_args=extra)
         r_passed += rp
         r_failed += rf
         r_errors += re_
