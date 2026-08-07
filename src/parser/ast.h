@@ -263,9 +263,10 @@ struct SelectStatement {
     std::optional<int> limit;
 
     // Week 30. Set by the Binder when it binds a SubqueryExpr directly inside
-    // THIS statement. It exists so the "not yet executable" refusal and
-    // buildScanSchema's conservative widening need no nineteenth walker over
-    // the statement to find out. Any statement containing a subquery at any
+    // THIS statement. It existed so the "not yet executable" refusal (deleted in
+    // Week 33) and buildScanSchema's conservative widening need no nineteenth
+    // walker over the statement to find out; the widening is now its only
+    // consumer of that kind. Any statement containing a subquery at any
     // depth contains one DIRECTLY, so the top-level flag is always the right
     // test for "this query uses a subquery".
     //
@@ -283,9 +284,15 @@ struct SelectStatement {
     // accepts such a query and a nested block refuses it later, after the outer
     // levels have already been materialized and run.
     //
-    // It is the condition of the only refusal left at the end of
-    // Validator::validate, and therefore the containment development.md's
-    // slot-consumer table now rests on: a ColumnRef with query_level > 0 exists
-    // only inside a correlated subquery.
+    // !! WHAT THIS FLAG NO LONGER IS. It was the condition of the last refusal
+    // at the end of Validator::validate, and therefore the containment
+    // development.md's slot-consumer table rested on. Week 33 DELETED that
+    // refusal: a ColumnRef with query_level > 0 now reaches plan nodes, and the
+    // containment is the TYPE (common/column_id.h) — a level cannot be dropped
+    // silently because a bare int is not assignable where a ColumnId is
+    // required. The flag survives as what the Binder computes and what
+    // subquery_materialization/decorrelation route on; it guards nothing by
+    // itself. Three wrong answers this week came from code that kept trusting
+    // the refusal after it was gone, so do not restate it as a guarantee.
     bool has_correlated_subquery = false;
 };

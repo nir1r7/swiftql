@@ -255,11 +255,26 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
     }
     if (dynamic_cast<const SubqueryExpr*>(expr)) {
         // DISPATCH SITE 12, closed in Week 31 — as an INTERNAL invariant, not as
-        // a feature. Every subquery is replaced by a constant before planning
-        // (materializeSubqueries, run by main.cc after Validator::validate), and
-        // a correlated one is refused by the Validator. Reaching this therefore
-        // means the materialization walker (dispatch site 19) missed an Expr
-        // subtype, or the pass was not run at all.
+        // a feature. Every UNCORRELATED subquery is replaced by a constant
+        // before planning (materializeSubqueries, run by main.cc after
+        // Validator::validate).
+        //
+        // Week 33: this comment used to add "and a correlated one is refused by
+        // the Validator". That refusal is gone. A correlated node now SURVIVES
+        // materialization deliberately, and three refusals stand between it and
+        // this throw, none of them the Validator's: lowerExistsSubqueries
+        // consumes the decorrelatable shapes, and refuseUnloweredCorrelated runs
+        // on the WHERE residue (:836) and on HAVING (:868). The remaining
+        // positions — SELECT list, GROUP BY, ORDER BY, ON — hold no subquery at
+        // all, correlated or not: Validator's POSITION rule (WHERE and HAVING
+        // only, ast.h) and validateJoinCondition refuse them outright, and that
+        // rule Week 33 did NOT touch. Verified rather than assumed:
+        // `SELECT d.name, EXISTS (...) FROM drivers d` reports "SELECT:
+        // subqueries are supported in WHERE and HAVING only", not this throw.
+        //
+        // Reaching here therefore still means the materialization walker
+        // (dispatch site 19) missed an Expr subtype, or the pass was not run at
+        // all — but by a different argument than the one first written down.
         //
         // That throw is exactly what makes site 19 a LOUD dispatch site instead
         // of the eleventh silent one — do not delete it. This site is also the

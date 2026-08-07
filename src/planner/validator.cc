@@ -137,14 +137,15 @@ void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     // rule (it reads column 0 of the result) and this refusal (it never has to
     // ask a scope question), and main.cc therefore calls validate() before it.
     //
-    // This condition is also the containment development.md's slot-consumer
-    // table now rests on. It used to be "no statement with a subquery is
-    // planned"; it is now: a ColumnRef with query_level > 0 exists ONLY inside a
-    // correlated subquery, and those are refused here — while an UNCORRELATED
-    // body is handed to the planner as its own top-level statement, where every
-    // ref is level 0 against that statement's own range table. Either way every
-    // consumer below still sees level-0 refs from ONE range table, which is why
-    // both of Week 30's tripwires stay armed and unreached.
+    // Everything above this line describes the refusal as it stood through Week
+    // 32 and is kept as history, not as a live guarantee. In particular the
+    // containment development.md's slot-consumer table rested on — "a ColumnRef
+    // with query_level > 0 exists ONLY inside a correlated subquery, and those
+    // are refused here" — NO LONGER HOLDS AT THIS SITE. It is now held by the
+    // TYPE (common/column_id.h): a level cannot be dropped silently because a
+    // bare int is not assignable where a ColumnId is required, and every
+    // consumer that narrows to a slot names itself when it does.
+    //
     // Week 33 REMOVED the refusal that stood here. A correlated subquery is now
     // decorrelated into the Week 32 semi/anti join
     // (planner/subquery_decorrelation.h), and the shapes that rewrite cannot

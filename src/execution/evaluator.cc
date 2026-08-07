@@ -245,10 +245,13 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     // evaluate() is the semantic reference the vectorized kernels are checked
     // against and the two must never disagree about what a node means.
     //
-    // Every subquery is replaced by a constant before planning
-    // (materializeSubqueries); a correlated one is refused by the Validator. So
-    // reaching this means the materialization walker (dispatch site 19) missed
-    // an Expr subtype. That is what makes site 19 loud — do not delete it.
+    // Every UNCORRELATED subquery is replaced by a constant before planning
+    // (materializeSubqueries). Week 33: this used to add "a correlated one is
+    // refused by the Validator", which is no longer true — see the same
+    // correction at dispatch site 12 (logical_plan.cc) for what holds instead.
+    // Reaching this still means the materialization walker (dispatch site 19)
+    // missed an Expr subtype. That is what makes site 19 loud — do not delete
+    // it.
     if (dynamic_cast<const SubqueryExpr*>(expr)) {
         throw std::runtime_error(
             "internal: a subquery reached evaluation without being "

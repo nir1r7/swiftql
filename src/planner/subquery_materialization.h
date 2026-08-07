@@ -97,11 +97,24 @@ void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& o
 // Replaces every SubqueryExpr in `stmt` with a constant, innermost first, and
 // clears has_subquery when none is left.
 //
-// PRECONDITIONS, all established by Validator::validate, which the caller runs
-// FIRST (main.cc):
-//   - no correlated subquery anywhere in `stmt` — refused in Week 33's name;
+// PRECONDITIONS established by Validator::validate, which the caller runs FIRST
+// (main.cc):
 //   - a SCALAR or IN body has exactly one output column;
 //   - a subquery appears only in WHERE / HAVING.
+//
+// !! A THIRD BULLET USED TO STAND HERE and is recorded rather than deleted,
+// because its quiet expiry is how this pass shipped a wrong answer. It read "no
+// correlated subquery anywhere in `stmt` — refused in Week 33's name". Week 33
+// DELETED that Validator refusal; the sentence outlived it, and the pass went on
+// trusting it — running every correlated body once as if it were self-contained
+// and substituting a literal, with the outer ref resolved by bare name against
+// the body's own schema. `WHERE EXISTS (...)` folded to `Filter [1]`.
+//
+// The pass no longer inherits the property. It ROUTES on the Binder's own
+// `correlated` flag: a correlated node survives this pass exactly as a Kind::IN
+// node does, and what happens to it is the planner's (decorrelation for EXISTS,
+// refuseUnloweredCorrelated by name for the rest). Nothing here reads a
+// correlated body for a value.
 // The pass trusts them rather than re-checking: run it before validation and
 // `WHERE speed > (SELECT speed, team FROM laps)` silently materializes column 0
 // of a query the Validator was about to reject — a wrong answer instead of a

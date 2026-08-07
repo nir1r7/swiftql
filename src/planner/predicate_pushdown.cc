@@ -38,15 +38,23 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         // was corrected for four lines below.
         // Week 33, Task 8: the README asked this week to make the answer for a
         // correlated subquery PRECISE (its refs' slots, decremented one level)
-        // rather than conservative. It turned out to be MOOT, which is a better
-        // outcome than the change: decorrelation extracts the correlated
-        // conjunct from stmt.where BEFORE the LogicalFilter is built, and the
-        // body is planned only after its correlated conjuncts have become join
-        // keys — so no correlated ref survives into any predicate this walker
-        // runs over. Shapes decorrelation refuses throw instead of arriving.
-        // The -1 stays as the answer for an UNRESOLVED ref, which is what it
-        // always also meant, and restampSlots' body branch stays unreachable by
-        // the same argument rather than by the one Week 30 wrote down.
+        // rather than conservative. It stays conservative, and the argument
+        // first written here for why that is moot was FALSE — it claimed "no
+        // correlated ref survives into any predicate this walker runs over",
+        // which the comment twenty lines above contradicts in the same file
+        // (classifyJoinCondition calls this walker directly on a nested query's
+        // ON conjuncts, where a correlated ref is exactly what it sees) and
+        // which round 1's C-2 disproved with a wrong answer.
+        //
+        // The containment that actually holds is CHECKABLE, which is the whole
+        // difference: soleSlot (below) returns -1 for any conjunct whose slot
+        // set contains -1, so a conjunct holding a correlated or unresolved ref
+        // is never pushed, and restampSlots is never called on one. That matters
+        // because restampSlots does `cr->id = ColumnId::local(slot)` — it would
+        // overwrite a correlated id's LEVEL with 0, the exact collapse ColumnId
+        // exists to prevent. Record it as "soleSlot rejects any conjunct
+        // containing -1", which a reader can verify in ten lines, not as "no
+        // correlated ref arrives", which depends on every upstream pass.
         out.insert(cr->id.isLocal() ? cr->id.localSlot("collectSlots") : -1);
         return;
     }
@@ -106,11 +114,16 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     // a constant with respect to this block, so `WHERE r1.x = (SELECT ...)`
     // keeps soleSlot == 1 and still pushes onto relation 1's scan.
     //
-    // The exact set (correlated refs' slots, level-decremented) buys pushdown
-    // for a correlated conjunct, which nothing can execute until Week 33
-    // decorrelates it; land it there. NOT reachable from the CLI this week —
-    // Validator refuses a bound subquery before any logical plan exists — but
-    // the branch ships with the node, and is unit-tested directly.
+    // The exact set (correlated refs' slots, level-decremented) would buy
+    // pushdown for a correlated conjunct. Week 33 did not add it, and the
+    // reason recorded here for the branch being unreachable — "Validator
+    // refuses a bound subquery before any logical plan exists" — is the refusal
+    // Week 33 DELETED, so it justifies nothing now. What is true, and is
+    // checkable rather than historical: -1 is the conservative "cannot name it
+    // here" sentinel, soleSlot rejects any conjunct whose slot set contains it,
+    // and the effect is therefore only WITHHELD PUSHDOWN. Safe in either
+    // reachability state, which is why nothing else had to change when the
+    // refusal came down.
     if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
         collectSlots(sq->operand.get(), out);   // IN's operand is THIS block's
         if (sq->correlated) out.insert(-1);
