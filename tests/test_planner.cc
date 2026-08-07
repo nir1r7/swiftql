@@ -530,3 +530,26 @@ TEST(PlannerTest, OuterJoinKeepsAPreservedSideOnlyPruningHint) {
     ASSERT_NE(scan, nullptr);
     EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
 }
+
+// Week 30. Planner::plan derives the preserved-slot set for the pruning-hint
+// rule from the FROM scan's OWN schema instead of the hard-coded {0} it used to
+// pass. The constant was correct only because of the `stmt.joins.size() > 1`
+// refusal 110 lines above it — an undocumented coupling of exactly the kind the
+// `jc` pointer in that function exists to remove.
+//
+// The derivation rests on one property, and this is it: a catalog scan schema,
+// narrowed or not, stamps every column slot 0. If that ever stops being true the
+// derived set changes silently and the three pruning-hint tests above start
+// measuring something else.
+TEST(PlannerTest, TheFromScanSchemaStampsSlotZeroForEveryColumn) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    Parser p("SELECT l.team, d.name FROM laps l LEFT JOIN drivers d "
+             "ON l.driver_id = d.driver_id WHERE l.season = 2024");
+    auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
+    Schema scan_schema = buildScanSchema(stmt, catalog.getTable("laps").schema);
+    ASSERT_GT(scan_schema.size(), 0);
+    for (const ColumnDef& c : scan_schema.columns()) {
+        EXPECT_EQ(c.relation_slot, 0) << "column " << c.name;
+    }
+}

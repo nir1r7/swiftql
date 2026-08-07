@@ -1001,3 +1001,226 @@ TEST(LogicalPlan, ExplainQualifiesAJoinKeyThatIsAmbiguousOnTheLeftInput) {
     // `grp` exists at slot 0 (a) and slot 1 (b) on the merged left schema
     EXPECT_EQ(top->explain(), "LogicalJoin [grp@1 = grp]");
 }
+
+// ===== Week 30: the subquery node's dispatch sites =====
+
+static const SubqueryExpr* firstSubquery(const Expr* e) {
+    if (!e) return nullptr;
+    if (auto* s = dynamic_cast<const SubqueryExpr*>(e)) return s;
+    if (auto* b = dynamic_cast<const BinaryExpr*>(e)) {
+        if (auto* l = firstSubquery(b->left.get())) return l;
+        return firstSubquery(b->right.get());
+    }
+    return nullptr;
+}
+
+static SelectStatement bindOnly(const std::string& sql, const Catalog& cat) {
+    Parser p(sql);
+    auto stmt = p.parse();
+    Binder::bind(stmt, cat);
+    return stmt;
+}
+
+// DISPATCH SITE 11. cloneExpr THROWS on an unknown subtype, which is why it is
+// done first. The statement is SHARED rather than deep-copied: SelectStatement
+// is move-only, so a deep copy would need a clone-a-statement walker whose
+// omissions (a dropped HAVING) are silent.
+TEST(SubqueryDispatch, CloneSharesTheStatementAndCopiesTheOperand) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
+                         "(SELECT driver_id FROM laps)", cat);
+    const SubqueryExpr* sq = firstSubquery(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+
+    auto copy = cloneExpr(sq);
+    auto* c = dynamic_cast<SubqueryExpr*>(copy.get());
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->subquery.get(), sq->subquery.get()) << "the statement is shared";
+    EXPECT_NE(c->operand.get(), sq->operand.get()) << "the operand is a real copy";
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(c->operand.get())->relation_slot,
+              dynamic_cast<const ColumnRef*>(sq->operand.get())->relation_slot);
+    EXPECT_EQ(c->kind, sq->kind);
+    EXPECT_EQ(c->negated, sq->negated);
+    EXPECT_EQ(c->correlated, sq->correlated);
+}
+
+// DISPATCH SITE 1. Falling through to "?" would give two different subqueries
+// ONE identity, and substituteInto() rewrites any subtree whose exprKey matches
+// a GROUP BY key. The address is stable across a clone precisely because the
+// statement is shared.
+TEST(SubqueryDispatch, ExprKeyIsDistinctPerSubqueryAndStableAcrossAClone) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps) "
+                         "AND season > (SELECT MIN(season) FROM laps)", cat);
+    auto* top = dynamic_cast<const BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(top, nullptr);
+    const SubqueryExpr* a = firstSubquery(top->left.get());
+    const SubqueryExpr* b = firstSubquery(top->right.get());
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_NE(exprKey(a), exprKey(b));
+    EXPECT_NE(exprKey(a), "?");
+
+    auto copy = cloneExpr(a);
+    EXPECT_EQ(exprKey(copy.get()), exprKey(a));
+}
+
+// DISPATCH SITE 10. Visible: --explain prints predicates.
+TEST(SubqueryDispatch, ExprToStringRendersEachForm) {
+    Catalog cat(CATALOG);
+    auto s1 = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
+    EXPECT_EQ(exprToString(firstSubquery(s1.where.get())), "(SELECT ...)");
+
+    auto s2 = bindOnly("SELECT name FROM drivers WHERE NOT EXISTS (SELECT * FROM laps)", cat);
+    EXPECT_EQ(exprToString(firstSubquery(s2.where.get())), "NOT EXISTS (SELECT ...)");
+
+    auto s3 = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
+                       "(SELECT driver_id FROM laps)", cat);
+    EXPECT_EQ(exprToString(firstSubquery(s3.where.get())), "driver_id IN (SELECT ...)");
+}
+
+// DISPATCH SITE 7, the sharpest silent one. Collecting the INNER aggregate as an
+// outer AggregateSpec would compute AVG(speed) over the OUTER relation and emit
+// a column for it.
+TEST(SubqueryDispatch, CollectAggregatesStopsAtTheSubqueryBoundary) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT team, SUM(speed) FROM laps GROUP BY team "
+                         "HAVING SUM(speed) > (SELECT AVG(speed) FROM drivers)", cat);
+    std::vector<const AggregateExpr*> aggs;
+    collectAggregates(stmt.having.get(), aggs);
+    ASSERT_EQ(aggs.size(), 1u) << "the subquery's own AVG must not be collected here";
+    EXPECT_EQ(aggs[0]->function_name, "SUM");
+}
+
+// DISPATCH SITES 12 and 13 both THROW, which is what makes every later omission
+// loud. They name the week rather than falling into the generic
+// "unknown Expr subtype", and they are unreachable from the CLI because
+// Validator refuses first.
+TEST(SubqueryDispatch, TypeInferenceAndEvaluationAreLoudAndNamed) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
+    const SubqueryExpr* sq = firstSubquery(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+    const Schema& s = cat.getTable("laps").schema;
+    try {
+        inferExprType(sq, s);
+        ADD_FAILURE() << "inferExprType must throw for a subquery";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+    }
+}
+
+// ===== Week 30: what Validator refuses, and in which order =====
+
+TEST(SubqueryValidation, PositionIsRestrictedToWhereAndHaving) {
+    Catalog cat(CATALOG);
+    auto expectMessage = [&](const std::string& sql, const std::string& needle) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a rejection for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+                << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    expectMessage("SELECT (SELECT AVG(speed) FROM laps) FROM drivers",
+                  "SELECT: subqueries are supported in WHERE and HAVING only");
+    expectMessage("SELECT team FROM laps GROUP BY (SELECT AVG(speed) FROM laps)",
+                  "GROUP BY: subqueries are supported in WHERE and HAVING only");
+    expectMessage("SELECT team FROM laps ORDER BY (SELECT AVG(speed) FROM laps)",
+                  "ORDER BY: subqueries are supported in WHERE and HAVING only");
+    // DISPATCH SITE 18, in the shape that file already uses for AggregateExpr
+    expectMessage("SELECT l.team FROM laps l JOIN drivers d "
+                  "ON l.driver_id = d.driver_id AND EXISTS (SELECT * FROM laps)",
+                  "JOIN ON: subqueries are not supported in a join condition");
+}
+
+// Arity is decidable at bind time from the select list alone; CARDINALITY
+// ("returned more than one row") is Week 31's runtime check. EXISTS has no arity
+// rule at all — TPC-H Q4 and Q21 both write `select *`.
+TEST(SubqueryValidation, ScalarAndInRequireExactlyOneOutputColumn) {
+    Catalog cat(CATALOG);
+    auto expectMessage = [&](const std::string& sql, const std::string& needle) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a rejection for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+                << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    expectMessage("SELECT team FROM laps WHERE speed > (SELECT speed, team FROM laps)",
+                  "scalar subquery must return exactly one column");
+    expectMessage("SELECT team FROM laps WHERE speed > (SELECT * FROM laps)",
+                  "scalar subquery must return exactly one column");
+    expectMessage("SELECT team FROM laps WHERE season IN (SELECT * FROM drivers)",
+                  "IN subquery must return exactly one column");
+    // ...and EXISTS (SELECT *) reaches the Week 31 refusal instead
+    expectMessage("SELECT team FROM laps WHERE EXISTS (SELECT * FROM drivers)",
+                  "not yet executable (Week 31)");
+}
+
+// The refusal is LAST: every parse, bind and validate error a query is entitled
+// to fires first. Proving it needs faults INSIDE the nested query, which is also
+// what proves validateExpr handed the body to a fresh validation against its own
+// schema rather than descending with the outer one.
+TEST(SubqueryValidation, RealQueryDefectsOutrankTheNotExecutableRefusal) {
+    Catalog cat(CATALOG);
+    auto expectMessage = [&](const std::string& sql, const std::string& needle) {
+        try {
+            buildLogical(sql, cat);
+            ADD_FAILURE() << "expected a rejection for: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(needle), std::string::npos)
+                << "for: " << sql << "\n  actual: " << e.what();
+        }
+    };
+    expectMessage("SELECT team FROM laps WHERE EXISTS (SELECT * FROM nosuchtable)",
+                  "Table not found: 'nosuchtable'");
+    expectMessage("SELECT team FROM laps WHERE EXISTS "
+                  "(SELECT * FROM drivers WHERE nosuchcol = 1)",
+                  "column not found: 'nosuchcol'");
+    expectMessage("SELECT team FROM laps WHERE EXISTS "
+                  "(SELECT name FROM drivers GROUP BY age)",
+                  "must appear in GROUP BY");
+    expectMessage("SELECT team FROM laps WHERE EXISTS "
+                  "(SELECT COUNT(*) FROM drivers HAVING COUNT(*) > 1)",
+                  "HAVING requires GROUP BY");
+    // ...and the outer query's own faults still come first too
+    expectMessage("SELECT nosuchcol FROM laps WHERE EXISTS (SELECT * FROM drivers)",
+                  "column not found: 'nosuchcol'");
+}
+
+// A subquery's own aggregate is legal even inside a WHERE, because the body is a
+// different scope with its own aggregate rule. Descending into it from the outer
+// walk (which carries allow_aggregates=false for a WHERE) would reject TPC-H
+// Q17, Q11 and Q22 outright.
+TEST(SubqueryValidation, AnAggregateInsideASubqueryInWhereIsLegal) {
+    Catalog cat(CATALOG);
+    try {
+        buildLogical("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+        EXPECT_EQ(std::string(e.what()).find("not allowed in WHERE"), std::string::npos)
+            << "the outer WHERE's aggregate rule must not reach into the subquery";
+    }
+}
+
+// A correlated reference is supplied by an enclosing query, so it is constant
+// within every group of THIS one and needs no GROUP BY entry (site 5), and it
+// must not be checked against this scope's schema (site 4).
+TEST(SubqueryValidation, CorrelatedRefsAreNotThisScopesToCheckOrGroup) {
+    Catalog cat(CATALOG);
+    try {
+        buildLogical("SELECT l.team FROM laps l WHERE EXISTS "
+                     "(SELECT d.name FROM drivers d WHERE d.driver_id = l.driver_id "
+                     " GROUP BY d.name)", cat);
+        ADD_FAILURE() << "expected the Week 31 refusal";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+            << e.what();
+    }
+}

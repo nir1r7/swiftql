@@ -607,9 +607,16 @@ TEST(JoinEnumeration, JoinCardinalityIsUnflooredAndTheStampIsNot) {
 // callers that skip the Binder) has no place in the join graph: keysBetween and
 // rebuild both test membership of the placed set, which a -1 endpoint can never
 // satisfy, so the key would be dropped from the rebuilt tree — a missing conjunct
-// and MORE rows if the join had a second key. Unreachable from the CLI, so this
-// is the shape of a planner bug and must be loud, like every other check here.
-TEST(JoinEnumeration, UnboundJoinKeyIsRefusedRatherThanDropped) {
+// and MORE rows if the join had a second key.
+//
+// Week 30 turns the refusal into a DECLINE. This used to throw, which made it
+// the one place the optimized path could fail on input --no-optimize accepts,
+// and Week 31/34 make the condition reachable for a legitimate plan: a subquery
+// introduces scans that are not range-table entries of this query, at which
+// point `slot >= countRelations()` stops meaning "unbound key". The property to
+// pin is therefore stronger than "it does not throw": the tree must come back
+// in WRITTEN order, unreordered, with no order= decision claiming a search ran.
+TEST(JoinEnumeration, UnboundJoinKeyDeclinesRatherThanDroppingOrThrowing) {
     Catalog cat(CATALOG);
     seedStats(cat);
     // A MULTI-key join is what makes this a wrong answer rather than an error:
@@ -630,7 +637,29 @@ TEST(JoinEnumeration, UnboundJoinKeyIsRefusedRatherThanDropped) {
     ASSERT_GE(joins.front()->keys.size(), 2u);
     const_cast<LogicalJoin*>(joins.front())->keys[0].from_slot = -1;
 
-    EXPECT_THROW(JoinEnumeration::apply(std::move(plan), cat), std::runtime_error);
+    // capture the written-order shape before the pass sees it
+    std::vector<int> written;
+    for (const LogicalJoin* j : joins) written.push_back(j->join_slot);
+    const size_t written_keys = joins.front()->keys.size();
+
+    std::unique_ptr<LogicalPlanNode> out;
+    ASSERT_NO_THROW(out = JoinEnumeration::apply(std::move(plan), cat));
+    ASSERT_NE(out, nullptr);
+
+    std::vector<const LogicalJoin*> after;
+    collectJoins(out.get(), after);
+    ASSERT_EQ(after.size(), written.size());
+    for (size_t i = 0; i < written.size(); ++i) {
+        EXPECT_EQ(after[i]->join_slot, written[i]) << "the tree was reordered anyway";
+    }
+    // the key is still there — declining is what keeps it, dropping it is the
+    // wrong answer this check has always existed to prevent
+    EXPECT_EQ(after.front()->keys.size(), written_keys);
+    // and no decision is claimed: `order=` must keep meaning "the search ran"
+    for (const LogicalJoin* j : after) {
+        EXPECT_EQ(j->order_decision.find("order="), std::string::npos)
+            << "a declined tree must not print an order= line";
+    }
 }
 
 // ── the guards that had never executed ──────────────────────────────────────

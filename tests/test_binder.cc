@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "planner/binder.h"
 #include "planner/planner.h"
+#include "planner/validator.h"
+#include "parser/expr_utils.h"
 #include "planner/plan_nodes.h"
 #include "parser/parser.h"
 #include "storage/csv_loader.h"
@@ -898,4 +900,282 @@ TEST(Binder, GroupByInputColumnBeatsAlias) {
 
     EXPECT_EQ(stmt.group_by[0].expr, nullptr);
     EXPECT_EQ(stmt.group_by[0].column_name, "speed");
+}
+
+// ===== Week 30: nested scopes =====
+
+// Reach the SubqueryExpr in a bound statement's WHERE (possibly under a
+// comparison), so the scope assertions below read the real node.
+static const SubqueryExpr* whereSubquery(const SelectStatement& stmt) {
+    const Expr* e = stmt.where.get();
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+        if (auto* s = dynamic_cast<const SubqueryExpr*>(bin->right.get())) return s;
+        if (auto* s = dynamic_cast<const SubqueryExpr*>(bin->left.get())) return s;
+    }
+    return dynamic_cast<const SubqueryExpr*>(e);
+}
+
+// First ColumnRef in an expression tree matching a column name, anywhere.
+static const ColumnRef* findRef(const Expr* e, const std::string& name) {
+    if (!e) return nullptr;
+    if (auto* c = dynamic_cast<const ColumnRef*>(e))
+        return c->column_name == name ? c : nullptr;
+    if (auto* b = dynamic_cast<const BinaryExpr*>(e)) {
+        if (auto* l = findRef(b->left.get(), name)) return l;
+        return findRef(b->right.get(), name);
+    }
+    if (auto* a = dynamic_cast<const AggregateExpr*>(e)) return findRef(a->argument.get(), name);
+    if (auto* u = dynamic_cast<const UnaryExpr*>(e)) return findRef(u->operand.get(), name);
+    if (auto* n = dynamic_cast<const IsNullExpr*>(e)) return findRef(n->operand.get(), name);
+    return nullptr;
+}
+
+// A slot is a position in the range table of the scope query_level steps out.
+// An uncorrelated subquery's refs are all level 0 IN ITS OWN scope, and the
+// enclosing query's are level 0 in theirs — the two 0s are different range
+// tables, which is exactly why the level field exists.
+TEST(BinderTest, UncorrelatedSubqueryRefsAreLocalToTheirOwnScope) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM drivers d2 "
+        "JOIN laps l2 ON d2.driver_id = l2.driver_id)", cat);
+    EXPECT_TRUE(stmt.has_subquery);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+    EXPECT_FALSE(sq->correlated);
+
+    // the inner AVG(speed) resolves to the INNER range table's slot 1 (laps l2),
+    // not to the outer query's laps at slot 0
+    const ColumnRef* inner = findRef(sq->subquery->select_list[0].get(), "speed");
+    ASSERT_NE(inner, nullptr);
+    EXPECT_EQ(inner->query_level, 0);
+    EXPECT_EQ(inner->relation_slot, 1);
+}
+
+// TPC-H Q17's shape. A ref that resolves in an ENCLOSING scope is correlated:
+// it carries the level it resolved at and the slot it occupies IN THAT SCOPE.
+TEST(BinderTest, CorrelatedRefCarriesItsLevelAndTheOuterScopesSlot) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT l.lap_id FROM laps l WHERE l.speed > "
+        "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)", cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+    EXPECT_TRUE(sq->correlated);
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* local = dynamic_cast<const ColumnRef*>(cmp->left.get());    // l2.team
+    auto* outer = dynamic_cast<const ColumnRef*>(cmp->right.get());   // l.team
+    ASSERT_NE(local, nullptr);
+    ASSERT_NE(outer, nullptr);
+    EXPECT_EQ(local->query_level, 0);
+    EXPECT_EQ(outer->query_level, 1);
+    EXPECT_EQ(outer->relation_slot, 0);
+}
+
+// The shape that fails if the two numbering domains were conflated: the outer
+// query has TWO relations, and the correlated ref names the second. Slot 1 in
+// the outer scope, while the subquery's own slot 1 does not exist at all.
+TEST(BinderTest, CorrelatedRefAcrossAJoinKeepsTheOuterSlot) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team)", cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+    EXPECT_TRUE(sq->correlated);
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* outer = dynamic_cast<const ColumnRef*>(cmp->right.get());   // d.team
+    ASSERT_NE(outer, nullptr);
+    EXPECT_EQ(outer->query_level, 1);
+    EXPECT_EQ(outer->relation_slot, 1) << "the outer range table's second entry";
+}
+
+// SHADOWING 1 — an inner relation whose alias repeats an outer one. SQL says the
+// inner wins; the duplicate-alias diagnostic must stay PER SCOPE or this is a
+// spurious "duplicate table alias".
+TEST(BinderTest, InnerAliasShadowsAnOuterAliasOfTheSameName) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT x.team FROM laps x WHERE EXISTS "
+        "(SELECT * FROM drivers x WHERE x.age > 30)", cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* age = dynamic_cast<const ColumnRef*>(cmp->left.get());
+    ASSERT_NE(age, nullptr);
+    EXPECT_EQ(age->query_level, 0) << "x must be the INNER drivers, not the outer laps";
+    EXPECT_EQ(age->relation_slot, 0);
+    EXPECT_FALSE(sq->correlated) << "nothing here reaches out";
+}
+
+// SHADOWING 2 — an unqualified name present in BOTH scopes. The inner one wins,
+// and this is NOT an ambiguity: the ambiguity check is per scope. A binder that
+// searched a flattened range table would either throw here or resolve outward.
+TEST(BinderTest, UnqualifiedNameInBothScopesResolvesToTheInnerOne) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS "
+        "(SELECT * FROM drivers d WHERE team = 'Ferrari')", cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* team = dynamic_cast<const ColumnRef*>(cmp->left.get());
+    ASSERT_NE(team, nullptr);
+    EXPECT_EQ(team->query_level, 0) << "`team` exists in laps AND drivers; inner wins";
+    EXPECT_FALSE(sq->correlated);
+}
+
+// SHADOWING 3 — a name that exists ONLY in the enclosing scope. The subquery has
+// one relation, and before Week 30 a single-relation block took slot 0 for every
+// unqualified name without checking existence, which would have swallowed this
+// silently. It must reach outward instead and be marked correlated. (Week 33
+// decorrelates it; Week 30 only has to represent it, which is the README bullet.)
+TEST(BinderTest, NameOnlyInTheOuterScopeResolvesOutwardAndMarksCorrelation) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS "
+        "(SELECT * FROM sj s WHERE season = 2024)", cat);
+    const SubqueryExpr* sq = whereSubquery(stmt);
+    ASSERT_NE(sq, nullptr);
+    EXPECT_TRUE(sq->correlated);
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* season = dynamic_cast<const ColumnRef*>(cmp->left.get());
+    ASSERT_NE(season, nullptr);
+    EXPECT_EQ(season->query_level, 1) << "sj has no `season`; laps does";
+    EXPECT_EQ(season->relation_slot, 0);
+
+    // and a name in NEITHER scope stays this scope's problem, reported by the
+    // Validator against the subquery's own schema rather than resolved outward
+    auto bad = bindQuery("SELECT l.lap_id FROM laps l WHERE EXISTS "
+                         "(SELECT * FROM sj s WHERE nosuchcol = 1)", cat);
+    try {
+        Validator::validate(bad, cat);
+        ADD_FAILURE() << "expected the subquery's own column error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("column not found: 'nosuchcol'"),
+                  std::string::npos) << e.what();
+    }
+}
+
+// Ambiguity is still decided PER SCOPE — two relations of one block sharing a
+// column name is as unresolvable as it ever was.
+TEST(BinderTest, AmbiguityInsideASubqueryIsStillAmbiguous) {
+    Catalog cat(CATALOG);
+    try {
+        bindQuery("SELECT lap_id FROM laps l WHERE EXISTS "
+                  "(SELECT * FROM laps l2 JOIN drivers d ON l2.driver_id = d.driver_id "
+                  " WHERE team = 'Ferrari')", cat);
+        ADD_FAILURE() << "expected an ambiguity error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("ambiguous column reference"), std::string::npos)
+            << e.what();
+    }
+}
+
+// Two levels out (TPC-H Q20's shape): the innermost block and the one between it
+// and the resolving scope are BOTH correlated — neither can be evaluated
+// independently of the block that supplies the value.
+TEST(BinderTest, CorrelationMarksEveryScopeBetween) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT name FROM drivers d WHERE d.driver_id IN "
+        "(SELECT l.driver_id FROM laps l WHERE l.speed > "
+        " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = d.driver_id))", cat);
+    const SubqueryExpr* mid = whereSubquery(stmt);
+    ASSERT_NE(mid, nullptr);
+    EXPECT_TRUE(mid->correlated) << "the middle block is correlated too";
+
+    auto* cmp = dynamic_cast<const BinaryExpr*>(mid->subquery->where.get());
+    ASSERT_NE(cmp, nullptr);
+    auto* inner = dynamic_cast<const SubqueryExpr*>(cmp->right.get());
+    ASSERT_NE(inner, nullptr);
+    EXPECT_TRUE(inner->correlated);
+
+    auto* icmp = dynamic_cast<const BinaryExpr*>(inner->subquery->where.get());
+    ASSERT_NE(icmp, nullptr);
+    auto* two_out = dynamic_cast<const ColumnRef*>(icmp->right.get());
+    ASSERT_NE(two_out, nullptr);
+    EXPECT_EQ(two_out->query_level, 2);
+}
+
+// ===== Week 30: binding is idempotent, which closes two live alias bugs =====
+
+// Both of these returned `Error: unknown table qualifier: 'drivers'` before
+// Week 30, on every path, at two relations. resolveColumnRef's unqualified
+// branch rewrites table_name to the TABLE name while the range table is keyed on
+// the REF name, so re-binding an already-bound clone took the qualified path and
+// looked for a relation called `drivers` among `l` and `d`.
+TEST(BinderTest, OrderByOverAnUnqualifiedSelectAliasBindsInAnAliasedQuery) {
+    Catalog cat(CATALOG);
+    SelectStatement stmt;
+    ASSERT_NO_THROW(stmt = bindQuery(
+        "SELECT name AS n FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "ORDER BY n", cat));
+    ASSERT_EQ(stmt.order_by.size(), 1u);
+    auto* col = dynamic_cast<const ColumnRef*>(stmt.order_by[0].expr.get());
+    ASSERT_NE(col, nullptr) << "the alias must be substituted by the bound select item";
+    EXPECT_EQ(col->column_name, "name");
+    EXPECT_EQ(col->relation_slot, 1);
+}
+
+TEST(BinderTest, GroupByOverAnUnqualifiedSelectAliasBindsInAnAliasedQuery) {
+    Catalog cat(CATALOG);
+    SelectStatement stmt;
+    ASSERT_NO_THROW(stmt = bindQuery(
+        "SELECT name AS n, COUNT(*) AS c FROM laps l JOIN drivers d "
+        "ON l.driver_id = d.driver_id GROUP BY n", cat));
+    ASSERT_EQ(stmt.group_by.size(), 1u);
+    EXPECT_EQ(stmt.group_by[0].column_name, "name");
+    EXPECT_EQ(stmt.group_by[0].relation_slot, 1);
+}
+
+// The fix must NOT be "write ref_name back": aggregateOutputName IS
+// exprToString, which renders table_name.column_name, so that spelling would
+// rename every aggregate over an unqualified column in an aliased query.
+// This is the regression guard for the fix, not for the bug.
+TEST(BinderTest, AliasFixDoesNotMoveAggregateOutputNames) {
+    Catalog cat(CATALOG);
+    auto stmt = bindQuery(
+        "SELECT AVG(speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat);
+    auto* agg = dynamic_cast<const AggregateExpr*>(stmt.select_list[0].get());
+    ASSERT_NE(agg, nullptr);
+    EXPECT_EQ(aggregateOutputName(agg), "AVG(laps.speed)");
+
+    // and a single-relation query keeps its UNqualified rendering, which the
+    // pre-Week-30 `range_table.size() < 2` shortcut is what produced
+    auto one = bindQuery("SELECT SUM(speed * 2) FROM laps", cat);
+    auto* agg1 = dynamic_cast<const AggregateExpr*>(one.select_list[0].get());
+    ASSERT_NE(agg1, nullptr);
+    EXPECT_EQ(aggregateOutputName(agg1), "SUM((speed * 2))");
+}
+
+// Binding twice must be a no-op. It is the precondition for SubqueryExpr's
+// shared statement: cloneExpr shares the shared_ptr, so two nodes can reach one
+// SelectStatement and the Binder can walk it twice.
+TEST(BinderTest, BindingIsIdempotent) {
+    Catalog cat(CATALOG);
+    Parser p("SELECT name AS n, AVG(speed) FROM laps l JOIN drivers d "
+             "ON l.driver_id = d.driver_id WHERE speed BETWEEN 300 AND 320 ORDER BY n");
+    auto stmt = p.parse();
+    Binder::bind(stmt, cat);
+    const ColumnRef* before = firstSelectCol(stmt);
+    ASSERT_NE(before, nullptr);
+    const int slot = before->relation_slot;
+    const std::string qualifier = before->table_name;
+
+    ASSERT_NO_THROW(Binder::bind(stmt, cat));
+    const ColumnRef* after = firstSelectCol(stmt);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->relation_slot, slot);
+    EXPECT_EQ(after->table_name, qualifier);
 }

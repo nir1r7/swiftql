@@ -677,3 +677,108 @@ TEST(ParserTest, TrailingInputIsRejected) {
     EXPECT_NO_THROW(Parser("SELECT team FROM laps LIMIT 2;").parse());
     EXPECT_NO_THROW(Parser("SELECT team FROM laps LIMIT 2").parse());
 }
+
+// ===== Week 30: subquery productions =====
+
+// The scalar form lives at the PRIMARY level because `(SELECT ...)` is
+// self-delimiting, which is what lets it compose with arithmetic for free —
+// TPC-H Q17's `< 0.2 * (select avg(...) ...)` needs exactly that. One token of
+// lookahead after '(' separates it from a parenthesized expression, and SELECT
+// can begin no expression, so the grammar stays unambiguous.
+TEST(ParserTest, ScalarSubqueryParsesAsAPrimary) {
+    Parser p("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)");
+    auto stmt = p.parse();
+    auto* bin = dynamic_cast<BinaryExpr*>(stmt.where.get());
+    ASSERT_NE(bin, nullptr);
+    auto* sq = dynamic_cast<SubqueryExpr*>(bin->right.get());
+    ASSERT_NE(sq, nullptr);
+    EXPECT_EQ(sq->kind, SubqueryExpr::Kind::SCALAR);
+    EXPECT_FALSE(sq->negated);
+    EXPECT_EQ(sq->operand, nullptr) << "only IN carries a left-hand operand";
+    ASSERT_NE(sq->subquery, nullptr);
+    EXPECT_EQ(sq->subquery->from_table, "laps");
+
+    // ...and composes with arithmetic, which is the whole reason for the level
+    Parser q("SELECT team FROM laps WHERE speed > 0.2 * (SELECT AVG(speed) FROM laps)");
+    EXPECT_NO_THROW(q.parse());
+
+    // a plain parenthesized expression is untouched
+    Parser r("SELECT team FROM laps WHERE (speed + 1) > 2");
+    auto rs = r.parse();
+    EXPECT_EQ(dynamic_cast<SubqueryExpr*>(rs.where.get()), nullptr);
+}
+
+// EXISTS is also self-delimiting, so it sits beside CASE at the primary level.
+// NOT EXISTS is the trap: parseCompare's NOT lookahead only fires AFTER a
+// complete left operand, so a leading NOT reaches parsePrimary and would hit
+// the "general NOT is not supported" message without the lookahead there.
+TEST(ParserTest, ExistsAndNotExistsParse) {
+    Parser p("SELECT name FROM drivers WHERE EXISTS (SELECT * FROM laps)");
+    auto stmt = p.parse();
+    auto* sq = dynamic_cast<SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+    EXPECT_EQ(sq->kind, SubqueryExpr::Kind::EXISTS);
+    EXPECT_FALSE(sq->negated);
+    EXPECT_TRUE(sq->subquery->select_star) << "EXISTS (SELECT *) is TPC-H Q4/Q21";
+
+    Parser n("SELECT name FROM drivers WHERE NOT EXISTS (SELECT * FROM laps)");
+    auto ns = n.parse();
+    auto* nsq = dynamic_cast<SubqueryExpr*>(ns.where.get());
+    ASSERT_NE(nsq, nullptr);
+    EXPECT_TRUE(nsq->negated);
+
+    // and in the middle of an AND chain, where parseAndExpr must still reach
+    // parsePrimary with the NOT as the current token
+    Parser a("SELECT name FROM drivers WHERE age > 30 AND NOT EXISTS (SELECT * FROM laps)");
+    EXPECT_NO_THROW(a.parse());
+
+    // general NOT is still refused — the lookahead must not have widened it
+    EXPECT_THROW(Parser("SELECT name FROM drivers WHERE NOT age = 30").parse(), ParseError);
+}
+
+// IN (subquery) is a DIFFERENT production, not a longer constant list: InExpr's
+// design is a set hashed once at compile time, which a subquery cannot be, and
+// Week 32 lowers this shape to a semi-/anti-join.
+TEST(ParserTest, InSubqueryIsItsOwnProductionNotAnInExpr) {
+    Parser p("SELECT name FROM drivers WHERE driver_id IN (SELECT driver_id FROM laps)");
+    auto stmt = p.parse();
+    EXPECT_EQ(dynamic_cast<InExpr*>(stmt.where.get()), nullptr)
+        << "it must not be folded into the constant-list node";
+    auto* sq = dynamic_cast<SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(sq, nullptr);
+    EXPECT_EQ(sq->kind, SubqueryExpr::Kind::IN);
+    EXPECT_FALSE(sq->negated);
+    ASSERT_NE(sq->operand, nullptr) << "the left-hand expression belongs to the OUTER query";
+    EXPECT_EQ(dynamic_cast<ColumnRef*>(sq->operand.get())->column_name, "driver_id");
+
+    Parser n("SELECT name FROM drivers WHERE driver_id NOT IN (SELECT driver_id FROM laps)");
+    auto ns = n.parse();
+    EXPECT_TRUE(dynamic_cast<SubqueryExpr*>(ns.where.get())->negated);
+
+    // the constant list is untouched
+    Parser c("SELECT team FROM laps WHERE season IN (2024, 2025)");
+    auto cs = c.parse();
+    ASSERT_NE(dynamic_cast<InExpr*>(cs.where.get()), nullptr);
+}
+
+// A subquery ends at its own ')', so it must go through parseSelect() rather
+// than parse() — parse() demands end-of-input. Nesting then costs nothing: the
+// recursive-descent methods are re-entrant.
+TEST(ParserTest, SubqueriesNestAndKeepTheirOwnClauses) {
+    Parser p("SELECT name FROM drivers d WHERE d.driver_id IN "
+             "(SELECT l.driver_id FROM laps l WHERE l.speed > "
+             " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) "
+             " GROUP BY l.driver_id HAVING COUNT(*) > 2)");
+    auto stmt = p.parse();
+    auto* outer = dynamic_cast<SubqueryExpr*>(stmt.where.get());
+    ASSERT_NE(outer, nullptr);
+    EXPECT_EQ(outer->subquery->group_by.size(), 1u);
+    EXPECT_NE(outer->subquery->having, nullptr);
+    auto* mid = dynamic_cast<BinaryExpr*>(outer->subquery->where.get());
+    ASSERT_NE(mid, nullptr);
+    ASSERT_NE(dynamic_cast<SubqueryExpr*>(mid->right.get()), nullptr);
+
+    // the outer statement's own end-of-input check still fires
+    EXPECT_THROW(Parser("SELECT name FROM drivers WHERE EXISTS (SELECT * FROM laps) GARBAGE")
+                     .parse(), ParseError);
+}

@@ -940,11 +940,13 @@ TEST(PruningHintForPreservedSide, OuterJoinTestsEveryPreservedSlotNotJustZero) {
 }
 
 // collectSlots is DISPATCH SITE 8: a missed Expr subtype yields an EMPTY slot
-// set, and both of its other callers read empty as the conservative answer
-// (pushdown declines to push; classifyJoinCondition declines to make a key).
-// Reading it as permissive here would let a future node type — Week 30/32's
-// subquery expressions are the first realistic chance — silently turn this guard
-// off and hand a null-supplying predicate back to the preserved side's scan.
+// set, and its three callers do NOT agree on what that means (corrected in
+// Week 30, along with predicate_pushdown.h/.cc, which said the opposite):
+// soleSlot reads empty as -1 and declines to push, which is CONSERVATIVE, while
+// classifyJoinCondition reads it as "no forward reference" and ACCEPTS the
+// conjunct, which is PERMISSIVE. Here empty would read as "mentions nothing
+// unpreserved" and turn the guard OFF, so this caller must fail closed on its
+// own account rather than on a property of the others.
 TEST(PruningHintForPreservedSide, AnEmptySlotSetFailsClosed) {
     // a constant predicate carries no ColumnRef, so collectSlots yields nothing —
     // the same state an unhandled subtype would produce. Withholding costs
@@ -961,3 +963,62 @@ TEST(PruningHintForPreservedSide, AnEmptySlotSetFailsClosed) {
     EXPECT_EQ(pruningHintForPreservedSide(stmt.where.get(), JoinType::INNER, {0}),
               stmt.where.get());
 }
+
+// ===== Week 30: collectSlots and the subquery node (DISPATCH SITE 8) =====
+
+// Not reachable from the CLI this week — Validator refuses a bound subquery
+// before any logical plan exists — so these call the walker directly, the way
+// PruningHintForPreservedSide.AnEmptySlotSetFailsClosed already does. readme.md's
+// site-8 note requires the branch to ship WITH the node, because Week 31 turns
+// it live and a miss there is a wrong answer, not a lost optimization.
+
+static SelectStatement bindSql(const std::string& sql, const Catalog& cat) {
+    Parser p(sql);
+    auto stmt = p.parse();
+    Binder::bind(stmt, cat);
+    return stmt;
+}
+
+// A subquery's OWN refs are positions in a DIFFERENT scope's range table, so
+// contributing them here would name this block's relations by another block's
+// numbering. An uncorrelated subquery is a constant with respect to this block
+// and contributes nothing at all.
+TEST(CollectSlots, UncorrelatedSubqueryContributesOnlyItsOperandsSlots) {
+    Catalog cat(CATALOG);
+    auto stmt = bindSql("SELECT l.team FROM laps l JOIN drivers d "
+                        "ON l.driver_id = d.driver_id "
+                        "WHERE d.age IN (SELECT season FROM laps l2)", cat);
+    std::unordered_set<int> slots;
+    collectSlots(stmt.where.get(), slots);
+    EXPECT_EQ(slots, (std::unordered_set<int>{1}))
+        << "d.age is slot 1; the body's own slot 0 belongs to another scope";
+}
+
+// A CORRELATED subquery does reference this block — that is what correlation
+// means — so it must contribute something. -1 is this walker's existing
+// "references something this block cannot name" value, and it makes every
+// caller conservative: soleSlot declines to push, and the pruning-hint guard
+// withholds.
+TEST(CollectSlots, CorrelatedSubqueryContributesTheConservativeSentinel) {
+    Catalog cat(CATALOG);
+    auto stmt = bindSql("SELECT l.team FROM laps l JOIN drivers d "
+                        "ON l.driver_id = d.driver_id "
+                        "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team)", cat);
+    std::unordered_set<int> slots;
+    collectSlots(stmt.where.get(), slots);
+    EXPECT_EQ(slots.count(-1), 1u) << "a correlated conjunct owns no single relation";
+
+    // ...which is exactly what keeps the pruning-hint guard closed over it
+    EXPECT_EQ(pruningHintForPreservedSide(stmt.where.get(), JoinType::LEFT, {0, 1}), nullptr);
+    // and an inner join is untouched, as always
+    EXPECT_EQ(pruningHintForPreservedSide(stmt.where.get(), JoinType::INNER, {0, 1}),
+              stmt.where.get());
+}
+
+// restampSlots' own SubqueryExpr branch (dispatch site 9) cannot be exercised
+// yet and deliberately has no test: the only route to it is a conjunct that
+// soleSlot pushes below a join, and no statement containing a subquery reaches
+// PredicatePushdown at all this week (Validator refuses first). Its correctness
+// is an argument rather than an assertion, and the argument is the test above —
+// a CORRELATED subquery yields -1, so soleSlot returns -1, so such a conjunct is
+// never pushed; an UNCORRELATED one has nothing inside the body to restamp.
