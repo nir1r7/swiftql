@@ -828,10 +828,16 @@ WEEK33_DECORRELATED_VOLCANO_REJECTED = [
 # SQLite says 6, and 0 where SQLite says 14. This file held no directly
 # correlated IN at all, which is exactly why every mode passed.
 WEEK33_CORRELATED_IN_SHAPES = [
-    # nested two deep, the inner one correlated to the MIDDLE block (Q20)
-    "SELECT name FROM drivers d WHERE d.driver_id IN "
-    "(SELECT l.driver_id FROM laps l WHERE l.speed > "
-    " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
+    # MOVED to WEEK34_CORRELATED_SCALAR_VEC_ONLY. Its old comment here called it
+    # "nested two deep, the inner one correlated to the MIDDLE block", and that
+    # description is what kept it looking unsupported. Re-read: the IN body
+    # references only its OWN relation `l`, so the IN is UNCORRELATED and the
+    # scalar is correlated ONE level, to the IN body's own block. It is therefore
+    # two INDEPENDENT mechanisms in two separate blocks — Week 32's semi-join
+    # lowering for the IN, and Week 34's scalar decorrelation running inside the
+    # body's own LogicalPlanBuilder::build — not a two-level correlation at all.
+    # Verified against SQLite before the move, including a variant that returns a
+    # proper subset (19 of 20 drivers) and the NOT IN / anti-join form.
     # R2-C1: SwiftQL 20, SQLite 6
     "SELECT COUNT(*) FROM drivers d WHERE d.driver_id IN "
     "(SELECT l.lap_id FROM laps l WHERE l.team = d.team)",
@@ -849,9 +855,15 @@ WEEK33_CORRELATED_NESTED_VOLCANO = [
     (q, "not supported on the Volcano path") for q in WEEK33_CORRELATED_IN_SHAPES]
 
 WEEK33_CORRELATED_BINDS = [
-    # scalar, correlated (Q17), composed with arithmetic
-    "SELECT l.lap_id FROM laps l WHERE l.speed > "
-    "0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    # MOVED to WEEK34_CORRELATED_SCALAR_VEC_ONLY. This is Q17 exactly — a
+    # correlated scalar as an operand of ARITHMETIC — and Week 34's
+    # lowerCorrelatedScalars makes it legal: the node is not a whole conjunct, so
+    # it is replaced in place through forEachSubquery while the GROUP BY join is
+    # grafted onto the spine. Verified against SQLite before the move: 2084 rows
+    # both ways at a coefficient that actually discriminates, exact set match,
+    # optimized and --no-optimize. Kept as a comment so the move is visible here
+    # and not only in a diff — nothing leaves a rejection suite without arriving
+    # in a diffed one.
     # a correlated ref inside the NESTED query's own ON clause
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
@@ -1049,9 +1061,27 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "AND l2.season = 2024)",
     # ARRIVED FROM WEEK33_CORRELATED_BINDS. Week 33 refused this exact shape and
     # recorded it as its checkpoint miss; it is Q17's, and it is why this suite
-    # exists.
+    # exists. The 0.2 coefficient is the one Week 33 wrote, and it matches every
+    # row - kept verbatim so the moved entry is recognisable - with the
+    # discriminating coefficients below carrying the actual oracle weight.
     "SELECT l.lap_id AS id FROM laps l WHERE l.speed > 0.2 * "
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) ORDER BY id LIMIT 10",
+    # The correlated scalar in every other ARITHMETIC position: on the left of the
+    # comparison, and inside a subtraction. lowerCorrelatedScalars replaces the
+    # node through its owning slot, so position within the expression must not
+    # matter - these are what say so.
+    "SELECT l.lap_id AS id FROM laps l WHERE l.speed > 1.06 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) ORDER BY id",
+    "SELECT l.lap_id AS id FROM laps l WHERE "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) * 1.06 < l.speed "
+    "ORDER BY id",
+    "SELECT l.lap_id AS id FROM laps l WHERE l.speed - "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) > 18 ORDER BY id",
+    # TWO correlated scalars in one predicate: two derived relations grafted onto
+    # one spine, at two different synthetic slots.
+    "SELECT l.lap_id AS id FROM laps l WHERE l.speed > "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) AND l.speed < "
+    "(SELECT MAX(l3.speed) FROM laps l3 WHERE l3.team = l.team) ORDER BY id",
     # ---- THE ZERO-ROW GROUP RULE, one query per aggregate kind. ----
     #
     # Week 34 audit round 1, F1: a silent WRONG ANSWER, and the whole reason this
@@ -1102,12 +1132,26 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id)",
 
     # ARRIVED FROM WEEK33_CORRELATED_IN_SHAPES. The correlation is INSIDE the IN
-    # body and relative to that block, so the scalar rewrite runs during the
-    # body's own build() - two lowerings stacked on two different spines in one
-    # query, which nothing else here exercises.
+    # body and relative to that block, so the IN itself is UNCORRELATED and the
+    # scalar rewrite runs during the body's own build() - two lowerings stacked on
+    # two different spines in one query, which nothing else here exercises.
     "SELECT d.name AS nm FROM drivers d WHERE d.driver_id IN "
     "(SELECT l.driver_id FROM laps l WHERE l.speed > "
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)) ORDER BY nm",
+    # ...and the same shape at a coefficient that actually DISCRIMINATES. The
+    # entry above returns all 20 drivers, so it would pass against an engine that
+    # ignored the inner scalar entirely; this one returns 19, a proper subset, and
+    # is the one that can fail. A weak oracle query is the failure Week 32 shipped
+    # a regression past.
+    "SELECT d.name AS nm FROM drivers d WHERE d.driver_id IN "
+    "(SELECT l.driver_id FROM laps l WHERE l.speed > 1.10 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id)) ORDER BY nm",
+    # The ANTI-JOIN half of the same shape: NOT IN over a body whose own scalar is
+    # decorrelated. Week 32's three-valued NOT IN rule and Week 34's LEFT-join
+    # null-extension meet here, and nothing else in the suite puts them together.
+    "SELECT d.name AS nm FROM drivers d WHERE d.driver_id NOT IN "
+    "(SELECT l.driver_id FROM laps l WHERE l.speed > 1.10 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id)) ORDER BY nm",
 ]
 
 WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
