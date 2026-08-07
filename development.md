@@ -330,8 +330,9 @@ and (Week 25) `[NOT] BETWEEN`, `[NOT] LIKE`, `[NOT] IN (constants)`
 >   null-extended rows. The preserved side still pushes.
 > - **Join enumeration declines the whole tree.** `R ⟕ S ≠ S ⟕ R` and
 >   associativity fails, so no reordering is legal without conflict/eligibility
->   sets. `--explain` prints no `order=` line for such a tree, because there was
->   no decision.
+>   sets. `--explain` reports `join-ordering=skipped (outer join)` and prints no
+>   `order=` line — a decision was available and was refused, which is worth
+>   saying, but no order was chosen.
 >
 > The build side is forced rather than costed: the preserved side must be the
 > probe input (`build=<table> ... (outer: the preserved side must probe)`), and
