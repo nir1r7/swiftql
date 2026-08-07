@@ -1,18 +1,21 @@
 # Phase 5 orchestrator state
-Current: week 33 — TASK 4 (correlated scalar, the Q17/Q22 shape) sent back as REQUIRED.
-  Week 33's checkpoint is "Required correlated TPC-H queries execute correctly", and Q17/Q22
-  are correlated SCALAR subqueries, so the checkpoint is NOT met without Task 4. It was about
-  to be deferred to Week 34 — do not let that stand. Week 34 is derived tables + distinct
-  aggregates, and TPC-H is only measured at Week 36.
-  DONE: tasks 1 (gated green alone), 2, 3, 5, 9. Both self-named gaps closed: NOT EXISTS over
-  a nullable key asserted vs SQLite in BOTH directions; Volcano refusal pinned in
-  WEEK33_DECORRELATED_VOLCANO_REJECTED.
-  ACCEPTED DEVIATION, to be recorded as such: the README's week-33 bullet "retain a correct
-  fallback for unsupported patterns" ships as a REFUSAL, not a fallback. Reason accepted — a
-  real fallback needs a dependent-join operator this engine has never had, and a second
-  execution production risks the two-path drift weeks 26/28/30 each had to undo. Must be
-  written up as a bullet consciously NOT met, in the README and week 34's notes.
-  REMAINING: task 4, then 7 + 8, then 6 (Volcano parity, fine to stay a stated gap).
+Current: week 33 — finishing tasks 7(2,3) and 8, then the Week 34 notes, then verification.
+  !! WEEK 33 CHECKPOINT IS PARTLY MISSED, ON THE RECORD (not a deferral):
+  MET for EXISTS/NOT EXISTS (Q4, Q21). NOT MET for correlated SCALAR (Q17, Q22's correlated
+  half). Blocker is STRUCTURAL: a STANDARD join must merge schemas, and merging needs the
+  aggregate's output column to carry a slot in the OUTER range table, which the Binder never
+  issued because the body is not a relation of the outer FROM. That is LogicalJoin's own
+  two-range-table containment invariant, which the README already predicted Week 34's derived
+  tables would break. KEY INSIGHT: a decorrelated scalar subquery IS a derived table with an
+  implicit join, so the minimum fix (a range-table entry whose schema is a plan subtree's
+  output_schema) is Week 34's core deliverable. Building it in week 33 = doing week 34's
+  infrastructure early and calling it correlation.
+  => WEEK 34 NOW EXPLICITLY OWNS Q17 + Q22 as deliverables, with the minimum-fix sketch and
+  the three silently-breaking consumers (JoinEnumeration::hasSlotOutsideRangeTable declining
+  with no reported decision; Validator's SUM/AVG check indexing stmt.joins[slot-1] out of
+  range; indexOf(name, slot) above the join) carried into its starting notes.
+  ALSO ON THE RECORD: the README bullet "retain a correct fallback for unsupported patterns"
+  ships as a REFUSAL — a conscious deviation, written up as one.
   STILL OPEN: no auditor has read the ColumnId migration.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
