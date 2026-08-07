@@ -51,6 +51,12 @@ a reclaim when possible.
   an uncommitted state file does not survive the exact event it exists for.
 - **Recovery, every reboot:** `git fetch origin claude/phase5-week26-qomtkb`, confirm local HEAD
   is an ancestor, then `git reset --hard origin/claude/phase5-week26-qomtkb`.
+  THEN IMMEDIATELY re-set the git identity — a reclaim restores .git/config, so subagents
+  commit as the user until it is fixed:
+    git config user.email noreply@anthropic.com && git config user.name Claude
+  This is why 301 commits carry the user's email. DO NOT rewrite history to fix them: that
+  span includes Weeks 1-25 the user authored themselves, and force-pushing over their
+  authorship is their decision, not ours. Setting the config forward is the whole remedy.
 - **Root cause of lost agents:** background subagents do NOT keep the session alive. A turn that
   ends with only background agents running reads as idle → reclaim → the next heartbeat boots a
   fresh container and those agents are gone. Two gate+audit pairs were lost this way.
