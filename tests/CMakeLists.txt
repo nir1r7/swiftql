@@ -8,6 +8,7 @@ add_executable(swiftql_tests
     test_vectorized.cc
     test_binder.cc
     test_logical_plan.cc
+    test_subquery.cc
     test_vec_plan_builder.cc
     test_stats.cc
     test_cardinality.cc

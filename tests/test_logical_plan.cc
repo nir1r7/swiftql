@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 #include "planner/logical_plan.h"
 #include "planner/binder.h"
+#include "planner/validator.h"
+#include "planner/subquery_materialization.h"
+#include "execution/evaluator.h"
 #include "parser/parser.h"
 #include "parser/expr_utils.h"
 #include "catalog/catalog.h"
@@ -19,6 +22,18 @@ static std::unique_ptr<LogicalPlanNode> buildLogical(const std::string& sql, con
     auto stmt = parser.parse();
     Binder::bind(stmt, cat);
     return LogicalPlanBuilder::build(std::move(stmt), cat);
+}
+
+// Parse + bind + validate only. Week 31 narrowed the subquery refusal to
+// CORRELATED subqueries, so an uncorrelated one now VALIDATES and is
+// materialized by the CLI before planning — a test that only wants to know what
+// the Validator decides must stop at the Validator rather than plan a statement
+// whose subqueries nothing has substituted.
+static void validateOnly(const std::string& sql, const Catalog& cat) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    Validator::validate(stmt, cat);
 }
 
 // Top-down node-type spine following children[0] (the single-input chain).
@@ -1093,9 +1108,14 @@ TEST(SubqueryDispatch, CollectAggregatesStopsAtTheSubqueryBoundary) {
 }
 
 // DISPATCH SITES 12 and 13 both THROW, which is what makes every later omission
-// loud. They name the week rather than falling into the generic
-// "unknown Expr subtype", and they are unreachable from the CLI because
-// Validator refuses first.
+// loud. Week 31 closed them as INTERNAL invariants rather than as features: an
+// uncorrelated subquery is replaced by a constant before planning and a
+// correlated one is refused, so a SubqueryExpr reaching either site means the
+// materialization walker (site 19) missed an Expr subtype.
+//
+// That is precisely why these two throws are the backstop that lets site 19 be a
+// LOUD dispatch site instead of the eleventh silent one. Deleting them would
+// turn a missed subtype into a wrong answer.
 TEST(SubqueryDispatch, TypeInferenceAndEvaluationAreLoudAndNamed) {
     Catalog cat(CATALOG);
     auto stmt = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
@@ -1106,7 +1126,17 @@ TEST(SubqueryDispatch, TypeInferenceAndEvaluationAreLoudAndNamed) {
         inferExprType(sq, s);
         ADD_FAILURE() << "inferExprType must throw for a subquery";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+        EXPECT_NE(std::string(e.what()).find("without being materialized"), std::string::npos)
+            << e.what();
+    }
+    // site 13, in the same test as site 12 because they must close together:
+    // evaluate() is the semantic reference the vectorized kernels are checked
+    // against, and the two must never disagree about what a node means.
+    try {
+        evaluate(sq, Row{}, s);
+        ADD_FAILURE() << "evaluate must throw for a subquery";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("without being materialized"), std::string::npos)
             << e.what();
     }
 }
@@ -1156,15 +1186,21 @@ TEST(SubqueryValidation, ScalarAndInRequireExactlyOneOutputColumn) {
                   "scalar subquery must return exactly one column");
     expectMessage("SELECT team FROM laps WHERE season IN (SELECT * FROM drivers)",
                   "IN subquery must return exactly one column");
-    // ...and EXISTS (SELECT *) reaches the Week 31 refusal instead
-    expectMessage("SELECT team FROM laps WHERE EXISTS (SELECT * FROM drivers)",
-                  "not yet executable (Week 31)");
+    // ...and EXISTS (SELECT *) has no arity rule at all, so since Week 31 it is
+    // simply a legal, executable query: the check must not have grown into one
+    // that rejects what EXISTS is entitled to write.
+    EXPECT_NO_THROW(validateOnly("SELECT team FROM laps WHERE EXISTS (SELECT * FROM drivers)", cat));
 }
 
 // The refusal is LAST: every parse, bind and validate error a query is entitled
 // to fires first. Proving it needs faults INSIDE the nested query, which is also
 // what proves validateExpr handed the body to a fresh validation against its own
 // schema rather than descending with the outer one.
+//
+// Week 31 narrowed the refusal to correlated subqueries and left the ordering
+// alone, which is what these cases pin: every message below is unchanged, and
+// the correlated case at the end shows the discipline still holds for the
+// refusal that replaced it.
 TEST(SubqueryValidation, RealQueryDefectsOutrankTheNotExecutableRefusal) {
     Catalog cat(CATALOG);
     auto expectMessage = [&](const std::string& sql, const std::string& needle) {
@@ -1190,6 +1226,12 @@ TEST(SubqueryValidation, RealQueryDefectsOutrankTheNotExecutableRefusal) {
     // ...and the outer query's own faults still come first too
     expectMessage("SELECT nosuchcol FROM laps WHERE EXISTS (SELECT * FROM drivers)",
                   "column not found: 'nosuchcol'");
+    // the same discipline for Week 31's narrowed refusal: a defect inside a
+    // CORRELATED subquery must outrank "correlated ... (Week 33)", or that
+    // refusal becomes the catch-all the old one was kept from becoming
+    expectMessage("SELECT l.team FROM laps l WHERE EXISTS "
+                  "(SELECT * FROM drivers d WHERE d.nosuchcol = l.team)",
+                  "'nosuchcol' not found");
 }
 
 // A subquery's own aggregate is legal even inside a WHERE, because the body is a
@@ -1198,15 +1240,12 @@ TEST(SubqueryValidation, RealQueryDefectsOutrankTheNotExecutableRefusal) {
 // Q17, Q11 and Q22 outright.
 TEST(SubqueryValidation, AnAggregateInsideASubqueryInWhereIsLegal) {
     Catalog cat(CATALOG);
-    try {
-        buildLogical("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
-            << e.what();
-        EXPECT_EQ(std::string(e.what()).find("not allowed in WHERE"), std::string::npos)
-            << "the outer WHERE's aggregate rule must not reach into the subquery";
-    }
+    // Since Week 31 this validates cleanly rather than reaching a refusal, which
+    // is stronger evidence for the same property: if the outer WHERE's
+    // aggregate rule reached into the body, this would throw
+    // "aggregate functions are not allowed in WHERE clause".
+    EXPECT_NO_THROW(
+        validateOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat));
 }
 
 // A correlated reference is supplied by an enclosing query, so it is constant
@@ -1218,9 +1257,9 @@ TEST(SubqueryValidation, CorrelatedRefsAreNotThisScopesToCheckOrGroup) {
         buildLogical("SELECT l.team FROM laps l WHERE EXISTS "
                      "(SELECT d.name FROM drivers d WHERE d.driver_id = l.driver_id "
                      " GROUP BY d.name)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
+        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
             << e.what();
     }
 }
@@ -1238,9 +1277,9 @@ TEST(SubqueryValidation, ACorrelatedRefInANestedOnClauseIsNotCheckedHere) {
         buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
                      "(SELECT 1 FROM drivers d JOIN drivers d2 "
                      " ON d.driver_id = d2.driver_id AND d.age = l.lap_id)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
+        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
             << e.what();
         EXPECT_EQ(std::string(e.what()).find("not found in table 'd'"), std::string::npos)
             << "an inner-scope schema must not be indexed by an outer-scope slot";
@@ -1271,9 +1310,9 @@ TEST(SubqueryValidation, ANestedKeylessJoinStillHitsTheCrossProductRefusal) {
         buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
                      "(SELECT 1 FROM drivers d JOIN laps p "
                      " ON d.driver_id = p.driver_id AND p.speed > l.speed)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
+        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
             << e.what();
     }
 }
@@ -1289,9 +1328,9 @@ TEST(SubqueryValidation, ACorrelatedGroupKeyIsAcceptedWhateverTheOuterBlockHolds
     auto expectRefusal = [&](const std::string& sql) {
         try {
             buildLogical(sql, cat);
-            ADD_FAILURE() << "expected the Week 31 refusal for: " << sql;
+            ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal for: " << sql;
         } catch (const std::runtime_error& e) {
-            EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"),
+            EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"),
                       std::string::npos) << "for: " << sql << "\n  actual: " << e.what();
         }
     };
@@ -1413,9 +1452,9 @@ TEST(SubqueryValidation, ACorrelatedAggregateArgumentIsTypedWhereItResolved) {
     // ...and a LEGAL correlated numeric argument must still bind
     try {
         buildLogical(outer + "(SELECT SUM(d.age) FROM drivers x)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
+        ADD_FAILURE() << "expected the Week 33 correlated-subquery refusal";
     } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
+        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 33)"), std::string::npos)
             << e.what();
     }
 }
@@ -1447,15 +1486,11 @@ TEST(SubqueryValidation, ACorrelatedExpressionGroupKeyDoesNotSatisfyALocalColumn
                     "(SELECT driver_id FROM drivers d GROUP BY l.driver_id)");
 
     // control: a LOCAL expression group key must still satisfy the same
-    // reference, or the fix has simply broken expression grouping
-    try {
-        buildLogical("SELECT lap_id FROM laps l WHERE EXISTS "
-                     "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)", cat);
-        ADD_FAILURE() << "expected the Week 31 refusal";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("not yet executable (Week 31)"), std::string::npos)
-            << e.what();
-    }
+    // reference, or the fix has simply broken expression grouping. Uncorrelated,
+    // so since Week 31 it validates cleanly instead of reaching a refusal.
+    EXPECT_NO_THROW(
+        validateOnly("SELECT lap_id FROM laps l WHERE EXISTS "
+                     "(SELECT driver_id + 1 FROM drivers d GROUP BY driver_id + 1)", cat));
 }
 
 // exprKey is prefixed only above level 0, so every key in a query with no
