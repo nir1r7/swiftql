@@ -31,6 +31,16 @@ The output is therefore a PAIR: how many queries answered correctly, and in how
 many modes each. The two-mode / four-mode census is COMPUTED from the run, never
 typed.
 
+ 4. AN ANSWER THAT ASSERTS NOTHING IS NOT AN ANSWER. Every query is also run
+    through a MUTATION CHECK (tpch_queries.MUTATIONS): neuter the one predicate
+    that carries the query's characteristic feature, ask the oracle for both
+    answers, and require them to DIFFER. A query whose mutant answers
+    identically is INERT and is subtracted from the headline figure, alongside
+    the queries whose answer is empty or all-NULL. This exists because the
+    original detector -- "did both sides return zero rows" -- could not see
+    q16, whose NOT IN anti-join filtered nothing on synthetic data and which was
+    counted as an answer for a week.
+
 TIMING. --time parses the Execution: line out of --explain-analyze rather than
 using wall clock, exactly as benchmark.py does. main.cc reloads every table a
 query touches on EVERY invocation (table_rows is declared inside the per-query
@@ -49,7 +59,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tpch_queries import QUERY_IDS, VALIDATION_PARAMS, render          # noqa: E402
+from tpch_queries import QUERY_IDS, VALIDATION_PARAMS, render, render_mutant  # noqa: E402
 from compare_against_sqlite import load_from_catalog, normalize, rows_equal  # noqa: E402
 
 SWIFTQL_BIN = "./build/swiftql"
@@ -229,6 +239,60 @@ def classify(rc, stdout, stderr, oracle_rows, ordered):
                                          f"{len(rows)} rows vs {len(oracle_rows)}")
 
 
+# Vacuity verdicts. All three mean "this query matched the oracle while
+# asserting nothing about the feature it exists to exercise".
+DISCRIMINATING = "DISCRIMINATING"
+EMPTY = "EMPTY"          # zero rows on both sides
+ALL_NULL = "ALL_NULL"    # every value NULL -- an aggregate over an empty input
+INERT = "INERT"          # the characteristic predicate changes no answer
+MUTATION_BROKEN = "MUTATION_BROKEN"   # the mutation could not be applied or run
+
+VACUITY_REASON = {
+    EMPTY: "zero rows on both sides",
+    ALL_NULL: "every value is NULL -- an aggregate over an empty input, so the "
+              "comparison asserts nothing",
+    INERT: "neutering it does not change the answer",
+}
+
+
+def mutation_check(conn, qid):
+    """Does this query's characteristic predicate change its answer?
+
+    Run entirely on the SQLite oracle, deliberately: the question is whether
+    THE DATA makes the feature selective, not whether the engine implements it.
+    That keeps the check cheap enough to run on every gate, and it gives a
+    verdict even for a query the engine still refuses (q17, q21) -- so when
+    Week 36 ports one, it already knows whether the data will test it.
+
+    Returns (verdict, label, detail).
+    """
+    try:
+        label, mutant_sql = render_mutant(qid)
+    except Exception as e:                       # fragment did not apply
+        return MUTATION_BROKEN, "?", str(e)[:200]
+
+    base = oracle_answer(conn, render(qid))
+    if base is None:
+        return MUTATION_BROKEN, label, "SQLite could not run the query"
+    if len(base) == 0:
+        return EMPTY, label, VACUITY_REASON[EMPTY]
+    if all(v is None for row in base for v in row.values()):
+        return ALL_NULL, label, VACUITY_REASON[ALL_NULL]
+
+    mutant = oracle_answer(conn, mutant_sql)
+    if mutant is None:
+        return MUTATION_BROKEN, label, "SQLite could not run the mutant"
+
+    # Positional, not normalize()'d: this compares one SQLite answer against
+    # another, so column names and types are identical by construction and any
+    # difference at all -- a row, a value, a count -- is the discrimination we
+    # are asking about.
+    same = ([tuple(r.values()) for r in base] == [tuple(r.values()) for r in mutant])
+    if same:
+        return INERT, label, VACUITY_REASON[INERT]
+    return DISCRIMINATING, label, f"{len(base)} rows -> {len(mutant)}"
+
+
 def oracle_answer(conn, sql):
     """Run the query on SQLite. None means the oracle cannot express it."""
     try:
@@ -264,7 +328,7 @@ def time_query(catalog, mode_args, sql, warmups, reps):
             "min_us": samples[0], "n": len(samples)}
 
 
-def render_report(qids, cells, details, fingerprints, empties, catalog, provenance):
+def render_report(qids, cells, details, fingerprints, vacuity, catalog, provenance):
     print("=" * 78)
     print("TPC-H correctness report")
     print("=" * 78)
@@ -300,12 +364,41 @@ def render_report(qids, cells, details, fingerprints, empties, catalog, provenan
     pinned = sum(1 for v in cells.values() if v == REFUSED_EXPECTED)
     unknown = sorted(k for k, v in cells.items() if v == REFUSED_UNEXPECTED)
 
+    # The headline. "Answered" is the raw count; MEANINGFULLY answered subtracts
+    # every query whose match asserted nothing, and it is the figure Week 36
+    # improves on. The two are printed together so neither can be quoted alone.
+    vacuous = {q: vacuity[q] for q in qids
+               if q in vacuity and vacuity[q][0] in (EMPTY, ALL_NULL, INERT)}
+    broken = sorted(q for q in qids
+                    if q in vacuity and vacuity[q][0] == MUTATION_BROKEN)
+    meaningful = sorted(q for q in answered if q not in vacuous)
+    meaningful_modes = {}
+    for q in meaningful:
+        meaningful_modes.setdefault(correct_modes[q], []).append(q)
+
     print("-" * 78)
     print(f"answered correctly:            {len(answered)}/{len(qids)}")
     for n in sorted(by_count, reverse=True):
         label = {4: "in all four modes", 2: "in the two vectorized modes only"}.get(
             n, f"in {n} mode(s)")
         print(f"  {label:<30} {len(by_count[n]):>3}   {sorted(by_count[n])}")
+    print(f"MEANINGFULLY answered:         {len(meaningful)}/{len(qids)}"
+          "   (mutation-checked: neutering the characteristic predicate changes"
+          " the answer)")
+    for n in sorted(meaningful_modes, reverse=True):
+        label = {4: "in all four modes", 2: "in the two vectorized modes only"}.get(
+            n, f"in {n} mode(s)")
+        print(f"  {label:<30} {len(meaningful_modes[n]):>3}   "
+              f"{sorted(meaningful_modes[n])}")
+    if vacuous:
+        print(f"  VACUOUS (matched, asserts nothing): {len(vacuous):>3}")
+        for q in sorted(vacuous):
+            verdict, mlabel, detail = vacuous[q]
+            print(f"      {q:<4} {verdict:<9} {mlabel}: {detail}")
+    if broken:
+        print(f"  !! MUTATION BROKEN ({len(broken)}) -- the check itself did not run:")
+        for q in broken:
+            print(f"      {q}: {vacuity[q][2]}")
     print(f"not answered (gap or refusal): {len(unported):>3}   {unported}")
     for q in unported:
         # The REASON, not just the id: this list IS Week 36's worklist and a bare
@@ -337,10 +430,10 @@ def render_report(qids, cells, details, fingerprints, empties, catalog, provenan
     print("    C++ coverage only. No template above uses the alias-list form.")
     if blind:
         print(f"  * ORACLE_BLIND this run: {blind}")
-    if empties:
-        print("  * VACUOUS PASSES -- these matched with ZERO rows on both sides,")
-        print("    so they assert only that both engines found nothing:")
-        print(f"      {sorted(empties)}")
+    print("  * The mutation check neuters ONE predicate per query -- the one")
+    print("    named beside each verdict above. A query it calls DISCRIMINATING")
+    print("    could still contain a second, inert feature; the check bounds the")
+    print("    headline figure from above, it does not certify the query.")
     print("  * The data is synthetic unless PROVENANCE says otherwise; the")
     print("    published TPC-H answer set does not apply to it.")
     print()
@@ -364,7 +457,67 @@ def render_report(qids, cells, details, fingerprints, empties, catalog, provenan
         print(f"  correlated-scalar rewrite present: {'yes' if left else 'no'}")
     print("=" * 78)
 
-    return len(mismatched) == 0 and not unknown
+    # The machine-readable form of everything above. This dict IS the baseline
+    # the gate compares against, so it holds only facts a regression would move.
+    summary = {
+        "meaningful": sorted(meaningful),
+        "modes": {q: correct_modes[q] for q in qids},
+        "vacuous": {q: [vacuity[q][0], vacuity[q][2]] for q in sorted(vacuous)},
+        "mutation_broken": broken,
+        "unported": sorted(unported),
+        "mismatched": mismatched,
+        "unexplained": [f"{q}|{m}" for q, m in unknown],
+    }
+    # A wrong answer, an unexplained error, or a mutation check that could not
+    # run all fail the run. A dialect gap does not: it is Week 36's work,
+    # recorded rather than hidden.
+    return (not mismatched and not unknown and not broken), summary
+
+
+def compare_baseline(summary, baseline_path):
+    """RED on a regression against a recorded baseline. Returns (ok, lines).
+
+    Two regressions, both of which a bare 'answered' count would hide:
+      * a query that was meaningfully answered and no longer is -- whether it
+        stopped answering or became vacuous;
+      * a query that answers in FEWER modes than it did.
+    An improvement is not a failure: it is reported, with the instruction to
+    refresh the baseline, because a stale baseline that silently accepts more is
+    how a gate stops measuring.
+    """
+    with open(baseline_path) as f:
+        base = json.load(f)
+
+    lines, ok = [], True
+    # Only queries this run actually covered: --queries q1 must not read as 21
+    # regressions.
+    ran = set(summary["modes"])
+    was = set(base.get("meaningful", [])) & ran
+    now = set(summary["meaningful"])
+    lost = sorted(was - now)
+    gained = sorted(now - was)
+    for q in lost:
+        why = summary["vacuous"].get(q)
+        reason = f"now VACUOUS ({why[0]})" if why else "no longer answers"
+        lines.append(f"REGRESSION: {q} was meaningfully answered, {reason}")
+        ok = False
+    for q in sorted(base.get("modes", {})):
+        old_n = base["modes"][q]
+        new_n = summary["modes"].get(q)
+        if new_n is None:
+            continue                      # not in this run's query subset
+        if new_n < old_n:
+            lines.append(f"REGRESSION: {q} answers in {new_n} modes, was {old_n}")
+            ok = False
+    if gained:
+        lines.append(f"IMPROVED: {gained} newly meaningful -- rerun with "
+                     f"--write-baseline {baseline_path} to lock it in")
+    for q in sorted(base.get("modes", {})):
+        new_n = summary["modes"].get(q)
+        if new_n is not None and new_n > base["modes"][q]:
+            lines.append(f"IMPROVED: {q} answers in {new_n} modes, was "
+                         f"{base['modes'][q]} -- rerun with --write-baseline")
+    return ok, lines
 
 
 def main():
@@ -376,6 +529,16 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--warmups", type=int, default=1)
     ap.add_argument("--json", default="", help="write the per-query record here")
+    ap.add_argument("--baseline", default="",
+                    help="compare against this baseline and exit non-zero on a "
+                         "regression (a query that stops answering, becomes "
+                         "vacuous, or answers in fewer modes)")
+    ap.add_argument("--write-baseline", default="",
+                    help="write this run's summary as the new baseline")
+    ap.add_argument("--fingerprint-all", action="store_true",
+                    help="capture a plan fingerprint for every answering cell. "
+                         "Off by default: only q22's is reported, and an extra "
+                         "--explain invocation per cell roughly doubles the run")
     args = ap.parse_args()
 
     qids = [q.strip() for q in args.queries.split(",") if q.strip()] or QUERY_IDS
@@ -388,24 +551,25 @@ def main():
 
     conn = load_from_catalog(args.catalog)
 
-    cells, details, fingerprints, timings = {}, {}, {}, {}
-    empties = set()
+    cells, details, fingerprints, timings, vacuity = {}, {}, {}, {}, {}
 
     for qid in qids:
         sql = render(qid)
         ordered = "ORDER BY" in sql.upper()
         oracle = oracle_answer(conn, sql)
-        if oracle is not None and len(oracle) == 0:
-            # A zero-row answer on both sides is a PASS that asserted nothing.
-            # Naming them is the difference between a harness and a rubber stamp.
-            empties.add(qid)
+
+        # Vacuity BEFORE the engine runs: it is a property of the query and the
+        # data, and it costs two SQLite queries, so it is never skipped.
+        vacuity[qid] = mutation_check(conn, qid)
+        print(f"  {qid:<5} {'mutation':<14} {vacuity[qid][0]}"
+              f"  ({vacuity[qid][1]}: {vacuity[qid][2]})")
 
         for mode, extra in MODES:
             rc, out, err = run_swiftql(args.catalog, extra, sql)
             outcome, detail = classify(rc, out, err, oracle, ordered)
             cells[(qid, mode)] = outcome
             details[(qid, mode)] = detail
-            if rc == 0:
+            if rc == 0 and (args.fingerprint_all or qid == "q22"):
                 fp = plan_fingerprint(args.catalog, extra, sql)
                 if fp is not None:
                     fingerprints[(qid, mode)] = fp
@@ -418,8 +582,8 @@ def main():
                     timings[(qid, mode)] = t
 
     print()
-    ok = render_report(qids, cells, details, fingerprints, empties,
-                       args.catalog, provenance)
+    ok, summary = render_report(qids, cells, details, fingerprints, vacuity,
+                                args.catalog, provenance)
 
     if args.time:
         print("\nLATENCY (engine Execution: line, median of "
@@ -439,15 +603,34 @@ def main():
                         if details[(q, m)]},
             "fingerprints": {f"{q}|{m}": fingerprints[(q, m)]
                              for (q, m) in fingerprints},
-            "vacuous": sorted(empties),
+            "mutations": {q: list(vacuity[q]) for q in vacuity},
             "timings": {f"{q}|{m}": timings[(q, m)] for (q, m) in timings},
+            # Nested, not merged: the record's "modes" is the list of mode NAMES
+            # and the summary's is a per-query COUNT. Merging would silently
+            # replace one with the other.
+            "summary": summary,
         }
         with open(args.json, "w") as f:
             json.dump(record, f, indent=2, sort_keys=True)
         print(f"\nwrote {args.json}")
 
-    # A wrong answer or an unexplained error fails the run. A dialect gap does
-    # not: it is Week 36's work, recorded rather than hidden.
+    if args.write_baseline:
+        with open(args.write_baseline, "w") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"wrote baseline {args.write_baseline}")
+
+    if args.baseline:
+        base_ok, lines = compare_baseline(summary, args.baseline)
+        print(f"\nBASELINE {args.baseline}: "
+              f"{'OK' if base_ok else 'REGRESSION'}")
+        for line in lines:
+            print(f"  {line}")
+        ok = ok and base_ok
+
+    # A wrong answer, an unexplained error, a broken mutation check or a
+    # regression against the baseline fails the run. A dialect gap does not: it
+    # is Week 36's work, recorded rather than hidden.
     sys.exit(0 if ok else 1)
 
 

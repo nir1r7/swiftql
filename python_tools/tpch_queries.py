@@ -457,7 +457,117 @@ VALIDATION_PARAMS = {
 QUERY_IDS = [f"q{i}" for i in range(1, 23)]
 
 
-def render(qid, params=None):
+# ---------------------------------------------------------------------------
+# MUTATIONS — one per query, and the reason this file has them.
+#
+# A TPC-H harness lies in one specific way: a query MATCHES the oracle while the
+# feature it exists to exercise contributed nothing. run_tpch.py's original
+# vacuity detector only caught the whole-query case (zero rows on both sides),
+# which is why q18 was named and q16 was not — q16 returned 305 rows whose
+# anti-join filtered NOTHING, because the synthetic supplier comments contained
+# no '%Customer%Complaints%'. Deleting the entire NOT IN gave a byte-identical
+# answer, and that pass was counted in the headline figure for a week.
+#
+# So each query names the ONE predicate that carries its characteristic
+# feature, and the check is mechanical: neuter that predicate, ask SQLite for
+# both answers, and require them to DIFFER. A query whose mutant answers
+# identically is INERT — it is not an answer, it is a coincidence, and it counts
+# as unanswered.
+#
+# Where a query has a subquery/join feature (q2 q4 q11 q13 q15 q16 q17 q18 q20
+# q21 q22) the mutation neuters exactly that. Where it does not (q1 q3 q5 q6 q7
+# q8 q9 q10 q12 q14 q19) it neuters the spec-literal filter or CASE arm that
+# selects the query's subject, because that is the part a generator with the
+# wrong value domains would silently turn into a no-op.
+#
+# Each entry is (label, old_fragment, new_fragment) applied to the
+# whitespace-COLLAPSED template BEFORE parameter substitution, so the fragments
+# read exactly like the template text above. A fragment that does not occur
+# EXACTLY ONCE is an error, not a skip: a mutation that silently fails to apply
+# reports every query as discriminating, which is the failure this check exists
+# to prevent.
+# ---------------------------------------------------------------------------
+MUTATIONS = {
+    "q1": ("the l_shipdate cutoff",
+           "WHERE l_shipdate <= ':DELTA_DATE'", "WHERE 1 = 1"),
+    "q2": ("the correlated MIN(ps_supplycost) scalar subquery",
+           "AND ps_supplycost = ( SELECT MIN(ps_supplycost) FROM partsupp "
+           "JOIN supplier ON s_suppkey = ps_suppkey "
+           "JOIN nation ON s_nationkey = n_nationkey "
+           "JOIN region ON n_regionkey = r_regionkey "
+           "WHERE p_partkey = ps_partkey AND r_name = ':REGION')", ""),
+    "q3": ("the c_mktsegment filter",
+           "WHERE c_mktsegment = ':SEGMENT'", "WHERE 1 = 1"),
+    "q4": ("the correlated EXISTS semi-join",
+           "AND EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey "
+           "AND l_commitdate < l_receiptdate)", ""),
+    "q5": ("the customer/supplier same-nation join condition",
+           "JOIN supplier ON l_suppkey = s_suppkey AND c_nationkey = s_nationkey",
+           "JOIN supplier ON l_suppkey = s_suppkey"),
+    "q6": ("the l_discount BETWEEN band",
+           "AND l_discount BETWEEN :DISCOUNT_LO AND :DISCOUNT_HI", ""),
+    "q7": ("the nation-pair filter over the derived table",
+           "WHERE (supp_nation = ':NATION1' AND cust_nation = ':NATION2') "
+           "OR (supp_nation = ':NATION2' AND cust_nation = ':NATION1')",
+           "WHERE 1 = 1"),
+    "q8": ("the p_type filter inside the derived body",
+           "AND p_type = ':TYPE'", ""),
+    "q9": ("the p_name LIKE '%color%' filter",
+           "WHERE p_name LIKE '%:COLOR%'", "WHERE 1 = 1"),
+    "q10": ("the l_returnflag = 'R' filter",
+            "AND l_returnflag = 'R'", ""),
+    "q11": ("the HAVING with its uncorrelated scalar subquery",
+            "HAVING SUM(ps_supplycost * ps_availqty) > ( "
+            "SELECT SUM(ps_supplycost * ps_availqty) * :FRACTION FROM partsupp "
+            "JOIN supplier ON ps_suppkey = s_suppkey "
+            "JOIN nation ON s_nationkey = n_nationkey "
+            "WHERE n_name = ':NATION')", ""),
+    "q12": ("the commit/receipt/ship date ordering",
+            "AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate", ""),
+    "q13": ("the LEFT JOIN's outer-ness (customers with no orders)",
+            "LEFT JOIN orders", "JOIN orders"),
+    "q14": ("the PROMO CASE arm",
+            "CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) "
+            "ELSE 0 END", "l_extendedprice * (1 - l_discount)"),
+    "q15": ("the = (SELECT MAX(total_revenue)) equality",
+            "WHERE revenue0.total_revenue = ( SELECT MAX(revenue1.total_revenue) "
+            "FROM ( SELECT l_suppkey AS supplier_no, "
+            "SUM(l_extendedprice * (1 - l_discount)) AS total_revenue FROM lineitem "
+            "WHERE l_shipdate >= ':DATE' AND l_shipdate < ':DATE_PLUS_3M' "
+            "GROUP BY l_suppkey ) AS revenue1)", ""),
+    "q16": ("the NOT IN (suppliers with complaints) anti-join",
+            "AND ps_suppkey NOT IN (SELECT s_suppkey FROM supplier "
+            "WHERE s_comment LIKE '%Customer%Complaints%')", ""),
+    "q17": ("the correlated 0.2 * AVG(l_quantity) scalar subquery",
+            "AND l_quantity < (SELECT 0.2 * AVG(l_quantity) FROM lineitem "
+            "WHERE l_partkey = p_partkey)", ""),
+    "q18": ("the IN (subquery with HAVING) semi-join",
+            "WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem "
+            "GROUP BY l_orderkey HAVING SUM(l_quantity) > :QUANTITY)",
+            "WHERE 1 = 1"),
+    "q19": ("the second and third OR arms",
+            "OR (p_brand = ':BRAND2' AND p_container IN ('MED BAG', 'MED BOX', "
+            "'MED PKG', 'MED PACK') AND l_quantity >= :QTY2 AND l_quantity <= "
+            ":QTY2 + 10 AND p_size BETWEEN 1 AND 10 AND l_shipmode IN ('AIR', "
+            "'REG AIR') AND l_shipinstruct = 'DELIVER IN PERSON') OR (p_brand = "
+            "':BRAND3' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', "
+            "'LG PKG') AND l_quantity >= :QTY3 AND l_quantity <= :QTY3 + 10 AND "
+            "p_size BETWEEN 1 AND 15 AND l_shipmode IN ('AIR', 'REG AIR') AND "
+            "l_shipinstruct = 'DELIVER IN PERSON')", ""),
+    "q20": ("the nested IN (subquery) semi-joins",
+            "WHERE s_suppkey IN ( SELECT ps_suppkey FROM partsupp "
+            "WHERE ps_partkey IN (SELECT p_partkey FROM part "
+            "WHERE p_name LIKE ':COLOR%') AND ps_availqty > 0) AND", "WHERE"),
+    "q21": ("the NOT EXISTS anti-join",
+            "AND NOT EXISTS (SELECT * FROM lineitem l3 "
+            "WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey != l1.l_suppkey "
+            "AND l3.l_receiptdate > l3.l_commitdate)", ""),
+    "q22": ("the NOT EXISTS anti-join (customers with no orders)",
+            "AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)", ""),
+}
+
+
+def _substitute(qid, sql, params):
     """Substitute :NAME placeholders and collapse whitespace.
 
     Longest name first, so :DATE_PLUS_1Y is not eaten by :DATE. The
@@ -465,9 +575,6 @@ def render(qid, params=None):
     in this file: a template that renders with a leftover ':FOO' produces a
     perfectly plausible parse error that reads like a dialect gap.
     """
-    if params is None:
-        params = VALIDATION_PARAMS[qid]
-    sql = TEMPLATES[qid]
     for name in sorted(params, key=len, reverse=True):
         sql = sql.replace(":" + name, params[name])
     collapsed = " ".join(sql.split())
@@ -478,10 +585,38 @@ def render(qid, params=None):
     return collapsed
 
 
+def render(qid, params=None):
+    """The query as run: template + validation parameters, whitespace collapsed."""
+    return _substitute(qid, TEMPLATES[qid],
+                       VALIDATION_PARAMS[qid] if params is None else params)
+
+
+def render_mutant(qid, params=None):
+    """(label, sql) for the query with its characteristic predicate neutered.
+
+    Raises if the fragment does not occur exactly once in the collapsed
+    template. That is deliberate: a mutation that silently fails to apply makes
+    every query look like it discriminates.
+    """
+    label, old, new = MUTATIONS[qid]
+    collapsed = " ".join(TEMPLATES[qid].split())
+    n = collapsed.count(old)
+    if n != 1:
+        raise ValueError(
+            f"{qid}: mutation fragment occurs {n} times, expected exactly 1: {old!r}")
+    return label, _substitute(qid, collapsed.replace(old, new),
+                              VALIDATION_PARAMS[qid] if params is None else params)
+
+
 if __name__ == "__main__":
     missing = [q for q in QUERY_IDS if q not in TEMPLATES]
     if missing:
         raise SystemExit(f"missing templates: {missing}")
+    missing_mut = [q for q in QUERY_IDS if q not in MUTATIONS]
+    if missing_mut:
+        raise SystemExit(f"missing mutations: {missing_mut}")
     for qid in QUERY_IDS:
         render(qid)          # raises on an unsubstituted parameter
-    print(f"ok: {len(QUERY_IDS)} templates render with their validation parameters")
+        render_mutant(qid)   # raises on a fragment that does not apply
+    print(f"ok: {len(QUERY_IDS)} templates render with their validation parameters, "
+          f"and {len(MUTATIONS)} mutations apply")
