@@ -1140,3 +1140,20 @@ TEST(VecPlanBuilder, OuterJoinKeepsAPreservedSideOnlyPruningHint) {
     EXPECT_NE(scan->explain().find("VecScan [laps"), std::string::npos) << scan->explain();
     EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
 }
+
+// m3 (round 2): the guard tests every slot the LEFT INPUT carries, not slot 0
+// alone. In (A JOIN B) LEFT JOIN C, relation B is preserved too — testing {0}
+// withheld a hint over B from a scan entitled to it, which measurably disabled
+// zone-map pruning on the un-pushed (--no-optimize) leg for a relation the outer
+// join has nothing to do with. buildVec skips pushdown, which is that leg.
+TEST(VecPlanBuilder, OuterJoinKeepsAHintOverAPreservedRelationOtherThanZero) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(
+        "SELECT COUNT(*) FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
+        "LEFT JOIN laps l ON d.driver_id = l.driver_id WHERE d2.age > 30", cat);
+    const VecPlanNode* scan = leftmostScan(plan.get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("VecScan [drivers"), std::string::npos) << scan->explain();
+    EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos)
+        << "slot 1 is preserved by this outer join: " << scan->explain();
+}

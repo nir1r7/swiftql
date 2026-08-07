@@ -468,3 +468,65 @@ TEST(PlannerTest, MultiWayOuterJoinKeepsTheExistingVolcanoRefusal) {
         EXPECT_NE(std::string(e.what()).find("Volcano path"), std::string::npos);
     }
 }
+
+// ===== Week 29 round 2: the pruning hint on the Volcano path =====
+
+// Plan a query over COLUMNAR tables on the Volcano path, which is the only mode
+// where a zone-map pruning hint exists at all (SeqScanNode ignores it under row
+// storage). Mirrors ResidualOnConjunctReachesTheFromScanAsAPruningHint above.
+static std::unique_ptr<PlanNode> bindAndPlanColumnar(const std::string& sql,
+                                                     Catalog& catalog) {
+    Parser p(sql);
+    auto stmt = p.parse();
+    Binder::bind(stmt, catalog);
+    std::unordered_map<std::string, ColumnarTable> columnar;
+    for (const std::string& t : {std::string("laps"), std::string("drivers")}) {
+        const auto& m = catalog.getTable(t);
+        columnar.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+    }
+    return Planner::plan(std::move(stmt), catalog, {}, std::move(columnar));
+}
+
+// The FROM scan is the PRESERVED side of an outer join, and it is the second of
+// the engine's two pruning-hint routes. An outer join no longer folds its ON
+// residuals into the WHERE, so `stmt.where` is exactly where the null-supplying
+// side's conjuncts live — and handing it to this scan delegates the safety to
+// ChunkPruner's slot test in another file, which is the delegation the vectorized
+// builder stopped making. Volcano is the correctness baseline; its latent guard
+// must not be the weaker one.
+TEST(PlannerTest, OuterJoinWithholdsAPruningHintOverTheNullSupplyingSide) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlanColumnar(
+        "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id "
+        "WHERE l.season = 2024", catalog);
+    const PlanNode* scan = findNode(plan.get(), "SeqScan [drivers");
+    ASSERT_NE(scan, nullptr);
+    EXPECT_EQ(scan->explain().find("pruning=on"), std::string::npos)
+        << "a hint over the null-supplying relation must not reach the preserved "
+           "side's scan: " << scan->explain();
+}
+
+// The guard is scoped to outer joins: an inner join folded its residuals into the
+// WHERE, so every conjunct is a legal filter on the join output and the hint is
+// unchanged — including the mixed-slot shape, which is what this path always had.
+TEST(PlannerTest, InnerJoinKeepsItsPruningHintUnchanged) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlanColumnar(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.season = 2024 AND d.age > 30", catalog);
+    const PlanNode* scan = findNode(plan.get(), "SeqScan [laps");
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
+}
+
+// ...and a preserved-side-only hint still descends, or the guard would cost every
+// outer join the pruning it is entitled to (sigma_p(R) LEFTJOIN S is equivalent).
+TEST(PlannerTest, OuterJoinKeepsAPreservedSideOnlyPruningHint) {
+    Catalog catalog("../tests/data/test_catalog.json");
+    auto plan = bindAndPlanColumnar(
+        "SELECT COUNT(*) FROM laps l LEFT JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.season = 2024", catalog);
+    const PlanNode* scan = findNode(plan.get(), "SeqScan [laps");
+    ASSERT_NE(scan, nullptr);
+    EXPECT_NE(scan->explain().find("pruning=on"), std::string::npos) << scan->explain();
+}

@@ -13,6 +13,7 @@
 #include "storage/csv_to_columnar.h"
 #include "common/value.h"
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -904,4 +905,59 @@ TEST(PredicatePushdown, InnerJoinBelowAnOuterJoinStillPushes) {
     ASSERT_EQ(inner->type, LogicalNodeType::JOIN);
     EXPECT_EQ(inner->children[1]->type, LogicalNodeType::FILTER);
     EXPECT_EQ(inner->children[1]->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// ── Week 29 round 2: the shared pruning-hint rule ───────────────────────────
+
+// One rule, two callers (VectorizedPlanBuilder's JOIN case and Planner::plan's
+// FROM scan). Tested directly, because the two branches that matter are the ones
+// no query on the shipped catalog can currently reach.
+TEST(PruningHintForPreservedSide, InnerJoinHintIsAlwaysHandedThrough) {
+    // an inner join folded its ON residuals into the WHERE, so every conjunct is
+    // a legal filter on the join output — withholding would cost the mixed-slot
+    // --no-optimize hint the Phase 4 benchmark measures
+    Parser parser("SELECT team FROM laps WHERE season = 2024");
+    auto stmt = parser.parse();
+    const Expr* hint = stmt.where.get();
+    EXPECT_EQ(pruningHintForPreservedSide(hint, JoinType::INNER, {}), hint);
+    EXPECT_EQ(pruningHintForPreservedSide(nullptr, JoinType::LEFT, {0}), nullptr);
+}
+
+TEST(PruningHintForPreservedSide, OuterJoinTestsEveryPreservedSlotNotJustZero) {
+    Catalog cat(CATALOG);
+    // `d2.age > 30` is slot 1 — preserved in (A JOIN B) LEFT JOIN C, and NOT
+    // preserved in A LEFT JOIN B. Testing slot 0 alone withheld it from a scan
+    // entitled to it, which measurably disabled zone-map pruning for a relation
+    // the outer join has nothing to do with.
+    Parser parser("SELECT l.team FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
+                  "LEFT JOIN laps l ON d.driver_id = l.driver_id WHERE d2.age > 30");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    const Expr* hint = stmt.where.get();
+
+    EXPECT_EQ(pruningHintForPreservedSide(hint, JoinType::LEFT, {0, 1}), hint);
+    EXPECT_EQ(pruningHintForPreservedSide(hint, JoinType::LEFT, {0}), nullptr);
+}
+
+// collectSlots is DISPATCH SITE 8: a missed Expr subtype yields an EMPTY slot
+// set, and both of its other callers read empty as the conservative answer
+// (pushdown declines to push; classifyJoinCondition declines to make a key).
+// Reading it as permissive here would let a future node type — Week 30/32's
+// subquery expressions are the first realistic chance — silently turn this guard
+// off and hand a null-supplying predicate back to the preserved side's scan.
+TEST(PruningHintForPreservedSide, AnEmptySlotSetFailsClosed) {
+    // a constant predicate carries no ColumnRef, so collectSlots yields nothing —
+    // the same state an unhandled subtype would produce. Withholding costs
+    // nothing: collectSimplePredicates needs a ColumnRef to make a prunable triple.
+    Parser parser("SELECT team FROM laps WHERE 1 = 1");
+    auto stmt = parser.parse();
+    std::unordered_set<int> slots;
+    collectSlots(stmt.where.get(), slots);
+    ASSERT_TRUE(slots.empty()) << "fixture must actually produce an empty slot set";
+
+    EXPECT_EQ(pruningHintForPreservedSide(stmt.where.get(), JoinType::LEFT, {0}), nullptr);
+    // ...and an inner join still hands it through, because the guard does not
+    // apply there at all
+    EXPECT_EQ(pruningHintForPreservedSide(stmt.where.get(), JoinType::INNER, {0}),
+              stmt.where.get());
 }
