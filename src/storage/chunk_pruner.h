@@ -28,9 +28,29 @@ namespace {
         // `team`) would prune the FROM table on the JOIN table's value —
         // those must stay ignored. slot < 1 covers scan-local (0) and
         // unresolved/single-table (-1).
+        // Week 30. `relation_slot < 1` is a test on a slot, and since Week 30 a
+        // slot is a position in the range table of the scope `query_level`
+        // blocks out. A CORRELATED ref carries (level 1, slot 0), which reads as
+        // scan-local here and is then matched against the scanned table's zone
+        // maps BY NAME below — two numbering domains, and with a shared column
+        // name (`team`, `driver_id`) the wrong relation's zone maps prune the
+        // scan. Silently skipped chunks, no error: invariant 12's subject and
+        // the worst failure mode in this file.
+        //
+        // Unreachable today (execution runs after Validator refuses a subquery),
+        // and NOT protected by the collectSlots/soleSlot `-1` containment that
+        // covers restampSlots: vectorized_plan_builder hands the whole un-pushed
+        // WHERE to the FROM-side scan as a hint, so on `--no-optimize` a
+        // correlated conjunct arrives here without pushdown ever seeing it.
+        //
+        // DECLINE rather than throw. A pruning hint is an optimization, so
+        // contributing nothing is correct-and-slower — the "decline and fall
+        // back" pattern development.md prescribes for exactly this. (Compare
+        // buildAggregateSchema, which throws for a correlated GROUP BY key:
+        // grouping is not an optimization and has no correct fallback.)
         const auto* col = dynamic_cast<const ColumnRef*>(bin->left.get());
         const auto* lit = dynamic_cast<const Literal*>(bin->right.get());
-        if (col && lit && col->relation_slot < 1){
+        if (col && lit && col->query_level == 0 && col->relation_slot < 1){
             out.emplace_back(col->column_name, bin->op, lit->value);
         }
     }
