@@ -1,26 +1,24 @@
 # Phase 5 orchestrator state
-Current: week 33 CRITICAL FIX ROUND (agent a18b428befd1e3c84, launched ~11:31 UTC).
-  Audit r1: 2 CRITICAL, 2 HIGH, 5 MEDIUM, 1 LOW — the most severe tally of the phase.
-  C-1: NOT EXISTS is lowered to the SAME JoinSemantics::ANTI that carries NOT IN's three-valued
-  NULL rule, so a NULL build key empties the result and a NULL probe key drops a row the
-  standard requires. The header says the rule "must NOT be applied here" and NOTHING ENFORCES
-  IT. The implementer's reasoning last round was right; the code did the opposite. Fix must
-  carry the semantics IN THE TYPE, not a comment, so it cannot be re-merged.
-  C-2: a correlated ref in the body's JOIN ... ON becomes an inner-join residual after
-  splitCorrelation runs, then resolves BY BARE NAME against the body's own schema — wrong rows,
-  no error.
-  HIGH: rightKeyIndices matches the body key by bare name against a possibly-merged,
-  possibly-aliased body output schema (two silent wrong-answer shapes).
-  MEDIUM incl.: decorrelation in practice only supports SELECT * bodies (must be ENFORCED and
-  STATED if true); the containment assertion in subquery_decorrelation.cc and
-  subquery_lowering.cc is TAUTOLOGICAL — an assertion that cannot fail reads as a guarantee.
-  Audit could not run the oracle (gate owned build/), so C-1 is a code trace — fix round must
-  REPRODUCE it first.
-  Audit did NOT reach: the plan/README cross-check, compare_against_sqlite.py, the test diffs.
+Current: week 33 — fix agent a18b428befd1e3c84 now owns BOTH the red gate and the 2 criticals.
+  Told to DIAGNOSE the red before fixing: decide per failing test whether it encoded the old
+  refusal (update it, and say in the commit what the new assertion pins) or caught a real break
+  (fix the code). Getting that backwards is how a real defect gets "fixed" by editing its test —
+  the exact failure week 32 shipped.
+  The sqlite red is the louder signal: correlated scalar is a recorded checkpoint MISS and is
+  supposed to be REFUSED, but the suite reports it returning ROWS. Either the refusal has a
+  hole or a shape is being decorrelated that should not be — and those rows may be wrong.
+  Then C-1 (NOT EXISTS carrying NOT IN's three-valued NULL rule, enforced by nothing) and
+  C-2 (correlated ref in a body's JOIN ... ON resolving by bare name). If the sqlite failures
+  share a cause with either, fix once.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅
-Last gate: GREEN (week 33 round 1, ColumnId migration alone) — 0 warnings, unit 775/775, sqlite 996, regression 318 all modes
+Last gate: !! RED (week 33 round 2) — FIRST RED GATE OF THE PHASE.
+  build PASS (verified not stale); unit 769/775 with 6 SubqueryValidation/SubqueryMaterialization
+  failures; sqlite 952 passed / 56 failed / 4 errors, first being "expected a rejection, got
+  rows" on a correlated scalar in the Rejections mode; regression 318 PASS.
+  Measured ecee221, i.e. the shipped week-33 tree BEFORE the critical fix round.
+  PACING RULE NOW IN FORCE: back to SERIAL — no concurrent audit until a gate is GREEN again.
 Week 32 verdict: checkpoint met. 4 gates / 4 audits; 1 blocker, 1 high, 6 medium, 8 low.
   The HIGH was a REGRESSION a green 988-query oracle could not see, because the test guarding
   that capability had been narrowed to a scalar stand-in.
