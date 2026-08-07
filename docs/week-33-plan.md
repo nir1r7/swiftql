@@ -1241,6 +1241,34 @@ correlated TPC-H queries execute correctly" — is met for the `EXISTS` /
 `NOT EXISTS` family (Q4, Q21) and **not** for the correlated-scalar family (Q17,
 and Q22's correlated half). That is a checkpoint miss, recorded as one.
 
+### Handed to Week 34 — DISPOSITION (written by Week 34)
+
+All four items are dispositioned below rather than carried forward silently.
+
+1. **A genuine correct-but-slower fallback — RE-DECLINED, with the refused set
+   measurably smaller.** Week 34 did not build a dependent-join operator, for
+   the reason stated below plus one more: it would have landed in the same week
+   that removes the schema containment Weeks 32 and 33 were both built on. What
+   changed is the *scope* of the refusal — a correlated scalar subquery over an
+   aggregate body now **executes** (Week 34 Task 6), so Q17's shape left the
+   rejection suite for a diffed one. Every remaining refusal is a language limit
+   named in the README dialect table.
+2. **Task 6, Volcano semi/anti parity — RE-DECLINED, and the cost is now
+   COUNTED.** Week 34 made the gap larger, adding derived tables as a third
+   vectorized-only family. The number is in README Limitations: 55 queries
+   diffed in two modes against 168 in four. A count is falsifiable where "some
+   queries" is not, so the week it stops being worth deferring is visible.
+3. **Tasks 4, 7, 8 — Task 4 DONE (Q17 executes), Task 7 was already closed in
+   Week 33, Task 8's `buildScanSchema` narrowing still open** and now also
+   applies to derived bodies, where it is a *different* problem: narrowing a
+   derived body means rewriting its select list, which changes the schema the
+   enclosing block was bound against. Stated at `buildRelation` with its reason.
+4. **`WEEK33_CORRELATED_EXPECT` is still a prefix.** Week 34 added per-shape
+   messages for its *own* refusals (`WEEK34_CORRELATED_SCALAR_REFUSED` pins
+   three distinct ones) but did not retrofit Week 33's. Still open.
+
+The original hand-off follows unchanged.
+
 ### Handed to Week 34
 
 1. **A genuine correct-but-slower fallback.** Week 33 ships a *refusal* for every
