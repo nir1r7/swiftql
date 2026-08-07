@@ -744,3 +744,61 @@ TEST(ExistsDecorrelation, ACorrelatedRefInTheBodysSelectListIsRefusedByName) {
             << "a legal query must not report a planner defect: " << e.what();
     }
 }
+
+// H-2 (round 1): the body's key was resolved by NAME against the body's OUTPUT
+// schema, which buildProjectSchema names by SELECT ALIAS. `l.speed AS driver_id`
+// therefore rebound the key `driver_id` to `speed`, and the semi-join probed
+// d.driver_id against laps.speed. Verified against SQLite: 0 rows where SQLite
+// returns 20. The body is now projected to its key columns, so the alias cannot
+// reach the lookup — there is no lookup.
+TEST(ExistsDecorrelation, AnAliasInTheBodysSelectListCannotShadowTheJoinKey) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT d.name FROM drivers d WHERE EXISTS "
+                            "(SELECT l.speed AS driver_id FROM laps l "
+                            " WHERE l.driver_id = d.driver_id)", cat);
+    const LogicalJoin* j = findJoin(plan.get());
+    ASSERT_NE(j, nullptr);
+    ASSERT_EQ(j->keys.size(), 1u);
+    const Schema& body = j->children[1]->output_schema;
+    ASSERT_EQ(body.size(), 1) << "the body must be projected to its key columns only";
+    EXPECT_EQ(body.column(0).name, "driver_id")
+        << "and it must be the KEY column, not the aliased one";
+}
+
+// M-3 (round 1): the correlated conjunct is removed from body.where BEFORE the
+// body is planned, so buildScanSchema never saw the key column and narrowed it
+// away. `EXISTS (SELECT 1 FROM ...)` — the most idiomatic EXISTS body there is —
+// died with "join key 'driver_id' not found on the joined relation".
+TEST(ExistsDecorrelation, ABodyThatIsNotSelectStarStillKeepsItsKeyColumn) {
+    Catalog cat(CATALOG);
+    for (const char* body_sql : {"SELECT 1 FROM drivers d WHERE d.driver_id = l.driver_id",
+                                 "SELECT d.name FROM drivers d WHERE d.driver_id = l.driver_id",
+                                 "SELECT * FROM drivers d WHERE d.driver_id = l.driver_id"}) {
+        const std::string sql =
+            std::string("SELECT l.lap_id FROM laps l WHERE EXISTS (") + body_sql + ")";
+        std::unique_ptr<LogicalPlanNode> plan;
+        ASSERT_NO_THROW(plan = planLowered(sql, cat)) << sql;
+        const LogicalJoin* j = findJoin(plan.get());
+        ASSERT_NE(j, nullptr) << sql;
+        ASSERT_EQ(j->children[1]->output_schema.size(), 1) << sql;
+        EXPECT_EQ(j->children[1]->output_schema.column(0).name, "driver_id") << sql;
+    }
+}
+
+// H-1 (round 1): a body that is a JOIN has a MERGED output schema, and invariant
+// 3 makes duplicate column names legal there. indexOf(join_col) took the first
+// match, so the probe could run against the wrong relation's column. The body is
+// now projected to the key columns before the join is built, so the merged
+// schema never reaches a name lookup.
+TEST(ExistsDecorrelation, AJoinBodyIsProjectedToItsKeyBeforeTheMergedSchemaCanShadowIt) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered("SELECT d.name FROM drivers d WHERE EXISTS "
+                            "(SELECT * FROM laps l JOIN drivers t "
+                            " ON l.lap_id = t.driver_id WHERE t.team = d.team)", cat);
+    const LogicalJoin* semi = findJoin(plan.get());
+    ASSERT_NE(semi, nullptr);
+    EXPECT_EQ(semi->semantics, JoinSemantics::SEMI);
+    ASSERT_EQ(semi->children[1]->output_schema.size(), 1)
+        << "`team` lives in BOTH body relations; a merged schema here is the bug";
+    EXPECT_EQ(semi->children[1]->output_schema.column(0).name, "team");
+}

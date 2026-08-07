@@ -89,14 +89,39 @@ std::vector<int> leftKeyIndices(const Schema& left_schema, const std::vector<Joi
     return idx;
 }
 
-// Resolve the RIGHT input's key columns. children[1] is always exactly one
-// relation (left-deep; Week 28's DP keeps that shape), and a standalone scan's
-// schema stamps every column slot 0 — the join_slot stamp lives only on the
-// MERGED schema — so the bare-name overload is both unambiguous and the only
-// one that resolves here.
-std::vector<int> rightKeyIndices(const Schema& right_schema, const std::vector<JoinKey>& keys) {
+// Resolve the RIGHT input's key columns.
+//
+// For a STANDARD join, children[1] is always exactly one relation (left-deep;
+// Week 28's DP keeps that shape), and a standalone scan's schema stamps every
+// column slot 0 — the join_slot stamp lives only on the MERGED schema — so the
+// bare-name overload is both unambiguous and the only one that resolves here.
+//
+// For a SEMI/ANTI join that rationale does NOT hold and Week 33 round 1 found
+// two silent wrong answers behind it: children[1] is a whole subquery body,
+// which may be a JOIN (merged schema, duplicate names legal by invariant 3) and
+// whose column names come from its SELECT ALIASES. So the name being looked up
+// was resolved in one schema and matched in another. `positional` says the
+// lowering has already arranged the body's output to BE the key tuple, in key
+// order — subquery_decorrelation.cc projects the body to its key columns, and
+// Week 32's IN body has exactly one output column by the Validator's arity
+// rule. Nothing is looked up by name, so nothing can shadow it.
+std::vector<int> rightKeyIndices(const Schema& right_schema, const std::vector<JoinKey>& keys,
+                                bool positional = false) {
     std::vector<int> idx;
     idx.reserve(keys.size());
+    if (positional) {
+        // Loud rather than latent: the lowering owns this arrangement, so a
+        // mismatch is a planner bug and says so like every other check of its
+        // kind.
+        if (right_schema.size() != static_cast<int>(keys.size())) {
+            throw std::runtime_error(
+                "internal: a semi/anti join's build input must output exactly its "
+                "key columns (got " + std::to_string(right_schema.size())
+                + " for " + std::to_string(keys.size()) + " keys)");
+        }
+        for (size_t i = 0; i < keys.size(); ++i) idx.push_back(static_cast<int>(i));
+        return idx;
+    }
     for (const JoinKey& k : keys) {
         int i = right_schema.indexOf(k.join_col);
         if (i < 0) {
@@ -379,7 +404,11 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                     "VectorizedPlanBuilder: lowered join input does not match its logical schema");
             }
             std::vector<int> left_idx  = leftKeyIndices(from_schema, join->keys);
-            std::vector<int> right_idx = rightKeyIndices(jn_schema, join->keys);
+            // POSITIONAL for a semi/anti join: both lowerings arrange the body's
+            // output to BE the key tuple, so nothing is matched by name against a
+            // schema that name was not resolved in (round 1 H-1, H-2, M-3).
+            std::vector<int> right_idx = rightKeyIndices(
+                jn_schema, join->keys, join->semantics != JoinSemantics::STANDARD);
 
             // Week 32 — SEMI/ANTI. The side is FORCED, not costed: a hash
             // semi-join emits PROBE-side rows, so the outer spine must be the

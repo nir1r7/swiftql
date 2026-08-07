@@ -37,6 +37,7 @@ void requireDecorrelatableBody(const SelectStatement& body) {
 // meaningless — that is the silent wrong answer this whole week is about.
 void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
                       std::vector<JoinKey>& keys,
+                      std::vector<std::unique_ptr<Expr>>& body_key_refs,
                       std::vector<std::unique_ptr<Expr>>& local) {
     for (auto& c : body_conjuncts) {
         // Does this conjunct reach outside the body? collectSlots (dispatch
@@ -81,6 +82,15 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
         keys.push_back(JoinKey{outer_side->column_name,
                                body_side->column_name,
                                outer_side->id.outward().localSlot("splitCorrelation")});
+
+        // The BODY side's full identity, kept rather than reduced to its name.
+        // JoinKey has no field for it (join_condition.h's struct predates this
+        // second producer), and a name alone is not an identity -- that is the
+        // root of H-1/H-2: the right key was resolved by BARE NAME against a
+        // schema the name was never resolved in. Carrying the ref itself lets
+        // the body be projected to exactly its key columns below, after which
+        // the right key indices are positional and no name lookup happens.
+        body_key_refs.push_back(cloneExpr(body_side));
     }
     body_conjuncts.clear();
 }
@@ -163,8 +173,9 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         splitConjuncts(std::move(body.where), body_conjuncts);
 
         std::vector<JoinKey> keys;
+        std::vector<std::unique_ptr<Expr>> body_key_refs;
         std::vector<std::unique_ptr<Expr>> local;
-        splitCorrelation(body_conjuncts, keys, local);
+        splitCorrelation(body_conjuncts, keys, body_key_refs, local);
         if (keys.empty())
             refuse("no equality links the subquery to the enclosing query, so "
                    "there is no join key to decorrelate on");
@@ -175,6 +186,35 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         // nothing.
         body.where = conjoinAll(std::move(local));
         refuseSurvivingCorrelatedRefs(body);
+
+        // PROJECT THE BODY TO ITS KEY COLUMNS, in key order. A semi/anti join
+        // emits no body column at all, so the body's own SELECT list is dead
+        // weight -- and resolving the join key against it BY NAME was three
+        // separate defects (round 1 H-1, H-2, M-3):
+        //
+        //   H-1  a body that is a JOIN has a MERGED output schema, where
+        //        invariant 3 makes duplicate names legal; indexOf(name) took the
+        //        first match, so the probe ran against the wrong relation's
+        //        column. Wrong rows, no error, an identical --explain.
+        //   H-2  buildProjectSchema names columns by SELECT ALIAS, so
+        //        `SELECT l.speed AS driver_id` rebound the key `driver_id` to
+        //        `speed`. Verified: 0 rows where SQLite returns 20.
+        //   M-3  the correlated conjunct is removed from body.where BEFORE the
+        //        body is planned, so buildScanSchema never sees the key column
+        //        and narrows it away. `EXISTS (SELECT 1 FROM ...)` -- the most
+        //        idiomatic EXISTS body in SQL -- died with "join key not found".
+        //
+        // Replacing the list fixes all three at once and makes the right key
+        // indices POSITIONAL (0..k-1), the shape Week 32's IN lowering already
+        // had by taking body column 0. Nothing is silently dropped: the
+        // discarded expressions could not have been read by anything, because
+        // the operator never emits a body row. The clauses for which a select
+        // list WOULD change the row set -- DISTINCT, GROUP BY, HAVING, an
+        // aggregate, LIMIT -- are every one of them refused by
+        // requireDecorrelatableBody, which is what makes this rewrite sound
+        // rather than merely convenient.
+        body.select_star = false;
+        body.select_list = std::move(body_key_refs);
         auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
 
         // !! output_schema is the LEFT child's, NOT a merged schema — the

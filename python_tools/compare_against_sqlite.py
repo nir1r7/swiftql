@@ -763,6 +763,28 @@ WEEK33_DECORRELATED_VEC_ONLY = [
     "SELECT COUNT(*) FROM drivers d LEFT JOIN laps l "
     "ON d.driver_id = l.driver_id AND l.lap_id < 5 "
     "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.lap_id = l.lap_id)",
+    # Round 1 H-2 — an ALIAS in the body's SELECT list shadowing the join key.
+    # The key was resolved by name against the body's OUTPUT schema, which
+    # buildProjectSchema names by alias, so this probed d.driver_id against
+    # laps.speed: 0 rows where SQLite returns 20.
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT l.speed AS driver_id FROM laps l WHERE l.driver_id = d.driver_id)",
+    # Round 1 M-3 — the two most idiomatic EXISTS bodies in SQL. Both used to
+    # die with "join key 'driver_id' not found on the joined relation", because
+    # the correlated conjunct is removed before the body is planned and
+    # buildScanSchema then narrowed the key column away.
+    "SELECT COUNT(*) FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM drivers d WHERE d.driver_id = l.driver_id)",
+    "SELECT COUNT(*) FROM laps l WHERE EXISTS "
+    "(SELECT d.name FROM drivers d WHERE d.driver_id = l.driver_id)",
+    # Round 1 H-1 — a JOIN body, whose merged schema holds `team` TWICE
+    # (invariant 3 makes that legal). indexOf took the first match.
+    "SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l JOIN drivers t ON l.lap_id = t.driver_id "
+    " WHERE t.team = d.team)",
+    "SELECT COUNT(*) FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM laps l JOIN drivers t ON l.lap_id = t.driver_id "
+    " WHERE t.team = d.team)",
 ]
 
 # The other half of that capability difference, asserted so the boundary cannot
