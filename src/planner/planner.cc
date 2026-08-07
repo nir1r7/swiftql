@@ -1,6 +1,7 @@
 #include "planner.h"
 #include "join_condition.h"
 #include "predicate_pushdown.h"   // pruningHintForPreservedSide — shared with the vectorized builder
+#include "subquery_materialization.h"   // forEachSubqueryConst
 #include "parser/expr_utils.h"
 #include <unordered_set>
 
@@ -23,6 +24,43 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         throw std::runtime_error(
             "multi-way joins are not supported on the Volcano path; "
             "use --execution vectorized");
+    }
+
+    // Week 32 — set-membership lowering is vectorized-only, and the refusal
+    // lives HERE rather than in Validator for the reason Week 26 established:
+    // the two engines genuinely differ in capability, and a shared-validator
+    // refusal would deny the shape to the engine that can execute it.
+    //
+    // Why Volcano does not get a semi-join yet. This function builds exactly ONE
+    // HashJoinNode, from stmt.joins; a semi-join is a SECOND join for any query
+    // whose FROM already joins, and there is no plan-tree shape here to hold it
+    // (the logical layer's LogicalPlanBuilder is where the lowering grafts the
+    // body's subtree, and this path does not go through it). Faking one would be
+    // the silent dropped-relation failure the refusal above exists to prevent.
+    //
+    // !! WHAT THIS COSTS, stated rather than discovered later: Volcano is the
+    // correctness baseline and compare_against_sqlite.py runs it as a separate
+    // oracle leg, so every IN-subquery query is now diffed against SQLite in the
+    // two VECTORIZED modes only. The refusal is pinned by message in that file's
+    // Volcano rejection suite — the diffed suite cannot hold a query that
+    // errors — which is what makes this boundary visible instead of implicit.
+    if (stmt.has_subquery) {
+        // WHERE and HAVING are the only legal subquery positions
+        // (validateExpr's allow_subqueries flag), so those two trees are the
+        // whole search space.
+        bool has_in = false;
+        auto scan = [&](const Expr* e) {
+            forEachSubqueryConst(e, [&](const SubqueryExpr& sq) {
+                if (sq.kind == SubqueryExpr::Kind::IN) has_in = true;
+            });
+        };
+        scan(stmt.where.get());
+        scan(stmt.having.get());
+        if (has_in) {
+            throw std::runtime_error(
+                "IN subqueries are lowered to a semi-join and are not supported "
+                "on the Volcano path; use --execution vectorized");
+        }
     }
 
     // expression GROUP BY keys: rewrite post-aggregate references, mirroring
