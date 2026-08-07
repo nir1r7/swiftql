@@ -1,27 +1,23 @@
 # Phase 5 orchestrator state
-Current: week 35 — THE COUNT IS SETTLED AND VERIFIED FROM A FULL 22x4 RUN THE AGENT DID
-  ITSELF (docs/tpch-sf0.01-report.json, docs/tpch-baseline.json):
-    17/22 MEANINGFULLY ANSWERED — 4 in all four modes (q1 q6 q12 q14), 13 vectorized-only
-      (q3 q4 q5 q7 q8 q9 q10 q11 q13 q15 q16 q20 q22)
-    VACUOUS 3 — q2 INERT (one part survives its filters, so the correlated MIN(ps_supplycost)
-      selects what was already selected), q18 EMPTY, q19 ALL_NULL
-    UNPORTED 2 — q17, q21, refused by name, 0 modes each
-    34 of 88 cells are Volcano refusals pinned by message.
-    "20/22" is true ONLY for "matched the oracle" and must not be quoted as answered.
-  The mutation check was HARDENED while being validated: base-vs-mutant comparison was
-  POSITIONAL, so a mutation that only reshuffled rows tied under a partial ORDER BY read as
-  DISCRIMINATING and INFLATED the figure. Now multiset-based; verified to change no verdict
-  on this data. q16 passes its mutation (5 suppliers now match the phrase; deleting the NOT IN
-  keeps 305 rows but changes supplier_cnt, and SwiftQL still matches SQLite in both vec modes).
-  !! Q17 IS UNPORTED. Week 34 delivered the correlated-scalar MECHANISM and I recorded its
-  checkpoint as met — but the actual TPC-H Q17 text still does not run. "The feature exists"
-  and "the query works" are different claims. Q17 and Q21 are WEEK 36's to port.
-  STILL OWED, one short agent each (~15 min windows):
-    - Wire run_tpch.py into the `verify` skill as a FIFTH gate step. ABSENT today, so a GREEN
-      gate says nothing about TPC-H. Must report meaningfully-answered with the mode split and
-      go RED on a regression.
-    - nan/inf compare equal at compare_against_sqlite.py:1874.
-    - random_diff.py:113-117 projects only driver_id/team from rels[:3]; driver_id is the join key.
+Current: week 35 — THE VERIFY GATE NOW HAS FIVE STEPS (c7b8262). TPC-H is wired in at
+  .claude/skills/verify/SKILL.md; the verdict block in .claude/skills/phase5-week/SKILL.md and
+  README Layer 9 both updated. Fifth line, printed by run_tpch.py and copied verbatim:
+    tpch: PASS (17/22 meaningful vs SQLite: 4 in all four modes, 13 vectorized-only;
+                3 vacuous; 2 unported)
+  VACUOUS AND UNPORTED ARE COUNTED APART FROM THE HEADLINE, never into it.
+  Regression detection: compare_baseline diffs docs/tpch-baseline.json and fails if a query
+  stops answering, becomes vacuous, or answers in FEWER MODES. An improvement passes and says
+  "IMPROVED, refresh the baseline". A third verdict NO-BASELINE fires when --baseline is
+  omitted, because a run that cannot see a regression must not report PASS.
+  Runtime 5m08s (88 swiftql invocations, each reloading a 9MB lineitem.tbl, not parallelised)
+  — stated plainly in the skill rather than hidden. sf0.01 default; larger SF is opt-in and
+  needs its own baseline. data/tpch/ is gitignored, so the harness exits non-zero naming the
+  seeded generator command instead of crashing.
+  NEXT: final gate + audit for week 35 (gate now ~17 min because of the TPC-H step), then
+  close week 35 and start week 36.
+  STILL OWED (small, can ride with week 36): nan/inf compare equal at
+  compare_against_sqlite.py:1874; random_diff.py:113-117 projects only driver_id/team from
+  rels[:3] and driver_id is the join key.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
