@@ -1,20 +1,23 @@
 # Phase 5 orchestrator state
-Current: THE FIVE-WAY SEAM AUDIT — the last step before the user's week 37.
-  Five auditors in parallel, each with its matching project skill, each writing to
-  scratchpad/audits/seam-<name>-pass-1.md and COMMITTING IT ITSELF (scratchpad does not survive
-  a reclaim, and an audit file is the input to its fix round):
-    join chain      weeks 26-29  skill: invariants
-    subquery chain  weeks 30-34  skill: operator-correctness
-    engine divergence            skill: vectorized-audit
-    optimizer preservation       skill: optimizer-diff
-    storage                      skill: storage-verify
-  Then: fix blockers (one agent per auditor that found any), gate, repeat up to 5 passes,
-  stopping as soon as a pass returns no blockers. Then STOP and report. Week 37 is the user's.
-  FINAL PHASE 5 NUMBERS: unit 550 -> 805, oracle 476 -> 1290 checks, regression 231 -> 318,
-  TPC-H not measurable -> 20/22 meaningful vs SQLite (5 four-mode, 15 vec-only; 1 vacuous;
-  1 unported; 34 of 88 cells Volcano refusals pinned by message).
-  PROVENANCE stands: dbgen unavailable, the generator reproduces value DOMAINS not
-  distributions, the published answer set does NOT apply. "matches SQLite", never "correct".
+Current: SEAM AUDIT PASS 1 — five auditors launched 23:41 UTC, each committing its own file.
+  1 of 5 REPORTED: engine divergence (seam-engine-divergence-pass-1.md) — 0 high, 1 medium,
+  1 low.
+  !! THE MEDIUM IS A REAL CROSS-ENGINE WRONG ANSWER that survived 14 weeks and ~30 audits:
+  plan_nodes.cc:317 emits GROUP BY results in unordered_map HASH order while
+  vec_hash_aggregate_node.cc:243 emits in INSERTION order. Under ORDER BY <agg> LIMIT n WITH A
+  TIE AT THE CUT (suite query compare_against_sqlite.py:53) the two engines return different
+  row SETS, and normalize()'s sort cannot mask it because the sets differ. It survived because
+  it only manifests when a tie straddles the LIMIT boundary — every "do both engines agree"
+  check got yes.
+  LOW/latent: vectorized_plan_builder.cc:486-493 passes on_residual=nullptr for semi/anti
+  instead of forwarding it, defeating the constructor guard at vec_hash_join_node.cc:31.
+  Verified in agreement: all three refusals total and correctly ordered; outer joins; the six
+  key serializers; COUNT(DISTINCT); sort; DISTINCT; the week 32 semi-join row path.
+  NOT REACHED by that auditor: VecDerivedNode re-entry under a derived-table self-join;
+  Volcano columnar scan vs VecScanNode zone-map pruning; checked_arith.h/columnar_eval.cc vs
+  scalar evaluator.cc.
+  WAITING on the other four (join chain, subquery chain, optimizer preservation, storage)
+  before dispatching fixes, so they batch into one round rather than racing the tree.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅ 36 ✅ — WEEK PLAN COMPLETE
