@@ -1,24 +1,24 @@
 # Phase 5 orchestrator state
-Current: week 35 fix round (agent ace28f349cf48c3b7). Implementation of all 8 tasks is done
-  and pushed. FIRST REAL MEASUREMENT OF THE PHASE GOAL, at SF=0.01:
-    20/22 answered — 5 in all four modes, 15 in the two vectorized modes only;
-    34/88 cells Volcano refusals pinned by message; 2 refused by name; 2 VACUOUS.
-  The audit independently re-derived the same 20/22 but found q16 is a SECOND vacuous pass
-  (its NOT IN subquery returns 0 rows on the synthetic data, so deleting the whole anti-join
-  predicate gives byte-identical 305 rows). So the honest figure is 18 OF 22 MEANINGFULLY
-  ANSWERED. Fix round is making q16 discriminate AND building a MUTATION CHECK into the
-  harness — for each of the 22, neuter its characteristic predicate and assert the answer
-  changes — because two vacuous passes found by two different routes is no evidence there are
-  only two. A number below 20 is the RIGHT outcome; week 36 needs the true baseline.
-  PROVENANCE, must not be upgraded by week 36: dbgen was unavailable, so the generator
-  reproduces the spec's value DOMAINS but not its distributions. PROVENANCE.txt states the
-  published answer set does NOT apply — SQLite over the same files is the only oracle.
-  Say "matches SQLite", never "correct" or "TPC-H compliant".
-  Q22's internal error was found BY THE HARNESS and fixed: materializeSubqueries never
-  recursed into derived bodies while collectQueryTables ten lines above it did — the same
-  class as week 33's three wrong answers.
-  The computed census CONTRADICTED the README's typed "56" (real: 93); the README now cites
-  the harness.
+Current: week 35 fix round, THIRD agent (a36d25b62173b2520, launched 19:08 UTC).
+  !! RECLAIM CADENCE HAS TIGHTENED TO ~20 MINUTES (18:45, 19:07 observed) — it is no longer
+  hourly. Scope every agent to ONE job it can finish and push inside ~15 minutes, and tell it
+  to name the remaining jobs in ## Progress rather than starting them.
+  Two agents were killed mid-round. What survived, because of commit-per-unit:
+    f7c6cdb fix(data): seed Q16's anti-join phrase — the audit's BLOCKER is fixed and pushed.
+    cc3e4ce wip(harness): 342 UNVALIDATED lines of mutation-check machinery recovered from a
+      killed agent's working tree, committed so the next restart cannot take it. Committing is
+      NOT endorsing — nobody has checked it.
+  THE ANSWER COUNT IS CONTESTED AND MUST BE SETTLED BEFORE IT IS QUOTED:
+    harness first reported 20 | audit corrected to 18 | recovered baseline claims 17.
+    At most one is right; none is verified. The current agent regenerates it from a run it
+    performs itself.
+  STILL OWED after that (named for a successor, not started):
+    - Wire run_tpch.py into the `verify` skill as a FIFTH gate step. It is ABSENT today, so a
+      GREEN gate says nothing about TPC-H — which is week 36's entire deliverable. Must report
+      meaningfully-answered with the mode split and go RED on a regression.
+    - nan/inf compare equal at compare_against_sqlite.py:1874.
+    - random_diff.py:113-117 projects only driver_id/team from rels[:3], and driver_id is the
+      join key, so column-identity reach is narrower than claimed.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
