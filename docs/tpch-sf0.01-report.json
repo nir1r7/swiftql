@@ -131,86 +131,6 @@
     "q9|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path"
   },
   "fingerprints": {
-    "q10|col-vec": {
-      "LogicalJoin": 6
-    },
-    "q10|col-vec-noopt": {
-      "LogicalJoin": 3
-    },
-    "q11|col-vec": {
-      "LogicalJoin": 4
-    },
-    "q11|col-vec-noopt": {
-      "LogicalJoin": 2
-    },
-    "q12|col-vec": {
-      "LogicalJoin": 2
-    },
-    "q12|col-vec-noopt": {
-      "LogicalJoin": 1
-    },
-    "q12|col-volcano": {},
-    "q12|row-volcano": {},
-    "q13|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalLeftJoin": 2
-    },
-    "q13|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalLeftJoin": 1
-    },
-    "q14|col-vec": {
-      "LogicalJoin": 2
-    },
-    "q14|col-vec-noopt": {
-      "LogicalJoin": 1
-    },
-    "q14|col-volcano": {},
-    "q14|row-volcano": {},
-    "q15|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalJoin": 2
-    },
-    "q15|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalJoin": 1
-    },
-    "q16|col-vec": {
-      "LogicalAntiJoin": 2,
-      "LogicalJoin": 2
-    },
-    "q16|col-vec-noopt": {
-      "LogicalAntiJoin": 1,
-      "LogicalJoin": 1
-    },
-    "q18|col-vec": {
-      "LogicalJoin": 4,
-      "LogicalSemiJoin": 2
-    },
-    "q18|col-vec-noopt": {
-      "LogicalJoin": 2,
-      "LogicalSemiJoin": 1
-    },
-    "q19|col-vec": {
-      "LogicalJoin": 2
-    },
-    "q19|col-vec-noopt": {
-      "LogicalJoin": 1
-    },
-    "q19|col-volcano": {},
-    "q19|row-volcano": {},
-    "q1|col-vec": {},
-    "q1|col-vec-noopt": {},
-    "q1|col-volcano": {},
-    "q1|row-volcano": {},
-    "q20|col-vec": {
-      "LogicalJoin": 2,
-      "LogicalSemiJoin": 4
-    },
-    "q20|col-vec-noopt": {
-      "LogicalJoin": 1,
-      "LogicalSemiJoin": 2
-    },
     "q22|col-vec": {
       "LogicalAntiJoin": 2,
       "LogicalDerived": 2
@@ -218,62 +138,6 @@
     "q22|col-vec-noopt": {
       "LogicalAntiJoin": 1,
       "LogicalDerived": 1
-    },
-    "q2|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalJoin": 14,
-      "LogicalLeftJoin": 2
-    },
-    "q2|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalJoin": 7,
-      "LogicalLeftJoin": 1
-    },
-    "q3|col-vec": {
-      "LogicalJoin": 4
-    },
-    "q3|col-vec-noopt": {
-      "LogicalJoin": 2
-    },
-    "q4|col-vec": {
-      "LogicalSemiJoin": 2
-    },
-    "q4|col-vec-noopt": {
-      "LogicalSemiJoin": 1
-    },
-    "q5|col-vec": {
-      "LogicalJoin": 10
-    },
-    "q5|col-vec-noopt": {
-      "LogicalJoin": 5
-    },
-    "q6|col-vec": {},
-    "q6|col-vec-noopt": {},
-    "q6|col-volcano": {},
-    "q6|row-volcano": {},
-    "q7|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalJoin": 10
-    },
-    "q7|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalJoin": 5
-    },
-    "q8|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalJoin": 14
-    },
-    "q8|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalJoin": 7
-    },
-    "q9|col-vec": {
-      "LogicalDerived": 2,
-      "LogicalJoin": 10
-    },
-    "q9|col-vec-noopt": {
-      "LogicalDerived": 1,
-      "LogicalJoin": 5
     }
   },
   "modes": [
@@ -282,6 +146,118 @@
     "col-vec",
     "col-vec-noopt"
   ],
+  "mutations": {
+    "q1": [
+      "DISCRIMINATING",
+      "the l_shipdate cutoff",
+      "3 rows -> 3"
+    ],
+    "q10": [
+      "DISCRIMINATING",
+      "the l_returnflag = 'R' filter",
+      "20 rows -> 20"
+    ],
+    "q11": [
+      "DISCRIMINATING",
+      "the HAVING with its uncorrelated scalar subquery",
+      "477 rows -> 503"
+    ],
+    "q12": [
+      "DISCRIMINATING",
+      "the commit/receipt/ship date ordering",
+      "2 rows -> 2"
+    ],
+    "q13": [
+      "DISCRIMINATING",
+      "the LEFT JOIN's outer-ness (customers with no orders)",
+      "26 rows -> 25"
+    ],
+    "q14": [
+      "DISCRIMINATING",
+      "the PROMO CASE arm",
+      "1 rows -> 1"
+    ],
+    "q15": [
+      "DISCRIMINATING",
+      "the = (SELECT MAX(total_revenue)) equality",
+      "1 rows -> 100"
+    ],
+    "q16": [
+      "DISCRIMINATING",
+      "the NOT IN (suppliers with complaints) anti-join",
+      "305 rows -> 305"
+    ],
+    "q17": [
+      "DISCRIMINATING",
+      "the correlated 0.2 * AVG(l_quantity) scalar subquery",
+      "1 rows -> 1"
+    ],
+    "q18": [
+      "EMPTY",
+      "the IN (subquery with HAVING) semi-join",
+      "zero rows on both sides"
+    ],
+    "q19": [
+      "ALL_NULL",
+      "the second and third OR arms",
+      "every value is NULL -- an aggregate over an empty input, so the comparison asserts nothing"
+    ],
+    "q2": [
+      "INERT",
+      "the correlated MIN(ps_supplycost) scalar subquery",
+      "neutering it does not change the answer"
+    ],
+    "q20": [
+      "DISCRIMINATING",
+      "the nested IN (subquery) semi-joins",
+      "4 rows -> 6"
+    ],
+    "q21": [
+      "DISCRIMINATING",
+      "the NOT EXISTS anti-join",
+      "3 rows -> 3"
+    ],
+    "q22": [
+      "DISCRIMINATING",
+      "the NOT EXISTS anti-join (customers with no orders)",
+      "7 rows -> 7"
+    ],
+    "q3": [
+      "DISCRIMINATING",
+      "the c_mktsegment filter",
+      "10 rows -> 10"
+    ],
+    "q4": [
+      "DISCRIMINATING",
+      "the correlated EXISTS semi-join",
+      "5 rows -> 5"
+    ],
+    "q5": [
+      "DISCRIMINATING",
+      "the customer/supplier same-nation join condition",
+      "5 rows -> 5"
+    ],
+    "q6": [
+      "DISCRIMINATING",
+      "the l_discount BETWEEN band",
+      "1 rows -> 1"
+    ],
+    "q7": [
+      "DISCRIMINATING",
+      "the nation-pair filter over the derived table",
+      "4 rows -> 1244"
+    ],
+    "q8": [
+      "DISCRIMINATING",
+      "the p_type filter inside the derived body",
+      "2 rows -> 2"
+    ],
+    "q9": [
+      "DISCRIMINATING",
+      "the p_name LIKE '%color%' filter",
+      "175 rows -> 175"
+    ]
+  },
   "provenance": [
     "generator: python_tools/generate_tpch.py (NOT the official dbgen)",
     "scale:     0.01",
@@ -291,12 +267,75 @@
     "published TPC-H answer set DOES NOT APPLY to this data. The only",
     "valid oracle here is SQLite over these same files."
   ],
+  "summary": {
+    "meaningful": [
+      "q1",
+      "q10",
+      "q11",
+      "q12",
+      "q13",
+      "q14",
+      "q15",
+      "q16",
+      "q20",
+      "q22",
+      "q3",
+      "q4",
+      "q5",
+      "q6",
+      "q7",
+      "q8",
+      "q9"
+    ],
+    "mismatched": [],
+    "modes": {
+      "q1": 4,
+      "q10": 2,
+      "q11": 2,
+      "q12": 4,
+      "q13": 2,
+      "q14": 4,
+      "q15": 2,
+      "q16": 2,
+      "q17": 0,
+      "q18": 2,
+      "q19": 4,
+      "q2": 2,
+      "q20": 2,
+      "q21": 0,
+      "q22": 2,
+      "q3": 2,
+      "q4": 2,
+      "q5": 2,
+      "q6": 4,
+      "q7": 2,
+      "q8": 2,
+      "q9": 2
+    },
+    "mutation_broken": [],
+    "unexplained": [],
+    "unported": [
+      "q17",
+      "q21"
+    ],
+    "vacuous": {
+      "q18": [
+        "EMPTY",
+        "zero rows on both sides"
+      ],
+      "q19": [
+        "ALL_NULL",
+        "every value is NULL -- an aggregate over an empty input, so the comparison asserts nothing"
+      ],
+      "q2": [
+        "INERT",
+        "neutering it does not change the answer"
+      ]
+    }
+  },
   "timings": {},
   "tolerance": {
     "abs": 1e-06,
     "rel": 1e-09
-  },
-  "vacuous": [
-    "q18"
-  ]
+  }
 }

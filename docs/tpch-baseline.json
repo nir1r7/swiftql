@@ -60,7 +60,7 @@
     ],
     "q2": [
       "INERT",
-      "deleting the correlated MIN(ps_supplycost) subquery does not change the answer"
+      "neutering it does not change the answer"
     ]
   }
 }
