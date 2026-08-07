@@ -66,3 +66,68 @@ skip lowering when `sq->correlated` (push it to `kept`) so it reaches
 point. Then delete the stale precondition bullet at `subquery_lowering.h:29`
 and add both queries above to `WEEK33_CORRELATED_BINDS`.
 
+**Corroboration from inside the fix round itself.**
+`src/planner/subquery_decorrelation.h:22-25`, written *this round*, says:
+
+> It is a SIBLING of subquery_lowering.h rather than an addition to it, because
+> that header's stated preconditions include "no correlated subquery anywhere",
+> **which stops being true this week and must be restated rather than silently
+> invalidated.**
+
+It was not restated. `subquery_lowering.h:29` still carries it verbatim, and
+`subquery_lowering.cc` still behaves as if it held. The round diagnosed the
+defect precisely and repaired one of the two files.
+
+---
+
+### R2-M1 (MEDIUM) — `AnAliasInTheBodysSelectListCannotShadowTheJoinKey` cannot fail on the bug it names
+
+`tests/test_subquery.cc:756-771` (added `12efb77`). It pins round 1's H-2 with:
+
+```cpp
+auto plan = planLowered("SELECT d.name FROM drivers d WHERE EXISTS "
+                        "(SELECT l.speed AS driver_id FROM laps l "
+                        " WHERE l.driver_id = d.driver_id)", cat);
+const Schema& body = j->children[1]->output_schema;
+ASSERT_EQ(body.size(), 1) << "the body must be projected to its key columns only";
+EXPECT_EQ(body.column(0).name, "driver_id") << "and it must be the KEY column, not the aliased one";
+```
+
+The alias in the chosen query **is** `driver_id`. Under the pre-fix behaviour
+the body's select list survives unchanged, `buildProjectSchema` names the single
+output column by its SELECT alias — `driver_id` — and the schema is therefore
+also size 1 with name `driver_id`. **Both assertions pass on the defective
+code**, so the test would not fail if `subquery_decorrelation.cc:216-217` (the
+`select_list = std::move(body_key_refs)` rewrite) were reverted.
+
+What actually distinguishes the two states is the column's TYPE: the key column
+`l.driver_id` is `INT`, the aliased `l.speed` is `DOUBLE`. Concrete state
+producing the wrong behaviour: revert `subquery_decorrelation.cc:216-217` and
+this test still goes green while `SELECT COUNT(*) FROM drivers d WHERE EXISTS
+(SELECT l.speed AS driver_id FROM laps l WHERE l.driver_id = d.driver_id)`
+returns 0 against SQLite's 20.
+
+**Minimal fix:** add `EXPECT_EQ(body.column(0).type, TypeId::INT);`, or alias to
+a name that is not the key (`AS k`). Its two siblings —
+`AJoinBodyIsProjectedToItsKeyBeforeTheMergedSchemaCanShadowIt`
+(`test_subquery.cc:788-802`, old schema had 14 columns) and
+`ABodyThatIsNotSelectStarStillKeepsItsKeyColumn` (`test_subquery.cc:773-786`,
+old names were `1`/`name`/5 columns) — do fail on the pre-fix code and are fine.
+
+---
+
+### R2-L1 (LOW) — a third stale citation of the deleted Validator refusal, harmless today
+
+`src/planner/predicate_pushdown.cc:110-113`:
+
+> "NOT reachable from the CLI this week — Validator refuses a bound subquery
+> before any logical plan exists — but the branch ships with the node"
+
+That refusal is the one Week 33 deleted, so `if (sq->correlated) out.insert(-1)`
+(`predicate_pushdown.cc:115`) *is* now CLI-reachable — via the correlated `IN`
+of R2-C1, and via any correlated node that survives materialization into a
+conjunct pushdown inspects. Unlike the other two sites this one is **safe**: -1
+is the conservative "cannot name it here" sentinel and it only suppresses
+pushdown. Comment only; no wrong answer. Flagged because it is the same
+sentence pattern and a future reader would take it as still-true.
+
