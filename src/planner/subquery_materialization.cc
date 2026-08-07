@@ -139,6 +139,24 @@ namespace {
 // two substitutions. Two textually identical but DISTINCT subqueries still run
 // twice — a missed optimization, not a wrong answer; a structural key is Week
 // 37's.
+//
+// !! A KEY OUTLIVES THE STATEMENT IT NAMES, and is therefore COMPARED ONLY,
+// never dereferenced. `visit` replaces the SubqueryExpr through its slot, which
+// releases the last shared_ptr to that SelectStatement while its address is
+// still a live key for the rest of the walk. Nothing reads through the key —
+// `cache.find` compares addresses — so this is not a dangling READ. What it
+// would be is an ABA collision: a SelectStatement allocated at the recycled
+// address would hit this cache and receive ANOTHER subquery's rows, silently.
+// That is unreachable for one reason, which is the invariant to preserve:
+// EVERY SelectStatement IS ALLOCATED AT PARSE TIME (parser.cc:355/477/639 are
+// the only `make_shared<SelectStatement>` in the engine) and parsing has
+// finished before this pass begins; nothing here allocates one — `body` at
+// runOnce is a stack local, and cloneExpr shares the shared_ptr rather than
+// making a second statement. The first week that heap-allocates a
+// SelectStatement DURING planning — Week 34's derived tables are the candidate —
+// breaks it, and the fix is to hold the shared_ptr in the cache VALUE, which
+// pins the address for the pass's lifetime. Adding that pin now would be a field
+// no reachable input needs.
 using ResultCache = std::unordered_map<const SelectStatement*, SubqueryResult>;
 
 const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
