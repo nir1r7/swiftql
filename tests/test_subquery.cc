@@ -255,6 +255,42 @@ TEST(SubqueryMaterialization, MaterializesTheInnerBodyBeforeRunningTheOuterOne) 
     for (bool f : nested_flag) EXPECT_FALSE(f) << "a body must be materialized before it runs";
 }
 
+// The same "innermost first" property for the shape the SCALAR test above
+// cannot reach: an IN node is not materialized, but its BODY may hold subqueries
+// of its own, and those are still this pass's business. Week 32's first cut
+// returned from `visit` on Kind::IN before runOnce, which is where the recursion
+// lived — so the body's own SCALAR node survived into planning and
+// inferExprType (dispatch site 12) threw an INTERNAL-invariant message at legal
+// SQL that Week 31 answered. The IN node itself must still be untouched.
+TEST(SubqueryMaterialization, MaterializesASubqueryNestedInsideAnInBody) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
+                         "(SELECT driver_id FROM laps WHERE speed > "
+                         " (SELECT AVG(speed) FROM laps))", cat);
+    int runs = 0;
+    materializeSubqueries(stmt, canned({oneCol("AVG(speed)", TypeId::DOUBLE),
+                                        {Row{Value(312.5)}}}, &runs));
+
+    // Exactly one run: the nested SCALAR. The IN body itself is run by the
+    // semi-join's build side, not here.
+    EXPECT_EQ(runs, 1);
+
+    const auto* sq = dynamic_cast<const SubqueryExpr*>(whereOf(stmt));
+    ASSERT_NE(sq, nullptr) << "the IN node must still survive the pass";
+    EXPECT_EQ(sq->kind, SubqueryExpr::Kind::IN);
+    EXPECT_TRUE(stmt.has_subquery);
+
+    // The body must reach LogicalPlanBuilder free of SubqueryExpr nodes: sites
+    // 12/13 throw on one, and a semi-join body is planned like any other block.
+    ASSERT_NE(sq->subquery, nullptr) << "the IN body must not have been moved out";
+    const auto* body_pred = dynamic_cast<const BinaryExpr*>(sq->subquery->where.get());
+    ASSERT_NE(body_pred, nullptr);
+    const Literal* lit = asLiteral(body_pred->right.get());
+    ASSERT_NE(lit, nullptr) << "the body's nested scalar must have been substituted";
+    EXPECT_DOUBLE_EQ(lit->value.asDouble(), 312.5);
+    EXPECT_FALSE(sq->subquery->has_subquery);
+}
+
 // The walker is dispatch site 19 and must reach a subquery inside every
 // container node, not only at the top of a predicate.
 TEST(SubqueryMaterialization, TheWalkerReachesASubqueryInsideEveryContainerNode) {

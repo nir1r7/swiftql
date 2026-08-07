@@ -261,7 +261,23 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     auto visit = [&](std::unique_ptr<Expr>& slot) {
         auto* sq = dynamic_cast<SubqueryExpr*>(slot.get());
         if (!sq) return;
-        if (sq->kind == SubqueryExpr::Kind::IN) { in_survives = true; return; }
+        if (sq->kind == SubqueryExpr::Kind::IN) {
+            // The NODE survives, but its BODY is still this pass's business:
+            // `x IN (SELECT k FROM t WHERE c > (SELECT AVG(c) FROM t))` is legal
+            // SQL Week 31 answered. The recursion that handles it lives inside
+            // runOnce ("Innermost first"), which this arm returns before — so it
+            // is repeated here. Nothing else of runOnce applies: the body is NOT
+            // moved, NOT limit-capped and NOT cached, because it is planned by
+            // the semi-join's build side rather than run for a value.
+            //
+            // Without this, the body's own SCALAR node reaches
+            // LogicalPlanBuilder and inferExprType (dispatch site 12) throws its
+            // "the materialization walker missed a subtype" message — an
+            // internal-defect report for a perfectly ordinary query.
+            materializeSubqueries(*sq->subquery, run);
+            in_survives = true;
+            return;
+        }
         const SubqueryResult& res = runOnce(sq, run, cache);
         std::unique_ptr<Expr> replacement = buildReplacement(sq, res);
         // An aliased constant keeps its name, for the same reason foldNode

@@ -547,6 +547,16 @@ WEEK32_SEMI_JOIN_VEC_ONLY = [
     # top-level statement (docs/week-32-plan.md 0)
     "SELECT COUNT(*) FROM laps WHERE driver_id IN "
     "(SELECT driver_id FROM drivers GROUP BY driver_id)",
+    # a SUBQUERY INSIDE THE IN BODY. Week 31 answered this shape by
+    # materializing both nodes; Week 32 routes the outer one to the lowering,
+    # and the body's own scalar is STILL materialization's business. The first
+    # cut returned from the walker before the "innermost first" recursion, so
+    # this query died at dispatch site 12 with an internal-invariant message
+    # while the suite stayed green — a capability regressing silently is exactly
+    # what the oracle is for, so the shape is pinned here as well as in
+    # tests/test_subquery.cc.
+    "SELECT COUNT(*) FROM drivers WHERE driver_id IN "
+    "(SELECT driver_id FROM laps WHERE speed > (SELECT AVG(speed) FROM laps))",
 ]
 
 WEEK32_SEMI_JOIN_VOLCANO_REJECTED = [
