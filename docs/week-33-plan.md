@@ -1109,7 +1109,9 @@ to them.
 - [x] `AggregateSpec` (planner/logical_plan.h) + consumers.
 - [x] Tests (6 files needed edits; the other three touched only `ColumnDef` /
       `ColumnStatsEntry` slots, which are not migrated).
-- [ ] `development.md` → *Relation slots and query levels*.
+- [x] `development.md` → *Relation slots and query levels*.
+- [x] Pinning tests: `localSlot` throws on a correlated id; `exprKey`'s encoding
+      is byte-identical; `unresolved()` is `(0, -1)`.
 
 All of `src/` compiles. Narrowing sites created, each named in its
 `localSlot(...)` argument: `lowerInSubqueries`, `collectSlots`,
@@ -1130,6 +1132,9 @@ asserts exactly the conjunction it replaced; a **lone** slot assertion →
 strengthening it into a level assertion the test never made. No assertion was
 removed or weakened.
 
-**Next concrete step:** the two pinning tests (`localSlot` throws on a
-correlated id; `exprKey`'s encoding is byte-identical for a level-0 ref), then
-`development.md` → *Relation slots and query levels*.
+**Task 1 is code-complete.** `grep -rn "query_level" src/ tests/` returns only
+comments; `grep -rn "relation_slot" src/ tests/` returns only `ColumnDef` and
+`ColumnStatsEntry` readers, which are schema slots and out of scope by design.
+
+**Next concrete step:** a separate verifier owns the gate (build, unit suite,
+oracle suite in all four modes). Task 2 does not begin until it is green.
