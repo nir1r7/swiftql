@@ -1283,15 +1283,61 @@ Success criteria for the week, in the form the gate reports them:
 
 | Task | State | Note |
 |---|---|---|
-| 1 — lift the constant wrapper (Q17) | IN PROGRESS | — |
-| 2 — the sweep the lift obliges | not started | must land in the SAME commit as Task 1 |
-| 3 — Q21 | not started | 3a (establish + record) mandatory, 3b (implement) stretch |
+| 1 — lift the constant wrapper (Q17) | **DONE** | spec form runs; plan byte-identical to the constant-outside form |
+| 2 — the sweep the lift obliges | **DONE** | landed in the same commit; sweep report below |
+| 3 — Q21 | next | 3a (establish + record) mandatory, 3b (implement) stretch |
 | 4 — Volcano breakdown | measured, unwritten | table is in Task 4 above; owed to the report |
 | 5 — inherited divergences | not started | — |
-| 6 — small items owed | not started | 6a (NaN) is a real oracle hole, do it early |
+| 6 — small items owed | 6a DONE (uncommitted) | 6b/6c/6d not started |
 | 7 — scale + memory | measured, unwritten | numbers in Task 7 above; owed to README |
 | 8 — re-baseline + report + gate | not started | full run, no `--queries` |
 
-**Next concrete step:** add `constantOnly` / `constantWrapperAggregateSlot` to
-`src/planner/subquery_decorrelation.cc`'s anonymous namespace and change
-`requireDecorrelatableScalarBody` to return the located slot.
+### Task 2 sweep report — checked, not only hit
+
+A sweep that lists only its hits is not evidence it was thorough, so both columns
+are recorded.
+
+**Changed (the restriction is cited and the citation went stale):**
+
+| Site | What changed |
+|---|---|
+| `src/planner/subquery_decorrelation.cc` | `requireDecorrelatableScalarBody`'s aggregate check replaced by `constantWrapperAggregateSlot` + `constantOnly`; the "THE LOAD-BEARING ONE" comment rewritten to say the refusal **narrowed** |
+| `src/planner/subquery_decorrelation.h` | Week 34 header: a new block after point 3 stating the wrapper rule, why the wrapper is lifted rather than pushed through (the COUNT rule), and that point 2's refusal narrowed rather than vanished |
+| `README.md` Feature Scope (subqueries bullet) | rewritten: Q17's text runs; the two forms produce the same plan |
+| `README.md` dialect refusal table | row **rewritten to the new boundary**, not deleted — a removed row is how a limitation becomes a silent claim of support |
+| `README.md` Week 34 section | the "Corrected in Week 35" paragraph now closes with ✅ Week 36 |
+| `README.md` Limitations (correlated bullet) | same rewrite as Feature Scope, with the COUNT reason |
+| `python_tools/tpch_queries.py` | module docstring ("the list of them IS Week 36's worklist" → WAS, worked, and **the template was not altered**) and q17's own comment |
+| `python_tools/compare_against_sqlite.py` | 7 new diffed entries in `WEEK34_CORRELATED_SCALAR_VEC_ONLY`; 3 new pinned refusals in `WEEK34_CORRELATED_SCALAR_REFUSED`, with the header rewritten to say the rule narrowed |
+
+**Checked and still true (no edit needed) — recorded so the sweep is auditable:**
+
+| Site | Why it still holds |
+|---|---|
+| `logical_plan.cc:1021` call site | its comment is about pass ORDER and `range_table_size`, neither of which the wrapper touches |
+| `subquery_decorrelation.h` points 1 and 3 | point 1 (LEFT join, COUNT exception) is unchanged and is now *depended on* by the lift; point 3 (the node is not a whole conjunct, `forEachSubquery`) is unchanged |
+| `requireDecorrelatableBody` (the EXISTS guard) and its header | not shared, not widened, not touched — the separation the header argues for is exactly what let the scalar rule move alone |
+| `development.md` relation-slot table | its derived-relation row describes the *right child*, which the wrapper does not change |
+| `tests/test_subquery.cc:460` | mentions "the correlated scalar must survive the pass" — a statement about materialization, not about the select-list shape |
+| `WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED` | a comprehension over the vec-only list, so the 7 new entries generate 7 new Volcano entries automatically; confirmed by running that they reach `VOLCANO_CORRELATED`, not `VOLCANO_IN` |
+| the non-aggregate entry pinned at `WEEK34_CORRELATED_SCALAR_REFUSED[0]` | `(SELECT l2.speed ...)` has no aggregate at all, so it still refuses, and its needle `single aggregate` still matches the narrowed message |
+
+**Mutation-tested, because a needle that never bites pins nothing:**
+
+| Mutant | Result |
+|---|---|
+| `if (l && r) refuse(...)` → `if (false)` (two-aggregate guard off) | the two-aggregate entry **FAILED** — the query got as far as `Column not found in schema: COUNT(*)`, i.e. a far-from-the-cause message, which is what the guard prevents |
+| the final `refuse(...)` → `return &item` (wrapper whitelist off) | the `CASE`-wrapper entry and the non-aggregate entry both **FAILED**, and the `CASE` one *returned rows* rather than erroring — a silent answer where SQL says nothing sensible |
+
+**A design error the work caught, recorded because the assertion that caught it
+is the lesson.** The first form located the aggregate slot inside
+`requireDecorrelatableScalarBody` and held the pointer across `splitCorrelation`.
+That is wrong for the **unwrapped** body, where the located slot IS
+`body.select_list[0]` and `std::move`-ing the item out of the vector empties it.
+The wrapped case worked and every Week 34 shape broke. A defensive
+`internal: the located ... slot moved` check turned that into a loud error on the
+first run; the fix was structural — locate **after** the move, on the caller's
+own local, so the pointer cannot outlive what it names.
+
+**Next concrete step:** Task 3a — reproduce q21's refusal against the rebuilt
+binary and record the requirement; then decide 3b.

@@ -160,13 +160,121 @@ void refuseSurvivingCorrelatedRefs(const SelectStatement& body) {
     check(body.where.get(), "WHERE");
 }
 
+// Week 36 — IS THIS SUBTREE A CONSTANT? The other half of
+// constantWrapperAggregateSlot below, and written beside it on purpose: the two
+// are one whitelist read in two directions, and a node admitted by one that the
+// other cannot descend into is the drift this pair exists to make impossible.
+//
+// Literals and arithmetic over literals only. Everything else is refused, and
+// each exclusion earns its place:
+//   ColumnRef      a body-local ref outside the aggregate is an UNGROUPED
+//                  reference -- a different query; an OUTER one is a correlated
+//                  ref in the SELECT list, which refuseSurvivingCorrelatedRefs
+//                  already declines by name. Do not widen that silently.
+//   AggregateExpr  a second aggregate needs a second output column and a second
+//                  zero-row rule; the COUNT CASE below is written for one.
+//   SubqueryExpr   a nested body inside the wrapper is a scope question this
+//                  rewrite does not answer.
+//   everything else (CASE, SUBSTRING, LIKE, IN, IS NULL, INTERVAL)
+//                  no TPC-H query needs one, each adds a type or NULL question,
+//                  and an IntervalLiteral must not survive planning at all.
+bool constantOnly(const Expr* e) {
+    if (!e) return true;
+    if (dynamic_cast<const Literal*>(e)) return true;
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(e))
+        return constantOnly(bin->left.get()) && constantOnly(bin->right.get());
+    if (auto* un = dynamic_cast<const UnaryExpr*>(e))
+        return constantOnly(un->operand.get());
+    return false;
+}
+
+// Week 36 — THE CONSTANT WRAPPER around the body's aggregate.
+//
+// TPC-H Q17 writes `(SELECT 0.2 * AVG(l_quantity) ...)`: the select-list item is
+// a BinaryExpr WRAPPING the aggregate, not the aggregate. Week 34 required
+// found[0] == body.select_list[0] and refused the spec's own text, while the
+// semantically identical constant-OUTSIDE form `0.2 * (SELECT AVG(...) ...)`
+// decorrelated and matched SQLite. This function is the whole difference.
+//
+// THE WRAPPER IS LIFTED OUT OF THE BODY, not pushed through it. The body still
+// selects the bare aggregate; the caller re-attaches the wrapper around the
+// SUBSTITUTED reference in the outer expression. That is sound exactly when
+// every leaf other than the aggregate is a constant -- then f(agg) evaluated per
+// group inside and f(agg_column) evaluated per outer row outside are the same
+// function of the same argument.
+//
+// !! WHY NOT KEEP THE WRAPPER IN THE BODY. Naming the derived column
+// exprToString(wrapper) also runs -- `SELECT team, 0.2 * AVG(speed) ... GROUP BY
+// team` is already legal here. It breaks the COUNT rule: the zero-row CASE would
+// substitute 0 for the WHOLE wrapper, so a body of `1 + COUNT(*)` over an empty
+// correlation group answers 0 where SQL says 1. Lifting puts the CASE at the
+// aggregate's own position, where it is correct by construction and needs no
+// second copy of the tree.
+//
+// Returns the OWNING SLOT of the aggregate, so the caller can move the aggregate
+// out and assign the substitution back in. When the wrapper IS the aggregate
+// (Week 34's shape) it returns the item's own slot, which makes that shape a
+// special case of this one rather than a second production.
+//
+// NOT A DISPATCH SITE. It walks only BinaryExpr and UnaryExpr and refuses every
+// other node type, so a new expression node owes it nothing -- see
+// development.md's 17-site checklist, which this deliberately does not join. If
+// it is ever widened to more node types, it DOES join that list.
+std::unique_ptr<Expr>* constantWrapperAggregateSlot(std::unique_ptr<Expr>& item) {
+    if (dynamic_cast<AggregateExpr*>(item.get())) return &item;
+
+    if (auto* bin = dynamic_cast<BinaryExpr*>(item.get())) {
+        std::unique_ptr<Expr>* l = constantOnly(bin->left.get())
+                                 ? nullptr : constantWrapperAggregateSlot(bin->left);
+        std::unique_ptr<Expr>* r = constantOnly(bin->right.get())
+                                 ? nullptr : constantWrapperAggregateSlot(bin->right);
+        if (l && r)
+            refuse("a correlated scalar subquery's select list may hold ONE "
+                   "aggregate (two would need two output columns and two "
+                   "zero-row rules)");
+        if (l || r) return l ? l : r;
+        // Neither side carries the aggregate and both are constant, so there is
+        // no aggregate anywhere -- the non-aggregate body Week 34 refused, and
+        // the message below is still its message.
+    } else if (auto* un = dynamic_cast<UnaryExpr*>(item.get())) {
+        if (!constantOnly(un->operand.get()))
+            return constantWrapperAggregateSlot(un->operand);
+    }
+
+    // THE LOAD-BEARING REFUSAL, narrowed but not removed. Without an aggregate,
+    // GROUP BY does not guarantee one row per key, and Week 31's runtime `scalar
+    // subquery returned more than one row` check has nowhere to live after the
+    // rewrite -- a query SQL calls an error would return an arbitrary row
+    // instead. Refusing keeps that divergence honest. Week 36 adds the second
+    // half: a wrapper that is not constant cannot be lifted out of the body, so
+    // the aggregate it holds is not one this rewrite can name.
+    refuse("a correlated scalar subquery is decorrelated only when its select "
+           "list is a single aggregate, optionally wrapped in constant "
+           "arithmetic (TPC-H Q17's `0.2 * AVG(...)`); a non-aggregate body has "
+           "no one-row-per-key guarantee, so 'returned more than one row' could "
+           "not be checked, and a non-constant wrapper cannot be lifted out of "
+           "the body");
+}
+
 // Week 34 — the SCALAR guard. Deliberately NOT requireDecorrelatableBody with a
 // flag: that function's stated condition is "no GROUP BY / HAVING / aggregate /
 // LIMIT / DISTINCT", and this rewrite REQUIRES an aggregate and ADDS a GROUP BY.
 // Widening it would leave one header stating a rule it no longer enforces for
 // half its callers, which is the shape that produced three silent wrong answers
 // in Week 33.
-void requireDecorrelatableScalarBody(const SelectStatement& body) {
+//
+// Week 36: the wrapper rule is enforced HERE, by calling the same locator the
+// lowering calls -- one function invoked twice, never two walkers that must
+// agree. It deliberately does NOT hand the located slot back: the caller moves
+// the select-list item out of the vector, which empties the slot a pointer taken
+// here would name. (That is not hypothetical -- it was the first form of this
+// change, and it broke every UNWRAPPED body while the wrapped one worked.) The
+// caller re-locates on its own local instead.
+//
+// The clause checks stay AHEAD of the wrapper check so a body with both a LIMIT
+// and a bad wrapper still reports the LIMIT, which is what the rejection suites
+// pin.
+void requireDecorrelatableScalarBody(SelectStatement& body) {
     if (body.limit)    refuse("a scalar body with LIMIT cannot be decorrelated");
     if (body.distinct) refuse("a scalar body with DISTINCT cannot be decorrelated");
     if (body.having)   refuse("a scalar body with HAVING cannot be decorrelated");
@@ -176,18 +284,7 @@ void requireDecorrelatableScalarBody(const SelectStatement& body) {
     if (body.select_star || body.select_list.size() != 1)
         refuse("a correlated scalar subquery must select exactly one expression");
 
-    // THE LOAD-BEARING ONE, and the reason it is not merely a scope reduction.
-    // Without an aggregate, GROUP BY does not guarantee one row per key, and
-    // Week 31's runtime `scalar subquery returned more than one row` check has
-    // nowhere to live after the rewrite -- a query SQL calls an error would
-    // return an arbitrary row instead. Refusing keeps that divergence honest.
-    std::vector<const AggregateExpr*> found;
-    collectAggregates(body.select_list[0].get(), found);
-    if (found.size() != 1 || found[0] != body.select_list[0].get())
-        refuse("a correlated scalar subquery is decorrelated only when its select "
-               "list is a single aggregate (a non-aggregate body has no "
-               "one-row-per-key guarantee, so 'returned more than one row' could "
-               "not be checked)");
+    (void)constantWrapperAggregateSlot(body.select_list[0]);
 }
 
 } // namespace
@@ -242,7 +339,20 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             // emits group columns then aggregates, which makes the right-side key
             // indices positional 0..k-1 -- the same shape Week 33's body projection
             // produced and Week 32's IN lowering had by taking body column 0.
-            auto agg_expr = std::move(body.select_list[0]);
+            // Week 36: take the WHOLE select-list item -- which for TPC-H Q17 is
+            // `0.2 * AVG(l_quantity)`, not the aggregate. agg_slot points at a
+            // unique_ptr INSIDE it, or at `wrapper` itself when the wrapper IS
+            // the aggregate (Week 34's shape); the substitution below assigns
+            // back into that slot, so one code path serves both.
+            auto wrapper = std::move(body.select_list[0]);
+            // LOCATE AFTER THE MOVE, not before. The guard above already proved
+            // the wrapper is legal; re-running the same locator on this local is
+            // what makes the pointer structurally valid rather than valid by a
+            // precondition nobody rechecks. Locating in the guard and holding the
+            // pointer across the move is wrong for the unwrapped body, where the
+            // slot IS body.select_list[0] and the move empties it.
+            std::unique_ptr<Expr>* agg_slot = constantWrapperAggregateSlot(wrapper);
+            auto agg_expr = std::move(*agg_slot);
             const auto* agg = static_cast<const AggregateExpr*>(agg_expr.get());
             const std::string agg_name = aggregateOutputName(agg);
             // !! COUNT IS THE EXCEPTION TO THE ZERO-ROW RULE, and getting this
@@ -316,8 +426,16 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             ref->column_name = agg_name;
             ref->id = ColumnId::local(derived_slot);
 
+            // Week 36 — the substitution goes back into the AGGREGATE'S OWN SLOT
+            // inside the wrapper, and the wrapper then becomes the conjunct's
+            // expression. That ordering is what makes the COUNT rule correct for
+            // a wrapped body for free: `1 + COUNT(*)` over an empty correlation
+            // group becomes `1 + CASE WHEN ref IS NULL THEN 0 ELSE ref END` = 1,
+            // where substituting 0 for the whole wrapper would have answered 0.
+            // When the wrapper IS the aggregate, agg_slot == &wrapper and the
+            // assignment refills `wrapper` -- one path, no branch.
             if (!count_body) {
-                slot = std::move(ref);
+                *agg_slot = std::move(ref);
             } else {
                 // COALESCE(ref, 0), spelled in the dialect this engine has:
                 //   CASE WHEN ref IS NULL THEN 0 ELSE ref END
@@ -348,8 +466,9 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
                 when.result = std::move(zero);
                 case_expr->when_clauses.push_back(std::move(when));
                 case_expr->else_expr = std::move(ref);
-                slot = std::move(case_expr);
+                *agg_slot = std::move(case_expr);
             }
+            slot = std::move(wrapper);
             ++out.lowered;
         });
     }

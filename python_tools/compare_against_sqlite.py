@@ -1273,6 +1273,44 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "SELECT d.name AS nm FROM drivers d WHERE d.driver_id NOT IN "
     "(SELECT l.driver_id FROM laps l WHERE l.speed > 1.10 * "
     "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id)) ORDER BY nm",
+
+    # WEEK 36 — THE CONSTANT WRAPPER, i.e. TPC-H Q17's own text. Week 34 required
+    # the body's select-list item to BE the aggregate and refused `0.2 * AVG(x)`;
+    # the wrapper is now lifted out of the body and re-attached around the
+    # substituted reference. The pair below is the point: the two forms are
+    # semantically identical, only the parenthesis position differs, and after the
+    # rewrite they produce the SAME plan. Both are diffed so a divergence between
+    # them cannot hide.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > 0.5 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
+    "(SELECT 0.5 * AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    # A coefficient that DISCRIMINATES rather than one that keeps every row: the
+    # entries above return all 10000 laps, so they would pass against an engine
+    # that dropped the predicate. This one returns a proper subset.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
+    "(SELECT 1.02 * AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+    # !! THE WRAPPED-COUNT PAIR, and the reason the wrapper is lifted OUT of the
+    # body rather than pushed through it. COUNT over an empty group is 0, not
+    # NULL, so the substitution site wraps the reference in
+    # `CASE WHEN ref IS NULL THEN 0 ELSE ref END`. Lifting puts that CASE at the
+    # AGGREGATE'S position inside the wrapper, so `1 + COUNT(*)` over a zero-row
+    # group reads 1 + 0 = 1. Keeping the wrapper in the body would have
+    # substituted 0 for the WHOLE wrapper and answered 0 — a silent wrong answer
+    # of exactly the shape Week 34's audit found (F1), one level further in.
+    # `speed > 999` matches nothing, so EVERY correlation key is a zero-row group.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > 1 + "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    # ...and its non-COUNT twin, where the zero-row value IS NULL and the wrapper
+    # must propagate it. Pinning only the COUNT half teaches the wrong rule: the
+    # two aggregate families disagree here and both must be diffed.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > 1 + "
+    "(SELECT AVG(l.speed) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)",
+    # The MIXED case for the wrapped form — one correlation key with no group and
+    # nineteen with one — which is what a PARTIAL regression looks like.
+    "SELECT d.driver_id AS did, d.age AS age FROM drivers d WHERE d.age > 1 + "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.lap_id < 60) "
+    "ORDER BY did",
 ]
 
 # Three entries wrap their correlated scalar in an IN, and has_in is tested
@@ -1288,6 +1326,13 @@ WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
 # by construction, so Week 31's runtime `scalar subquery returned more than one
 # row` check has nowhere to live — a query SQL calls an error would return an
 # arbitrary row. SQLite answers all of these, so each is a divergence.
+#
+# WEEK 36 NARROWED THE FIRST ONE RATHER THAN REMOVING IT. The rule is no longer
+# "the select-list item must BE the aggregate" but "an aggregate, optionally
+# wrapped in CONSTANT arithmetic" — because a constant wrapper can be lifted out
+# of the body and re-attached outside, and a non-constant one cannot. The
+# entries below pin both halves of the new boundary, so a future widening cannot
+# pass silently.
 WEEK34_CORRELATED_SCALAR_REFUSED = [
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)",
@@ -1298,6 +1343,29 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.speed > l.speed)",
      "only an equality between two columns can become a join key"),
+
+    # WEEK 36 — TWO AGGREGATES under one wrapper. The lift is written for ONE
+    # output column and ONE zero-row rule; two would need two of each, and the
+    # COUNT CASE has no way to know which reference it wraps.
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT AVG(l2.speed) / COUNT(*) FROM laps l2 WHERE l2.team = l.team)",
+     "may hold ONE aggregate"),
+    # WEEK 36 — a wrapper node the lift does not admit. CASE is refused by NAME
+    # even though it is constant-valued here: it has no vectorized kernel by
+    # design, it raises three-valued questions the arithmetic path does not, and
+    # no TPC-H query needs one. The whitelist is Literal + arithmetic, full stop.
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT CASE WHEN AVG(l2.speed) > 1 THEN 1 ELSE 0 END FROM laps l2 "
+     "WHERE l2.team = l.team)",
+     "wrapped in constant arithmetic"),
+    # WEEK 36 — a wrapper naming a BODY COLUMN outside the aggregate. Refused,
+    # but NOT by the wrapper rule: the Validator's grouped-reference check runs
+    # first and reports the ungrouped column, which is the better diagnostic and
+    # is why this entry pins THAT message. Recorded rather than "fixed" — moving
+    # the wrapper check earlier would replace a precise message with a vaguer one.
+    ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
+     "(SELECT AVG(l2.speed) + l2.lap_id FROM laps l2 WHERE l2.team = l.team)",
+     "must appear in GROUP BY or be used in an aggregate function"),
 ]
 
 WEEK34_DISTINCT_AGG_QUERIES = [

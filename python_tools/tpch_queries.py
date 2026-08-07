@@ -8,7 +8,11 @@ parser, execution and optimizer correctness gaps". So these templates are
 written in the SwiftQL dialect wherever the rewrite is already DOCUMENTED and
 mechanical, and a template the dialect still cannot express is a RECORDED
 OUTCOME rather than a blocker — run_tpch.py has an UNPORTED state for exactly
-that, and the list of them IS Week 36's worklist.
+that, and the list of them WAS Week 36's worklist. Week 36 worked it: q17's
+template is UNCHANGED and now runs, because the ENGINE changed (a correlated
+scalar subquery's select list may be an aggregate under a constant wrapper). A
+template is never rewritten to make a query pass -- that would move the figure by
+weakening what the query tests, which is the opposite of what the harness is for.
 
 Dialect rewrites already decided elsewhere and applied here:
 
@@ -313,7 +317,10 @@ TEMPLATES = {
         ORDER BY supplier_cnt DESC, p_brand, p_type, p_size
     """,
 
-    # Correlated scalar subquery over an aggregate body -- Week 34's headline.
+    # Correlated scalar subquery over an aggregate body -- Week 34's headline,
+    # and the SPEC'S OWN TEXT: the constant sits INSIDE the subquery, wrapping
+    # the aggregate. Week 34 refused that shape; Week 36 lifted the restriction.
+    # The template was never altered to accommodate either.
     "q17": """
         SELECT SUM(l_extendedprice) / 7.0 AS avg_yearly
         FROM lineitem

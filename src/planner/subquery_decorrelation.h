@@ -114,6 +114,33 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
 //     forEachSubquery (dispatch site 19) is the maintained walker for that; a
 //     private one here would be a twentieth silent dispatch site.
 //
+// WEEK 36 — THE CONSTANT WRAPPER, and what it changed about point 2 above.
+// Week 34 enforced "the body's select-list item IS the aggregate"
+// (`found[0] == body.select_list[0]`), which refused TPC-H Q17'S OWN TEXT:
+// the spec writes `(SELECT 0.2 * AVG(l_quantity) ...)`, a `*` node WRAPPING the
+// aggregate. The semantically identical constant-OUTSIDE form
+// `0.2 * (SELECT AVG(...) ...)` decorrelated and matched SQLite, so the engine
+// could answer the query but not read it.
+//
+// The rule is now "an aggregate, optionally wrapped in CONSTANT arithmetic", and
+// THE WRAPPER IS LIFTED OUT OF THE BODY rather than pushed through it: the body
+// still selects the bare aggregate, and the wrapper is re-attached around the
+// SUBSTITUTED reference outside. Sound exactly when every leaf other than the
+// aggregate is a constant — then f(agg) per group and f(agg_column) per outer row
+// are the same function of the same argument. After the rewrite the spec's text
+// and the constant-outside text produce the SAME PLAN, which is how the change is
+// verified rather than merely tested.
+//
+// !! WHY NOT PUSH THE WRAPPER THROUGH THE BODY, since `SELECT k, 0.2 * AVG(x)
+// ... GROUP BY k` is already legal here: it breaks point 1's COUNT rule. The
+// zero-row CASE would substitute 0 for the WHOLE wrapper, so a body of
+// `1 + COUNT(*)` over an empty correlation group answers 0 where SQL says 1.
+// Lifting puts the CASE at the AGGREGATE'S position inside the wrapper, where it
+// is correct by construction. Point 2's refusal therefore NARROWED and did not
+// disappear: a non-aggregate body, a second aggregate and a non-constant wrapper
+// are each still refused by name, and each is pinned in
+// WEEK34_CORRELATED_SCALAR_REFUSED.
+//
 // !! requireDecorrelatableBody (the EXISTS guard) IS NOT REUSED, and must not be
 // widened with a flag. Its condition 3 states "the body has NO GROUP BY /
 // HAVING / aggregate / LIMIT / DISTINCT" — and this lowering REQUIRES an
