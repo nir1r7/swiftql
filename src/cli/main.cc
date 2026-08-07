@@ -18,6 +18,8 @@
 #include "planner/join_enumeration.h"
 #include "planner/vec_plan_node.h"
 #include "planner/vectorized_plan_builder.h"
+#include "planner/validator.h"
+#include "planner/subquery_materialization.h"
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
 #include "common/schema.h"
@@ -77,6 +79,71 @@ Args parseArgs(int argc, char* argv[]) {
         else std::cerr << "Unknown argument: " << flag << "\n";
     }
     return args;
+}
+
+// Drain a vectorized plan into rows. Selection-vector aware: a chunk that has
+// been filtered reports its surviving rows through `sel`, and reading num_rows
+// instead returns rows the filter removed. Shared by the top-level run and by
+// the nested-query runner below so there is one copy of that rule.
+std::vector<Row> drainVec(VecPlanNode* node) {
+    std::vector<Row> rows;
+    while (DataChunk* chunk = node->nextChunk()) {
+        int n = chunk->filter_applied
+            ? static_cast<int>(chunk->sel.indices.size())
+            : chunk->num_rows;
+        for (int i = 0; i < n; ++i) {
+            int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
+            Row row;
+            row.reserve(chunk->columns.size());
+            for (const auto& cv : chunk->columns) {
+                row.push_back(valueAt(cv, r));
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+    return rows;
+}
+
+// Week 31. Plan and run one nested statement to completion, on the vectorized
+// path. Mirrors the top-level path's stage order exactly — pushdown, then join
+// enumeration, then estimation — so a nested query is optimized by the same
+// passes in the same order as a top-level one.
+//
+// `no_optimize` is threaded through for the same reason it exists at the top
+// level: compare_against_sqlite.py runs the vectorized suite twice, and that
+// second leg is the differential oracle. A runner that always optimized would
+// give both legs the same subquery result and quietly stop testing the sub-plan.
+SubqueryResult runVectorizedToRows(SelectStatement stmt, const Catalog& catalog,
+                                   std::unordered_map<std::string, ColumnarTable> tables,
+                                   bool no_optimize) {
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
+    if (!no_optimize) {
+        logical = PredicatePushdown::apply(std::move(logical), catalog);
+        logical = JoinEnumeration::apply(std::move(logical), catalog);
+        CardinalityEstimator::estimate(*logical, catalog);
+    }
+    auto node = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), catalog);
+    node->open();
+    SubqueryResult out{node->outputSchema(), drainVec(node.get())};
+    node->close();
+    return out;
+}
+
+// The same, on the Volcano path. A three-or-more-relation body is refused here
+// by the pre-existing Week 27 guard, with its existing message naming
+// --execution vectorized: an ordinary capability difference, identical to the
+// one a top-level multi-way join already has.
+SubqueryResult runVolcanoToRows(SelectStatement stmt, const Catalog& catalog,
+                                std::unordered_map<std::string, std::vector<Row>> table_rows,
+                                std::unordered_map<std::string, ColumnarTable> columnar_tables) {
+    auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows),
+                              std::move(columnar_tables));
+    plan->open();
+    std::vector<Row> rows;
+    while (Row* r = plan->next()) rows.push_back(*r);
+    plan->close();
+    SubqueryResult out{plan->outputSchema(), std::move(rows)};
+    return out;
 }
 
 void printResults(const std::vector<Row>& rows, const Schema& schema) {
@@ -275,21 +342,35 @@ int main(int argc, char* argv[]) {
 
             // load CSV data (excluded from timing, per benchmark methodology)
             std::unordered_map<std::string, std::vector<Row>> table_rows;
-            const TableMetadata& meta = catalog.getTable(stmt.from_table);
-            table_rows[stmt.from_table] = CSVLoader::load(meta.filepath, meta.schema);
-            // Week 19: statistics are table-scoped, not query-scoped — compute once
-            // per process, before columnar conversion frees the row data
-            if (!catalog.hasStats(stmt.from_table)) {
-                catalog.setStats(stmt.from_table, TableStats::compute(table_rows[stmt.from_table], meta.schema));
-            }
-            // one load per joined table; a self-join names the same table twice,
-            // and table_rows is keyed by table name, so the guard matters
-            for (const auto& j : stmt.joins) {
-                if (table_rows.count(j.join_table)) continue;
-                const TableMetadata& jmeta = catalog.getTable(j.join_table);
-                table_rows[j.join_table] = CSVLoader::load(jmeta.filepath, jmeta.schema);
-                if (!catalog.hasStats(j.join_table)) {
-                    catalog.setStats(j.join_table, TableStats::compute(table_rows[j.join_table], jmeta.schema));
+            // Week 31: a NESTED query scans tables the outer FROM/JOIN list
+            // never names, and this loop used to walk only those two. One walker
+            // answers both this question and the rewrite below
+            // (subquery_materialization.h), so the two cannot drift; before it,
+            // `WHERE x > (SELECT AVG(age) FROM drivers)` on a FROM laps query
+            // died with a raw std::out_of_range from table_rows.at().
+            //
+            // One load per table: a self-join names the same table twice, and
+            // both this map and the catalog's statistics are keyed by table
+            // name, so collectQueryTables dedupes and the guard stays.
+            std::vector<std::string> needed_tables;
+            collectQueryTables(stmt, needed_tables);
+            for (const auto& tname : needed_tables) {
+                if (table_rows.count(tname)) continue;
+                // A table that does not exist is the VALIDATOR's message to give
+                // ("Table not found: 'x'"), and it runs a few lines below. Before
+                // this skip, a nested `FROM nosuchtable` was diagnosed by
+                // catalog.getTable() as "Table name does not exist" — a worse
+                // message, from a loader, about a query defect. The loader is not
+                // a diagnostic site.
+                if (!catalog.hasTable(tname)) continue;
+                const TableMetadata& tmeta = catalog.getTable(tname);
+                table_rows[tname] = CSVLoader::load(tmeta.filepath, tmeta.schema);
+                // Week 19: statistics are table-scoped, not query-scoped —
+                // compute once per process, before columnar conversion frees the
+                // row data. A nested query's tables need them too: the optimizer
+                // costs its sub-plan from the same statistics.
+                if (!catalog.hasStats(tname)) {
+                    catalog.setStats(tname, TableStats::compute(table_rows[tname], tmeta.schema));
                 }
             }
 
@@ -310,6 +391,78 @@ int main(int argc, char* argv[]) {
                     }
                     return 0;  // exit after first query; storage size doesn't change per query
                 }
+            }
+
+            // Week 31 — uncorrelated subqueries, materialized once, ABOVE both
+            // engines. One implementation, four modes agreeing by construction:
+            // the same property Week 30 bought by putting one refusal at the end
+            // of Validator::validate, rather than one guard per planner.
+            //
+            // DIAGNOSTICS FIRST. materializeSubqueries TRUSTS three Validator
+            // rules — exactly one output column for SCALAR/IN, position
+            // restricted to WHERE/HAVING, and no correlated subquery — so a
+            // query breaking one must be refused before anything runs. Running
+            // the pass first would materialize column 0 of a two-column scalar
+            // subquery the Validator was about to reject: a wrong answer instead
+            // of a diagnostic. validate() is pure, so the planners calling it
+            // again below cost one extra walk and keep the ordering discipline
+            // Week 26 established (a genuine query defect outranks an engine
+            // limitation).
+            //
+            // It runs BEFORE --explain returns, too: --explain must go through
+            // the pass or it prints a plan the engine cannot build. The cost is
+            // that --explain executes the nested query, exactly as it already
+            // performs constant folding — see README's Limitations.
+            // Materializing a subquery EXECUTES a nested query, so its time is
+            // real query work and is added to the plan timer below rather than
+            // vanishing between the clocks the way the CSV load deliberately
+            // does. Week 37 must be able to see it.
+            double subquery_us = 0.0;
+            if (stmt.has_subquery) {
+                auto sub_start = std::chrono::high_resolution_clock::now();
+                // Inside the guard: an ordinary query would otherwise validate
+                // twice (here and inside its planner) for no benefit, and the
+                // ordering property only exists to protect the pass below.
+                Validator::validate(stmt, catalog);
+
+                SubqueryRunner run_subquery;
+                if (args.execution == "vectorized" && args.storage == "columnar") {
+                    run_subquery = [&](SelectStatement body) {
+                        // Its own copies: both scan nodes take their table BY
+                        // VALUE and the outer query still needs the originals.
+                        // Lowering's scan_uses counter already copies for a
+                        // self-join, so this is the existing cost model rather
+                        // than a new one — and the reason a shared table
+                        // representation is on Week 37's list, not this week's.
+                        std::unordered_map<std::string, ColumnarTable> tables;
+                        std::vector<std::string> names;
+                        collectQueryTables(body, names);
+                        for (const auto& n : names) tables.emplace(n, columnar_tables.at(n));
+                        return runVectorizedToRows(std::move(body), catalog,
+                                                   std::move(tables), args.no_optimize);
+                    };
+                } else {
+                    run_subquery = [&](SelectStatement body) {
+                        std::unordered_map<std::string, std::vector<Row>> rows_copy;
+                        std::unordered_map<std::string, ColumnarTable> cols_copy;
+                        std::vector<std::string> names;
+                        collectQueryTables(body, names);
+                        for (const auto& n : names) {
+                            if (columnar_tables.count(n)) cols_copy.emplace(n, columnar_tables.at(n));
+                            else                          rows_copy.emplace(n, table_rows.at(n));
+                        }
+                        return runVolcanoToRows(std::move(body), catalog,
+                                                std::move(rows_copy), std::move(cols_copy));
+                    };
+                }
+                // The nested query runs on the SAME engine as the query that
+                // contains it: handing a three-relation body to Volcano would
+                // refuse TPC-H Q11's subquery in vectorized mode, which is a
+                // capability difference invented by the plumbing rather than by
+                // either engine.
+                materializeSubqueries(stmt, run_subquery);
+                subquery_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - sub_start).count();
             }
 
             if (args.execution == "vectorized"){
@@ -363,7 +516,7 @@ int main(int argc, char* argv[]) {
                 std::unique_ptr<VecPlanNode> vec_node = VectorizedPlanBuilder::build(
                     std::move(logical), std::move(columnar_tables), catalog);
 
-                double plan_us = std::chrono::duration<double, std::micro>(
+                double plan_us = subquery_us + std::chrono::duration<double, std::micro>(
                     std::chrono::high_resolution_clock::now() - plan_start).count();
 
                 if (args.explain) {
@@ -391,21 +544,7 @@ int main(int argc, char* argv[]) {
 
                 auto exec_start = std::chrono::high_resolution_clock::now();
                 vec_node->open();
-                std::vector<Row> rows;
-                while (DataChunk* chunk = vec_node->nextChunk()) {
-                    int n = chunk->filter_applied
-                        ? static_cast<int>(chunk->sel.indices.size())
-                        : chunk->num_rows;
-                    for (int i = 0; i < n; ++i) {
-                        int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
-                        Row row;
-                        row.reserve(chunk->columns.size());
-                        for (const auto& cv : chunk->columns) {
-                            row.push_back(valueAt(cv, r));
-                        }
-                        rows.push_back(std::move(row));
-                    }
-                }
+                std::vector<Row> rows = drainVec(vec_node.get());
                 vec_node->close();
                 double total_us = std::chrono::duration<double, std::micro>(
                     std::chrono::high_resolution_clock::now() - exec_start).count();
@@ -434,7 +573,7 @@ int main(int argc, char* argv[]) {
             // time planning
             auto plan_start = std::chrono::high_resolution_clock::now();
             auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows), std::move(columnar_tables));
-            double plan_us = std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - plan_start).count();
+            double plan_us = subquery_us + std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - plan_start).count();
 
             if (args.explain) {
                 std::vector<NodeLine> lines;
