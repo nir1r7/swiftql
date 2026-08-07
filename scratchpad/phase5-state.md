@@ -1,12 +1,35 @@
 # Phase 5 orchestrator state
-Current: week 35, implementation dispatching ~16:26 UTC to agent ace28f349cf48c3b7
-  (it wrote docs/week-35-plan.md, 8 tasks). Week 34 is CLOSED — 3 gates (1 red), 2 audits,
-  1 cleanup; checkpoint met including Q17.
+Current: week 35 fix round (agent ace28f349cf48c3b7). Implementation of all 8 tasks is done
+  and pushed. FIRST REAL MEASUREMENT OF THE PHASE GOAL, at SF=0.01:
+    20/22 answered — 5 in all four modes, 15 in the two vectorized modes only;
+    34/88 cells Volcano refusals pinned by message; 2 refused by name; 2 VACUOUS.
+  The audit independently re-derived the same 20/22 but found q16 is a SECOND vacuous pass
+  (its NOT IN subquery returns 0 rows on the synthetic data, so deleting the whole anti-join
+  predicate gives byte-identical 305 rows). So the honest figure is 18 OF 22 MEANINGFULLY
+  ANSWERED. Fix round is making q16 discriminate AND building a MUTATION CHECK into the
+  harness — for each of the 22, neuter its characteristic predicate and assert the answer
+  changes — because two vacuous passes found by two different routes is no evidence there are
+  only two. A number below 20 is the RIGHT outcome; week 36 needs the true baseline.
+  PROVENANCE, must not be upgraded by week 36: dbgen was unavailable, so the generator
+  reproduces the spec's value DOMAINS but not its distributions. PROVENANCE.txt states the
+  published answer set does NOT apply — SQLite over the same files is the only oracle.
+  Say "matches SQLite", never "correct" or "TPC-H compliant".
+  Q22's internal error was found BY THE HARNESS and fixed: materializeSubqueries never
+  recursed into derived bodies while collectQueryTables ten lines above it did — the same
+  class as week 33's three wrong answers.
+  The computed census CONTRADICTED the README's typed "56" (real: 93); the README now cites
+  the harness.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅
-Last gate: GREEN (week 34 round 3, closing) — build PASS, unit 800/800, sqlite 1270,
-  regression 318 all modes; binaries genuinely relinked, staleness disproved.
+Last gate: GREEN (week 35 round 1) — build PASS, unit 805/805, sqlite 1290 checks
+  (168 four-mode diffs + 93 vec-only + 157 rejection entries), regression 318. Not stale.
+!! THE GATE DOES NOT COVER TPC-H. The verify skill runs four gates — build, swiftql_tests,
+  compare_against_sqlite.py, test_new_queries.py — and NONE exercises run_tpch.py. So a GREEN
+  gate says nothing about TPC-H, and WEEK 36'S DELIVERABLE IS TPC-H CORRECTNESS. Asked the
+  week-35 agent to wire it in as a FIFTH gate step that reports the MEANINGFULLY-ANSWERED
+  figure and goes RED on a regression (a query that stops answering, or becomes vacuous).
+  Until that lands, do not read a green gate as evidence about TPC-H.
 Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
   2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
   and one stale-rejection pair, both fixed.
