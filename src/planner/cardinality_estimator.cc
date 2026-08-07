@@ -31,7 +31,8 @@ static bool comparable(const Value& a, const Value& b) {
 double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& ctx) {
     if (auto* isnull = dynamic_cast<const IsNullExpr*>(pred)) {
         auto* col = dynamic_cast<const ColumnRef*>(isnull->operand.get());
-        const ColumnStatsEntry* e = col ? ctx.findForRef(col->column_name, col->relation_slot) : nullptr;
+        const ColumnStatsEntry* e = col && col->id.isLocal()
+            ? ctx.findForRef(col->column_name, col->id.localSlot("selectivity")) : nullptr;
         if (!e || e->table_rows == 0) {
             // fallback is the assumed null fraction, so it must respect polarity:
             // IS NOT NULL keeps ~everything, not ~nothing
@@ -50,7 +51,8 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     // alone does not misprice it.
     if (auto* in = dynamic_cast<const InExpr*>(pred)) {
         auto* col = dynamic_cast<const ColumnRef*>(in->operand.get());
-        const ColumnStatsEntry* e = col ? ctx.findForRef(col->column_name, col->relation_slot) : nullptr;
+        const ColumnStatsEntry* e = col && col->id.isLocal()
+            ? ctx.findForRef(col->column_name, col->id.localSlot("selectivity")) : nullptr;
 
         // Distinct values only. `x IN (2022, 2022, 2022)` matches exactly the
         // rows `x = 2022` does; counting the duplicates inflated k past NDV,
@@ -168,7 +170,12 @@ double CardinalityEstimator::selectivity(const Expr* pred, const StatsContext& c
     // a query --no-optimize answered correctly.
     if (lit->value.isNull()) return 0.0;
 
-    const ColumnStatsEntry* e = ctx.findForRef(col->column_name, col->relation_slot);
+    // A correlated ref names a relation this context has no stats for, so the
+    // fallback selectivities below are the right answer — the same conservative
+    // stance collectSlots takes with -1.
+    const ColumnStatsEntry* e = col->id.isLocal()
+        ? ctx.findForRef(col->column_name, col->id.localSlot("selectivity"))
+        : nullptr;
 
     if (op == "=" || op == "!=") {
         double eq = FALLBACK_EQ_SELECTIVITY;
@@ -487,7 +494,10 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 for (const auto& g : agg.group_by) {
                     // slot-first lookup mirrors execution: a qualified GROUP BY
                     // reads NDV from the named join side
-                    const ColumnStatsEntry* e = child_ctx.findForRef(g.column_name, g.relation_slot);
+                    const ColumnStatsEntry* e = g.id.isLocal()
+                        ? child_ctx.findForRef(g.column_name,
+                                               g.id.localSlot("aggregate cardinality"))
+                        : nullptr;
                     // unknown NDV contributes no reduction; the clamp bounds it
                     groups *= (e && e->stats->distinct_count > 0)
                             ? static_cast<double>(e->stats->distinct_count)

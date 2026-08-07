@@ -70,8 +70,8 @@ std::string substringOf(const std::string& s, int64_t start, bool has_length, in
 
 
 int resolveColumnIndex(const ColumnRef& col, const Schema& schema){
-    if (col.relation_slot >= 0) {
-        int idx = schema.indexOf(col.column_name, col.relation_slot);
+    if (col.id.isResolved() && col.id.isLocal()) {
+        int idx = schema.indexOf(col.column_name, col.id.localSlot("evaluate"));
         if (idx != -1) return idx;
         // slot-qualified miss (e.g. post-aggregate/projected schema that no
         // longer carries the original slot): fall back to bare name.

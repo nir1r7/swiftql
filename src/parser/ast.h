@@ -1,5 +1,6 @@
 #pragma once
 #include "common/value.h"
+#include "common/column_id.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -22,18 +23,14 @@ struct ColumnRef : Expr {
     // -1 = unresolved. Distinguishes self-join occurrences (l1 vs l2) that
     // share a canonical table_name. Evaluation resolves by (slot, name) when
     // slot >= 0, falling back to bare name otherwise.
-    int relation_slot = -1;
-    // Week 30. How many query blocks OUT from the block this ref is written in
-    // the relation lives: 0 = this query's own range table (the default, so
-    // every pre-existing ref and every hand-built test tree keeps its meaning),
-    // 1 = the immediately enclosing query, and so on. RELATIVE, like Postgres's
-    // varlevelsup, so a subquery's tree means the same thing wherever it sits.
-    //
-    // !! relation_slot is a position in the range table of the scope this many
-    // steps OUT. Reading a slot without its level compares two different
-    // numbering domains — an inner slot 1 and an outer slot 1 are different
-    // relations. Every walker that routes by slot must test the level first.
-    int query_level = 0;
+    // Week 33. Was `int relation_slot` + `int query_level` (Weeks 16 and 30).
+    // ONE field, because they were never independently meaningful: a slot is a
+    // position in the range table of the scope the level blocks out, so reading
+    // one without the other compares two numbering domains — an inner slot 1 and
+    // an outer slot 1 are different relations. The type is what enforces it now;
+    // see common/column_id.h. Unresolved by default, so every hand-built test
+    // tree keeps its bare-name fallback.
+    ColumnId id;
 };
 
 // literal or constant
@@ -209,13 +206,12 @@ struct OrderByItem {
 struct GroupByColumn {
     std::string table_name;   // as typed; empty if unqualified
     std::string column_name;
-    int relation_slot = -1;   // range-table position (0 = FROM); -1 = unresolved
-    // Week 30. The scope `relation_slot` is a position in, exactly as on
-    // ColumnRef: 0 = this query block, >= 1 = an enclosing one. A GROUP BY item
-    // resolves through resolveColumnRef, which walks OUT, so without this field
-    // the slot of a correlated group key was stored in an inner-scope struct
-    // with nothing to say which range table it indexed.
-    int query_level = 0;
+    // Week 33. Was `relation_slot` + `query_level`, and the round trip between
+    // this struct and ColumnRef was itself one of Week 30's five collapse bugs:
+    // a GROUP BY item resolves through resolveColumnRef, which walks OUT, so an
+    // outer slot was stored in an inner-scope struct with nothing to say which
+    // range table it indexed. One field, carried whole. See common/column_id.h.
+    ColumnId id;
     // non-null for expression grouping (GROUP BY season - 1): the group key
     // is evaluate(expr) per row instead of a column read. shared_ptr (not
     // unique_ptr) keeps the struct copyable — planner/test sites copy

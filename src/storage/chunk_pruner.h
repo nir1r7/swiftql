@@ -58,7 +58,8 @@ namespace {
         // that is an accident of the comparison operators, not a stated rule,
         // and this file's whole subject is not resting on accidents.
         if (col && lit && !lit->value.isNull()
-            && col->query_level == 0 && col->relation_slot < 1){
+            && col->id.isLocal()
+            && col->id.localSlot("collectSimplePredicates") < 1){
             out.emplace_back(col->column_name, bin->op, lit->value);
         }
     }

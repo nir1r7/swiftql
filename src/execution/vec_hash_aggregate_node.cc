@@ -43,8 +43,9 @@ void VecHashAggregateNode::consumeAll() {
     std::vector<int> group_idxs;
     for (const auto& g : group_by_cols_){
         if (g.expr) { group_idxs.push_back(-1); continue; }
-        int idx = g.relation_slot >= 0
-            ? child_schema.indexOf(g.column_name, g.relation_slot)
+        int idx = g.id.isResolved()
+            ? child_schema.indexOf(g.column_name,
+                                   g.id.localSlot("VecHashAggregateNode group key"))
             : -1;
         if (idx < 0) idx = child_schema.indexOf(g.column_name);
         group_idxs.push_back(idx);
@@ -58,8 +59,9 @@ void VecHashAggregateNode::consumeAll() {
             continue;
         }
         // slot-aware: distinguishes join sides sharing a column name (e.g. AVG(l2.speed))
-        int idx = spec.relation_slot >= 0
-            ? child_schema.indexOf(spec.column, spec.relation_slot)
+        int idx = spec.id.isResolved()
+            ? child_schema.indexOf(spec.column,
+                                   spec.id.localSlot("VecHashAggregateNode argument"))
             : -1;
         if (idx < 0) idx = child_schema.indexOf(spec.column);
         agg_idxs.push_back(idx);

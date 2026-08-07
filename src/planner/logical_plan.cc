@@ -93,8 +93,9 @@ static TypeId specArgType(const AggregateSpec& spec, const Schema& table_schema)
     if (spec.is_star) return TypeId::INT;
     if (spec.argument) return inferExprType(spec.argument, table_schema);
     if (spec.column.empty()) return TypeId::INT;
-    int idx = spec.relation_slot >= 0
-        ? table_schema.indexOf(spec.column, spec.relation_slot) : -1;
+    int idx = spec.id.isResolved()
+        ? table_schema.indexOf(spec.column,
+                               spec.id.localSlot("aggregate argument")) : -1;
     if (idx < 0) idx = table_schema.indexOf(spec.column);
     return idx >= 0 ? table_schema.column(idx).type : TypeId::INT;
 }
@@ -114,8 +115,9 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         // slot-first with bare-name fallback — same contract as
         // resolveColumnIndex() in evaluator.cc
-        int idx = col->relation_slot >= 0
-            ? schema.indexOf(col->column_name, col->relation_slot) : -1;
+        int idx = col->id.isResolved()
+            ? schema.indexOf(col->column_name,
+                             col->id.localSlot("inferExprType")) : -1;
         if (idx < 0) idx = schema.indexOf(col->column_name);
         if (idx < 0) throw std::runtime_error(
             "column not found: '" + col->column_name + "'");
@@ -299,8 +301,9 @@ Schema buildProjectSchema(const SelectStatement& stmt, const Schema& table_schem
         if (auto* col = dynamic_cast<ColumnRef*>(expr.get())) {
             // resolve slot-first (correct side on a join with shared names),
             // falling back to bare name against post-aggregate schemas
-            int idx = col->relation_slot >= 0
-                ? table_schema.indexOf(col->column_name, col->relation_slot)
+            int idx = col->id.isResolved()
+                ? table_schema.indexOf(col->column_name,
+                                       col->id.localSlot("buildProjectSchema"))
                 : -1;
             if (idx < 0) idx = table_schema.indexOf(col->column_name);
             if (idx >= 0) {
@@ -383,14 +386,15 @@ Schema buildAggregateSchema(const std::vector<GroupByColumn>& group_by,
         // HashAggregateNode, VecHashAggregateNode and CardinalityEstimator all
         // read `g.relation_slot` too, and all three run on a plan whose schema
         // was built here — if it throws, they never see the key.
-        if (g.query_level > 0) {
+        if (!g.id.isLocal()) {
             throw std::runtime_error(
                 "internal: a correlated GROUP BY key ('" + g.column_name
                 + "') reached plan construction; its slot names an enclosing "
                   "query's range table");
         }
-        int idx = g.relation_slot >= 0
-            ? table_schema.indexOf(g.column_name, g.relation_slot)
+        int idx = g.id.isResolved()
+            ? table_schema.indexOf(g.column_name,
+                                   g.id.localSlot("buildAggregateSchema"))
             : -1;
         if (idx < 0) idx = table_schema.indexOf(g.column_name);
         if (idx < 0) {
@@ -432,7 +436,7 @@ std::vector<AggregateSpec> extractAggregates(const SelectStatement& stmt){
             spec.argument = agg->argument.get();  // non-owning; see AggregateSpec
             if (auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get())) {
                 spec.column = col->column_name;
-                spec.relation_slot = col->relation_slot; // carry join side, e.g. AVG(l2.speed)
+                spec.id = col->id;   // carry join side, e.g. AVG(l2.speed)
             }
         }
         return spec;
@@ -837,7 +841,8 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
             if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
-            ref->relation_slot = col.relation_slot; // preserve side so SELECT * on a self-join emits both sides
+            ref->id = ColumnId::local(col.relation_slot);  // schema slot -> local id:
+            // preserve side so SELECT * on a self-join emits both sides
             star_exprs.push_back(std::move(ref));
             star_cols.push_back(col);
         }

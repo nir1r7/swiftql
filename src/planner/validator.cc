@@ -30,7 +30,7 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
         // Week 30. A correlated ref is supplied by an enclosing query, so it is
         // constant within every group of THIS one and needs no GROUP BY entry.
-        if (col->query_level > 0) return;
+        if (!col->id.isLocal()) return;
         for (const auto& g : group_by) {
             if (g.expr) continue;
             // name match plus slot compatibility: SELECT a.grp with
@@ -42,9 +42,7 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
             // correlated ref), so this rejects a correlated GROUP BY key as a
             // match for a local column of the same name.
             if (g.column_name == col->column_name &&
-                g.query_level == col->query_level &&
-                (col->relation_slot < 0 || g.relation_slot < 0 ||
-                 col->relation_slot == g.relation_slot)) {
+                col->id.couldBeSameRelation(g.id)) {
                 return;
             }
         }
@@ -190,17 +188,18 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
             // INNER query's own joins. The check that belongs to the block
             // owning the relation is made by the Binder, which is the only
             // layer holding the scope chain — see checkCorrelatedAggregateArg.
-            if (col->query_level > 0) continue;
+            if (!col->id.isLocal()) continue;
 
             // pick the schema the argument resolves against: binder slot when
             // bound, table-name match for unbound qualified refs, FROM otherwise
             const Schema* target = nullptr;
-            if (col->relation_slot > 0
-                && col->relation_slot <= static_cast<int>(stmt.joins.size())) {
+            const int col_slot = col->id.localSlot("SUM/AVG argument check");
+            if (col_slot > 0
+                && col_slot <= static_cast<int>(stmt.joins.size())) {
                 // slot k > 0 is joins[k-1]'s relation — the one arithmetic
                 // identity the whole multi-way generalization rests on
-                target = &catalog.getTable(stmt.joins[col->relation_slot - 1].join_table).schema;
-            } else if (col->relation_slot == 0 || col->table_name.empty()) {
+                target = &catalog.getTable(stmt.joins[col_slot - 1].join_table).schema;
+            } else if (col_slot == 0 || col->table_name.empty()) {
                 target = &schema;
             } else if (col->table_name == stmt.from_table) {
                 target = &schema;
@@ -343,8 +342,8 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
         // `EXISTS (SELECT COUNT(*) FROM drivers d GROUP BY season)` was refused
         // with "GROUP BY column not found: 'season'" under a one-relation outer
         // query and accepted under a two-relation one, for the same subquery.
-        if (g.query_level > 0) continue;
-        if (g.relation_slot >= 0 && !g.table_name.empty()) continue; // binder verified
+        if (!g.id.isLocal()) continue;
+        if (g.id.isResolved() && !g.table_name.empty()) continue; // binder verified
         bool found;
         if (!g.table_name.empty()) {
             // qualified but unbound (validator-only callers that skip the Binder)
@@ -399,7 +398,7 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
     // output schema at execution time and are not checked here.
     for (const auto& item : stmt.order_by) {
         if (auto* col = dynamic_cast<const ColumnRef*>(item.expr.get())) {
-            if (col->query_level == 0 && col->table_name.empty()
+            if (col->id.isLocal() && col->table_name.empty()
                 && !schema.hasColumn(col->column_name)) {
                 throw std::runtime_error("ORDER BY column not found: '" + col->column_name + "'");
             }
@@ -445,7 +444,7 @@ void Validator::validateExpr(const Expr* expr, const Schema& schema, const std::
         // Binder already verified it against that scope's range table — the
         // same reason validateJoinCondition trusts a bound ref's slot instead
         // of re-deriving the relation from table_name.
-        if (col->query_level > 0) return;
+        if (!col->id.isLocal()) return;
         // skip validation for qualified refs (table.column)
         // full resolution handled when join schema is merged
         if (col->table_name.empty() && !schema.hasColumn(col->column_name)) {
@@ -563,7 +562,7 @@ void Validator::validateJoinCondition(const Expr* expr,
         // d2.driver_id AND d.age = l.lap_id)` reported
         // "JOIN ON: column 'lap_id' not found in table 'd'" — an error the
         // query is not entitled to, against a relation it never named.
-        if (col->query_level > 0) return;
+        if (!col->id.isLocal()) return;
 
         // A BOUND ref carries the relation the Binder resolved it against, so
         // check that relation by slot. `relations` is built in range-table
@@ -576,9 +575,9 @@ void Validator::validateJoinCondition(const Expr* expr,
         // lands on the wrong entry and rejects a legal query —
         // `FROM drivers x JOIN laps drivers ON age = drivers.driver_id` checked
         // `age` against laps.
-        if (col->relation_slot >= 0 &&
-            col->relation_slot < static_cast<int>(relations.size())) {
-            const auto& rel = relations[col->relation_slot];
+        const int slot = col->id.localSlot("validateJoinCondition");
+        if (slot >= 0 && slot < static_cast<int>(relations.size())) {
+            const auto& rel = relations[slot];
             if (!rel.second->hasColumn(col->column_name)) {
                 throw std::runtime_error("JOIN ON: column '" + col->column_name
                     + "' not found in table '" + rel.first + "'");

@@ -60,7 +60,7 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
         // body_plan's OWN schema. The two slot domains never meet.
         JoinKey key{operand->column_name,
                     body_plan->output_schema.columns()[0].name,
-                    operand->relation_slot};
+                    operand->id.localSlot("lowerInSubqueries")};
 
         // !! output_schema is the LEFT child's, NOT a merged schema. This is the
         // invariant that keeps the body's slot numbering out of the outer plan

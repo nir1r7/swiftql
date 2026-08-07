@@ -36,7 +36,7 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
         // this comment claimed otherwise — the same class of
         // false-justification-that-stops-anyone-checking that this file's header
         // was corrected for four lines below.
-        out.insert(cr->query_level > 0 ? -1 : cr->relation_slot);
+        out.insert(cr->id.isLocal() ? cr->id.localSlot("collectSlots") : -1);
         return;
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
@@ -150,7 +150,7 @@ int soleSlot(const Expr* conjunct) {
 // pruning hints (it ignores slot >= 1 refs; see chunk_pruner.h).
 void restampSlots(Expr* expr, int slot) {
     if (!expr) return;
-    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { cr->relation_slot = slot; return; }
+    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { cr->id = ColumnId::local(slot); return; }
     if (auto* bin = dynamic_cast<BinaryExpr*>(expr)) {
         restampSlots(bin->left.get(), slot);
         restampSlots(bin->right.get(), slot);

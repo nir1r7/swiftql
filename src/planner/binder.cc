@@ -94,8 +94,7 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
                         if (auto* cr = dynamic_cast<ColumnRef*>(clone.get())) {
                             g.table_name = cr->table_name;
                             g.column_name = cr->column_name;
-                            g.relation_slot = cr->relation_slot;
-                            g.query_level = cr->query_level;
+                            g.id = cr->id;
                         } else {
                             g.expr = std::move(clone);
                         }
@@ -117,15 +116,14 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
         // qualified path against a range table keyed on REF names, so
         // `SELECT name AS n FROM laps l JOIN drivers d ... GROUP BY n` failed
         // with "unknown table qualifier: 'drivers'".
-        tmp.relation_slot = g.relation_slot;
-        tmp.query_level = g.query_level;
+        tmp.id = g.id;
         resolveColumnRef(&tmp, scope);
         g.table_name = tmp.table_name;
-        g.relation_slot = tmp.relation_slot;
         // Week 30 round 1: the level travels with the slot. resolveColumnRef
         // walks OUT, so a group key can resolve in an enclosing block, and a
-        // slot stored without its level indexes the wrong range table.
-        g.query_level = tmp.query_level;
+        // slot stored without its level indexes the wrong range table. Week 33:
+        // ColumnId carries the pair, so the two can no longer be copied apart.
+        g.id = tmp.id;
     }
     bindExpr(stmt.having.get(), scope, catalog);
     // SQLite scoping: ORDER BY names resolve against select-list aliases
@@ -179,13 +177,16 @@ void Binder::checkCorrelatedAggregateArg(const AggregateExpr* agg, const Scope& 
     // verified the column exists in it.
     if (agg->function_name != "SUM" && agg->function_name != "AVG") return;
     auto* col = dynamic_cast<const ColumnRef*>(agg->argument.get());
-    if (!col || col->query_level <= 0 || col->relation_slot < 0) return;
+    if (!col || col->id.isLocal() || !col->id.isResolved()) return;
 
+    // The one reader that legitimately wants the slot WITHOUT being in its
+    // scope: it walks the chain out to the scope the level names first.
+    const int slot = col->id.slotInOwnScope("checkCorrelatedAggregateArg");
     const Scope* s = &scope;
-    for (int i = 0; i < col->query_level && s; ++i) s = s->parent;
-    if (!s || col->relation_slot >= static_cast<int>(s->range_table.size())) return;
+    for (int i = 0; i < col->id.level() && s; ++i) s = s->parent;
+    if (!s || slot >= static_cast<int>(s->range_table.size())) return;
 
-    const Schema* sch = s->range_table[col->relation_slot].schema;
+    const Schema* sch = s->range_table[slot].schema;
     int idx = sch->indexOf(col->column_name);
     if (idx < 0) return;   // existence is resolveColumnRef's, and it threw already
     if (sch->column(idx).type == TypeId::STRING) {
@@ -307,8 +308,8 @@ void Binder::resolveColumnRef(ColumnRef* col, Scope& scope) {
     //
     // query_level is relative to the block the ref is written in, which is
     // exactly `scope` on every walk, so re-deriving it here cannot drift.
-    if (col->relation_slot >= 0) {
-        if (col->query_level > 0) markCorrelated(scope, col->query_level);
+    if (col->id.isResolved()) {
+        if (!col->id.isLocal()) markCorrelated(scope, col->id.level());
         return;
     }
 
@@ -330,8 +331,7 @@ void Binder::resolveColumnRef(ColumnRef* col, Scope& scope) {
                 // output names are built from it, and self-join occurrences
                 // are only distinguishable by their aliases. Routing uses the
                 // (level, slot) pair, never the qualifier text.
-                col->relation_slot = slot;        // range-table position
-                col->query_level = level;
+                col->id = ColumnId::outer(level, slot);   // (level, position)
                 markCorrelated(scope, level);
                 return;
             }
@@ -368,8 +368,7 @@ void Binder::resolveColumnRef(ColumnRef* col, Scope& scope) {
             // subquery would have swallowed EVERY unqualified name at slot 0
             // and never walked out, so no correlated reference could resolve.
             if (s->range_table.size() >= 2) col->table_name = resolved_table;
-            col->relation_slot = resolved_slot;
-            col->query_level = level;
+            col->id = ColumnId::outer(level, resolved_slot);
             markCorrelated(scope, level);
             return;
         }
@@ -385,8 +384,7 @@ void Binder::resolveColumnRef(ColumnRef* col, Scope& scope) {
         throw std::runtime_error("unknown table qualifier: '" + col->table_name + "'");
     }
     if (scope.range_table.size() < 2) {
-        col->relation_slot = 0;
-        col->query_level = 0;
+        col->id = ColumnId::local(0);
         return;
     }
     // several relations and no match: leave unresolved; Validator reports

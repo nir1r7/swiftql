@@ -109,7 +109,7 @@ inline std::string literalKey(const Value& v) {
 inline std::string exprKey(const Expr* expr) {
     if (!expr) return "?";
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        if (col->relation_slot >= 0) {
+        if (col->id.isResolved()) {
             // Week 30 round 2: the LEVEL is part of the identity. A slot is a
             // position in the range table of the scope query_level blocks out,
             // so `0#driver_id` meant two different columns and two refs
@@ -125,14 +125,15 @@ inline std::string exprKey(const Expr* expr) {
             // therefore every aggregate-spec dedupe and group-key match in a
             // query with no subquery — is byte-identical. This text is for
             // MATCHING, never display, so widening it costs nothing visible.
-            std::string key = std::to_string(col->relation_slot) + "#" + col->column_name;
+            std::string key = std::to_string(col->id.slotInOwnScope("exprKey"))
+                            + "#" + col->column_name;
             // The ':' is load-bearing, not decoration. Concatenating two decimal
             // numbers is not prefix-free: level 1 / slot 23 and level 12 / slot 3
             // both render "^123#team" — the identical collision this prefix
             // exists to remove, one order of magnitude further out. Both halves
             // are legal SwiftQL (a 24-relation block plans; nesting is unbounded).
-            return col->query_level > 0
-                ? "^" + std::to_string(col->query_level) + ":" + key
+            return !col->id.isLocal()
+                ? "^" + std::to_string(col->id.level()) + ":" + key
                 : key;
         }
         return col->table_name.empty()
@@ -323,7 +324,7 @@ inline std::unique_ptr<Expr> cloneExpr(const Expr* expr) {
     if (!expr) return nullptr;
     std::unique_ptr<Expr> out;
     if (auto* col = dynamic_cast<const ColumnRef*>(expr)) {
-        out = std::make_unique<ColumnRef>(*col);   // memberwise: keeps relation_slot
+        out = std::make_unique<ColumnRef>(*col);   // memberwise: keeps ColumnId
     } else if (auto* lit = dynamic_cast<const Literal*>(expr)) {
         auto l = std::make_unique<Literal>(lit->value);
         // Week 31: null_type is the type of a NULL constant, which only a

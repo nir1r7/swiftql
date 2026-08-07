@@ -1102,12 +1102,25 @@ to them.
 ### State
 
 - [x] `src/common/column_id.h` added.
-- [ ] `ColumnRef` (parser/ast.h) + consumers.
-- [ ] `GroupByColumn` (parser/ast.h) + consumers.
-- [ ] `AggregateSpec` (planner/logical_plan.h) + consumers.
+- [x] `ColumnRef` (parser/ast.h) + consumers.
+- [x] `GroupByColumn` (parser/ast.h) + consumers — migrated with `ColumnRef`,
+      because the round trip between the two (binder.cc) is what a split would
+      have had to express as two half-migrated copies.
+- [x] `AggregateSpec` (planner/logical_plan.h) + consumers.
 - [ ] Tests (9 files hand-build these types).
 - [ ] `development.md` → *Relation slots and query levels*.
 
-**Next concrete step:** replace `ColumnRef::relation_slot` + `query_level` with
-`ColumnId id`, then work the compiler's error list, classifying each site against
-`development.md`'s consumer table before fixing it.
+All of `src/` compiles. Narrowing sites created, each named in its
+`localSlot(...)` argument: `lowerInSubqueries`, `collectSlots`,
+`collectSimplePredicates`, `evaluate`, `inferExprType`, `buildProjectSchema`,
+`buildAggregateSchema`, `HashAggregateNode` (group key + argument),
+`VecHashAggregateNode` (group key + argument), `classifyJoinCondition`,
+`validateJoinCondition`, the SUM/AVG argument check, and the aggregate-argument
+schema lookup. One escape-hatch use each in `exprKey` and
+`Binder::checkCorrelatedAggregateArg`, both documented at the call site.
+
+**Next concrete step:** migrate the test files. `tests/test_storage.cc` is where
+the compiler currently stops; then test_binder, test_vec_plan_builder,
+test_logical_plan, test_join_enumeration, test_cardinality,
+test_predicate_pushdown, test_planner, test_subquery. Spelling only — an
+assertion that has to change is a behaviour change hiding in a rename.

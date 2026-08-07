@@ -227,8 +227,9 @@ void HashAggregateNode::open() {
                 key.push_back(evaluate(g.expr.get(), *row, child_schema));
                 continue;
             }
-            int idx = g.relation_slot >= 0
-                ? child_schema.indexOf(g.column_name, g.relation_slot)
+            int idx = g.id.isResolved()
+                ? child_schema.indexOf(g.column_name,
+                                       g.id.localSlot("HashAggregateNode group key"))
                 : -1;
             if (idx < 0) idx = child_schema.indexOf(g.column_name);
             key.push_back((*row)[idx]);
@@ -253,8 +254,9 @@ void HashAggregateNode::open() {
                     // expression argument (e.g. SUM(speed * 2)): evaluate per row
                     val = evaluate(spec.argument, *row, child_schema);
                 } else {
-                    int agg_idx = spec.relation_slot >= 0
-                        ? child_schema.indexOf(spec.column, spec.relation_slot)
+                    int agg_idx = spec.id.isResolved()
+                        ? child_schema.indexOf(spec.column,
+                                               spec.id.localSlot("HashAggregateNode argument"))
                         : -1;
                     if (agg_idx < 0) agg_idx = child_schema.indexOf(spec.column);
                     if (agg_idx < 0) {

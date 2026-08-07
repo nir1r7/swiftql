@@ -298,7 +298,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
-            ref->relation_slot = col.relation_slot; // preserve side so SELECT * on a self-join emits both sides
+            ref->id = ColumnId::local(col.relation_slot);  // schema slot -> local id:
+            // preserve side so SELECT * on a self-join emits both sides
             star_exprs.push_back(std::move(ref));
             star_cols.push_back(col);
         }

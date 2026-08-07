@@ -80,21 +80,26 @@ JoinCondition classifyJoinCondition(const Expr* condition, int right_slot) {
             // The forward-reference check above needs no change: collectSlots
             // already maps a query_level > 0 ref to -1, and -1 <= right_slot,
             // so a correlated ref is correctly not a forward reference.
-            if (lc->query_level > 0 || rc->query_level > 0) {
+            if (!lc->id.isLocal() || !rc->id.isLocal()) {
                 out.residuals.push_back(c);
                 continue;
             }
-            if (lc->relation_slot < 0 || rc->relation_slot < 0) {
+            // Both are level 0: the guard above returned for a correlated
+            // operand, which is what keeps JoinKey::from_slot's "carries no
+            // query level" contract true (join_condition.h).
+            const int l_slot = lc->id.localSlot("classifyJoinCondition");
+            const int r_slot = rc->id.localSlot("classifyJoinCondition");
+            if (!lc->id.isResolved() || !rc->id.isResolved()) {
                 // unbound: positional routing, as documented in the header
-                out.keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
+                out.keys.push_back({lc->column_name, rc->column_name, l_slot});
                 continue;
             }
-            if (rc->relation_slot == right_slot && lc->relation_slot != right_slot) {
-                out.keys.push_back({lc->column_name, rc->column_name, lc->relation_slot});
+            if (r_slot == right_slot && l_slot != right_slot) {
+                out.keys.push_back({lc->column_name, rc->column_name, l_slot});
                 continue;
             }
-            if (lc->relation_slot == right_slot && rc->relation_slot != right_slot) {
-                out.keys.push_back({rc->column_name, lc->column_name, rc->relation_slot});
+            if (l_slot == right_slot && r_slot != right_slot) {
+                out.keys.push_back({rc->column_name, lc->column_name, r_slot});
                 continue;
             }
             // Falls through when both operands are the same relation (a local
