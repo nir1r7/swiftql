@@ -671,20 +671,63 @@ WEEK31_MATERIALIZATION_REFUSED = [
 # everything Week 30 built — nested scopes, correlation detection, per-scope
 # validation, the level carried on every ref — because all of it has to succeed
 # to get here.
-WEEK33_CORRELATED_EXPECT = "correlated subqueries are not yet executable (Week 33)"
+# Week 33 executes the decorrelatable shapes, so this is no longer ONE message.
+# The shapes below are refused by decorrelation itself ("correlated subquery:
+# <what it declined>") or, on Volcano, by the capability refusal ("correlated
+# subqueries are decorrelated to a semi-join and are not supported..."). The
+# common prefix is what every one of them shares; a per-shape expectation would
+# be better and is Week 34's to add when the shapes stop moving.
+WEEK33_CORRELATED_EXPECT = "correlated subquer"
+# Week 33 — DECORRELATED correlated subqueries: these EXECUTE and are diffed
+# against SQLite. Vectorized only, because Planner::plan runs no
+# LogicalPlanBuilder and therefore cannot decorrelate (the same capability
+# difference Week 32's IN lowering has, refused in the two Volcano modes below).
+WEEK33_DECORRELATED_VEC_ONLY = [
+    # EXISTS, correlated (Q4/Q21) — `select *` inside must stay legal
+    "SELECT d.name FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 340) "
+    "ORDER BY d.name",
+    # NOT EXISTS (Q21): the leading-NOT production, lowered to an ANTI join
+    "SELECT d.name FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id) ORDER BY d.name",
+    # ...and in the middle of an AND chain, so the conjunct extraction is not
+    # relying on the subquery being the whole WHERE
+    "SELECT d.name FROM drivers d WHERE d.age > 30 AND NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id) ORDER BY d.name",
+    # TWO correlated keys: the rewrite must produce a multi-key join, not stop
+    # at the first equality it finds
+    "SELECT l.lap_id FROM laps l WHERE EXISTS "
+    "(SELECT * FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    " AND l2.season = l.season AND l2.speed > 340) ORDER BY l.lap_id LIMIT 50",
+    # correlated across a JOIN in the outer query: the ref names relation 1, so
+    # from_slot must come from the OUTER range table and not the body's
+    "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+    "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team) "
+    "ORDER BY l.team LIMIT 50",
+    # ANTI JOIN AND NULL — the trap NOT IN was in Week 32, asserted rather than
+    # argued. EXISTS is a pure existence test and is never UNKNOWN, so a NULL on
+    # either side of the key simply fails to match and the outer row SURVIVES.
+    # That is the opposite of NOT IN, where one NULL in the set makes the whole
+    # predicate never-true. `sector_1` is nullable in the generated data, so this
+    # is a real NULL-keyed body and not a synthetic one.
+    "SELECT d.driver_id FROM drivers d WHERE NOT EXISTS "
+    "(SELECT * FROM laps l WHERE l.sector_1 = d.age) ORDER BY d.driver_id",
+    "SELECT d.driver_id FROM drivers d WHERE EXISTS "
+    "(SELECT * FROM laps l WHERE l.sector_1 = d.age) ORDER BY d.driver_id",
+]
+
+# The other half of that capability difference, asserted so the boundary cannot
+# drift silently: the diffed oracle cannot hold a query that errors, so without
+# this nothing tests that Volcano REFUSES rather than quietly answering.
+WEEK33_DECORRELATED_VOLCANO_REJECTED = [
+    (query, "not supported on the Volcano path")
+    for query in WEEK33_DECORRELATED_VEC_ONLY
+]
+
 WEEK33_CORRELATED_BINDS = [
     # scalar, correlated (Q17), composed with arithmetic
     "SELECT l.lap_id FROM laps l WHERE l.speed > "
     "0.2 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
-    # EXISTS, correlated (Q4/Q21) — `select *` inside must stay legal
-    "SELECT d.name FROM drivers d WHERE EXISTS "
-    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 340)",
-    # NOT EXISTS (Q21): the leading-NOT production
-    "SELECT d.name FROM drivers d WHERE NOT EXISTS "
-    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
-    # ...and in the middle of an AND chain
-    "SELECT d.name FROM drivers d WHERE d.age > 30 AND NOT EXISTS "
-    "(SELECT * FROM laps l WHERE l.driver_id = d.driver_id)",
     # nested two deep, the inner one correlated to the MIDDLE block (Q20). The
     # TOP node is uncorrelated, so this is the query that proves the statement
     # flag propagates outward — without it the refusal fires from a nested run
@@ -692,10 +735,6 @@ WEEK33_CORRELATED_BINDS = [
     "SELECT name FROM drivers d WHERE d.driver_id IN "
     "(SELECT l.driver_id FROM laps l WHERE l.speed > "
     " (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))",
-    # correlated across a JOIN in the outer query: the ref names relation 1, so
-    # (query_level 1, relation_slot 1)
-    "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
-    "WHERE EXISTS (SELECT * FROM laps l2 WHERE l2.team = d.team)",
     # a correlated ref inside the NESTED query's own ON clause
     "SELECT lap_id FROM laps l WHERE EXISTS "
     "(SELECT 1 FROM drivers d JOIN drivers d2 ON d.driver_id = d2.driver_id "
@@ -1376,6 +1415,23 @@ def main():
         mp, mf, me = run_rejection_suite(
             WEEK31_SUBQUERY_VOLCANO_REJECTED,
             f"Week 31 multi-relation subquery body refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+
+    # Week 33 — decorrelated EXISTS / NOT EXISTS. Same split, same reason as
+    # Week 32's: the capability difference is real, so BOTH halves are asserted.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, WEEK33_DECORRELATED_VEC_ONLY,
+            f"Week 33 decorrelated EXISTS — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            WEEK33_DECORRELATED_VOLCANO_REJECTED,
+            f"Week 33 decorrelated EXISTS refused — {label}", extra_args=extra)
         m_passed += mp
         m_failed += mf
         m_errors += me

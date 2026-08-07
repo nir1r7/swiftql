@@ -1144,9 +1144,30 @@ removed or weakened.
       decorrelation refuses a GROUP BY body so a correlated key here means the
       rewrite left one behind). Volcano refusal added in `Planner::plan` beside
       Week 32's identical one for `IN`.
-- [ ] Task 5: Volcano refusal (capability difference -> `Planner::plan`), README
-      dialect rows, rejection-suite entries.
+- [x] Task 3 harness: `WEEK33_DECORRELATED_VEC_ONLY` (diffed against SQLite,
+      including BOTH halves of the anti-join NULL question) and
+      `WEEK33_DECORRELATED_VOLCANO_REJECTED` (the refusal pinned by message —
+      the diffed oracle cannot hold a query that errors). The now-executable
+      shapes left `WEEK33_CORRELATED_BINDS`; nothing left that suite without
+      arriving in the other.
+- [ ] Task 5: README dialect rows; the honest naming of what the fallback is.
 - [ ] Tasks 4, 6, 7, 8, 9.
+
+### Why `ColumnId` was worth 87 sites — the concrete case
+
+Record this before anyone proposes simplifying the type back to an `int`.
+`inferExprType` (dispatch site 12) resolved a `ColumnRef` **slot-first** against
+the schema of the block being planned. For a correlated ref that slot indexes an
+*enclosing* block's range table. Pre-migration the lookup would not have failed:
+`team` and `driver_id` exist in **both** shipped tables, so
+`indexOf("team", 0)` against the wrong schema is a clean **hit**, and
+`inferExprType` would have returned the wrong relation's column type and carried
+on. After the migration it throws, naming itself
+(`internal: inferExprType read a correlated column reference as a local relation
+slot (query level 1)`), which is how it was found — on the first correlated
+query ever planned, within minutes of the refusal coming down. That is the
+entire bug class Weeks 30-32 kept re-discovering by audit, converted into a
+message that points at its own site.
 
 **Correlated `EXISTS` / `NOT EXISTS` now execute** on the vectorized path.
 
