@@ -1,5 +1,14 @@
 # Phase 5 orchestrator state
-Current: week 34, round 1, step 1 (teach) — launching ~13:45 UTC.
+Current: week 34, round 1, step 2 (implement) — agent a4e5229d58781224a, launched 14:08 UTC.
+  10-task plan at docs/week-34-plan.md. Task 1 is a REFUSAL INVENTORY built BEFORE the refusal
+  is removed; Task 10 is the closing sweep. Week 33's lesson is encoded at both ends.
+  Q17 IS A DELIVERABLE here (week 33 recorded its absence as a checkpoint miss and handed it
+  over). If tasks 3-5 land and task 6 is still blocked, that must be STATED with the reason,
+  not deferred a second time.
+  Q22 nuance the plan flagged honestly: its derived-table half is tasks 2-4, but its correlated
+  half in standard TPC-H text is a NOT EXISTS already decorrelated in week 33 — so task 6 alone
+  does not close Q22.
+  ON RECLAIM: resume from ## Progress in docs/week-34-plan.md. Never restart the week.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial checkpoint)
