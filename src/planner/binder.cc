@@ -95,6 +95,7 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
                             g.table_name = cr->table_name;
                             g.column_name = cr->column_name;
                             g.relation_slot = cr->relation_slot;
+                            g.query_level = cr->query_level;
                         } else {
                             g.expr = std::move(clone);
                         }
@@ -117,9 +118,14 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
         // `SELECT name AS n FROM laps l JOIN drivers d ... GROUP BY n` failed
         // with "unknown table qualifier: 'drivers'".
         tmp.relation_slot = g.relation_slot;
+        tmp.query_level = g.query_level;
         resolveColumnRef(&tmp, scope);
         g.table_name = tmp.table_name;
         g.relation_slot = tmp.relation_slot;
+        // Week 30 round 1: the level travels with the slot. resolveColumnRef
+        // walks OUT, so a group key can resolve in an enclosing block, and a
+        // slot stored without its level indexes the wrong range table.
+        g.query_level = tmp.query_level;
     }
     bindExpr(stmt.having.get(), scope, catalog);
     // SQLite scoping: ORDER BY names resolve against select-list aliases
@@ -230,7 +236,26 @@ void Binder::resolveColumnRef(ColumnRef* col, Scope& scope) {
     //
     // It is also the precondition for SubqueryExpr's shared statement (ast.h):
     // two nodes may share one SelectStatement, so the Binder may walk it twice.
-    if (col->relation_slot >= 0) return;
+    //
+    // Week 30 round 1: idempotent means "same result", not "does nothing".
+    // Correlation is derived from the stamp rather than from a side effect of
+    // resolution, because the stamp is what survives a second walk. Returning
+    // early WITHOUT marking made bindQuery report `false` on every re-walk, so
+    // SubqueryExpr::correlated was overwritten with false — and that is
+    // reachable inside ONE bind(): BETWEEN's desugaring clones its left operand
+    // before binding and cloneExpr SHARES the statement, so two SubqueryExpr
+    // nodes reach one SelectStatement and the second was left marked
+    // uncorrelated. collectSlots then contributes no -1 for it, soleSlot
+    // returns a single slot, and pushdown pushes a CORRELATED conjunct onto one
+    // relation's scan — the wrong answer the sentinel exists to prevent, and
+    // the precondition restampSlots' safety argument rests on.
+    //
+    // query_level is relative to the block the ref is written in, which is
+    // exactly `scope` on every walk, so re-deriving it here cannot drift.
+    if (col->relation_slot >= 0) {
+        if (col->query_level > 0) markCorrelated(scope, col->query_level);
+        return;
+    }
 
     // Innermost scope first, then out. `level` is what lands in query_level:
     // 0 = this block's own range table, >= 1 = a correlated reference.
