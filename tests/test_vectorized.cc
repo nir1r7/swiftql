@@ -4302,10 +4302,27 @@ TEST(VecSemiJoin, RefusesEveryIllegalCombination) {
                                swapped, left_outer, std::move(resid),
                                JoinSemantics::SEMI);
     };
-    EXPECT_THROW(make(probe_schema, true,  false, nullptr), std::runtime_error);
-    EXPECT_THROW(make(probe_schema, false, true,  nullptr), std::runtime_error);
-    EXPECT_THROW(make(probe_schema, false, false, col("pid")), std::runtime_error);
-    EXPECT_THROW(make(merged,       false, false, nullptr), std::runtime_error);
+    // The MESSAGE, not just the type. Four guards, four distinct messages, one
+    // exception type: EXPECT_THROW alone passes whenever *some* guard fires, so
+    // reordering them — or deleting one whose case another happens to catch —
+    // leaves the test green while the guard it named is gone.
+    auto message = [&](Schema out, bool swapped, bool left_outer,
+                       std::unique_ptr<Expr> resid) {
+        try {
+            make(std::move(out), swapped, left_outer, std::move(resid));
+            return std::string("<no throw>");
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what());
+        }
+    };
+    EXPECT_EQ(message(probe_schema, true,  false, nullptr),
+              "internal: a semi/anti join requires the probed side on the probe input");
+    EXPECT_EQ(message(probe_schema, false, true,  nullptr),
+              "internal: a semi/anti join cannot also be a left outer join");
+    EXPECT_EQ(message(probe_schema, false, false, col("pid")),
+              "internal: a semi/anti join takes no ON residual");
+    EXPECT_EQ(message(merged,       false, false, nullptr),
+              "internal: a semi/anti join's output schema must be the probe schema");
     EXPECT_NO_THROW(make(probe_schema, false, false, nullptr));
 }
 

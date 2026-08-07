@@ -117,7 +117,21 @@ void collectSlotTables(const LogicalPlanNode* node,
                        std::unordered_map<int, std::string>& out) {
     if (node->type != LogicalNodeType::JOIN) return;
     const auto* join = static_cast<const LogicalJoin*>(node);
-    out[join->join_slot] = leafScanTable(join->children[1].get());
+    // Week 32 — this is a READER of join_slot, and logical_plan.h's contract
+    // says every one of them either declines on semantics != STANDARD or is
+    // provably unreachable for such a node. It is reachable: two IN conjuncts
+    // stack two semi joins, and rowWidth() on the outer one's left child runs
+    // this walk over the inner one. Without the decline it stamps the BODY's
+    // table at key -1 — a slot that names no relation of this block — and the
+    // body contributes nothing to a semi join's output schema, so there is no
+    // entry to make. Latent today (the widths computed there are discarded
+    // before setCostDecision, and no spine column carries slot -1); declined
+    // here so the contract holds by construction rather than by luck.
+    if (join->semantics == JoinSemantics::STANDARD) {
+        out[join->join_slot] = leafScanTable(join->children[1].get());
+    }
+    // The left side is walked either way: a semi join's output schema IS its
+    // left child's, so every column this map is consulted for comes from there.
     const LogicalPlanNode* left = join->children[0].get();
     if (isSingleRelation(left)) {
         // A join always carries at least its own key columns per side, so the

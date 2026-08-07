@@ -185,14 +185,22 @@ TEST(SubqueryMaterialization, ExistsCapsTheBodyAtOneRowWithoutWideningAnExisting
 // out of an AST rewrite. The node must therefore SURVIVE this pass...
 TEST(SubqueryMaterialization, LeavesAnInNodeForSemiJoinLowering) {
     Catalog cat(CATALOG);
+    // The canned result is deliberately LARGER than Week 31's removed
+    // MAX_MATERIALIZED_IN_VALUES cap of 1024. At this layer "the cap is gone"
+    // can only mean "the result is never read at all", which is exactly what
+    // runs == 0 says; the cap's removal is covered end to end by
+    // WEEK32_SEMI_JOIN_VEC_ONLY's first query (10 000 distinct values), which is
+    // the one Week 31 could not answer.
+    std::vector<Row> big;
+    for (int64_t i = 0; i < 4096; ++i) big.push_back(Row{Value(i)});
     for (const char* sql : {"SELECT name FROM drivers WHERE driver_id IN "
                             "(SELECT driver_id FROM laps)",
                             "SELECT name FROM drivers WHERE driver_id NOT IN "
                             "(SELECT driver_id FROM laps)"}) {
         auto stmt = bindOnly(sql, cat);
         int runs = 0;
-        materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT),
-                                            {Row{Value(int64_t(1))}}}, &runs));
+        materializeSubqueries(stmt, canned({oneCol("driver_id", TypeId::INT), big},
+                                           &runs));
         // ...unrun: the body is executed by the semi-join's build side, not here.
         EXPECT_EQ(runs, 0) << sql;
         const auto* sq = dynamic_cast<const SubqueryExpr*>(whereOf(stmt));
@@ -206,18 +214,14 @@ TEST(SubqueryMaterialization, LeavesAnInNodeForSemiJoinLowering) {
     }
 }
 
-// The cap it replaces. Week 31 bounded the materialized set at 1024 distinct
-// values because evaluate()'s InExpr scans it LINEARLY per row; Week 32 removed
-// MAX_MATERIALIZED_IN_VALUES outright, because nothing is materialized. The
-// property under test is that a large result is no longer a refusal at all —
-// this is the query the README row and the rejection-suite entry both pinned.
-TEST(SubqueryMaterialization, NoLongerRefusesALargeInSet) {
-    Catalog cat(CATALOG);
-    auto stmt = bindOnly("SELECT name FROM drivers WHERE driver_id IN "
-                         "(SELECT driver_id FROM laps)", cat);
-    EXPECT_NO_THROW(materializeSubqueries(
-        stmt, canned({oneCol("driver_id", TypeId::INT), {}})));
-}
+// Week 31's MAX_MATERIALIZED_IN_VALUES cap had a test here — an EXPECT_NO_THROW
+// over an EMPTY canned result, which could not fail for two independent reasons:
+// the runner is never invoked for a Kind::IN node, and an empty set was under
+// the cap anyway. It has been folded into the test above rather than kept as a
+// green line that asserts nothing: the >1024-row canned result plus runs == 0 is
+// the strongest statement this layer can make about the removal, and the
+// executable proof that the cap is gone is the 10 000-distinct-value query in
+// WEEK32_SEMI_JOIN_VEC_ONLY, diffed against SQLite.
 
 // ===== the walker, the cache, and the flag =====
 
