@@ -1,14 +1,17 @@
 # Phase 5 orchestrator state
-Current: week 32, round 1, step 5 — FIX round (agent a19c64a68cf913e64, launched 08:52 UTC).
-  Audit r1: 1 BLOCKER, 1 medium, 1 low.
-  BLOCKER: WEEK32_LOWERING_REFUSED asserts in all four modes, but on Volcano
-  `Planner::plan`'s GENERIC refusal fires first, so 6 rejection assertions fail on their
-  expected message. Told A to decide which message is TRUE per mode, not to weaken the suite
-  or drop four-mode coverage. Expect the concurrent gate r1 to independently confirm this RED.
-  MEDIUM: cardinality_estimator.cc:376 stamps body stats at relation_slot = -1, contradicting
-  the consumer table this week added to development.md — one of the two is wrong, fix that one.
-  Audit did NOT reach a line-by-line read of the new C++ test bodies; a later audit must.
-  Week 32 implementation itself is complete + pushed (unit 768).
+Current: week 32, round 2 audit running (agent aa92cc4c44a7a1bf5, 09:00 UTC, 20-min budget).
+  Gate r1 (launched 08:45) still running against the PRE-FIX tree — its verdict will be stale;
+  read it as confirmation of the blocker, then run gate r2 AFTER it finishes.
+  DO NOT run two gates at once — they contend on the same build/ directory.
+  r1's blocker + medium + low are all FIXED and pushed (4 commits).
+  Blocker fix kept FOUR-MODE coverage: WEEK32_LOWERING_REFUSED now vec-modes-only, plus a
+  derived WEEK32_LOWERING_REFUSED_VOLCANO asserting the message Volcano actually emits —
+  chosen after verifying Planner::plan's guard really is IN-subquery-specific, not generic.
+  Medium: the CODE was wrong, not the doc — cardinality_estimator merged right.entries for
+  every join, so SEMI/ANTI returned body columns at slot -1. Now guarded on STANDARD.
+  r2 audit's FIRST target is the new C++ test bodies — nobody has read them line by line, and
+  one NULL test in this week already passed for the wrong reason (makeScan silently converts
+  Value::null() to 0).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅
