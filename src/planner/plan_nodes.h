@@ -192,6 +192,27 @@ class HashJoinNode : public PlanNode {
         // whose left input may be a merged join schema, resolves by slot into
         // indices instead.
         //
+        // Week 33, Task 7(2) — is the Volcano semi/anti refusal TOTAL? Week 32's
+        // hand-off flagged this as unproven and pointed at
+        // src/execution/hash_join_node.cc, which DOES NOT EXIST: the Volcano
+        // hash join is this class, in the planner layer. Correcting the pointer
+        // is half the finding.
+        //
+        // The answer is YES, and structurally rather than by a guard that could
+        // drift. This operator has NO JoinSemantics parameter, so a semi or anti
+        // join is not REPRESENTABLE here — there is no argument to pass and no
+        // branch to take. The refusals in Planner::plan (IN, Week 32; correlated,
+        // Week 33) therefore make a shape unreachable that could not have been
+        // built anyway; they exist to produce a NAMED message instead of a
+        // confusing one. That is a stronger containment than the vectorized
+        // side's, where JoinSemantics is a constructor argument and
+        // build_had_unmatchable_key_ carries NOT IN's three-valued rule.
+        //
+        // What this costs is the two-mode oracle coverage recorded as Week 33's
+        // Task 6 gap. Adding semantics here is the fix; note it needs a Volcano
+        // plan shape that can hold a SECOND join, which Planner::plan cannot
+        // express today.
+        //
         // Week 29 — same contract as VecHashJoinNode. left_outer emits every
         // probe row at least once, null-extended across the build block, and is
         // legal only with swapped == false: the PRESERVED side must be the probe

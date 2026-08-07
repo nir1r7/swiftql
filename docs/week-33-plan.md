@@ -1155,7 +1155,17 @@ removed or weakened.
       the hand-off below.
 - [!] **Task 4 (correlated scalar / Q17): BLOCKED, with the reason below.** Not
       a deferral of convenience — the blocker is structural and named.
-- [~] Task 7: item (1) pinned — `refuseUnloweredIn`'s call sites now have a
+- [x] Task 7 CLOSED. Item (2): the Volcano refusal is **total, structurally** —
+      `HashJoinNode` (which lives in `src/planner/plan_nodes.h`, **not** the
+      `src/execution/hash_join_node.cc` Week 32's hand-off named; correcting the
+      pointer is half the finding) has no `JoinSemantics` parameter at all, so a
+      semi/anti join is not representable there. The `Planner::plan` refusals
+      exist to give a named message, not to close a hole. Item (3):
+      `setCostDecision`'s consumption of `rowWidth` traced end to end — the
+      widths are computed for *every* join, including SEMI/ANTI, but reach the
+      cost model only through the STANDARD branch, so a decorrelated join's
+      width is computed and **discarded**. Both written at the site.
+- [x] Task 7: item (1) pinned — `refuseUnloweredIn`'s call sites now have a
       rejection-suite test (`WEEK33_NESTED_TRIPWIRE_REFUSED`) for an `IN` nested
       inside an `IN` body's `HAVING`, which round 4 left as a read rather than a
       test. Items (2) Volcano `HashJoinNode` refusal totality and (3)

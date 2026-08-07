@@ -251,6 +251,30 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             double join_est = join->children[1]->estimated_rows;
             bool estimate_driven = from_est >= 0 && join_est >= 0;
             double from_w = 8.0, join_w = 8.0;
+            // Week 33, Task 7(3) — setCostDecision's consumption of rowWidth,
+            // TRACED END TO END, because three audit rounds left it unconfirmed
+            // and half of collectSlotTables' rationale rested on it.
+            //
+            // The trace: rowWidth() runs HERE for every join, including a
+            // SEMI/ANTI one, because this block sits above the semantics switch
+            // below. Its results reach the cost model, and therefore
+            // setCostDecision, ONLY through the STANDARD branch — the SEMI/ANTI
+            // branch returns before from_w/join_w are read. So for a semi or
+            // anti join the widths are computed and DISCARDED.
+            //
+            // What that means for Week 33: a decorrelated EXISTS lowers to a
+            // SEMI/ANTI join, so it can never be mis-costed by a width that
+            // counts the body's columns — the cost decision it would feed is
+            // never taken. The asymmetry a merged-schema join would create
+            // (output is the left child's, so a width including children[1]
+            // would over-count) is therefore unreachable, not merely unlikely.
+            //
+            // !! This is a statement about the CURRENT shape, and the file's own
+            // collectSlotTables comment already warns that the "discarded before
+            // setCostDecision" argument dissolves the moment a STANDARD join is
+            // planned ABOVE a semi join. Week 34's derived tables are that week.
+            // The map argument in collectSlotTables does not depend on this one,
+            // which is why it is the load-bearing rationale and this is a trace.
             if (estimate_driven) {
                 // per-side row width from real avg_width stats (Gap 3); this
                 // feeds the hash-table memory term, so with equal row counts
