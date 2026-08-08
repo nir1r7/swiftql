@@ -75,8 +75,17 @@
 // schema while every columnar mode hands it the narrowed `buildScanSchema`
 // (planner.cc). Columns present only in the wide leg are, by construction,
 // columns the query references nowhere — so two rows that the narrow leg leaves
-// tied project to identical output rows and the difference is immaterial. See
-// `tests/test_sort_tiebreak.cc`, which pins that argument.
+// tied project to identical output rows and the difference is immaterial.
+//
+// That last argument is the weakest thing here, so it is pinned BEHAVIOURALLY
+// rather than trusted: the DISTINCT entry in `ENGINE_AGREEMENT_QUERIES`
+// (compare_against_sqlite.py) is the one entry whose sort input is a raw join
+// row rather than an aggregate's output, so it is the one that compares the two
+// legs over genuinely different column sets. It agrees today because the first
+// discriminating column is `driver_id` in both. If a future change makes the
+// wide leg's extra columns decide a cut, that entry goes red. `tests/
+// test_sort_tiebreak.cc` pins the comparator's own rules; it cannot see this
+// one, because it builds one schema.
 namespace sort_comparator {
 
 // compareForSort, widened so it can never throw. compareForSort refuses STRING
