@@ -241,3 +241,151 @@ Two things must be swept with it, per the standing rule:
   pass performs ("permuting a prefix", "pushing below an inner join"). It is now three
   moves, and the third one is the one that is unguarded. A precondition that lists the moves
   it covers must list all of them, or the next move added will land in the same gap.
+
+---
+
+### A.2 — `Validator::validateJoinKeyTypes` over the finished plan — **CLEAN**
+
+#### A.2.1 all four producers now refuse; the loss is the one the fix recorded
+
+Pass 3's nine K-shapes re-run verbatim on the same two-CSV catalog (`ids(code STRING)` /
+`nums(n INT)`), three legs:
+
+| # | producer | pass 3 (vectorized) | now |
+|---|---|---|---|
+| K1 | written `JOIN ON` | refused | refused (`JOIN ON: …`) |
+| K9 | written JOIN, derived input | refused | refused (`JOIN ON: …`) |
+| K2 | `IN` -> SEMI | `{beta}` (wrong) | refused (`IN / EXISTS subquery: …`) |
+| K3 | `IN` -> SEMI, other direction | `{seventeen}` (wrong) | refused |
+| K4 | `NOT IN` -> ANTI_NOT_IN | complement (wrong) | refused (`NOT IN subquery: …`) |
+| K5 | `EXISTS` -> SEMI | `{seventeen}` (wrong) | refused |
+| K6 | `NOT EXISTS` -> ANTI | complement (wrong) | refused (`NOT EXISTS subquery: …`) |
+| K7b | correlated scalar -> `$scalarN` LEFT join | `{seventeen}` (wrong) | refused (`join key: … the subquery's key column`) |
+| K8 | `IN` over a derived body | `{seventeen}` (wrong) | refused |
+
+Five of the six wrong answers were the "half a match" signature and one was its complement;
+all six are now refusals, and the refusal names its producer. Refusing rather than
+implementing affinity is the recorded, deliberate divergence from SQLite (K1..K9 all still
+disagree with the oracle by construction).
+
+#### A.2.2 the resolution really does match the physical builder — checked rule by rule
+
+| | `Validator::validateJoinKeyTypes` (`validator.cc:198-212`) | `VectorizedPlanBuilder` (`vectorized_plan_builder.cc:450-511, 852-857`) |
+|---|---|---|
+| left, bound key | `left.indexOf(from_col, from_slot)` | `left_schema.indexOf(k.from_col, k.from_slot)` — same call |
+| left, `from_slot < 0` | `left.indexOf(from_col)` bare name | same bare-name fallback, same condition |
+| right, STANDARD | `right.indexOf(join_col)` | `right_schema.indexOf(k.join_col)` |
+| right, SEMI/ANTI/ANTI_NOT_IN | positional, `ri = k` | positional, `idx.push_back(i)` — same predicate `semantics != STANDARD` |
+| a MISS | `continue` (not this rule's to report) | THROWS by name — so a miss is an error, never a silent skip |
+| arity | `ri >= right.size()` -> skip | throws `a semi/anti join's build input must output exactly its key columns` |
+
+The one asymmetry worth naming is that the walk runs on the **written-order** tree (last
+statement of `LogicalPlanBuilder::build`, `logical_plan.cc:1249`) and the physical builder
+runs on the **reordered** one. That is sound, and the reason is structural rather than
+lucky: `JoinEnumeration` is a fifth site that CONSTRUCTS `JoinKey`s (`:269`, `:271`, `:360`,
+`:362`), but each one it constructs is an `Edge` — a direction-free pair of the two columns
+the written tree already paired — so reordering can only SWAP a key's two sides and
+re-stamp `from_slot`. `requireJoinKeyTypes` is symmetric (`l_str == r_str`), so a swap
+cannot change the verdict, and the pair of COLUMNS is invariant. The `k == 1` rewrite
+(`join_enumeration.cc:287-289`) forces `from_slot = 0` against a LEAF schema, whose columns
+are slot-0-stamped in every leaf kind including DERIVED (`logical_plan.cc:495`), and
+`buildScanSchema` provably keeps a key column (`logical_plan.cc:332` collects the join
+condition), so that rewrite cannot turn a resolvable key into a miss either.
+
+#### A.2.3 the positional rule is right, and I made it discriminate
+
+Positional right-side resolution is the risky half, so it was checked with a shape where
+swapping the two key positions changes the ANSWER rather than only the plan
+(`p(a,b) = (1,100),(100,1),(7,7)`, `q(x,y) = (1,100)`):
+
+| query | SwiftQL (both legs) | SQLite |
+|---|---|---|
+| `EXISTS (SELECT 1 FROM q WHERE q.x = p.a AND q.y = p.b)` | `{1}` | `{1}` |
+| written in the other order (`q.y = p.b AND q.x = p.a`) | `{1}` | `{1}` |
+| `EXISTS (… q.x = p.b AND q.y = p.a)` | `{100}` | `{100}` |
+| `NOT EXISTS` of the first | `{100, 7}` | `{100, 7}` |
+| correlated scalar with the same composite key | `{}` | `{}` |
+
+The pairing is correct by construction, not by luck: `splitCorrelation`
+(`subquery_decorrelation.cc:208`) pushes `keys[i]` and `body_key_refs[i]` in lockstep, and
+the body's select list is `body_key_refs` verbatim (`:807`) — for the correlated scalar,
+`buildAggregateSchema` emits the group keys first in key order and the rewrite asserts
+`renamed.size() == keys.size() + 1` (`:598`). `lowerInSubqueries` has exactly one key and a
+one-column body.
+
+Eight further shapes over the f1 catalog (composite `EXISTS`/`NOT EXISTS`, a mixed-type
+composite whose SECOND component is the ill-typed one — correctly refused, a semi join
+whose body is a JOIN with duplicate names, `IN` over a derived body, a correlated scalar
+with a composite key, and an `EXISTS` whose body itself joins) all agree three ways.
+
+#### A.2.4 the AST loop is still Volcano's only cover — confirmed
+
+`Validator::validate`'s `stmt.joins` loop (`validator.cc:414-425`) is unchanged in effect
+and its new comment states the containment correctly. Volcano's refusals were re-measured
+rather than taken from the comment:
+
+    multi-way joins are not supported on the Volcano path
+    derived tables (FROM (subquery)) are not supported on the Volcano path
+    IN subqueries are lowered to a semi-join and are not supported on the Volcano path
+    correlated subqueries are decorrelated to a semi-join and are not supported on the Volcano path
+
+so `stmt.joins` really is Volcano's only `JoinKey` producer, and K1's refusal fires on the
+`row/volcano` leg with the `JOIN ON` context string. `Planner::plan` builds no logical
+plan, so the walk cannot see it — the loop's own stated reason for surviving.
+
+---
+
+### A.3 — the sequencing constraint, verified independently — **HOLDS**, and one part of B-3 is still open (P4-M1)
+
+Pass 3 raised the constraint (B-2/B-3 must not be fixed before B3-1). The order was
+respected; I checked the consequence rather than the commit order.
+
+**B-2 is fixed and the misattribution is gone.** A `LEFT JOIN` sealed inside a derived body
+no longer switches ordering off for the enclosing block's fully inner spine:
+
+    LogicalJoin [driver_id@0 = k] order=laps@0,drivers@1,@2 … method=dp
+      LogicalJoin [driver_id = driver_id]
+      LogicalDerived [x, 2 columns]
+        LogicalProject [k, t]
+          LogicalLeftJoin [driver_id = driver_id]      <- sealed, not consulted
+
+**B-3 is fixed for the two shapes it was measured on.** A 3-relation join inside a derived
+body used as a join input now gets `order=customer@1,nation@2,orders@0 cost=39938
+(written=67601) method=dp` (pass 3 measured `62729` silent); a semi join's BODY containing a
+3-relation join gets `order=drivers@1,drivers@2,laps@0 cost=43104 (written=60637) method=dp`.
+
+**The widening did not reopen B3-1.** Four shapes that put a sort inside or above a newly
+enumerated region, ordered compare, `optimized` vs `--no-optimize`:
+
+| shape | result |
+|---|---|
+| derived body: 3-rel join + tied `ORDER BY` + `LIMIT 5` | identical |
+| derived body: 3-rel join + PLAIN `LIMIT 5` (a `deterministicCut` sort INSIDE the body) | identical |
+| derived body with a tied `ORDER BY … LIMIT` joined to an outer relation | identical |
+| semi-join body with a 3-rel join, outer tied `ORDER BY … LIMIT` | identical |
+
+**P4-M1 (MEDIUM, plan quality — the half of B-3 the fix did not reach).** The block BELOW a
+declined semi/anti join is still never enumerated, and `slotDeclineReason`'s own comment
+(`join_enumeration.cc:159-168`) presents exactly that loss as its motivation. Re-measured
+now, post-fix, on the shipped catalog:
+
+    FROM laps l JOIN drivers d ON … JOIN drivers d2 ON …            <- no IN
+      LogicalJoin [driver_id@1 = driver_id] order=drivers@1,drivers@2,laps@0
+                                            cost=43104 (written=60637) method=dp
+
+    … the same spine … WHERE l.driver_id IN (SELECT d3.driver_id FROM drivers d3)
+      LogicalSemiJoin [driver_id@0 = driver_id] join-ordering=skipped (semi/anti join)
+        LogicalJoin [team@1 = team]           <- fully inner, 3 relations, NOT enumerated
+          LogicalJoin [driver_id = driver_id]
+
+**43104 against 60637, still lost.** The cause is `applyToSpineLeaves`
+(`join_enumeration.cc:665-672`): it steps OVER every JOIN on `children[0]` because
+`decompose` only accepts a written-order tree. For a spine `reorder` DECLINED, the tree it
+returned is UNTOUCHED and therefore still in written order, so `apply` — not the
+step-over — is applicable to `children[0]`. The step-over is required for a declined OUTER
+join (reordering across it is a wrong answer, not a slow one) and is required for a spine
+that was rebuilt; it is neither required nor free for the semi/anti decline, where the
+declined node sits ABOVE a block that is legal to reorder and whose merged schema keeps its
+`(slot, name)` pairs (A.1) so the semi join's own `leftKeyIndices` still resolves.
+Plan-quality only — declining is always legal — hence MEDIUM, not a blocker. Worth naming
+because the comment that motivates the decline reads as though the loss were unavoidable.

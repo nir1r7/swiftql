@@ -1,5 +1,44 @@
 # Phase 5 orchestrator state
 
+## PASS 4 — engine divergence: **1 BLOCKER / 3 MEDIUM / 2 LOW** (d20441d).
+**E-13 (BLOCKER) — the two engines evaluate expressions on DIFFERENT ROW SETS, IN BOTH DIRECTIONS.**
+`evaluate()` computes BOTH operands of `AND` before the tri-state (evaluator.cc:99-111);
+`evalPredicate` CASCADES the selection vector (columnar_eval.cc:143-146).
+  `SELECT name, age FROM drivers WHERE age > 30 AND SUBSTRING(name, age-30, 3) = 'er_'`
+    -> Volcano **errors**, vectorized returns the correct 3 rows.
+  **Swap the conjuncts and the vectorized path errors too — so it disagrees with ITSELF on a
+  COMMUTATIVE operator.**
+  Reverse direction: `SELECT SUBSTRING(name, age-34, 2) FROM drivers LIMIT 3` -> Volcano answers,
+  vectorized errors; WITHOUT the LIMIT all four modes agree.
+  A chunk-pruning variant makes THE TWO VOLCANO LEGS disagree with each other.
+  The project already reasoned about this class for `CASE` (README:782) and never drew the same
+  conclusion for the connective or the pipeline shape.
+  **This is the same class as the optimizer seam's P4-1** — partial evaluation order deciding
+  whether an error is raised — but between the ENGINES rather than between the legs. Fix round 4
+  should treat them together or it will fix one and leave the other.
+  CORPUS COVERAGE, MEASURED: 592 distinct SELECT literals, 11 with SUBSTRING, 5 under an AND, and
+  **all 5 have a CONSTANT start position.** Green is consistent with the finding.
+**E-14 (MEDIUM) — BOTH new INT->DOUBLE refusals fire on CORRECT-TODAY queries**, for reasons their
+  own comments do not cover: `taintWalk` arms BOTH operands of `/` regardless of type, so `x / 2.0`
+  (truncation impossible) is refused; and the magnitude refusal enforces the `%.15g` RENDERING
+  bound on values that are NEVER RENDERED. **The derived-table form has no working mode at all.**
+  A capability regression introduced by fix round 3.
+**E-15 (MEDIUM)** — the cut's cost lands on the INJECTED `LIMIT 1` for an uncorrelated EXISTS, where
+  only `!rows.empty()` is read: **17.25 s, 2.2x slower than counting the whole join (7.73 s)**,
+  against a 0.21 s control. (Pass 3 left those caps open on the ground that emptiness is
+  order-invariant — true, but it did not price them.)
+**E-17 (MEDIUM)** — the cut's sort sits ABOVE the projection, making it total: **adding a JOIN to a
+  LIMIT query converts a correct Volcano answer into an error.** New, caused by the fix under audit.
+  (Same root as storage's S-11, found independently.)
+LOW: a false justification sentence in `sort_comparator.h`; and `random_diff.py` STILL cannot
+  generate LIMIT-without-ORDER-BY — both stated reasons now expired, including a citation of a
+  `KNOWN_DIVERGENCES` suite that does not exist in the tree.
+PART A CLEAN: both pass-3 blockers closed **as a class, not as instances** — 108 mechanically
+  generated join+LIMIT shapes (4 TPC-H relation pairs x every predicate subset x three projection
+  forms incl. `SELECT *`), a 13-shape hand battery, 15 derived/correlated/semi shapes under a cut,
+  240 random_diff over 4 seeds. The `(relation_slot, name)` argument survives attack at ALL SIX of
+  its producers — the two routes to a duplicate pair are closed by EXPLICIT REFUSALS, not luck.
+
 ## PASS 4 — storage: **0 BLOCKER / 0 HIGH / 2 MEDIUM / 5 LOW** (edccf92). Clean seam.
 **IT CORRECTED ITS OWN SEAM'S PASS-3 NUMBER.** S-9's headline 1540x was over **Plan+Execution
 only** — the flattering denominator. End-to-end it is **+73.8 ms on 2697 ms = +2.7%**, because
