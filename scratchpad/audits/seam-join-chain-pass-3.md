@@ -263,6 +263,159 @@ derived table. **6 of 6 agree three ways**, including the column COUNT of `SELEC
 
 ---
 
+## BLOCKER B3-2 — Week 29's STRING-vs-numeric join-key refusal was written into the `stmt.joins` loop and never extended to the three join producers that arrived after it; a semi/anti/decorrelated join key silently half-matches, and the answers disagree with SQLite in both directions
+
+**Severity: BLOCKER.** A silent wrong answer on a query the engine accepts, in both
+vectorized modes, against the SQLite oracle. Reproduced column-to-column on an ordinary
+schema.
+
+### The rule, and where it lives
+
+`src/planner/validator.cc:284-318` (Week 29, deferred from the Week 27 audit) states the
+problem exactly:
+
+> A join key is compared as TEXT, which carries no type tag: a STRING "7" matches an INT 7
+> while "007" does not, while the identical predicate in a WHERE clause throws Type
+> mismatch — half a match, with no error either way, and both halves reachable on the
+> shipped catalog (drivers.team vs laps.lap_id). Under an outer join the unmatched half
+> comes back as null-extended rows rather than as missing ones, which is why it is closed
+> here.
+
+and closes it with
+
+    for (const JoinKey& k : on.keys) { ... if (l_str != r_str) throw ...; }
+
+That loop is inside `for (size_t i = 0; i < stmt.joins.size(); ++i)`. **`stmt.joins` is one
+of four producers of a `JoinKey` in this engine.** The other three are
+`subquery_lowering.cc` (`IN` / `NOT IN` -> `LogicalSemiJoin` / `LogicalAntiJoin`),
+`subquery_decorrelation.cc::splitCorrelation` (correlated `EXISTS` / `NOT EXISTS`), and
+`subquery_decorrelation.cc`'s correlated-scalar rewrite (the `$scalarN` LEFT join). None of
+the three is covered, and all three shipped *after* Week 29.
+
+### The failing shapes
+
+Data (`scratchpad`-local, two CSVs — a zero-padded STRING id column against an INT one,
+which is an entirely ordinary schema and is why the shipped catalogs cannot see this):
+
+    ids(code STRING, label STRING) = ('016','alpha'), ('17','beta'), ('0018','gamma'), ('19','delta')
+    nums(n INT, tag STRING)        = (16,'sixteen'), (17,'seventeen'), (18,'eighteen'), (20,'twenty')
+
+| # | query | SwiftQL (both vec modes) | SQLite |
+|---|---|---|---|
+| K1 | `FROM ids i JOIN nums m ON i.code = m.n` | **refused** — "cannot join a STRING column with a numeric one" | 3 rows |
+| K9 | `FROM nums m JOIN (SELECT i.code AS c FROM ids i) x ON m.n = x.c` | **refused**, same message | 3 rows |
+| K2 | `FROM ids i WHERE i.code IN (SELECT m.n FROM nums m)` | `{beta}` | `{alpha, beta, gamma}` |
+| K3 | `FROM nums m WHERE m.n IN (SELECT i.code FROM ids i)` | `{seventeen}` | `{eighteen, seventeen, sixteen}` |
+| K4 | `... m.n NOT IN (SELECT i.code FROM ids i)` | `{eighteen, sixteen, twenty}` | `{twenty}` |
+| K5 | `... EXISTS (SELECT 1 FROM ids i WHERE i.code = m.n)` | `{seventeen}` | `{eighteen, seventeen, sixteen}` |
+| K6 | `... NOT EXISTS (SELECT 1 FROM ids i WHERE i.code = m.n)` | `{eighteen, sixteen, twenty}` | `{twenty}` |
+| K7b | `... WHERE (SELECT count(*) FROM ids i WHERE i.code = m.n) > 0` | `{seventeen}` | `{eighteen, seventeen, sixteen}` |
+| K8 | `... m.n IN (SELECT x.c FROM (SELECT i.code AS c FROM ids i) x)` | `{seventeen}` | `{eighteen, seventeen, sixteen}` |
+
+**K1 and K9 are the containment working.** K2–K8 are the same key comparison with the guard
+missing: exactly one row matches — the one whose text is already canonical (`'17'` vs `17`)
+— and `'016'` / `'0018'` silently do not, where SQLite's numeric affinity converts them and
+does. The `NOT` forms return the complement, so the error appears as extra rows as well as
+missing ones. Optimized and `--no-optimize` agree with each other throughout; the divergence
+is against the oracle, not between the legs, which is why the 119 invariant checks are blind
+to it by construction.
+
+`--explain` shows there is nothing exotic in the plan — an ordinary semi join on a
+mismatched key:
+
+    LogicalSemiJoin [n = code]
+      LogicalScan [nums, 2 columns]
+      LogicalProject [code]
+        LogicalScan [ids, 1 columns]
+
+### Reachable without a custom catalog
+
+On the **shipped** `catalog.json`, with a string literal as the body's output column:
+
+    SELECT count(*) FROM laps l WHERE l.driver_id IN (SELECT '016' AS s FROM drivers d)
+      SwiftQL 0        SQLite 495
+    SELECT count(*) FROM laps l WHERE l.driver_id NOT IN (SELECT '016' AS s FROM drivers d)
+      SwiftQL 10000    SQLite 9505
+    ... IN (SELECT '16.0' ...) / (SELECT ' 16' ...) / (SELECT '+16' ...)
+      SwiftQL 0        SQLite 495   (three more non-canonical renderings)
+    ... IN (SELECT '16'  ...)
+      SwiftQL 495      SQLite 495   ("half a match", the half that agrees)
+
+Five divergent forms, one agreeing form, from the same pair of types — which is the precise
+signature Week 29 named and refused.
+
+### Why the encoding cannot be blamed instead
+
+`key_encoding.h` is careful and correct for the contract it states: `keyFieldText` routes an
+integral DOUBLE through the integer path so `7.0` and `7` join (matching SQLite's affinity),
+and it never intends to normalise a STRING. The bug is not in the encoding; it is that the
+one guard which keeps ill-typed pairs away from the encoding is attached to a single
+producer. The `int_keys` SIMD gate (`vectorized_plan_builder.cc:555-558`) is independently
+safe — it requires `TypeId::INT` on **both** resolved key columns — so nothing reaches the
+flat int64 buffer with a string; the exposure is entirely in the text-hash path.
+
+### Fix shape
+
+Move the type test out of `Validator::validate`'s `stmt.joins` loop and apply it where a
+`JoinKey` becomes a `LogicalJoin`'s key — i.e. once, at or just below `LogicalJoin`
+construction, where all four producers converge and both sides' schemas are known. Doing it
+at the producers instead means writing it three more times, which is how it came to be
+missing once already. Whichever site is chosen, refusing (Week 29's decision) rather than
+implementing affinity keeps the two behaviours consistent with each other and with the WHERE
+clause, which still throws `Type mismatch` on the identical predicate.
+
+The standing sweep this belongs to: `validator.cc:284-296`'s comment says the defect "is
+closed here". It is closed for one of four producers, and the comment must say which.
+
+---
+
 ## Part A′ — pass 2's three open MEDIUMs, re-ranked on the moved tree
+
+All three reproduce verbatim on `922ca15`. I **agree with pass 2's MEDIUM on all three**, and
+add one coupling that did not exist when pass 2 ranked them.
+
+### B-2 (`containsOuterJoin` recurses into a DERIVED body) — still MEDIUM, unchanged
+
+`join_enumeration.cc:91-100` is byte-identical. Re-ran pass 2's shape on `catalog.json`:
+
+    LogicalJoin [driver_id@0 = k] join-ordering=skipped (outer join)
+      LogicalJoin [driver_id = driver_id]              <- three inner relations
+      LogicalDerived [x, 2 columns]
+        LogicalProject [k, t]
+          LogicalLeftJoin [driver_id = driver_id]      <- the only outer join, sealed
+
+Still a plan-quality and reason-misattribution defect only; declining is always legal.
+
+### B-3 (`JoinEnumeration::apply` never descends past the topmost JOIN) — still MEDIUM, and the measurement is unchanged
+
+`join_enumeration.cc:612-618` is byte-identical, comment premise included. Re-measured on
+`data/tpch/sf0.01`:
+
+    body alone         order=customer@1,nation@2,orders@0  cost=38417 (written=62729) method=dp
+    body as join input no order= line anywhere; written order kept throughout
+
+**62729 against 38417, still silent** — no `join-ordering=skipped` line, because the body's
+join never meets the pass at all.
+
+### B-5 (`join_enumeration.h:84-91` carries verbatim the paragraph the `.cc` deleted as false) — still MEDIUM, unchanged
+
+Still word for word at `join_enumeration.h:84-91`, and `join_enumeration.h:65` still names
+`hasSlotOutsideRangeTable` and still calls the decline "silent" (pass 2's B-1, also still
+open). Fix round 2 swept `sort_comparator.h` and `compare_against_sqlite.py` for the
+scan-schema asymmetry and did not touch this header.
+
+### !! The new coupling: B-2 and B-3 must not be fixed before B3-1
+
+Both B-2 and B-3 are proposals to make the DP **run in more places**. Under B3-1, every place
+the DP newly runs is a place where the optimizer can permute a sort's input schema and change
+which rows survive a `LIMIT`. Today a derived body's join and the block under a declined
+outer/semi join are immune to B3-1 *because* they are never enumerated — B-3's defect is
+accidentally containing B3-1's. Fixing either of them first would widen a live divergence
+while closing a plan-quality one. Stated here because neither finding's own writeup can see
+the other.
+
+---
+
+## Part B — hunting what passes 1 and 2 missed
 
 (continues below)
