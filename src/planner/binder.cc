@@ -171,9 +171,33 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     // Fold constant arithmetic last, so every downstream pass — Validator, the
     // logical planner, pushdown, cardinality estimation, the chunk pruner, and
     // the columnar comparison fast path — sees `season = 2024` rather than
-    // `season = 2020 + 4`. Unconditional: folding cannot change results, so it
-    // is canonicalization rather than a cost-based decision, and both execution
-    // paths and `--no-optimize` get it.
+    // `season = 2020 + 4`. Unconditional, so it is canonicalization rather than
+    // a cost-based decision, and both execution paths and `--no-optimize` get
+    // it.
+    //
+    // Week 37. This used to say "folding cannot change results", flat, and that
+    // was FALSE — an audit refuted it by execution. What is actually true is
+    // narrower, and it is a claim about VALUES, not about queries:
+    //
+    //   for any expression it agrees to fold, the folded node evaluates to the
+    //   same Value as the original would have, on every row.
+    //
+    // That much foldNode does earn — it calls the same evaluate() the per-row
+    // path calls, declines on any throw so overflow and ill-typing still
+    // surface from their usual site, declines on a NULL result, and never folds
+    // an IS NULL, an aggregate, or into a subquery body.
+    //
+    // It does NOT follow that folding cannot change a query's OUTCOME, and the
+    // gap is any consumer downstream of here that tests the SHAPE of the tree
+    // rather than the value it computes. Folding manufactures Literal nodes;
+    // such a consumer sees one that the user did not write. There was exactly
+    // one — the Validator's column-ordinal rule — and `ORDER BY 1 + 1` was
+    // refused as "ORDER BY 2", an ordinal nobody typed. That rule now tests the
+    // parser's `written_ordinal` instead of Literal-ness, which is what it
+    // always meant (see validator.cc). The obligation this comment carries
+    // forward: a new rule that tests for a Literal in a position the user could
+    // have written an expression in must ask what the user WROTE, or gate
+    // itself ahead of this call.
     //
     // Week 30: this runs PER SCOPE. A subquery's own constants were folded by
     // its own bindQuery, and foldNode declines a SubqueryExpr (dispatch site

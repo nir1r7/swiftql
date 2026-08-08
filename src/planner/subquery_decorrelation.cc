@@ -468,6 +468,40 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             std::vector<ColumnDef> merged = spine->output_schema.columns();
             for (ColumnDef col : normalized.columns()) {
                 col.relation_slot = derived_slot;
+                // SEAM AUDIT pass 2 — B-1. HIDDEN, because `$scalarN` is not a
+                // relation the user wrote and `SELECT *` means "the columns of
+                // the relations in my FROM clause". Without this the star
+                // expansion in LogicalPlanBuilder::build (which runs LAST, over
+                // this merged schema) emitted `$k0` and the aggregate as result
+                // columns: `SELECT * FROM drivers d WHERE d.age > (SELECT
+                // COUNT(*) ...)` returned SEVEN columns where SQLite returns
+                // five. A WRONG ANSWER, not an error — the extra columns resolve
+                // cleanly. Inside a derived body the same defect surfaced as
+                // `internal: derived table 'x' was bound against a 5-column
+                // schema but planned to 7 columns`, because blockOutputSchema
+                // models no subquery lowering and so never saw them.
+                //
+                // `hidden` is exactly the right mechanism and not a borrowed
+                // one: its stated meaning is "computed and flows through the
+                // plan, but SELECT * synthesis skips it" (common/schema.h), and
+                // it is read in exactly three places — build()'s star expansion,
+                // Planner::plan's, and blockOutputSchema's step 3. Nothing about
+                // resolution consults it, so the outer predicate's
+                // slot-qualified read of the aggregate column is untouched;
+                // indexOf matches on name (and slot) alone.
+                //
+                // This is what re-narrows the star to the user's relations at
+                // EVERY nesting depth: a body containing a correlated scalar
+                // hides its own synthetic columns in its own build(), so the
+                // derived relation the enclosing block sees is already narrow,
+                // and blockOutputSchema (which drops hidden columns for a star
+                // body too) agrees with it by construction.
+                //
+                // The other three lowerings need no equivalent: SEMI / ANTI /
+                // ANTI_NOT_IN joins take children[0]'s schema unchanged
+                // (subquery_lowering.cc, and the anti-join site below), so they
+                // never widen the star's domain in the first place.
+                col.hidden = true;
                 merged.push_back(col);
             }
 

@@ -574,16 +574,69 @@ TEST(GroupKeyIdentity, SelfJoinSidesStayDistinct) {
 // A bare integer in ORDER BY parses as a Literal, so ORDER BY 1 used to sort
 // every row by the same constant and return them unsorted with no error at all.
 // Rejecting is the fix; SQLite would treat it as output column 1.
+//
+// Week 37: `-1` and `0` are here because SQLite calls them ordinals too — it
+// answers "1st ORDER BY term out of range", not a constant sort — so refusing
+// them is agreement, not extra strictness.
 TEST(ColumnOrdinals, RejectedInOrderByAndGroupBy) {
     Catalog cat(CATALOG);
     EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY 1", cat),
                  std::runtime_error);
     EXPECT_THROW(buildLogical("SELECT team, COUNT(*) FROM laps GROUP BY 1", cat),
                  std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY -1", cat),
+                 std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY 0", cat),
+                 std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT COUNT(*) FROM laps GROUP BY -1", cat),
+                 std::runtime_error);
     // a non-ordinal expression that merely contains an integer is unaffected
     EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY speed + 1", cat));
     EXPECT_NO_THROW(buildLogical(
         "SELECT season - 1 AS s, COUNT(*) FROM laps GROUP BY season - 1", cat));
+}
+
+// !! Week 37, and the reason the test above needed a companion: every witness
+// it used for "not an ordinal" contains a ColumnRef, so NONE of them can be
+// constant-folded, and it therefore passed identically whether or not the rule
+// was right. The rule tested Literal-ness of the tree the Validator receives,
+// and TWO rewrites that run before the Validator manufacture a Literal in these
+// positions out of text that was never an ordinal:
+//
+//   constant folding      `ORDER BY 1 + 1` -> Literal(2)   (binder.cc)
+//   alias substitution    `SELECT 1 AS one ... ORDER BY one` -> Literal(1)
+//
+// Both legal queries — SQLite accepts both, as a constant sort key on which
+// every row ties — were refused, and the refusal quoted back an ordinal the
+// user had not typed ("ORDER BY 2" for `ORDER BY 1 + 1`). Every EXPECT_NO_THROW
+// below threw before the fix; that is the whole point of the case.
+TEST(ColumnOrdinals, AFoldedOrSubstitutedConstantIsNotAnOrdinal) {
+    Catalog cat(CATALOG);
+    // folds to Literal(2) / Literal(1) before the Validator sees it
+    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY 1 + 1", cat));
+    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY 2 * 1", cat));
+    // (no bare `team` in the select list: a constant group key groups the whole
+    // table into one, so SwiftQL's own GROUP BY rule would refuse it for an
+    // unrelated and correct reason and hide what this case is testing)
+    EXPECT_NO_THROW(buildLogical("SELECT COUNT(*) FROM laps GROUP BY 1 + 1", cat));
+    // the binder replaces `one` with a clone of the select-list Literal
+    EXPECT_NO_THROW(buildLogical("SELECT 1 AS one, team FROM laps ORDER BY one", cat));
+    // parentheses make it an expression to SQLite, and parsePrimary strips them,
+    // so this is the one shape where only the FIRST TOKEN can tell the two apart
+    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY (1)", cat));
+    // one minus is an ordinal to SQLite (rejected above); two is an expression
+    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY - -1", cat));
+    // and the refusal, when it does fire, quotes the text the user typed
+    EXPECT_THROW({
+        try {
+            buildLogical("SELECT team, speed FROM laps ORDER BY 2", cat);
+        } catch (const std::runtime_error& e) {
+            EXPECT_STREQ(e.what(),
+                "ORDER BY 2: column ordinals are not supported; "
+                "use a column name or a select-list alias");
+            throw;
+        }
+    }, std::runtime_error);
 }
 
 // collectAggregates() stops walking at an AggregateExpr, so a nested aggregate

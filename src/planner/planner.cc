@@ -360,7 +360,14 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         std::vector<std::unique_ptr<Expr>> star_exprs;
         std::vector<ColumnDef> star_cols;
         for (const auto& col : child_schema.columns()) {
-            if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
+            // HAVING/ORDER-BY-only aggregates never reach output. The OTHER
+            // producer of `hidden` — a lowered correlated scalar's synthetic
+            // relation (seam audit pass 2, B-1) — cannot occur on this path:
+            // every correlated subquery is refused above, and this path runs no
+            // LogicalPlanBuilder. The test is kept identical to build()'s
+            // anyway, because "the two star expansions differ" is the shape a
+            // Volcano-only wrong answer would take.
+            if (col.hidden) continue;
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
             ref->id = ColumnId::local(col.relation_slot);  // schema slot -> local id:

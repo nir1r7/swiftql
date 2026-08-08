@@ -222,6 +222,23 @@ enum class JoinType { INNER, LEFT };
 struct OrderByItem {
     std::unique_ptr<Expr> expr;
     bool desc = false;
+    // Week 37. The column ordinal EXACTLY AS TYPED ("1", "-1"), or "" when this
+    // item is not an ordinal. The ordinal rule (validator.cc) is a rule about
+    // what the user WROTE, so it is decided by the only layer that knows — the
+    // parser — and carried here rather than re-derived downstream.
+    //
+    // Testing Literal-ness of `expr` instead was wrong, because two rewrites
+    // that run before the Validator MANUFACTURE a Literal in this position out
+    // of source text that was never an ordinal: constant folding (`ORDER BY
+    // 1 + 1` -> Literal(2)) and the binder's select-alias substitution
+    // (`SELECT 1 AS one ... ORDER BY one` -> Literal(1)). Both legal queries
+    // were refused, and the refusal quoted back "ORDER BY 2" / "ORDER BY 1" —
+    // a number the user had not typed. Storing the text is what makes quoting
+    // it back honest by construction.
+    //
+    // Only the parser sets this, so a hand-built OrderByItem is never an
+    // ordinal, which is correct: nobody wrote it.
+    std::string written_ordinal;
 };
 
 // one GROUP BY entry: optionally qualified, slot-stamped by the binder
@@ -241,6 +258,10 @@ struct GroupByColumn {
     // group-by vectors, and the expr is read-only after binding, so sharing
     // is safe. Last field so positional brace-inits ({"", "grp"}) stay valid.
     std::shared_ptr<Expr> expr;
+    // Week 37 — see OrderByItem::written_ordinal. Same rule, same reason:
+    // `GROUP BY 1 + 1` folded to Literal(2) and was refused as "GROUP BY 2".
+    // Defaulted and last, so positional brace-inits stay valid.
+    std::string written_ordinal;
 };
 
 // Week 34 — a relation in FROM / JOIN. Either a catalog table name or a DERIVED

@@ -19,8 +19,23 @@ struct ColumnDef {
     // merged join schema so qualified column references resolve to the correct
     // relation even when several share a column name (incl. self-joins).
     int relation_slot = 0;
-    // true for aggregate outputs referenced only in HAVING/ORDER BY: they are
-    // computed and flow through Filter/Sort, but SELECT * synthesis skips them
+    // "in the plan but not in the query's output list": the column is computed
+    // and flows through every operator normally, and only SELECT * synthesis
+    // skips it. Nothing about RESOLUTION consults this flag — indexOf matches on
+    // name (and slot) alone — so a hidden column is still readable by name from
+    // any expression above it. TWO producers:
+    //   1. aggregate outputs referenced only in HAVING / ORDER BY
+    //      (extractAggregates), which are computed for those clauses only;
+    //   2. the columns of the synthetic `$scalarN` relation a correlated scalar
+    //      subquery is lowered to (subquery_decorrelation.cc) — the outer
+    //      predicate reads the aggregate column by name, but the user wrote no
+    //      such relation, so `*` must not expand over it. Seam audit pass 2,
+    //      B-1: without this, `SELECT * FROM drivers d WHERE d.age > (SELECT
+    //      COUNT(*) ...)` returned 7 columns where SQLite returns 5.
+    // Read in exactly three places, and they must agree: the star expansion in
+    // LogicalPlanBuilder::build, the one in Planner::plan, and step 3 of
+    // blockOutputSchema (which is what makes a derived body's bound schema match
+    // its planned one).
     bool hidden = false;
 };
 

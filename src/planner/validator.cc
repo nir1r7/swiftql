@@ -330,23 +330,37 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
     // every row by the same constant and return them unsorted with no error,
     // and GROUP BY 1 failed with a message about the SELECT list. SQLite treats
     // both as references to output column 1.
+    //
+    // !! Week 37. The test is `written_ordinal`, stamped by the PARSER
+    // (ordinalAsWritten), and NOT `dynamic_cast<Literal*>` on the tree in front
+    // of us — which is what it used to be, and which was WRONG in a way an
+    // audit refuted by execution. The rule is syntactic, and SQLite's own is
+    // too: a term is an ordinal iff it is an integer literal with at most one
+    // leading minus. By the time the Validator runs, two rewrites have
+    // manufactured Literals in exactly these two positions out of source text
+    // that was never an ordinal — constant folding (binder.cc, `ORDER BY 1 + 1`
+    // -> Literal(2)) and the select-alias substitution just above it
+    // (`SELECT 1 AS one FROM laps ORDER BY one` -> Literal(1)). Testing the
+    // tree refused both of those legal queries, and quoted back "ORDER BY 2" /
+    // "ORDER BY 1", an ordinal the user had not typed. The message now quotes
+    // the parser's own record of the text, so it cannot invent one.
+    //
+    // What this deliberately did NOT change: `ORDER BY -1` and `ORDER BY 0` are
+    // still refused (both are ordinals to SQLite, which answers "term out of
+    // range"), and `ORDER BY (1)` is now accepted as the constant expression
+    // SQLite treats it as.
     for (const auto& item : stmt.order_by) {
-        if (auto* lit = dynamic_cast<const Literal*>(item.expr.get())) {
-            if (!lit->value.isNull() && lit->value.type() == TypeId::INT) {
-                throw std::runtime_error(
-                    "ORDER BY " + lit->value.toString() + ": column ordinals are not "
-                    "supported; use a column name or a select-list alias");
-            }
+        if (!item.written_ordinal.empty()) {
+            throw std::runtime_error(
+                "ORDER BY " + item.written_ordinal + ": column ordinals are not "
+                "supported; use a column name or a select-list alias");
         }
     }
     for (const auto& g : stmt.group_by) {
-        if (!g.expr) continue;
-        if (auto* lit = dynamic_cast<const Literal*>(g.expr.get())) {
-            if (!lit->value.isNull() && lit->value.type() == TypeId::INT) {
-                throw std::runtime_error(
-                    "GROUP BY " + lit->value.toString() + ": column ordinals are not "
-                    "supported; use a column name or a select-list alias");
-            }
+        if (!g.written_ordinal.empty()) {
+            throw std::runtime_error(
+                "GROUP BY " + g.written_ordinal + ": column ordinals are not "
+                "supported; use a column name or a select-list alias");
         }
     }
 

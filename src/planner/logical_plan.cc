@@ -547,9 +547,22 @@ Schema blockOutputSchema(const SelectStatement& stmt, const Catalog& catalog) {
         schema = buildAggregateSchema(stmt.group_by, extractAggregates(stmt), schema);
     }
 
-    // 3. Project. SELECT * drops hidden aggregate columns, exactly as build()'s
-    //    star expansion does — a body's HAVING/ORDER-BY-only aggregate is not a
+    // 3. Project. SELECT * drops hidden columns, exactly as build()'s star
+    //    expansion does — a body's HAVING/ORDER-BY-only aggregate is not a
     //    column of the derived RELATION.
+    //
+    //    !! THIS IS WHY THIS FUNCTION NEED NOT MODEL SUBQUERY LOWERING, and the
+    //    reason is worth stating because it looks like an omission. Steps 1-2
+    //    model the spine and the aggregate only; the join lowerCorrelatedScalars
+    //    grafts is invisible here. For a NAMED select list that is harmless (the
+    //    project schema is written from the list). For a `SELECT *` body it
+    //    would NOT be — the star would expand over the widened schema in build()
+    //    and over the narrow one here, and the drift check in buildRelation
+    //    would report an internal defect for legal SQL. That was seam audit pass
+    //    2's B-1, and it is closed at the OTHER end: the lowering marks its
+    //    synthetic columns hidden, so build()'s star drops exactly the columns
+    //    this function never had. The two agree by construction, and this
+    //    function stays a model of what the USER wrote.
     if (stmt.select_star) {
         std::vector<ColumnDef> star;
         for (const auto& col : schema.columns()) {
@@ -1091,7 +1104,13 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         std::vector<std::unique_ptr<Expr>> star_exprs;
         std::vector<ColumnDef> star_cols;
         for (const auto& col : child_schema.columns()) {
-            if (col.hidden) continue; // HAVING/ORDER-BY-only aggregates never reach output
+            // TWO kinds of column are skipped here, not one: a HAVING/ORDER-BY-
+            // only aggregate, and (seam audit pass 2, B-1) the columns of a
+            // synthetic `$scalarN` relation that lowerCorrelatedScalars grafted
+            // into this block. `*` means "the columns of the relations the user
+            // wrote", and this expansion runs LAST — over a schema the subquery
+            // lowerings have already widened. See common/schema.h on `hidden`.
+            if (col.hidden) continue;
             auto ref = std::make_unique<ColumnRef>();
             ref->column_name = col.name;
             ref->id = ColumnId::local(col.relation_slot);  // schema slot -> local id:

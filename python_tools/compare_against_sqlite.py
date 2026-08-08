@@ -145,6 +145,60 @@ CONSTANT_FOLDING_QUERIES = [
     "SELECT COUNT(*) AS c FROM laps WHERE season > 2 * (1000 + 10)",
     "SELECT COUNT(*) AS c FROM laps WHERE season > -(-2023)",
     "SELECT COUNT(*) AS c FROM laps WHERE season = 2020 + 4 AND speed > 100 * 3",
+
+    # !! Week 37. Folding in the ORDER BY / GROUP BY positions, which is where it
+    # used to change the OUTCOME rather than the value: the folded node is a
+    # Literal, the Validator's column-ordinal rule tested Literal-ness, and every
+    # one of these was REFUSED as an ordinal the user had not typed
+    # ("ORDER BY 1 + 1" -> "ORDER BY 2: column ordinals are not supported").
+    # SQLite accepts all of them — an integer literal is an ordinal to SQLite
+    # only when written as one, and `1 + 1` is a constant expression on which
+    # every row ties. The diffed suite could not hold them until now because it
+    # cannot hold a query that errors; the still-refused half is pinned in
+    # WEEK37_COLUMN_ORDINAL_REFUSED. Each carries a unique tie-break so a
+    # constant primary key still leaves a total order to compare in emitted
+    # order.
+    "SELECT team, speed FROM laps ORDER BY 1 + 1, lap_id LIMIT 10",
+    "SELECT team, speed FROM laps ORDER BY 2 * 1, lap_id LIMIT 10",
+    "SELECT team, speed FROM laps ORDER BY (1), lap_id LIMIT 10",
+    "SELECT team, speed FROM laps ORDER BY - -1, lap_id LIMIT 10",
+    "SELECT COUNT(*) AS c FROM laps GROUP BY 1 + 1",
+    # ...and the same manufactured Literal from the OTHER rewrite that runs
+    # before the Validator: the binder substitutes a clone of the select-list
+    # expression for an ORDER BY alias, so `one` became Literal(1) and the query
+    # was refused as "ORDER BY 1". Nothing was folded here at all.
+    "SELECT 1 AS one, team FROM laps ORDER BY one, lap_id LIMIT 10",
+]
+
+# The other half of Week 37, and the half that keeps the guard honest: what an
+# ordinal REFUSAL still is, now that the rule tests the parser's record of what
+# the user wrote instead of Literal-ness of the tree. Pinned here because the
+# diffed oracle cannot hold a query that errors, and because narrowing a guard
+# without pinning what survives is how a guard gets deleted by accident.
+#
+# The message must quote the text AS TYPED. That is the concrete defect the
+# audit found: with the rule reading a folded tree, `ORDER BY 1 + 1` was refused
+# as "ORDER BY 2", an ordinal that appears nowhere in the query.
+#
+# `-1` and `0` are ordinals to SQLite too — it answers "1st ORDER BY term out of
+# range" rather than sorting by a constant — so refusing them is agreement, and
+# they cannot go in the diffed suite because SQLite errors on them as well.
+WEEK37_COLUMN_ORDINAL_REFUSED = [
+    ("SELECT team, speed FROM laps ORDER BY 1 LIMIT 10",
+     "ORDER BY 1: column ordinals are not supported"),
+    ("SELECT team, speed FROM laps ORDER BY 2 LIMIT 10",
+     "ORDER BY 2: column ordinals are not supported"),
+    # not the first ORDER BY item: the two parse sites are separate code
+    ("SELECT team, speed FROM laps ORDER BY team, 2 LIMIT 10",
+     "ORDER BY 2: column ordinals are not supported"),
+    ("SELECT team, speed FROM laps ORDER BY -1 LIMIT 10",
+     "ORDER BY -1: column ordinals are not supported"),
+    ("SELECT team, speed FROM laps ORDER BY 0 LIMIT 10",
+     "ORDER BY 0: column ordinals are not supported"),
+    ("SELECT team, COUNT(*) FROM laps GROUP BY 1",
+     "GROUP BY 1: column ordinals are not supported"),
+    ("SELECT COUNT(*) FROM laps GROUP BY -1",
+     "GROUP BY -1: column ordinals are not supported"),
 ]
 
 # Expressions in the WHERE and projection positions now compile to the
@@ -415,6 +469,18 @@ WEEK31_SUBQUERY_QUERIES = [
     # a subquery over a table the outer query never names: before Week 31 the
     # loader walked from_table + joins only and this died in std::out_of_range
     "SELECT COUNT(*) FROM laps WHERE speed > (SELECT AVG(age) FROM drivers)",
+    # SEAM AUDIT pass 2, B-1's fourth lowering. `SELECT *` beside a MATERIALIZED
+    # subquery: the node is replaced by a literal and no relation is added, so
+    # the star's domain is untouched and the answer is 5 columns. That was true
+    # before the B-1 fix and is true after it — this entry is the immunity lock
+    # for it, and it lives HERE rather than in the vectorized-only seam suite
+    # because an uncorrelated scalar runs on Volcano too, which exercises the
+    # SECOND copy of the star expansion (Planner::plan's). The three lowerings
+    # that are vectorized-only are locked in SEAM2_STAR_OVER_LOWERED_SUBQUERY.
+    # Partial row set (8 of 20) on purpose: an all-rows or no-rows entry
+    # compares few or no columns.
+    "SELECT * FROM drivers d WHERE d.age > (SELECT AVG(l.speed) / 10 FROM laps l) "
+    "ORDER BY d.driver_id",
 
     # --- the NULL cases, which are the ones a materialization gets wrong ---
     # ZERO ROWS: the scalar is NULL, the comparison UNKNOWN, the answer no rows.
@@ -1433,6 +1499,124 @@ WEEK36_CORRELATED_RESIDUAL_REFUSED = [
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team "
      " AND l2.lap_id != l.lap_id)",
      "would have to ride as an ON residual"),
+]
+
+# SEAM AUDIT (subquery chain, pass 2) — B-1. `SELECT *` IN A BLOCK THAT HOLDS A
+# LOWERED SUBQUERY.
+#
+# THE COVERAGE HOLE THIS SUITE EXISTS TO CLOSE, stated first because it is the
+# reason a BLOCKER lived through 1336 oracle queries: every one of the 31
+# WEEK34_CORRELATED_SCALAR_VEC_ONLY entries NAMES ITS SELECT LIST, and so does
+# TPC-H Q17. Not one writes `SELECT *`. The star is the only thing that reads a
+# block's whole output schema, so the oracle had no way to observe that
+# lowerCorrelatedScalars WIDENS that schema with a synthetic relation
+# (`$scalarN` -> `$k0..$k{n-1}` plus the aggregate). It did, and the star
+# expanded over them:
+#
+#     SELECT * FROM drivers d WHERE d.age >
+#       (SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id
+#                                      AND l.speed > 999)
+#     SwiftQL: driver_id name nationality team age $k0 COUNT(*)   -- 7 columns
+#     SQLite:  driver_id name nationality team age               -- 5
+#
+# A WRONG ANSWER, not an error: the extra columns resolve cleanly, both engine
+# legs produce them identically, and `optimized == --no-optimize` reported
+# agreement. Inside a derived body the same defect became an INTERNAL error
+# (`derived table 'x' was bound against a 5-column schema but planned to 7`),
+# because blockOutputSchema models no subquery lowering and so never saw them.
+#
+# WHY EVERY ENTRY HERE IS A DIFF AND NOT A PIN: the leaked columns are named
+# `$k0` / `COUNT(*)` / `AVG(...)`, which no other column in these schemas is
+# called, so they cannot collapse into another key in normalize()'s dict — an
+# extra column changes the row TUPLE LENGTH, and rows_equal rejects on length
+# before it compares a value. That is what makes these entries discriminating
+# rather than decorative, and it was verified by re-running them against a
+# binary with the fix removed (all six of the first group failed).
+#
+# THE LAST FIVE ARE NOT ABOUT THE BUG — they are the immunity locks. The other
+# three lowerings (IN semi join, NOT IN anti join, EXISTS/NOT EXISTS
+# decorrelation) set the join's output_schema to children[0]'s and so never
+# widen the star's domain, and an uncorrelated scalar is substituted as a
+# literal with no relation added at all. They were correct before this fix and
+# are correct after it; without an entry each, that is a fact nobody is
+# checking. Their row sets are deliberately PARTIAL (17/3/11/9/8 of 20) — an
+# all-rows or no-rows entry compares zero or few columns and would pass on an
+# engine that emitted the wrong ones.
+SEAM2_STAR_OVER_LOWERED_SUBQUERY_VEC_ONLY = [
+    # THE BLOCKER, verbatim. COUNT with an unsatisfiable body filter, so every
+    # correlation group is empty and the leaked columns arrive as NULLs.
+    "SELECT * FROM drivers d WHERE d.age > (SELECT COUNT(*) FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.speed > 999) ORDER BY d.driver_id",
+    # ...and a NON-COUNT aggregate, where the leaked columns carry REAL VALUES
+    # rather than NULLs. Worth having both: a fix that dropped null-extended
+    # columns rather than synthetic ones would pass the entry above.
+    "SELECT * FROM laps l WHERE l.season = 2024 AND l.speed > 1.02 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) ORDER BY l.lap_id",
+    # TWO correlated scalars in one block: two synthetic relations, at two
+    # different range-table slots, stacked one join above the other. The second
+    # lowering's spine is the first lowering's MERGED schema, so this is what
+    # says the narrowing is carried through a stack rather than applied once.
+    "SELECT * FROM laps l WHERE l.speed > (SELECT AVG(l2.speed) FROM laps l2 "
+    "WHERE l2.team = l.team) AND l.speed < 1.02 * (SELECT AVG(l3.speed) "
+    "FROM laps l3 WHERE l3.driver_id = l.driver_id) ORDER BY l.lap_id",
+    # THE OTHER DIRECTION, and the entry that stops the fix from being "expand
+    # the star over relation 0 only": a real JOIN beside the correlated scalar.
+    # The star must still emit BOTH user relations and neither synthetic one.
+    # (normalize() keys rows by column name, so the two `driver_id`s and the two
+    # `team`s collapse on BOTH sides identically — 12 keys, not 14. That blind
+    # spot is documented at normalize(); it does not weaken this entry, because
+    # the columns under test are named `$k0` and `AVG(l2.speed)` and collapse
+    # into nothing.)
+    "SELECT * FROM drivers d JOIN laps l ON d.driver_id = l.driver_id "
+    "WHERE l.season = 2024 AND l.speed > 1.05 * (SELECT AVG(l2.speed) FROM laps l2 "
+    "WHERE l2.team = l.team) ORDER BY l.lap_id",
+    # THE DERIVED-BODY SYMPTOM (B-1's second half). Before the fix this was not a
+    # wrong answer but an INTERNAL ERROR — buildRelation's drift check caught
+    # blockOutputSchema (5) disagreeing with build() (7) and refused legal SQL.
+    # It is the one shape that proves the narrowing happens INSIDE the body's own
+    # build() rather than at the top level only.
+    "SELECT COUNT(*) AS n FROM (SELECT * FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.speed > 999)) AS x",
+    # ...and the same body with its columns READ BY NAME from outside, so the
+    # derived RELATION's schema is checked column-by-column and not just by
+    # width. `x.name` and `x.age` only resolve if the star published exactly the
+    # five columns of `drivers`, in order.
+    "SELECT x.name AS nm, x.age AS ag FROM (SELECT * FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.speed > 900)) AS x ORDER BY nm",
+
+    # --- the immunity locks: the three lowerings that never had the hole ---
+    # IN -> SEMI join (output_schema is children[0]'s)
+    "SELECT * FROM drivers d WHERE d.driver_id IN (SELECT l.driver_id FROM laps l "
+    "WHERE l.speed > 344 AND l.season = 2024) ORDER BY d.driver_id",
+    # NOT IN -> ANTI_NOT_IN join
+    "SELECT * FROM drivers d WHERE d.driver_id NOT IN (SELECT l.driver_id FROM laps l "
+    "WHERE l.speed > 344 AND l.season = 2024) ORDER BY d.driver_id",
+    # correlated EXISTS -> decorrelated SEMI join
+    "SELECT * FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.speed > 344.9) ORDER BY d.driver_id",
+    # correlated NOT EXISTS -> decorrelated ANTI join
+    "SELECT * FROM drivers d WHERE NOT EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.speed > 344.9) ORDER BY d.driver_id",
+    # (the fourth lowering — an UNCORRELATED scalar, materialized to a literal
+    # with no relation added — is NOT here: it runs on Volcano too, so its star
+    # entry lives in WEEK31_SUBQUERY_QUERIES and is diffed in all four modes.)
+]
+
+# Per-query pins, not a shared tail: these queries reach three DIFFERENT Volcano
+# refusals (IN, correlated, derived), and an entry that pinned only "not
+# supported on the Volcano path" would pass if the wrong one fired. Tested in
+# the order Planner::plan tests them — the IN guard runs before the correlated
+# one, and both run before the derived-table one.
+def _seam2_volcano_pin(q: str):
+    if " IN (" in q or " NOT IN (" in q:  return VOLCANO_IN
+    if "FROM (SELECT" in q:               return VOLCANO_DERIVED
+    return VOLCANO_CORRELATED
+
+SEAM2_STAR_OVER_LOWERED_SUBQUERY_VOLCANO_REJECTED = [
+    (q, _seam2_volcano_pin(q))
+    for q in SEAM2_STAR_OVER_LOWERED_SUBQUERY_VEC_ONLY
 ]
 
 WEEK34_DISTINCT_AGG_QUERIES = [
@@ -2518,6 +2702,8 @@ def main():
                              "Week 34 derived-table refusals"),
                             (WEEK31_MATERIALIZATION_REFUSED,
                              "Week 31 materialization divergences from SQLite"),
+                            (WEEK37_COLUMN_ORDINAL_REFUSED,
+                             "Week 37 column-ordinal refusals"),
                             (WEEK30_REJECTED_QUERIES, "Week 30 rejections")):
             rp, rf, re_ = run_rejection_suite(
                 suite, f"{name} — {label}", extra_args=extra)
@@ -2634,6 +2820,26 @@ def main():
         mp, mf, me = run_rejection_suite(
             WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED,
             f"Week 34 correlated scalar subqueries refused — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+
+    # SEAM AUDIT pass 2 — B-1. `SELECT *` in a block that holds a lowered
+    # subquery. Same split, same reason as the suite above; every entry here is
+    # a DIFF because the defect was a wrong answer, not a refusal.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, SEAM2_STAR_OVER_LOWERED_SUBQUERY_VEC_ONLY,
+            f"Seam pass 2 — SELECT * over a lowered subquery — {label}",
+            extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            SEAM2_STAR_OVER_LOWERED_SUBQUERY_VOLCANO_REJECTED,
+            f"Seam pass 2 — SELECT * over a lowered subquery refused — {label}",
+            extra_args=extra)
         m_passed += mp
         m_failed += mf
         m_errors += me

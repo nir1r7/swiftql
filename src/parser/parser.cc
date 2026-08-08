@@ -14,6 +14,46 @@ namespace {
 const char* const kNotSupportMessage =
     "NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL";
 
+// Week 37. "The user wrote a column ordinal here" — the fact the Validator's
+// ordinal rule (validator.cc) actually needs, recorded at the only layer that
+// can still tell. Returns the ordinal exactly as typed, or "" for anything
+// else, which is what the refusal has to quote back.
+//
+// The rule is SQLite's, and it is purely syntactic: an ORDER BY / GROUP BY term
+// is an ordinal iff it is an integer literal, optionally preceded by ONE unary
+// minus. Measured against sqlite3 — `2` is output column 2; `-1` and `0` are
+// ordinals and raise "term out of range"; `1 + 1`, `- -1` and `(1)` are
+// ordinary constant expressions it evaluates and accepts.
+//
+// `first` is the item's first token and it is load-bearing twice: it is what
+// separates `1` from `(1)` (parsePrimary strips parentheses, so both parse to a
+// bare Literal), and it is what stops `-speed` reaching the negated branch.
+// Given `first`, the shape of the parsed node settles the rest — at parse time
+// a top-level Literal can come from nowhere but parsePrimary consuming one
+// INT_LITERAL token, because every operator wraps its operands.
+//
+// This must be decided HERE. After the binder runs the same question is
+// unanswerable: constant folding and select-alias substitution both manufacture
+// Literals in these two positions out of text that was never an ordinal.
+std::string ordinalAsWritten(TokenType first, const Expr* expr) {
+    auto intLiteral = [](const Expr* e) -> const Literal* {
+        auto* lit = dynamic_cast<const Literal*>(e);
+        if (lit && !lit->value.isNull() && lit->value.type() == TypeId::INT) return lit;
+        return nullptr;
+    };
+    if (first == TokenType::INT_LITERAL) {
+        if (const Literal* lit = intLiteral(expr)) return lit->value.toString();
+    } else if (first == TokenType::MINUS) {
+        if (auto* neg = dynamic_cast<const UnaryExpr*>(expr)) {
+            if (neg->op == "-") {
+                if (const Literal* lit = intLiteral(neg->operand.get()))
+                    return "-" + lit->value.toString();
+            }
+        }
+    }
+    return "";
+}
+
 std::string upperCase(const std::string& s) {
     std::string out = s;
     for (char& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -179,14 +219,18 @@ SelectStatement Parser::parseSelect(){
         expect(TokenType::BY, "BY");
         {
             OrderByItem item;
+            const TokenType first = current_.type;
             item.expr = parseExpr();
+            item.written_ordinal = ordinalAsWritten(first, item.expr.get());
             item.desc = match(TokenType::DESC);
             if (!item.desc) match(TokenType::ASC);
             stmt.order_by.push_back(std::move(item));
         }
         while (match(TokenType::COMMA)) {
             OrderByItem item;
+            const TokenType first = current_.type;
             item.expr = parseExpr();
+            item.written_ordinal = ordinalAsWritten(first, item.expr.get());
             item.desc = match(TokenType::DESC);
             if (!item.desc) match(TokenType::ASC);
             stmt.order_by.push_back(std::move(item));
@@ -646,12 +690,14 @@ std::unique_ptr<Expr> Parser::parseExistsSubquery(bool negated) {
 std::vector<GroupByColumn> Parser::parseColumnList(){
     auto parseOne = [&]() -> GroupByColumn {
         GroupByColumn col;
+        const TokenType first = current_.type;
         auto expr = parseExpr();
         if (auto* cr = dynamic_cast<ColumnRef*>(expr.get())) {
             // plain (possibly qualified) column: keep the name-based fast path
             col.table_name = cr->table_name;
             col.column_name = cr->column_name;
         } else {
+            col.written_ordinal = ordinalAsWritten(first, expr.get());
             col.expr = std::move(expr);   // expression key (GROUP BY season - 1)
         }
         return col;
