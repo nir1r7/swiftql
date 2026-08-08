@@ -145,6 +145,16 @@ LOW: the "missed subtype answers TRUE" safety claim fails OPEN at OPERATOR granu
   (thread the filter's child schema through `pruningHintForPreservedSide`) is exactly the fix for
   the other. One fix, two findings.
 
+## A tool worth keeping: `scratchpad/tools/modes.sh`
+An auditor wrote a one-command six-mode differential runner and left it in the REPO ROOT untracked.
+Moved to `scratchpad/tools/` — it does not belong in the project and adding tools was not in scope
+for a fix round. It is one line per mode and trivially recreated if a reclaim eats it:
+  ./modes.sh <binary> <catalog> "<query>"
+runs row/volcano, row/volcano/noopt, col/volcano, col/volcano/noopt, col/vectorized,
+col/vectorized/noopt with `--no-cache --format tsv` and prints each on one line.
+**Nearly every auditor this phase hand-rolled this loop.** If Week 37 wants it in the project, that
+is a deliberate decision for the user, not a side effect of an audit.
+
 ## !! THE `setsid` BUG — it explains an earlier false "green"
 The detached-plus-`tail --pid` pattern I propagated **does not survive the 10-minute Bash cap**.
 Plain `setsid` does NOT fork when the shell's child is not already a process-group leader, so the
