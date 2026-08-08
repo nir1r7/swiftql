@@ -562,3 +562,134 @@ argument is the finding worth carrying forward: a screen handed the wrong schema
 does not fail safe, it fails in whichever direction the name table happens to
 point.
 
+---
+
+## Part B — the passes, re-enumerated from source at `b14d086`
+
+### B.1 The census is now **3 gated, 9 ungated**. `INVARIANT_SCOPE` says 5+1 and is short by THREE.
+
+`--no-optimize` still gates exactly three, re-read at both sites
+(`main.cc:574-588` top level, `main.cc:137-139` in `runVectorizedToRows`).
+Everything else that rewrites a plan runs on both legs:
+
+| # | pass | site | gated? | note |
+|---|---|---|---|---|
+| 1 | `PredicatePushdown` | `main.cc:576` / `:138` | **gated** | |
+| 2 | `JoinEnumeration` | `main.cc:590` / `:139` | **gated** | |
+| 3 | `CardinalityEstimator` | `main.cc:594` / `:140` | **gated** | |
+| 4 | `foldConstants` | `binder.cc:259` | no | identical by construction; runs before `build` |
+| 5 | `substituteGroupKeyRefs` | `logical_plan.cc:1063` | no | **absent from the harness census** |
+| 6 | derived normalization (`buildRelation`) | `logical_plan.cc:1067` | no | |
+| 7 | `lowerInSubqueries` | `logical_plan.cc:1159` | no | **violates the totality definition — P5-1** |
+| 8 | `lowerExistsSubqueries` | `logical_plan.cc:1165` | no | **violates the totality definition — P5-1** |
+| 9 | `lowerCorrelatedScalars` | `logical_plan.cc:1180` | no | clean — LEFT join, row-preserving (checked) |
+| 10 | `deterministicCut` | `logical_plan.cc:1280` | no | **absent from the harness census**; inserts a SORT |
+| 11 | **`applyLimit`** | `logical_plan.cc:1281` | no | **NEW in round 4, absent from the harness census.** Inserts a `LogicalLimit` in a different POSITION, conditionally on `exprMayRaise` |
+| 12 | `materializeSubqueries` | `main.cc:550` | no, but its **output is gate-dependent** | threads the flag into the nested runner |
+
+`python_tools/test_new_queries.py:635-642` still reads *"5 further passes are
+identical in both legs BY CONSTRUCTION … The 6th, materializeSubqueries"*. That is
+9, not 6 — pass 4's P4-4 named two of the three missing (`substituteGroupKeyRefs`,
+`deterministicCut`) and was ranked LOW and not acted on, and round 4 then added a
+third (`applyLimit`). **LOW P5-6**, unchanged in kind from P4-4 but now larger,
+and `applyLimit` is the entry that matters most: it is the only ungated pass whose
+firing is decided by `exprMayRaise`, so every defect in the screen is also a
+plan-shape defect on every `LIMIT` query, in both legs at once, where no
+differential can see it.
+
+### B.2 Preconditions: checked, believed, or reachable by a later shape
+
+| rule | precondition | CHECKED / BELIEVED | reachable by a later shape? |
+|---|---|---|---|
+| `distribute` inner/standard only | pushed side not null-supplying, not a semi/anti body | **checked**, positively | no |
+| pushdown before enumeration | `distribute` reads WRITTEN spine order | **believed** — guaranteed only by call order at `main.cc:576/590`; nothing asserts it | yes |
+| `foldConstants` before `build` | `inferExprType` throws on a surviving `IntervalLiteral` | **believed** — guaranteed by folding being last in `Binder::bind`; `binder.cc:190` says so in prose | yes |
+| **`deterministicCut` before `applyLimit`** | reversed, the LIMIT would sink below the projection and the sort would then be inserted ABOVE it, cutting different rows | **believed** — two adjacent lines (`:1280`, `:1281`). `applyLimit`'s comment describes the interaction but neither asserts the order | **yes — NEW this round** |
+| `applyLimit`'s PROJECT branch | `LIMIT n(π(R)) ≡ π(LIMIT n(R))` needs π 1:1 AND the child's order plan-stable | **checked, by an argument I had to reconstruct**: the branch can only fire when `deterministicCut` left the node a PROJECT, i.e. `orderIsPlanStable` was true, and `orderIsPlanStable` returns **false for JOIN** — so a reorderable child is structurally impossible here. Neither function says it is load-bearing for the other | no |
+| never below AGGREGATE / SORT / DISTINCT / LIMIT | structural | **checked** — `apply` rewrites only FILTER over JOIN / SCAN / DERIVED / PROJECT, and a body with a LIMIT has LIMIT as its root | no |
+| `remapThroughProject` | every named column a plain passthrough | **checked** (`dynamic_cast`, all-or-nothing) | no |
+| `projection_total` (P4-B1) | no select-list SIBLING may raise | **checked**, against the projection's INPUT schema — the right one | no |
+| **the totality screen — partition** | nothing crosses the frozen index | **checked at all five sites** (four movers + the pruner walk) | no |
+| **the totality screen — classifier** | every conjunct that can raise is classified so | **CHECKED BY SCHEMA, and the schema can be the WRONG one — P5-2** | **yes, today** |
+| **the totality rule vs. subquery lowering** | *"nothing may change that set … not a plan rewrite"* | **BELIEVED, and FALSE — P5-1**. Two lowerings interpose a row-reducing semi-join below the filter | yes |
+| `CardinalityEstimator::selectivity` | may decide plan quality only, never order for a raiser | **now stated** (`cardinality_estimator.h:101-114`) and enforced by the caller. Pass 3's B.1 gap is closed | — |
+| `deterministicCut` | inserted sort's input schema is plan-independent | **checked** (pass 4's A.6, re-read; `(relation_slot, name)` tie-break) | no |
+| `materializeSubqueries` | body's result is plan-independent | **checked** — B3-1b's repro agrees at this HEAD | — |
+
+### B.3 Idempotency and ordering
+
+* **`PredicatePushdown` is still effectively idempotent**, including round 4's new
+  `projection_total` screen: a second `apply` re-tests the same select list and
+  refuses the same conjuncts. The only non-idempotent write remains
+  `LogicalDerived::pushdown_decision`, a string overwritten with the same value
+  and never read by the pass.
+* **`JoinEnumeration` is still not idempotent** (pass 2's B-7); `applyToSpineLeaves`
+  still cannot hand a rebuilt spine back to `decompose`.
+* **`applyLimit` and `deterministicCut` run exactly once**, from `build`, so
+  idempotency does not arise — but their ORDER now matters and is unasserted
+  (B.2).
+* **Ordering dependencies are now three, all guaranteed by adjacency alone**:
+  pushdown→enumeration, folding→build, cut→limit. Each is documented in prose at
+  one end and at neither in code.
+
+### B.4 What I checked this pass and found CLEAN
+
+Recorded as results so the record is complete.
+
+* **Round 4's fixes are real.** All four of P4-1's divergences agree on both legs;
+  `chunk_pruner.h`'s own documented repro (`lap_id * 92233… > 0 AND lap_id > 999999`)
+  agrees across all six mode/leg cells where it used to split row-vs-columnar;
+  both of P4-B1's derived-body shapes agree; the DOUBLE-arithmetic plans are
+  byte-identical between spellings.
+* **The raise-site enumeration is now closable in one command**: no `throw` exists
+  in `columnar_eval.cc` or `expression_executor.cc`, so `evaluate()` + `value.cc`
+  + `checked_arith.h` + `canSkipChunk` is the entire set.
+* **A conjunct that raises only on rows a later predicate would eliminate DOES
+  raise, in every mover.** Run for `SUBSTRING(name, age-34, 2)` guarded by
+  `age > 99999` (drivers), for INT overflow guarded by `lap_id > 999999` (laps,
+  where a zone map really can prune), through a join, through a LEFT join,
+  through a derived body and through the PROJECT descent. The one place it does
+  NOT raise is P5-1 (subquery lowering) and P5-2 (the mistyped pruner hint).
+* **31 further cross-shape queries agree between the legs** in all three
+  supported modes — CASE with a raising arm both orders, IN over constants,
+  LIKE, bare-column predicates (`WHERE speed`, `WHERE lap_id`), unary minus over
+  INT and over DOUBLE, `IS NULL` over a raising operand, OR-inside-AND both
+  orders, GROUP BY / HAVING, a 3-relation self join both orders, derived bodies
+  with computed and passthrough select lists, and `LIMIT` with a raising
+  projection with and without `ORDER BY` and `DISTINCT`.
+* **`orderIsPlanStable` returns false for JOIN**, which is what makes
+  `applyLimit`'s new PROJECT branch unable to see a reorderable child (B.2).
+* **TPC-H sf0.01 has NO shared column name at all** across its eight tables
+  (checked programmatically), and `catalog.json`'s two shared names are
+  type-matched — so P5-2 is unreachable by every query in every harness. The
+  green gate is evidence about the corpus, not about the code.
+* **`pruning=on` is honest**: `vec_scan_node.cc:104-105` documents it as "a hint
+  is attached", and `--explain-analyze` prints the real `chunks_skipped=n/m`.
+* **`lowerCorrelatedScalars` uses a LEFT join** and is therefore row-preserving,
+  which is why it is not part of P5-1. Verified by execution and by `--explain`.
+
+### B.5 Not reached
+
+* **I ran no harness and no gate.** Every number here is a single-query CLI
+  invocation against `build/swiftql`, which is newer than every file under `src/`.
+  No source file was touched, no build was started, and the build lock was never
+  taken.
+* P5-3's 90× and P5-4's 2.55× are **debug-build** figures. Pass 4 recorded that
+  ratios on these shapes are build-sensitive by roughly 3×; take the Release
+  figure independently before quoting either.
+* I did not construct a **wrong-row** divergence. P5-2 is error-vs-rows, P5-1 is
+  error-vs-rows. I looked for a row divergence through the pruner (the
+  mistyping changes only whether the WALK continues, never what is COLLECTED —
+  the `localSlot() < 1` guard still rejects every foreign ref) and through the
+  freeze (the partition is sound at all five sites), and found none. Absence of a
+  repro is not a proof.
+* I did not chase the correlated-ref instance of P5-2's root cause. A correlated
+  `ColumnRef` also misses the slot-qualified lookup and takes the bare-name
+  fallback in `staticTypeOf`, and `forEachLocalColumnRef` SKIPS it in both
+  remappers, so a correlated ref inside a conjunct pushed into a derived body
+  would be neither typed nor remapped. I could not construct a query that reaches
+  it and did not want to report a shape I had not run.
+* I did not re-audit `subquery_materialization.cc` or `subquery_decorrelation.cc`
+  internals; the subquery-chain seam owns those. P5-1 is about WHERE the lowering
+  puts its node, not about the lowering.
+
