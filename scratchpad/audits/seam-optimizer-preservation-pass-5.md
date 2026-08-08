@@ -226,3 +226,80 @@ that is deliberately asked about a schema the expression was not written against
 Sharing one function between a resolver and a screen is what merged the two
 rules. That is a fix note, not a fix; I touched no source.
 
+---
+
+## Part A — `exprMayRaise`, form by form
+
+Every raise site reachable per row is in three files and nowhere else. I checked
+this rather than inherited it: `grep -n "throw"` over `src/execution/columnar_eval.cc`
+and `src/execution/expression_executor.cc` returns **no throw statements at all**
+— every mention is a comment about declining a shape so `evaluate()` raises it.
+So `evaluator.cc` + `common/value.cc` + `execution/checked_arith.h` is the whole
+set, and modelling `evaluate()` is modelling all three engines. That is a real
+strengthening of the argument since pass 4, and it is checkable in one command.
+
+`ChunkPruner::canSkipChunk` is the FOURTH site, outside `evaluate()` entirely,
+and round 4 guarded it directly (`chunk_pruner.h:150-155`: a STRING/non-STRING
+zone-map/literal pair returns false). Verified: `WHERE team = 5 AND speed > 999999`
+now errors on both legs where it used to answer 0 rows optimized.
+
+### The table
+
+Each row: the form, whether `evaluate()` can raise on it, what the screen
+answers, and how I decided. "run" = constructed and executed on both legs.
+
+| form | can raise? | screen | verdict |
+|---|---|---|---|
+| `Literal` | no | false | exact |
+| `ColumnRef` | yes — *Column not found* (`evaluator.cc:92`) | `!staticTypeOf` | exact for a LOCAL ref; **wrong for a foreign ref — P5-2** |
+| `+ - * /`, INT/INT | yes — `checkedAdd/Sub/Mul/Div`, and `INT64_MIN / -1` | true | exact-and-necessary. Cost measured, §P5-3 |
+| `+ - * /`, any DOUBLE | **no** — `evaluator.cc:155-160` takes the plain-IEEE branch | false | **exact.** This is round 4's fix and it is right |
+| `+ - * /` with a STRING operand | refused by `inferExprType` at plan time | true | over-approximate, free (unreachable) |
+| unary `-`, INT | yes — `checkedNegate` | true | exact |
+| unary `-`, DOUBLE | no | false | exact |
+| `AND` / `OR` with a non-INT operand | yes — `asInt()` → `bad_variant_access` (`value.cc:28`) | `l != INT \|\| r != INT` | exact. `WHERE speed AND …` run both orders: agrees |
+| comparison across the STRING boundary | yes — `NUMERIC_COERCE` (`value.cc:57`) | `(l==STRING) != (r==STRING)` | exact **as an expression**; P4-1's hole is closed. Run: 4/4 repros agree |
+| comparison, INT vs DOUBLE | no — coerced | false | exact |
+| comparison against a NULL `Literal` | **no** — `value.cc` returns false before the type check, which the screen's own comment states | reports `null_type` ⇒ can answer TRUE | **over-approximate, and it costs — §P5-4** |
+| `IN` over a constant list | yes, same boundary | per-value STRING test | exact; `values` is `vector<Value>` so the list hides no expression. Run: agrees both orders |
+| `LIKE` | yes — *LIKE requires a STRING operand* | operand must type STRING | exact. `pattern` is a `std::string`, not an Expr, so there is no computed-pattern case at all |
+| `SUBSTRING`, constant bounds | no — `inferExprType` decides the domain at plan time, both legs | false | exact; TPC-H Q22 stays total. Verified `1 + 1` accepted, `1 - 1` refused |
+| `SUBSTRING`, computed bounds | yes — `substringOf` | true | exact. Run: guard-first is total, raiser-first errors, **and still errors when a later conjunct eliminates every row** |
+| `CASE` arms | yes, any arm | screens EVERY arm + each condition must type INT | over-approximate ON PURPOSE (`evaluate` short-circuits, `ExpressionExecutor` declines the node) — correct, and the stricter answer is the only one both engines can honour. Run: agrees both orders |
+| `CASE` with a `case_operand` | — | — | **not a case**: `ast.h:128-137` says the simple form is not supported; searched CASE only |
+| `NOT x` | — | — | **not a case**: the parser refuses a standalone `NOT` (*"NOT is supported only as NOT BETWEEN, NOT LIKE, NOT IN or IS NOT NULL"*). Negation lives on `InExpr::negated` / `LikeExpr::negated` / `IsNullExpr::is_not_null`, all screened through their operand |
+| `IS NULL` | operand IS evaluated | recurses | exact |
+| `AggregateExpr` | yes — output column absent | `!staticTypeOf` | exact; `evaluate` reads the precomputed column and recomputes nothing |
+| a subquery inside a conjunct | `SubqueryExpr::evaluate` throws unconditionally | true (falls through) | correct and unreachable — but see **P5-1**, where the LOWERING of that subquery is the problem, not its evaluation |
+| a correlated reference | — | bare-name fallback | same root cause as P5-2; see below |
+| a UDF-like builtin | — | — | **`SUBSTRING` is the only one.** `ast.h:141-147` says so and prescribes a `FunctionExpr` + registry if a second arrives. If that happens it lands on the final `return true` — safe |
+
+### The one class the table cannot close: `staticTypeOf` fails OPEN on an OPERATOR, not on a subtype
+
+The file's stated defence (`expr_totality.h:44-46`) is:
+
+> A MISSED Expr subtype here must answer TRUE, which the final `return true`
+> delivers.
+
+That is true at **subtype** granularity and **false at operator granularity**, in
+three places, and it is the direct answer to Part B's "can it fire on a shape
+added later than it was written":
+
+1. `staticTypeOf`'s `BinaryExpr` arm ends `out = TypeId::INT; return true;` for
+   anything that is not `+ - * /`. A new operator — string concatenation `||` is
+   the obvious next one — is silently typed INT.
+2. `exprMayRaise`'s `BinaryExpr` arm ends `return (l == STRING) != (r == STRING);`
+   for the same set. `'a' || 'b'` would be typed STRING/STRING and answer
+   **FALSE — total**, and a concat kernel that can raise (allocation, or a length
+   cap) would be classified total from day one.
+3. Neither function tests `un->op` at all. `UnaryExpr` is treated as *the negate
+   node* by both. `ast.h:66-70` says `// "-"` and `Parser::parseUnary` enforces
+   it, so this is correct today — and a `NOT` node added as a `UnaryExpr` would
+   make `staticTypeOf` report the OPERAND's type (should be INT) and
+   `exprMayRaise` answer FALSE for `NOT speed`.
+
+Three files must stay in lockstep (`ast.h`'s comment, `parseUnary`, and these two
+functions) and nothing asserts it. Recorded as **LOW P5-5**: not wrong today,
+wrong by default on the next operator, and the header's own safety claim is what
+would stop a reader from checking.
+
