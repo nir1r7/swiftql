@@ -11,13 +11,24 @@
 #include "execution/vec_simd_loop_join_node.h"
 #include "planner/cost_model.h"
 #include "planner/predicate_pushdown.h"   // pruningHintForPreservedSide — shared with Planner::plan
+#include "execution/evaluator.h"          // resolveColumnIndex — same resolution the operators use
+#include "parser/expr_utils.h"            // aggregateOutputName
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
+
+// per-build lowering state: the table map plus a remaining-use count per
+// table, so a self-join (two LogicalScans, one map entry) copies the table
+// for every scan except the last, which moves it
+// Which output columns of which materializing node must refuse an INT Value.
+// Keyed by LOGICAL node, filled by armIntObservableColumns below and read by
+// the PROJECT and AGGREGATE cases of lowerNode.
+using IntObservableMap = std::unordered_map<const LogicalPlanNode*, std::vector<bool>>;
 
 // per-build lowering state: the table map plus a remaining-use count per
 // table, so a self-join (two LogicalScans, one map entry) copies the table
@@ -26,10 +37,359 @@ struct Lowering {
     std::unordered_map<std::string, ColumnarTable>& tables;
     std::unordered_map<std::string, int> scan_uses;
     const Catalog& catalog;   // borrowed, read-only: build-side width stats
+    const IntObservableMap& int_observable;
 
     std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where);
     std::unique_ptr<VecPlanNode> lowerNode(LogicalPlanNode* node, const Expr* pruning_where);
+
+    // The arming mask for one materializing node, sized to its output schema.
+    // Empty when nothing on this node is armed, which is the normal case.
+    std::vector<bool> maskFor(const LogicalPlanNode* node) const {
+        auto it = int_observable.find(node);
+        return it == int_observable.end() ? std::vector<bool>() : it->second;
+    }
 };
+
+// ===================================================================
+// INT-in-a-DOUBLE-column arming (see vec_types.h,
+// refuseObservableIntNarrowing, for WHAT is being refused and why the test
+// cannot live at appendColumnValue).
+//
+// The question this pass answers is the plan-shape one: a materialized column
+// whose declared type is DOUBLE but whose runtime Value can be INT is harmless
+// when it is only rendered (%.15g prints 7.0 as "7"), and wrong the moment
+// another expression DIVIDES with it, because INT/INT truncates and INT/DOUBLE
+// does not. So: walk the logical plan bottom-up carrying, per output column,
+// the set of ORIGINS whose INT-ness that column's runtime type still depends
+// on; at every expression, arm the origins that reach an operand of `/`.
+//
+// Why `/` alone and not "consumed by any expression". Everything else in the
+// dialect either coerces or normalizes, and widening would move answers that
+// pass today:
+//   - `+ - *` on INT/INT give an INT whose %.15g rendering is identical to the
+//     DOUBLE (`x+1` is "8" either way), so `WHERE x+1 > 3` and `SELECT x*2`
+//     agree across engines. They still PROPAGATE taint — `(x*2)/4` is 3 vs 3.5
+//     — which is why the walk returns an origin set instead of a bool;
+//   - comparisons coerce (Value::operator== / < promote INT against DOUBLE);
+//   - group keys, DISTINCT keys and join keys go through key_encoding.h, whose
+//     keyFieldText normalizes an integral double back to INT text — the same
+//     %g cliff, already handled there;
+//   - ORDER BY compares numerically, and 7 and 7.0 sort identically.
+// The one route left open on purpose is checked INT overflow: `x * <huge>`
+// throws in Volcano and yields a double here. That is a magnitude story like
+// narrowToDoubleColumn's, not this type story, and arming for it would refuse
+// `SELECT x*2`, which is right today.
+//
+// A COST that is real and is not hidden: `+ - *` overflow above, and an exact
+// division (`x` is 6 over `/2`, where INT and REAL division agree) — that one
+// is refused although it answers correctly today. Deciding it needs the test at
+// the division site, in expression_executor.cc / evaluator.cc, which this
+// change does not own.
+// ===================================================================
+
+// One materialized column that can hand an INT Value to a DOUBLE ColumnVector:
+// the producing LOGICAL node and its output column index.
+using IntOrigin = std::pair<const LogicalPlanNode*, int>;
+// Per output column of a node: the origins its runtime type still depends on.
+// Almost always empty; a vector beats a set at these sizes.
+using OriginSets = std::vector<std::vector<IntOrigin>>;
+
+void mergeOrigins(std::vector<IntOrigin>& into, const std::vector<IntOrigin>& from) {
+    for (const IntOrigin& o : from) {
+        if (std::find(into.begin(), into.end(), o) == into.end()) into.push_back(o);
+    }
+}
+
+// Can this expression's runtime Value be an INT? This is about the VALUE the
+// evaluator hands back, not about inferExprType — the two differ exactly where
+// this bug lives (a mixed CASE infers DOUBLE and returns its taken branch
+// verbatim). Conservative by default: an unknown shape answers yes, which can
+// only arm more, never less.
+bool mayYieldInt(const Expr* e, const Schema& schema) {
+    if (!e) return false;
+    if (auto* lit = dynamic_cast<const Literal*>(e)) {
+        return !lit->value.isNull() && lit->value.type() == TypeId::INT;
+    }
+    if (auto* cr = dynamic_cast<const ColumnRef*>(e)) {
+        const int idx = resolveColumnIndex(*cr, schema);
+        // A column read hands back whatever the ColumnVector holds, so its type
+        // is the schema's — never a surprise.
+        return idx >= 0 && schema.column(idx).type == TypeId::INT;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(e)) {
+        // Reading an already-computed aggregate column, same as a ColumnRef.
+        const int idx = schema.indexOf(aggregateOutputName(agg));
+        return idx >= 0 && schema.column(idx).type == TypeId::INT;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
+        return mayYieldInt(un->operand.get(), schema);
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+        const std::string& op = bin->op;
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            // evaluate(): INT only when BOTH operands are INT.
+            return mayYieldInt(bin->left.get(), schema)
+                && mayYieldInt(bin->right.get(), schema);
+        }
+        return true;   // comparison / AND / OR — boolean-as-INT
+    }
+    if (dynamic_cast<const IsNullExpr*>(e) || dynamic_cast<const InExpr*>(e)
+        || dynamic_cast<const LikeExpr*>(e)) {
+        return true;   // boolean-as-INT
+    }
+    if (dynamic_cast<const SubstringExpr*>(e)) return false;   // STRING
+    if (auto* c = dynamic_cast<const CaseExpr*>(e)) {
+        // The route this whole pass exists for: evaluate() returns the taken
+        // branch's Value untouched, so ANY INT branch makes the result INT for
+        // some row even though inferExprType unified the arms to DOUBLE.
+        for (const auto& w : c->when_clauses) {
+            if (mayYieldInt(w.result.get(), schema)) return true;
+        }
+        return c->else_expr && mayYieldInt(c->else_expr.get(), schema);
+    }
+    return true;
+}
+
+// Walk one expression over the child's origin sets. Returns the origins whose
+// INT-ness can still change THIS expression's result type, and arms — into
+// `armed` — every origin that reaches an operand of `/`.
+std::vector<IntOrigin> taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
+                                 std::vector<IntOrigin>& armed) {
+    std::vector<IntOrigin> out;
+    if (!e) return out;
+
+    if (auto* cr = dynamic_cast<const ColumnRef*>(e)) {
+        const int idx = resolveColumnIndex(*cr, schema);
+        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out, in[idx]);
+        return out;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(e)) {
+        // HAVING reaches its aggregate through an AggregateExpr, not a
+        // ColumnRef; evaluate() resolves it by aggregateOutputName against the
+        // aggregate node's own output schema, so this pass must too — this is
+        // the line that connects the HAVING reproduction to its origin.
+        const int idx = schema.indexOf(aggregateOutputName(agg));
+        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out, in[idx]);
+        return out;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
+        return taintWalk(un->operand.get(), schema, in, armed);
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+        std::vector<IntOrigin> l = taintWalk(bin->left.get(), schema, in, armed);
+        std::vector<IntOrigin> r = taintWalk(bin->right.get(), schema, in, armed);
+        const std::string& op = bin->op;
+        if (op == "/") {
+            // Either side decides: `2 / x` is 0 in Volcano and 0.2857… here.
+            mergeOrigins(armed, l);
+            mergeOrigins(armed, r);
+        }
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            mergeOrigins(out, l);
+            mergeOrigins(out, r);
+            return out;
+        }
+        // comparison / AND / OR: the result is a boolean INT in both engines, so
+        // the taint stops here even though the operands carried it.
+        return out;
+    }
+    if (auto* isn = dynamic_cast<const IsNullExpr*>(e)) {
+        taintWalk(isn->operand.get(), schema, in, armed);
+        return out;
+    }
+    if (auto* inx = dynamic_cast<const InExpr*>(e)) {
+        taintWalk(inx->operand.get(), schema, in, armed);
+        return out;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(e)) {
+        taintWalk(lk->operand.get(), schema, in, armed);
+        return out;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(e)) {
+        taintWalk(sub->operand.get(), schema, in, armed);
+        taintWalk(sub->start.get(), schema, in, armed);
+        taintWalk(sub->length.get(), schema, in, armed);
+        return out;   // STRING
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(e)) {
+        for (const auto& w : c->when_clauses) {
+            taintWalk(w.condition.get(), schema, in, armed);   // boolean; taint dies here
+            mergeOrigins(out, taintWalk(w.result.get(), schema, in, armed));
+        }
+        if (c->else_expr) mergeOrigins(out, taintWalk(c->else_expr.get(), schema, in, armed));
+        return out;
+    }
+    return out;   // Literal, and anything with no column underneath it
+}
+
+// Bottom-up over the logical plan. Returns the origin sets of `node`'s output
+// columns; records every armed origin in `arm`.
+OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm) {
+    auto armAll = [&arm](const std::vector<IntOrigin>& armed) {
+        for (const IntOrigin& o : armed) {
+            std::vector<bool>& mask = arm[o.first];
+            if (mask.empty()) mask.assign(o.first->output_schema.size(), false);
+            if (o.second >= 0 && o.second < static_cast<int>(mask.size())) mask[o.second] = true;
+        }
+    };
+
+    switch (node->type) {
+        case LogicalNodeType::SCAN:
+            // Base columns carry the storage's own type; nothing to narrow.
+            return OriginSets(node->output_schema.size());
+
+        case LogicalNodeType::DERIVED:
+        case LogicalNodeType::DISTINCT:
+        case LogicalNodeType::LIMIT: {
+            // Pure pass-throughs: same width, same values, DERIVED only renames.
+            // (The width equality is asserted for DERIVED in lowerNode.)
+            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            child.resize(node->output_schema.size());
+            return child;
+        }
+
+        case LogicalNodeType::FILTER: {
+            const LogicalFilter* f = static_cast<const LogicalFilter*>(node);
+            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            std::vector<IntOrigin> armed;
+            // The predicate is evaluated against the CHILD's schema — for a
+            // HAVING that is the aggregate's output schema, which is where the
+            // AggregateExpr above resolves.
+            taintWalk(f->predicate.get(), node->children[0]->output_schema, child, armed);
+            armAll(armed);
+            child.resize(node->output_schema.size());
+            return child;
+        }
+
+        case LogicalNodeType::SORT: {
+            const LogicalSort* s = static_cast<const LogicalSort*>(node);
+            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            std::vector<IntOrigin> armed;
+            for (const OrderByItem& item : s->order_by) {
+                taintWalk(item.expr.get(), node->children[0]->output_schema, child, armed);
+            }
+            armAll(armed);
+            child.resize(node->output_schema.size());
+            return child;
+        }
+
+        case LogicalNodeType::JOIN: {
+            const LogicalJoin* j = static_cast<const LogicalJoin*>(node);
+            OriginSets left  = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets right = collectIntOrigins(node->children[1].get(), arm);
+            // Equi-join keys are NOT observers: both engines key through
+            // key_encoding.h, whose keyFieldText renders an integral double as
+            // INT text, so 7 and 7.0 land in the same bucket either way.
+            const int width = node->output_schema.size();
+            OriginSets out(width);
+            if (width == static_cast<int>(left.size() + right.size())) {
+                // STANDARD: merged schema is [FROM..., JOIN...] in logical order.
+                for (size_t i = 0; i < left.size(); ++i)  out[i] = left[i];
+                for (size_t i = 0; i < right.size(); ++i) out[left.size() + i] = right[i];
+            } else if (width == static_cast<int>(left.size())) {
+                out = left;   // SEMI/ANTI: output schema IS the left child's
+            }
+            // Any other width is a planner bug that lowerNode's own size checks
+            // report; leaving the sets empty here only under-arms, and the
+            // build throws before anything runs.
+            if (j->on_residual) {
+                std::vector<IntOrigin> armed;
+                taintWalk(j->on_residual.get(), node->output_schema, out, armed);
+                armAll(armed);
+            }
+            return out;
+        }
+
+        case LogicalNodeType::AGGREGATE: {
+            const LogicalAggregate* a = static_cast<const LogicalAggregate*>(node);
+            const Schema& cs = node->children[0]->output_schema;
+            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            std::vector<IntOrigin> armed;
+
+            // buildAggregateSchema order: group-by columns, then aggregates.
+            OriginSets out(node->output_schema.size());
+            int c = 0;
+            for (const GroupByColumn& g : a->group_by) {
+                if (c >= static_cast<int>(out.size())) break;
+                std::vector<IntOrigin> in_set;
+                bool own = false;
+                if (g.expr) {
+                    in_set = taintWalk(g.expr.get(), cs, child, armed);
+                    own = mayYieldInt(g.expr.get(), cs);
+                } else {
+                    int idx = g.id.isResolved() ? cs.indexOf(g.column_name, g.id.localSlot(
+                                                      "vectorized int-observable group key"))
+                                                : -1;
+                    if (idx < 0) idx = cs.indexOf(g.column_name);
+                    if (idx >= 0 && idx < static_cast<int>(child.size())) in_set = child[idx];
+                }
+                out[c] = in_set;
+                // fillChunk appends the group key Value into a column declared
+                // from output_schema, so an expression key that returns INT
+                // reaches the same narrowing the aggregates do.
+                if (own && node->output_schema.column(c).type == TypeId::DOUBLE) {
+                    mergeOrigins(out[c], {IntOrigin{node, c}});
+                }
+                ++c;
+            }
+            for (const AggregateSpec& spec : a->aggregates) {
+                if (c >= static_cast<int>(out.size())) break;
+                std::vector<IntOrigin> in_set;
+                bool arg_int = false;
+                if (spec.argument && spec.column.empty()) {
+                    in_set = taintWalk(spec.argument, cs, child, armed);
+                    arg_int = mayYieldInt(spec.argument, cs);
+                } else if (!spec.is_star) {
+                    int idx = spec.id.isResolved() ? cs.indexOf(spec.column, spec.id.localSlot(
+                                                         "vectorized int-observable aggregate arg"))
+                                                   : -1;
+                    if (idx < 0) idx = cs.indexOf(spec.column);
+                    if (idx >= 0 && idx < static_cast<int>(child.size())) in_set = child[idx];
+                    arg_int = idx >= 0 && cs.column(idx).type == TypeId::INT;
+                }
+                // MIN/MAX are order statistics: they return an element of the
+                // input domain, keeping the argument's own Value AND type, so
+                // they carry both the taint and the INT-ness through. COUNT is
+                // INT-typed, and SUM/AVG accumulate into a double and emit a
+                // DOUBLE Value whatever the input was — neither can narrow.
+                const bool order_stat = spec.function == "MIN" || spec.function == "MAX";
+                if (order_stat) {
+                    out[c] = in_set;
+                    if (arg_int && node->output_schema.column(c).type == TypeId::DOUBLE) {
+                        mergeOrigins(out[c], {IntOrigin{node, c}});
+                    }
+                }
+                ++c;
+            }
+            armAll(armed);
+            return out;
+        }
+
+        case LogicalNodeType::PROJECT: {
+            const LogicalProject* p = static_cast<const LogicalProject*>(node);
+            const Schema& cs = node->children[0]->output_schema;
+            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            std::vector<IntOrigin> armed;
+
+            OriginSets out(node->output_schema.size());
+            for (int c = 0; c < static_cast<int>(p->exprs.size()); ++c) {
+                if (c >= static_cast<int>(out.size())) break;
+                out[c] = taintWalk(p->exprs[c].get(), cs, child, armed);
+                // This column is itself an origin when the type it DECLARES and
+                // the type it can RETURN disagree — a mixed CASE is the general
+                // route. A bare ColumnRef of a DOUBLE column is not: the value
+                // comes out of a DOUBLE ColumnVector already.
+                if (node->output_schema.column(c).type == TypeId::DOUBLE
+                    && mayYieldInt(p->exprs[c].get(), cs)) {
+                    mergeOrigins(out[c], {IntOrigin{node, c}});
+                }
+            }
+            armAll(armed);
+            return out;
+        }
+    }
+    return OriginSets(node->output_schema.size());
+}
 
 // count how many LogicalScans read each table (pre-pass over the whole tree)
 void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int>& uses) {
@@ -677,16 +1037,25 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         case LogicalNodeType::AGGREGATE: {
             auto* agg = static_cast<LogicalAggregate*>(node);
             auto child = lower(agg->children[0].get(), nullptr);
-            return std::make_unique<VecHashAggregateNode>(
+            auto n = std::make_unique<VecHashAggregateNode>(
                 std::move(child), std::move(agg->group_by),
                 std::move(agg->aggregates), agg->output_schema);
+            // fillChunk's MIN/MAX arm (and an expression group key) writes a
+            // Value into a column typed before the value existed; see
+            // collectIntOrigins.
+            n->setIntObservableColumns(maskFor(node));
+            return n;
         }
 
         case LogicalNodeType::PROJECT: {
             auto* proj = static_cast<LogicalProject*>(node);
             auto child = lower(proj->children[0].get(), nullptr);
-            return std::make_unique<VecProjectNode>(
+            auto n = std::make_unique<VecProjectNode>(
                 std::move(child), std::move(proj->exprs), proj->output_schema);
+            // Pass 2's evaluate() path is the other site that writes a Value
+            // into a pre-declared column type; see collectIntOrigins.
+            n->setIntObservableColumns(maskFor(node));
+            return n;
         }
 
         case LogicalNodeType::SORT: {
@@ -718,7 +1087,13 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
         std::unordered_map<std::string, ColumnarTable> columnar_tables,
         const Catalog& catalog) {
-    Lowering lowering{columnar_tables, {}, catalog};
+    // BEFORE lowering, not during: lowerNode MOVES the expressions out of the
+    // logical nodes (proj->exprs, agg->aggregates, filter->predicate), so the
+    // tree this walk reads no longer exists once lowering has run.
+    IntObservableMap int_observable;
+    collectIntOrigins(logical.get(), int_observable);
+
+    Lowering lowering{columnar_tables, {}, catalog, int_observable};
     countScans(logical.get(), lowering.scan_uses);
     return lowering.lower(logical.get(), nullptr);
 }

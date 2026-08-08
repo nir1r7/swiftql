@@ -30,6 +30,20 @@ struct ColumnVector {
     bool all_valid = true;
     std::vector<uint8_t> validity;
 
+    // Plan-shape arming for the INT -> DOUBLE narrowing; see
+    // refuseObservableIntNarrowing below. false — the default, and the value on
+    // every scan chunk, join output and ExpressionExecutor result — means the
+    // narrowing cannot change an answer here and only the magnitude rule
+    // applies. The two nodes that materialize a `Value` into a column type
+    // declared BEFORE the value exists (VecProjectNode, VecHashAggregateNode)
+    // set it per column, from a mask the vectorized plan builder computes over
+    // the LOGICAL plan.
+    //
+    // It rides on the ColumnVector, not on the node, because appendColumnValue
+    // is the single funnel every such write goes through; the cost is one
+    // predictably not-taken branch on the DOUBLE arm.
+    bool int_observable = false;
+
     int size() const {
         return std::visit([](const auto&v){
             return static_cast<int>(v.size());
@@ -171,10 +185,62 @@ inline double narrowToDoubleColumn(const Value& v) {
         "--execution volcano, or give the branches the same type.");
 }
 
+// The SECOND thing INT -> DOUBLE narrowing destroys, and it is not magnitude.
+//
+// narrowToDoubleColumn above asks "is this value still the same NUMBER, and
+// does it still PRINT the same?" and at 7 the answer to both is yes. What it
+// cannot ask is whether the value is still the same TYPE — and type is
+// load-bearing for exactly one operator, `/`, because evaluate() truncates
+// INT/INT and does not truncate INT/DOUBLE. So
+//
+//     SELECT x / 2 FROM (SELECT CASE WHEN c THEN 7 ELSE 0.5 END AS x ...) t
+//
+// is 3 in Volcano and in SQLite (x is the INT 7) and 3.5 here (x came back out
+// of a DOUBLE ColumnVector as 7.0). No magnitude is involved: it bites at 7.
+//
+// Why the test is not simply "refuse every INT -> DOUBLE narrowing". That
+// would reject `SELECT CASE WHEN c THEN 1 ELSE 0.5 END`, which is correct
+// today in all four modes and agrees with SQLite — the DOUBLE 1.0 prints as
+// "1" through %.15g, so a column that is only PROJECTED OUT is fine. Refusing
+// it would move a passing answer, which is not on offer.
+//
+// The distinction is therefore a PLAN-SHAPE fact, not a value fact: is this
+// materialized column read by another expression, or is it the query's output?
+// appendColumnValue sees one Value and cannot know. vectorized_plan_builder.cc
+// can, and it arms `cv.int_observable` on exactly the columns whose INT-ness
+// can reach an operand of a `/` somewhere above them (collectIntOrigins).
+//
+// Both halves are needed and both are narrow:
+//   - plan shape alone would refuse `SELECT x/2 FROM (SELECT CASE WHEN c THEN
+//     7 ELSE 0.5 END AS x FROM t WHERE never)`, where no row ever takes the INT
+//     branch and today's answer is right;
+//   - the runtime type test alone is the blanket refusal ruled out above.
+// Together they refuse a query only when a real INT value really does reach a
+// real division. The residue is stated rather than hidden: when that division
+// happens to be exact (`x` is 6, not 7, over `/2`) INT and REAL division agree
+// and the query was right before this refusal. Closing that last gap means
+// asking the question at the DIVISION rather than at the materialization, and
+// the division runs in expression_executor.cc / evaluator.cc, which this rule
+// deliberately does not reach into.
+inline void refuseObservableIntNarrowing(const Value& v) {
+    if (v.type() != TypeId::INT) return;
+    throw std::runtime_error(
+        "vectorized execution cannot materialize the integer " +
+        std::to_string(v.asInt()) + " into a DOUBLE result column that another "
+        "expression divides. A chunk column holds one type, so an expression "
+        "that mixes INTEGER and REAL results (typically a CASE) is stored as "
+        "REAL — and INTEGER/INTEGER truncates while INTEGER/REAL does not, so "
+        "the stored type changes the answer. Give the branches the same type, "
+        "or re-run with --execution volcano where that path supports the query "
+        "(it does not run derived tables).");
+}
+
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
-// narrows into a DOUBLE column through narrowToDoubleColumn above, which THROWS
-// rather than change the value or its rendering — read that comment before
-// touching this. This comment called the conversion "lossless" from 85be432
+// narrows into a DOUBLE column through TWO refusals — refuseObservableIntNarrowing
+// (the value's TYPE is observable to a `/` above, at any magnitude) and
+// narrowToDoubleColumn (the value or its rendering changes, above 1e15) — both
+// of which THROW rather than answer differently from Volcano and SQLite. Read
+// both comments before touching this. This comment called the conversion "lossless" from 85be432
 // (Week 24, the commit that added validity) until seam pass 3 found it. It is
 // not, above 1e15. Every other type disagreement is a planner/schema bug and
 // surfaces as bad_variant_access from the typed accessor, as it did before
@@ -207,6 +273,11 @@ inline void appendColumnValue(ColumnVector& cv, const Value& v) {
         case TypeId::INT:
             std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
         case TypeId::DOUBLE:
+            // The type rule first: it fires at any magnitude, and it is the one
+            // the plan armed. `int_observable` is false on all but a handful of
+            // columns in a plan, so the out-of-line Value::type() call inside
+            // stays off the path every ordinary DOUBLE cell takes.
+            if (cv.int_observable) refuseObservableIntNarrowing(v);
             std::get<std::vector<double>>(cv.data).push_back(narrowToDoubleColumn(v)); break;
         case TypeId::STRING:
             std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
