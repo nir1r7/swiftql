@@ -297,8 +297,15 @@ makes untrue. `NOT IN` never produces a residual, so this costs nothing.
 NAME from two aliases of the SAME table. In a merged residual schema `indexOf(name)` takes the
 first match. Wrong rows, no error, identical `--explain`. Refs MUST be restamped BY SLOT.
 This is exactly the class the deferred `ColumnId {level, slot}` migration makes a COMPILE ERROR.
-Doing q21 first = right by care. Doing the migration first = right by construction, 87 call sites
-across 6 layers. **Raise this with the user before dispatching.**
+**USER DECISION: q21 FIRST, ColumnId migration LATER.** So the slot-restamping is done BY HAND and
+the guarantee is care, not the compiler. Consequences that are now mandatory, not optional:
+  - The q21 fixer's brief must call out the wrong-relation hazard EXPLICITLY and require it to
+    demonstrate, with actual output, that `l1.l_suppkey` and `l3.l_suppkey` resolve to DIFFERENT
+    columns — not merely that the query returns 3 rows. The right answer by luck looks identical.
+  - It must add a test that FAILS if the refs resolve by name instead of by slot.
+  - A post-q21 audit must re-check this specifically. Wrong rows, no error, identical `--explain`
+    is the H-1 failure shape verbatim and no gate in this project can see it.
+  - The ColumnId migration stays on the deferred list and its justification just got stronger.
 TARGET IS KNOWN: mutation check says DISCRIMINATING; SQLite returns 3 rows
 (`Supplier#000000044 | 9`, `...054 | 7`, `...013 | 4`). q21 goes 0 modes -> 2 (vec-only; it has
 four joins and Volcano builds exactly one). **That is 21/22.**
@@ -312,11 +319,28 @@ exactly what PROVENANCE.txt warns of). 290 -> DISCRIMINATING.
 (300/312/315). Lowering it invents a value the spec does not contain — unlike q2's SIZE and q19's
 BRANDs, which were re-chosen from WITHIN the spec's own domains. Refuse this route even if it
 would make the number 22.
-HONEST ROUTE: **sf0.1** (~150k orders; the tail that stops at 295 today would clear 300).
-COST: sf0.1 needs its OWN baseline — which queries are vacuous is a property of the DATA, so it
-cannot be diffed against the sf0.01 baseline. Generator is seeded and reproducible:
+**USER DECISION: GENERATE sf0.1.** Route approved; the threshold stays at 300.
   python3 python_tools/generate_tpch.py --scale 0.1 --out-dir data/tpch/sf0.1
-Gate 5 runtime is ~5 min at sf0.01 and scales with data — budget for a slower gate.
+Do this AFTER q21, so the new baseline is recorded once against a tree that already answers q21 —
+otherwise the baseline is written twice and the second write is the kind of laundering the harness
+was hardened against in Week 35.
+MANDATORY when it lands, or the number is not honest:
+  - sf0.1 gets its OWN baseline. Vacuity is a property of the DATA; it CANNOT be diffed against
+    the sf0.01 baseline. Write it with a SECOND, SEPARATE run carrying
+    `--write-baseline docs/tpch-sf0.1-baseline.json --json docs/tpch-sf0.1-report.json` and NO
+    `--baseline` (the harness refuses `--write-baseline` without `--json`: the baseline IS the
+    report's `summary` key, and refreshing one alone is exactly how the pair spent Week 36
+    disagreeing about the headline figure).
+  - **VERIFY q18 ACTUALLY DISCRIMINATES at sf0.1** — do not assume. Measure max SUM(l_quantity)
+    per order on the generated files first; if it still does not clear 300, sf0.1 was the wrong
+    answer and the honest report is 21/22, NOT a threshold change.
+  - Re-check which OTHER queries change vacuity at the new scale — some may become vacuous that
+    were not. The figure must be re-derived, never carried over.
+  - **`data/tpch/` is GITIGNORED.** The generator is seeded, so record the exact command in the
+    README next to the baseline; a fresh clone has no data and gate 5 must name that command.
+  - Gate 5 is ~5 min at sf0.01 and scales with data — budget a slower gate, and decide whether
+    sf0.01 stays the gate with sf0.1 as an opt-in, or sf0.1 becomes the gate.
+  - Keep sf0.01's baseline and report. They are the record for every figure quoted in Weeks 35-36.
 
 ## CARRY TO WEEK 37
 - **S-0 is REFUTED** — see the storage entry above. Re-ranked LOW. The real storage item is the
