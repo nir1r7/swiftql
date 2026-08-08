@@ -509,3 +509,125 @@ This confirms pass 2's B2/B3/B4 against an independent oracle and an independent
 a result rather than an absence of effort: pass 2 reached the same conclusion by reading the two
 evaluators, and E-10 is the one thing that method could not see, because it lives above both.
 
+
+### B-6 — `VecSimdLoopJoinNode` is NOT a third source of order. **CLEAN, verified by run.**
+
+Pass 1 asserted from the source that the SIMD loop join emits probe-major/build-index like the hash
+join. Confirmed behaviourally: a query where the optimizer picks `VecSimdLoopJoin build=nation` and
+`--no-optimize` picks `VecHashJoin` on the *same* sides
+(`SELECT c.c_name, n.n_name FROM customer c JOIN nation n ON c.c_nationkey = n.n_nationkey LIMIT 4`)
+returns identical rows in all four modes. So the algorithm choice — which IS optimizer-gated — adds
+nothing to E-8. The two roots are the **build side** and the **join order**, and nothing else.
+
+### B-7 (LOW) **E-11** — `tests/test_sort_tiebreak.cc` cannot see E-9 by construction
+
+13 tests, and they are good ones — `VolcanoSortIsPermutationInvariant`,
+`VectorizedSortIsPermutationInvariantAndChunkInvariant`, `TheTwoENGINESAgreeOnTheSameInputMultiset`,
+`LimitCutSurvivesTheSameRowsOnBothEngines`, `EveryPermutationOfATiedInputGivesTheSameCut`. Every one
+permutes the **rows**. None permutes the **columns**, because each builds a single fixed `Schema`.
+The file's header already concedes this shape of blindness for the scan-schema case ("it cannot see
+this one, because it builds one schema"); the same sentence covers E-9, and nobody drew the second
+conclusion. A `SchemaColumnOrderDoesNotChangeTheCut` test — same rows, columns permuted, assert the
+same cut — is four lines and would have caught E-9 before it shipped.
+
+### B-8 (LOW) **E-12** — `sort_comparator.h` states a checkable precondition, and it is false
+
+Two claims in the header are now known-wrong, and both were written by the fix this pass audits:
+
+1. > It is a function of the row's VALUES alone. It cannot consult arrival order, hash bucket layout,
+   > chunk boundaries, or which side built the hash table — precisely the things that differ between
+   > the legs.
+
+   It also consults **schema column order**, which is a plan property and differs between the legs
+   (E-9). The list is presented as exhaustive and is not.
+
+2. > THE PRECONDITION IT RESTS ON, STATED SO IT CAN BE CHECKED: the sort's INPUT row must be the same
+   > in every mode. It is, for every shape this can decide, because ORDER BY is planned directly above
+   > the aggregate/filter/join and below the projection in both builders, and an aggregate's output
+   > schema (`buildAggregateSchema`) is the same in all four modes.
+
+   The justification covers only the aggregate case. For a join it is false: the sort's input row IS
+   the join's merged row, and `JoinEnumeration::rebuild` builds that schema from the chosen order.
+
+This is precisely the class 70570dc's own commit message names — "a comment asserting a property the
+code no longer has" — introduced by the commit two before it. Recording it separately from E-9
+because the header explicitly invites being checked, and the check fails.
+
+### B-9 — pass 2's E-5 persists, unchanged
+
+`plan_nodes.cc:332` is still `auto& group_accs = accumulators[key_str];` — `operator[]`, not `.at()`.
+Still unreachable (nothing erases from `accumulators`), still silent UB if it ever becomes reachable.
+Pass 2's issue-2 from pass 1 (a semi/anti join's `on_residual` silently dropped by the builder) **is**
+fixed — `vectorized_plan_builder.cc:524-529` now forwards `std::move(join->on_residual)` so the
+operator's own guard fires. Pass 2's E-4 (the tie-precondition self-check) is fixed too:
+`compare_against_sqlite.py:2929-2985` now asserts, per entry, that the probe exposes its key, that
+rows exist beyond the cut, that a tie spans the cut, and that the tie is MATERIAL.
+
+---
+
+## SUMMARY
+
+```
+BLOCKER   2   E-8, E-9
+HIGH      1   E-10
+LOW       2   E-11, E-12
+```
+
+| # | Rank | Finding | Concrete failing shape? |
+|---|---|---|---|
+| **E-8** | **BLOCKER** | The tie-break lives in the sort comparator, so it does not fire when there is no sort. `LIMIT` without `ORDER BY` still cuts on plan order, and the two engines still pick the join build side by different rules. Pass 2's E-1 and E-1b both reproduce at HEAD with the `ORDER BY` deleted, and the class reaches a bare `SELECT a, b FROM x JOIN y ... LIMIT n`. | Yes — run. `{AlphaTauri,Alpine,McLaren}` vs `{RedBull,AlphaTauri,McLaren}`; `COUNT(*)` 977 vs 1536; and a plain TPC-H `customer JOIN orders WHERE o_orderstatus='F' AND o_orderpriority='1-URGENT' LIMIT 3` giving disjoint row sets, `COUNT(*)` 11 vs 10 |
+| **E-9** | **BLOCKER** | The tie-break is lexicographic over the row **in schema index order**, and `JoinEnumeration::rebuild` builds the merged schema from the *chosen join order*. Two legs that both run the tie-break correctly still cut differently. The comparator's stated precondition ("the sort's INPUT row must be the same in every mode") is false for any multi-way join. | Yes — run. 3-way TPC-H join, `ORDER BY o_orderstatus` (constant over the survivors, so the tie-break decides everything) `LIMIT 3`: `Customer#000000001/282…` vs `Customer#000000404/2…`, disjoint; transported into a scalar, `COUNT(*)` 281 vs 1 |
+| **E-10** | HIGH | The vectorized path coerces every value it re-materializes to its schema type at seven sites; Volcano has no such site. `appendColumnValue`'s comment calls the INT->DOUBLE widening "lossless" — it is not above 2^53. Changes a VALUE, and changes a ROW COUNT under `DISTINCT`; the vectorized path also contradicts itself (`SELECT DISTINCT e` = 2 rows, `COUNT(DISTINCT e)` = 3). | Yes — run. `CASE ... THEN 9007199254740993 ELSE 0.5 END`: Volcano and SQLite `9007199254740993`, vectorized `9.00719925474099e+15`. `SELECT DISTINCT` of the same: 3 rows vs 2 |
+| **E-11** | LOW | `tests/test_sort_tiebreak.cc` permutes rows in five tests and columns in none — it cannot see E-9 by construction, for the same reason its header already concedes about the scan-schema case. | No — a coverage gap |
+| **E-12** | LOW | `sort_comparator.h` presents an exhaustive list of what the tie-break cannot consult (it can consult schema order) and a "stated so it can be checked" precondition that is false for joins. Written by the fix under audit. | N/A (documentation) |
+
+### What came back CLEAN — results, not gaps
+
+- **The tie-break's "identical rows may stay tied" argument is TRUE** (A-1). Everything that could
+  distinguish two rows sits below the sort; the only consumers of a sorted stream are Project,
+  Distinct and Limit, and a block's sorted output escapes upward only as forms in which
+  column-identical rows are interchangeable.
+- **Ascending-regardless-of-`desc` is safe** (A-2). No top-N, no limit-into-sort pushdown, no
+  `reverse`/`partial_sort`/`nth_element` anywhere; nothing downstream reads the tie-break's direction.
+- **The scan-schema fix has no other consumer** (A-4). All seven consumers enumerated;
+  `buildScanSchema` collects from every clause *including* `stmt.joins[].condition`, which is what a
+  LEFT join's un-folded residual needs; `narrowRows` is positional, throws by name, and its early-out
+  is sound. Six-query battery on the shapes that stress it: four modes byte-identical on all six.
+- **The other nine cut sites are closed** (A-3), including the two injected limits in
+  `runOnce` — the SCALAR cap of 2 exists so a multi-row body throws rather than silently picking, and
+  it does.
+- **The vec-only families, re-hunted against an independent SQLite oracle on 45 adversarial
+  NULL-bearing and degenerate queries: 42 clean, 3 declared refusals** (B-5). No NULL, three-valued
+  logic, type, DISTINCT or empty-input divergence found there.
+- **`VecSimdLoopJoinNode` adds no third ordering** (B-6), verified by run and not only by reading.
+- **TPC-H is clean on the optimizer axis**: 21 of 22 templates agree optimized vs `--no-optimize`,
+  1 refused, 0 divergent (B-4).
+
+### Verdict
+
+**The seam is not clean, and the fix under audit closed an instance rather than the class — for the
+second time in a row.** Pass 1 fixed a container's iteration order and left a plan decision (pass 2's
+E-1). Pass 2 fixed the sort comparator and left (a) every query that reaches a `LIMIT` without a sort
+(E-8) and (b) every sort whose input schema the optimizer permutes (E-9). Both blockers are the
+*same defect* pass 2 identified, correctly, in one sentence — "`std::stable_sort` propagates its
+INPUT order, and input order is a function of the PLAN, not of the query" — and then closed only at
+`std::stable_sort`. The cut is `LimitNode`/`VecLimitNode`, not `SortNode`, and nothing requires a
+sort beneath it.
+
+Both are demonstrated on run queries with both legs' output side by side, both violate
+`optimized == --no-optimize`, and both transport through `materializeSubqueries` into a differing
+scalar so they are arithmetic and not merely row order SQL leaves unspecified. E-8 additionally
+reproduces on an ordinary TPC-H two-relation query with two plain equality predicates, at a measured
+rate of **2 in 45** mechanically-generated join-plus-`LIMIT` queries — it does not need a
+pathological estimator input.
+
+The gate is green and that is consistent with all of this: the corpus contains **6** queries with
+`LIMIT` and no `ORDER BY`, only **1** with a join, and that one has no WHERE clause — so pushdown
+moves no estimate and the two build-side rules provably coincide. Measured, not assumed. Green here
+means the corpus has no instance of the class, exactly as it did before pass 2.
+
+E-10 is separate and structural: only one engine materializes `Value`s into typed columns, and that
+step is not lossless. Pass 2's type-and-precision sweep could not have found it, because it compared
+the two *evaluators* and the coercion is one layer above both.
+
+**This pass does not end the audit.**
