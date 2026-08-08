@@ -442,3 +442,123 @@ comparison. `lap_id + NULL` is screened as INT/INT-may-overflow today for the
 same reason. The fix is one clause in each arm, or one `isNullLiteral(e)` test at
 the top of `exprMayRaise`; I did not write it.
 
+---
+
+## Adjudication — the fixer disputed P4-B2, and **the fixer is right**. Do not
+## make `inferExprType` refuse a STRING-vs-numeric comparison at plan time.
+
+Pass 4's P4-B2 preferred fix was to have `inferExprType`'s `BinaryExpr` branch
+compare `l` against `r` for `= != < > <= >=` and throw. The fixer refused it on
+three grounds. I checked all three by execution and add a fourth that I think is
+decisive.
+
+**(1) "It converts queries that answer today into plan-time errors." TRUE, and I
+have the example.** `expr_totality.h`'s own cascade rule means a conjunct is
+evaluated only on the rows every earlier conjunct kept — including on *zero* rows:
+
+```
+SELECT team FROM laps WHERE team > 'zzzzz' AND team = 5     →  0 rows
+```
+
+verified on both legs and in every supported mode at this HEAD. Under P4-B2 this
+becomes a hard plan-time error. That is not a marginal query; it is the exact
+shape round 4 shipped the cascade rule to make well-defined.
+
+**(2) "It newly throws on a NULL `Literal` from a zero-row scalar subquery."
+TRUE, verified.**
+
+```
+SELECT team FROM laps WHERE team = (SELECT MAX(age) FROM drivers WHERE age > 999)
+  →  0 rows
+```
+
+`logical_plan.cc:114` returns `lit->null_type` for a NULL literal, and
+`subquery_materialization.cc:491` sets that from the body's schema — `INT` here,
+against a `STRING` column. `inferExprType` would refuse a query that answers.
+Every empty-scalar-subquery comparison whose types differ would become an error,
+and the user cannot see the types differ because the value is NULL.
+
+**(3) "It would be a third rule beside the SUBSTRING and overflow rules."** True
+but the weakest of the three; symmetry is an argument about maintenance, not
+about answers.
+
+**(4) The argument neither party made, and the one I would decide on: P4-B2
+CONTRADICTS THE DEFINITION ROUND 4 SHIPPED.** `expr_totality.h` says, as a
+definition and not a description:
+
+> PER-ROW EVALUATION IS NOT TOTAL. `evaluate()` can THROW on a row. So the SET OF
+> ROWS an expression is evaluated on decides whether a query errors …
+
+A plan-time refusal says the opposite — that whether `team = 5` errors is decided
+by the SCHEMA, before any row exists. The two rules cannot both be the rule. Round
+4 chose the row-set rule and built four movers, a chunk pruner and a LIMIT
+placement on it; P4-B2 would make `team = 5` the one predicate whose error
+behaviour is not a function of its row set. **Pass 4's P4-B2 is hereby withdrawn.**
+The screen approach round 4 took instead is the correct design, and P5-2 is a bug
+in it, not a reason to revisit it.
+
+---
+
+## The fixer's two open items, checked
+
+### (a) "The new declines are still silent in `--explain`." CONFIRMED, and the count is now SIX.
+
+`--explain` on the frozen P5-3 query prints the optimized plan **byte-identical
+to the written plan** and nothing else. Only two decision fields exist in the
+whole logical layer (`grep -n "decision" src/planner/logical_plan.h`):
+`LogicalDerived::pushdown_decision` and `LogicalJoin::order_decision`.
+`LogicalScan`, `LogicalProject` and `LogicalFilter` have none.
+
+Complete silent-decline census at this HEAD (phase 5 has now found six; pass 4
+said four):
+
+| decline | reported? |
+|---|---|
+| `reorder`, `n < 3` / `n > 32` | silent — honest, no decision existed |
+| `containsOuterJoin`, `slotDeclineReason` | `join-ordering=skipped (…)` |
+| `pushIntoDerived` entry refusal | `pushdown=skipped (…)`; still last-wins, and *"column does not resolve against the body"* still appears unconstructible (P4-3, unchanged) |
+| `remapThroughProject` descent refusal | **silent** |
+| `projection_total` refusal (P4-B1's screen) | **silent** — and `LogicalProject` has no field to put it in, which that call site now says outright |
+| the `firstMayRaise` freeze, at all four movers | **silent** — P5-3, 90× |
+| **`collectSimplePredicates` stopping at a raiser** | **silent, NEW in round 4** |
+| **`canSkipChunk`'s STRING-boundary refusal** | **silent, NEW in round 4** |
+
+The last two are the ones that turn into P5-2 when they misfire, and neither has
+any print at all — `--explain` shows `pruning=on` whether the hint yields
+everything or nothing. That string is *honest* as documented
+(`vec_scan_node.cc:104-105` says it means "a hint is attached", and
+`--explain-analyze` prints the real `chunks_skipped=n/m`), so I am not counting
+it as a defect — but it means the only way to observe either decline is to run
+the plan.
+
+### (b) "`--no-optimize` loses zone-map pruning on join queries, +21%." CONFIRMED — and the claim needs one refinement, and its proposed fix also closes P5-2.
+
+**Refinement: the loss is not unconditional. It is decided by written order.**
+`collectSimplePredicates` stops at the first conjunct it cannot type, so a
+scan-local conjunct written *before* the cross-relation one still prunes.
+Isolated measurement — same conjunct SET, same 398 rows, `--no-optimize` on both,
+five runs each:
+
+| `--no-optimize`, written order | `chunks_skipped` | `Execution:` median |
+|---|---|---|
+| `WHERE l.season = 2024 AND dr.nationality = 'British'` | **1/2** | 41 852 µs |
+| `WHERE dr.nationality = 'British' AND l.season = 2024` | **0/2** | 49 263 µs |
+
+**+17.7%**, same direction and nearly the same magnitude as the reported +21%,
+and now attributable to a single decision rather than to the leg. (The 18× gap
+between the legs on this query is the un-pushed join, not the pruning; quoting
+the leg-to-leg ratio here would have been the `Execution:`-line trap.)
+
+**The fix the fixer names is the fix for P5-2.** `chunk_pruner.h:50-57` proposes
+threading the filter's child schema alongside the hint through
+`pruningHintForPreservedSide`. With the WHERE's own schema in hand, `b.v` in
+P5-2's repro resolves at slot 1 to the STRING column, `conjunctMayRaise` answers
+TRUE, the walker stops, no chunk is skipped, and the `--no-optimize` leg raises
+exactly as the optimized leg does. The same change restores the pruning above,
+because `dr.nationality = 'British'` would then type correctly as total and the
+walk would continue. **One change; a 17.7% recovery and a divergence closed.**
+That the performance concession and the correctness hole are the same missing
+argument is the finding worth carrying forward: a screen handed the wrong schema
+does not fail safe, it fails in whichever direction the name table happens to
+point.
+
