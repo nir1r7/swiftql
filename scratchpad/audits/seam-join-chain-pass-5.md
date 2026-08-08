@@ -488,3 +488,59 @@ stays unconditional, which is what keeps a WHERE conjunct reaching the spine's
 scans". All three must be swept with the fix. **That is five consecutive passes in
 which the defect was an enumerated precondition one item shorter than the thing
 it governs.**
+
+### B5-6 — P5-B1 is not an artifact of the f1 catalog
+
+Same shape on `data/tpch/sf0.01`:
+
+    SELECT COUNT(*) FROM orders o
+    LEFT JOIN customer c
+      ON o.o_custkey = c.c_custkey
+     AND SUBSTRING(o.o_orderstatus, o.o_custkey - 140, 2) = 'x'
+    WHERE o.o_custkey > 145
+      opt -> 13532      noop / rvol / cvol -> Error: SUBSTRING: start position must be >= 1
+    the same without the WHERE -> Error on all four legs.
+
+And it is not a `COUNT(*)` artifact: the projected form
+
+    SELECT l.lap_id FROM laps l LEFT JOIN drivers d
+      ON l.driver_id = d.driver_id AND SUBSTRING(l.team, l.driver_id - 12, 2) = 'x'
+    WHERE l.driver_id > 15 LIMIT 3
+      opt -> 1, 8, 11      noop / rvol / cvol -> Error
+
+**The single guard proposed in P5-B1 covers all six instances**, which is worth
+stating because R5 and R6 route through different `apply` arms. In R5 the
+conjunct reaches the derived body only because `distribute` walked past the LEFT
+join into `children[0]` and `filterOnto` planted it there; `apply`'s child loop
+(and `applyToSpineLeaves`) then found a FILTER-over-DERIVED that would not exist
+if the recursion had declined. Same for R6's deeper relation. Declining the
+`children[0]` recursion at a LEFT join with a raising residual leaves the bucket
+in `by_slot`, and the existing leftover loop lifts it above the whole tree.
+
+### B5-7 — the shapes I could NOT break, recorded so the negatives mean something
+
+* **A correlated INEQUALITY cannot become an ON residual.** `EXISTS (SELECT 1
+  FROM drivers d WHERE d.age > l.driver_id)` is refused by name, and the refusal
+  text names the very object P5-B1 is about: "a correlated inequality has no
+  equi-join to lower to; it would have to ride as an ON residual on the semi/anti
+  join". So the decorrelation path cannot manufacture a second residual site.
+* **A semi/anti join carries no ON residual** — asserted at
+  `cardinality_estimator.cc:473-475` and pinned at
+  `tests/test_join_enumeration.cc:893`. `grep` confirms `on_residual` is assigned
+  in exactly one place in the whole tree (`logical_plan.cc:1132`), under
+  `jc.type == JoinType::LEFT`. That single site is what bounds P5-B1.
+* **An outer join never swaps build and probe** (`vectorized_plan_builder.cc:1093-1102`,
+  `from_builds` forced false, and the `(outer: the preserved side must probe)`
+  suffix says so in the plan), so the physical layer cannot change the candidate-
+  pair set on its own.
+* **Engine laziness cannot mask the residual under a `LIMIT`.** `deterministicCut`
+  puts a sort beneath every `LIMIT` over a join, which is a pipeline breaker, so
+  Volcano's pull-based `LimitNode` cannot stop the probe loop early. Both LIMIT
+  forms (plain and `ORDER BY`) raise on all four legs.
+* **`applyLimit` cannot descend a `LIMIT` below a join.** Its only descent is
+  past a `PROJECT` (`logical_plan.cc:1043`), and `orderIsPlanStable` returns
+  false for a `JOIN`, so a `LIMIT` over an un-ordered join always gets the
+  `deterministicCut` sort first.
+* The 36-shape comparison matrix (A.2), the 18-shape evaluation-order battery
+  (A.3), the 16-shape NULL battery (B5-3) and the K1–K9 key-type battery (B5-4)
+  produced no other disagreement.
