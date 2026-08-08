@@ -271,6 +271,53 @@ blocker-free does the audit end. Week 37 is the user's either way.
   stops at 295 today would clear 300. Cost: sf0.1 needs its OWN baseline, since which queries are
   vacuous is a property of the data. **This is the user's call, not mine.**
 
+## QUEUED BY THE USER — q21, AND THE GOAL IS 22/22
+**USER DIRECTIVE: implement q21. The stated goal is all 22 TPC-H queries.**
+DISPATCH IT the moment seam pass 3 closes — NOT before. An operator change underneath an audit
+makes that audit's findings describe a tree that no longer exists, and pass 3 is measuring.
+
+**The full requirement is already worked out — do NOT re-derive it.** `docs/week-36-plan.md`
+Task 3 and the comment at `subquery_decorrelation.cc:58-73`. Summary of the four pieces:
+1. `splitCorrelation` routes a correlated non-equality into a residual list instead of refusing.
+   **The refusal NARROWS, it does not disappear** — still refused when NO equality survives, since
+   a body correlated only by inequalities has no hash key and the fallback is a cross product this
+   engine has no operator for.
+2. The semi/anti build side must keep **rows**, not keys. Today it fills `build_keys_` (a set of
+   serialized keys); the STANDARD path already fills `hash_table_` (key -> vector<Row>). A routing
+   change, not a new data structure.
+3. A **private** `residual_schema_` = probe (+) projected-body, with a concatenated row to evaluate
+   against. `output_schema_` MUST NOT MOVE — that it stays the probe's is Week 32's containment,
+   and widening it would put body columns in scope above the join.
+4. Body-side residual columns **APPENDED** to the body projection, after the keys, so key indices
+   stay positional 0..k-1. Appending, never inserting.
+CONTAINMENT TO PRESERVE: `ANTI_NOT_IN` must keep refusing residuals. Its short-circuit answers
+"S contains a NULL, so `x NOT IN S` is never TRUE" — a claim about the KEY column that a residual
+makes untrue. `NOT IN` never produces a residual, so this costs nothing.
+**THE HAZARD THAT WILL BITE:** the residual compares `l3.l_suppkey` with `l1.l_suppkey` — the SAME
+NAME from two aliases of the SAME table. In a merged residual schema `indexOf(name)` takes the
+first match. Wrong rows, no error, identical `--explain`. Refs MUST be restamped BY SLOT.
+This is exactly the class the deferred `ColumnId {level, slot}` migration makes a COMPILE ERROR.
+Doing q21 first = right by care. Doing the migration first = right by construction, 87 call sites
+across 6 layers. **Raise this with the user before dispatching.**
+TARGET IS KNOWN: mutation check says DISCRIMINATING; SQLite returns 3 rows
+(`Supplier#000000044 | 9`, `...054 | 7`, `...013 | 4`). q21 goes 0 modes -> 2 (vec-only; it has
+four joins and Volcano builds exactly one). **That is 21/22.**
+
+### 22/22 needs a q18 decision that is NOT engineering
+q18 already matches SQLite; both sides return zero rows. MEASURED on the committed files: 15000
+orders, max SUM(l_quantity) per order = 295.0, orders over 300 = **0**, max lineitems/order = 7,
+max single quantity = 50 (ceiling 7x50=350 — no order hit both maxima; a DISTRIBUTION artifact,
+exactly what PROVENANCE.txt warns of). 290 -> DISCRIMINATING.
+**THE THRESHOLD MUST NOT MOVE.** 300 is already the LOWEST of the spec's three Q18 quantities
+(300/312/315). Lowering it invents a value the spec does not contain — unlike q2's SIZE and q19's
+BRANDs, which were re-chosen from WITHIN the spec's own domains. Refuse this route even if it
+would make the number 22.
+HONEST ROUTE: **sf0.1** (~150k orders; the tail that stops at 295 today would clear 300).
+COST: sf0.1 needs its OWN baseline — which queries are vacuous is a property of the DATA, so it
+cannot be diffed against the sf0.01 baseline. Generator is seeded and reproducible:
+  python3 python_tools/generate_tpch.py --scale 0.1 --out-dir data/tpch/sf0.1
+Gate 5 runtime is ~5 min at sf0.01 and scales with data — budget for a slower gate.
+
 ## CARRY TO WEEK 37
 - **S-0 is REFUTED** — see the storage entry above. Re-ranked LOW. The real storage item is the
   ~70-90 line `VecScanNode` row-backed constructor.
