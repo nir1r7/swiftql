@@ -95,6 +95,26 @@ The result is not vacuous — the freeze is visible and the control still moves:
     WHERE l.team LIKE 'zzz%' AND l.lap_id = 5                        (total)
       LogicalFilter [((l.lap_id = 5) AND l.team LIKE 'zzz%')]        <- reordered
 
+and the same for the other two movers, each against its own control:
+
+    distribute      WHERE d.nationality = 'Zzz' AND l.team = l.lap_id
+                      LogicalFilter [(l.team = l.lap_id)]      <- FROZEN above the join
+                        LogicalJoin [driver_id = driver_id]
+                    control, `l.team = 'Ferrari'` instead:
+                      LogicalJoin [driver_id = driver_id]
+                        LogicalFilter [(l.team = Ferrari)]     <- pushed to its own scan
+
+    pushIntoDerived FROM (SELECT l.team AS t, l.lap_id AS n FROM laps l) x
+                    WHERE x.t LIKE 'zzz%' AND x.t = x.n
+                      LogicalFilter [(x.t = x.n)]                                   <- stays
+                        LogicalDerived [x, …] pushdown=skipped (predicate can raise)
+                          LogicalProject [t, n]
+                            LogicalFilter [l.team LIKE 'zzz%']   <- entered AND descended
+
+The third is the whole round in one plan: the total conjunct written first enters
+the body and descends below its projection, the raising one written second is
+refused entry and the refusal is stamped.
+
 ---
 
 ## BLOCKER P5-B1 — a LEFT JOIN's `ON` residual is the one per-row expression in the join layer that NOTHING screens, and predicate pushdown on the preserved side changes the row set it is evaluated on: `optimized` answers where every other leg throws
@@ -576,3 +596,25 @@ the same query plus a raising ON residual, asserting the filter now stays ABOVE
 the join. The three totality pins at `:1048`, `:1073` and `:1121` all put the
 partial expression in a WHERE conjunct; `:1486`/`:1509` put it in a projection.
 None puts it in an `ON` clause, and `grep` finds no test in the tree that does.
+
+### B5-9 — the randomized joint sweep
+
+`$SCRATCH/gen5.py`, aimed at the join layer rather than at ground passes 3 and 4
+already covered: left-deep spines of 2–4 relations mixing base tables and five
+derived-body shapes, `JOIN` / `LEFT JOIN` at each level, single and COMPOSITE
+`ON` keys, total and PARTIAL `ON` residuals, `IN` / `NOT EXISTS` predicates
+stacked on the spine, cross-relation WHERE conjuncts, and an `ORDER BY 1 LIMIT n`
+tail on a fifth of the shapes. Two independent modes:
+
+* **mode A (semantic)** — every expression total; three legs, `vec` / `vecno` /
+  SQLite, sort-normalised positional TSV.
+* **mode B (error behaviour)** — a PARTIAL expression planted in a WHERE conjunct,
+  an `ON` residual of a LEFT join, or the select list; `vec` vs `vecno` only,
+  because SQLite promotes on overflow and cannot adjudicate. Both legs refusing
+  with the SAME message counts as agreement; different messages would be a diff.
+
+A `--no-optimize` TIMEOUT at the harness's 90-second cap is counted as a SKIP,
+not as agreement: a leg that did not finish has not agreed with anything. (These
+are real — the unoptimized leg materialises the whole join product on a 4-relation
+spine, in a Debug build.)
+
