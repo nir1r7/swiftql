@@ -1022,3 +1022,198 @@ TEST(CollectSlots, CorrelatedSubqueryContributesTheConservativeSentinel) {
 // is an argument rather than an assertion, and the argument is the test above —
 // a CORRELATED subquery yields -1, so soleSlot returns -1, so such a conjunct is
 // never pushed; an UNCORRELATED one has nothing inside the body to restamp.
+
+// ===== The totality screen (seam audit pass 3, B3-2) =====
+//
+// PER-ROW EVALUATION IS NOT TOTAL: `evaluate()` throws on a row whose SUBSTRING
+// start is < 1, and on INT overflow. Every conjunct MOVE this pass makes is
+// therefore a decision about whether the query ERRORS, not only about how fast
+// it runs — and both directions were reproducible from the CLI on the shipped
+// `catalog.json` before the screen existed.
+//
+// THE PROPERTY THESE TESTS PIN is not "predicates evaluate left to right" (SQL
+// fixes no such order, so every one of those answers is legal in isolation). It
+// is the one this project asserts: a conjunct is evaluated on the SAME ROW SET
+// in both legs, so it raises under the optimizer iff it raises under
+// `--no-optimize`. See the screen's comment in predicate_pushdown.cc.
+//
+// EACH TEST FAILS WITHOUT THE FIX, and the assertion that fails is named in its
+// comment — they are written against the CONJUNCT ORDER the pass produces, which
+// is exactly what changed.
+
+// Written order is [SUBSTRING (raises), speed] and speed is far more selective,
+// so before the screen the sort promoted speed and the SUBSTRING was never
+// reached: 0 rows optimized, `Error: SUBSTRING: start position must be >= 1`
+// under --no-optimize. The raising conjunct must keep index 0.
+TEST(PredicatePushdown, RaisingConjunctIsNotDemotedByTheSelectivitySort) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT team FROM laps "
+        "WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' AND speed > 390", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    ASSERT_EQ(root_and->op, "AND");
+    // WITHOUT THE FIX this is the `speed > 390` comparison: selectivity ~0.05
+    // against the SUBSTRING conjunct's FALLBACK_EQ_SELECTIVITY of 0.1.
+    const auto* left = dynamic_cast<const BinaryExpr*>(root_and->left.get());
+    ASSERT_NE(left, nullptr);
+    EXPECT_NE(dynamic_cast<const SubstringExpr*>(left->left.get()), nullptr)
+        << "the conjunct that can raise must keep its written position";
+}
+
+// The mirror image, and the one that matters most: the optimizer MANUFACTURING a
+// failure on a query that succeeds without it. LIKE deliberately has no
+// selectivity rule (FALLBACK_SELECTIVITY 0.5), so the SUBSTRING conjunct's 0.1
+// used to sort AHEAD of a predicate that matched nothing.
+TEST(PredicatePushdown, RaisingConjunctIsNotPromotedAheadOfAWrittenPredecessor) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT team FROM laps "
+        "WHERE team LIKE 'zzz%' AND SUBSTRING(team, lap_id - lap_id, 2) = 'x'", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    // WITHOUT THE FIX the left operand is the SUBSTRING comparison.
+    EXPECT_NE(dynamic_cast<const LikeExpr*>(root_and->left.get()), nullptr)
+        << "a predicate the user wrote FIRST must not be demoted below one that "
+           "can raise";
+}
+
+// THE CONTROL, and it is what keeps the screen from being a blanket refusal:
+// inferExprType decides a CONSTANT SUBSTRING's domain at plan time, in both
+// legs, before this pass runs — so `SUBSTRING(team, 1, 2)` cannot raise and is
+// sorted like any other conjunct. This is TPC-H Q22's shape.
+TEST(PredicatePushdown, ConstantArgumentSubstringIsTotalAndStillSorts) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT team FROM laps "
+        "WHERE SUBSTRING(team, 1, 2) = 'Fe' AND speed > 390", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    const auto* left = dynamic_cast<const BinaryExpr*>(root_and->left.get());
+    ASSERT_NE(left, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(left->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "speed")
+        << "a SUBSTRING with constant arguments cannot raise, so the sort keeps "
+           "working on it";
+}
+
+// The SECOND cause, which a fix confined to orderByWork would have missed.
+// Pushing a conjunct below the join moves it to a point where it sees EVERY row
+// of one relation rather than the join's survivors. Reproduced on the shipped
+// catalog: `d.nationality = 'Zzz' AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2)`
+// errored optimized and returned 0 rows under --no-optimize.
+TEST(PredicatePushdown, RaisingConjunctIsNotPushedBelowTheJoin) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.nationality = 'French' "
+        "  AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'", cat);
+
+    // The raising conjunct stays ABOVE the join...
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER)
+        << "WITHOUT THE FIX the SUBSTRING conjunct is single-slot and is pushed "
+           "onto the laps scan, leaving no residual filter here at all";
+    const auto* residual = static_cast<const LogicalFilter*>(plan->children[0].get());
+    EXPECT_NE(dynamic_cast<const SubstringExpr*>(
+        dynamic_cast<const BinaryExpr*>(residual->predicate.get())->left.get()), nullptr);
+
+    // ...and the FROM-side scan carries no filter of its own.
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN);
+    // The conjunct WRITTEN BEFORE it is total, so it still pushes: the screen
+    // freezes a suffix, it does not switch pushdown off.
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+}
+
+// distribute() deliberately leaves a bucket behind when the join at that slot is
+// LEFT (Week 29) or semi/anti (Week 32), and pushIntoJoin then lifts it above the
+// tree. Appending it there put a WRITTEN-EARLIER conjunct AFTER the raising one,
+// which is the same divergence with a third cause — reproduced on the shipped
+// catalog as `laps LEFT JOIN drivers WHERE d.nationality='Zzz' AND SUBSTRING(...)`,
+// which errored optimized and returned 0 rows under --no-optimize.
+TEST(PredicatePushdown, LeftoverBucketIsRestoredToItsWrittenPosition) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l LEFT JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.nationality = 'French' "
+        "  AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER);
+    const auto* residual = static_cast<const LogicalFilter*>(plan->children[0].get());
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(residual->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    ASSERT_EQ(root_and->op, "AND");
+    // WITHOUT THE FIX the left operand is the SUBSTRING conjunct: the
+    // null-supplying-side bucket is declined by distribute and appended LAST.
+    const auto* left = dynamic_cast<const BinaryExpr*>(root_and->left.get());
+    ASSERT_NE(left, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(left->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "nationality")
+        << "a leftover bucket must go back to the position the user wrote it in";
+}
+
+// ===== Descending past the first rewritable node (seam audit pass 2, B-2) =====
+
+// `apply` used to RETURN from the FILTER-over-JOIN branch, so a derived body's
+// own FILTER-over-JOIN was rewritten only when the ENCLOSING block happened to
+// have no join. Whether a body is optimized cannot depend on its caller's shape.
+TEST(PredicatePushdown, DescendsIntoADerivedBodyUnderAJoiningOuterBlock) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    // The outer WHERE is what makes the outer block a FILTER-over-JOIN, which is
+    // the branch that used to `return` before the body was ever reached. Without
+    // it `apply` falls through to the generic child loop and descends anyway —
+    // which is the audit's point: whether a body is optimized depended on a
+    // property of its CALLER.
+    auto plan = buildPushed(
+        "SELECT x.team FROM drivers d0 JOIN "
+        "  (SELECT l.team, l.driver_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "   WHERE l.season = 2020 AND d.age > 38) x "
+        "ON d0.driver_id = x.driver_id "
+        "WHERE d0.nationality = 'French'", cat);
+
+    const LogicalPlanNode* derived = nullptr;
+    std::vector<const LogicalPlanNode*> stack{plan.get()};
+    while (!stack.empty()) {
+        const LogicalPlanNode* n = stack.back(); stack.pop_back();
+        if (n->type == LogicalNodeType::DERIVED) { derived = n; break; }
+        for (const auto& c : n->children) stack.push_back(c.get());
+    }
+    ASSERT_NE(derived, nullptr);
+
+    // Inside the body, both conjuncts must have reached their own scans. WITHOUT
+    // THE FIX the body still carries one FILTER over its JOIN and both scans are
+    // bare.
+    const LogicalPlanNode* body_join = findNode(derived, LogicalNodeType::JOIN);
+    ASSERT_NE(body_join, nullptr) << "the body's join should be directly reachable "
+                                     "— a residual FILTER above it means nothing was pushed";
+    EXPECT_EQ(body_join->children[0]->type, LogicalNodeType::FILTER)
+        << "l.season = 2020 should have reached the laps scan";
+    EXPECT_EQ(body_join->children[1]->type, LogicalNodeType::FILTER)
+        << "d.age > 38 should have reached the drivers scan";
+}

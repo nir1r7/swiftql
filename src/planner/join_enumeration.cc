@@ -88,10 +88,37 @@ int countRelations(const LogicalPlanNode* node) {
 // reorderable block. Decline the whole tree instead, in the same shape as the
 // <3-relation and >32-relation declines: return it untouched and print no
 // order= line, because there was no decision to report.
+//
+// !! WHAT IT MUST NOT LOOK AT — seam audit pass 2, B-2. It used to walk EVERY
+// child, so it answered a question about a different query block. Its containment
+// rule is now written the same way `countRelations` above writes it, because it
+// is the SAME rule and having two spellings of it is how the two drifted:
+//
+//   * a DERIVED relation is an OPAQUE LEAF of this tree. `countRelations` counts
+//     it as one relation, `decompose` moves it out whole and `rebuild` never
+//     looks inside, so an outer join sealed in its BODY is never reordered by
+//     this pass and cannot make an ordering illegal here. Recursing into it made
+//     one `LEFT JOIN` inside a derived table switch ordering off for the
+//     enclosing block's fully inner spine — the exact "an unrelated construct
+//     costs the whole query its ordering" loss Week 29 added its decline string
+//     for, in a shape the string then MISATTRIBUTED.
+//   * a SEMI/ANTI join's children[1] is a subquery BODY, not a relation of this
+//     block, for the same reason `countRelations` skips it. Walking into it let a
+//     `LEFT JOIN` in the body report `join-ordering=skipped (outer join)` for a
+//     tree whose real and stronger reason is `(semi/anti join)` — the decline
+//     that `slotDeclineReason` would have named a few lines later. A decline
+//     string that names the wrong cause is worse than none: it is the surface a
+//     reader consults, and it sends them to the wrong construct.
+//
+// The node's OWN join_type is still decisive: a LEFT join anywhere on THIS
+// spine is a tree this pass must not touch.
 bool containsOuterJoin(const LogicalPlanNode* node) {
-    if (node->type == LogicalNodeType::JOIN &&
-        static_cast<const LogicalJoin*>(node)->join_type != JoinType::INNER) {
-        return true;
+    if (node->type == LogicalNodeType::DERIVED) return false;
+    if (node->type == LogicalNodeType::JOIN) {
+        const auto* join = static_cast<const LogicalJoin*>(node);
+        if (join->join_type != JoinType::INNER) return true;
+        if (join->semantics != JoinSemantics::STANDARD)
+            return containsOuterJoin(join->children[0].get());
     }
     for (const auto& child : node->children) {
         if (containsOuterJoin(child.get())) return true;
@@ -625,14 +652,57 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     return root;
 }
 
+// Re-enter every subtree hanging off a join spine that is NOT part of the spine:
+// each relation leaf, and a semi/anti join's body. Called on a spine this pass
+// has just finished with.
+//
+// It exists because `apply` must NOT recurse into its own result. `decompose`
+// (above) is only decomposable on a WRITTEN-ORDER tree — its own comment says so:
+// "a reordered tree's bottom join carries from_slot 0 for whatever relation sits
+// there, and would not be decomposable this way". A plain `for (child) apply()`
+// after `reorder` would hand the spine's inner joins straight back to
+// `decompose`, so the descent has to step OVER the spine and into its leaves.
+void applyToSpineLeaves(LogicalPlanNode* node, const Catalog& catalog) {
+    auto* join = static_cast<LogicalJoin*>(node);
+    if (join->children[0]->type == LogicalNodeType::JOIN)
+        applyToSpineLeaves(join->children[0].get(), catalog);
+    else
+        join->children[0] = JoinEnumeration::apply(std::move(join->children[0]), catalog);
+    join->children[1] = JoinEnumeration::apply(std::move(join->children[1]), catalog);
+}
+
 } // namespace
 
 std::unique_ptr<LogicalPlanNode> JoinEnumeration::apply(std::unique_ptr<LogicalPlanNode> node,
                                                         const Catalog& catalog) {
-    // The topmost JOIN is the root of the whole join tree — there is exactly one
-    // per statement until subqueries arrive in Week 30 — so this replaces at most
-    // once and never descends into a tree it has already reordered.
-    if (node->type == LogicalNodeType::JOIN) return reorder(std::move(node), catalog);
+    // !! SEAM AUDIT PASS 2, B-3. The comment that stood here read: "The topmost
+    // JOIN is the root of the whole join tree — there is exactly one per statement
+    // until subqueries arrive in Week 30 — so this replaces at most once and never
+    // descends into a tree it has already reordered." Subqueries arrived in Week
+    // 30, semi joins in Week 32, derived tables in Week 34. There are SEVERAL join
+    // trees per statement now, and this reordered only the outermost: a derived or
+    // subquery body's joins were enumerated only when the ENCLOSING block happened
+    // to have no join of its own, because that is the only case in which the
+    // generic child loop below was reached at all. Measured on
+    // `data/tpch/sf0.01/catalog.json` before the fix, on a 3-relation body under a
+    // joining outer block: 62729 vs 38417 (see the commit message), and NO decline
+    // line was printed, so `--explain` showed a body that had simply not been
+    // considered as one that had nothing to consider.
+    //
+    // SEQUENCING. This widens where the DP runs, and the DP permutes a join's
+    // merged schema. That was safe to do only after the sort tie-break stopped
+    // reading schema POSITION as column IDENTITY (`sort_comparator::tieBreakOrder`,
+    // ae768d6/d085230/6ab8848) — before it, widening the DP would have widened
+    // optimizer B3-1's `optimized != --no-optimize` to every sort inside a derived
+    // body. Verified rather than assumed: see the derived-body ORDER BY entry in
+    // tests/test_join_enumeration.cc.
+    if (node->type == LogicalNodeType::JOIN) {
+        node = reorder(std::move(node), catalog);
+        // reorder() returns a JOIN in every path (rebuild folds a left-deep tree;
+        // the declines return the node untouched).
+        applyToSpineLeaves(node.get(), catalog);
+        return node;
+    }
     for (auto& child : node->children) child = apply(std::move(child), catalog);
     return node;
 }

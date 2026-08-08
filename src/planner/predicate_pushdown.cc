@@ -236,6 +236,127 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
     return ctx;
 }
 
+// ── THE TOTALITY SCREEN (seam audit pass 3, B3-2) ────────────────────────────
+//
+// PER-ROW EVALUATION IS NOT TOTAL: `evaluate()` can THROW on a row. That makes
+// every conjunct MOVE this pass performs — reordering inside one filter, and
+// pushing a conjunct below a join — a decision about whether a query ERRORS,
+// not only about how fast it runs. Measured at HEAD before this screen existed,
+// on the shipped `catalog.json`, in BOTH directions:
+//
+//   MASKED    WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' AND speed = 333.3333
+//             optimized -> 0 rows,  --no-optimize -> Error
+//   INTRODUCED WHERE team LIKE 'zzz%' AND SUBSTRING(team, lap_id - lap_id, 2) = 'x'
+//             optimized -> Error,   --no-optimize -> 0 rows
+//   INTRODUCED (by distribute, NOT by orderByWork — the same defect with a
+//             second cause, so a fix confined to the sort would have closed half
+//             of it) laps l JOIN drivers d ON …
+//             WHERE d.nationality = 'Zzz' AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'
+//             optimized -> Error,   --no-optimize -> 0 rows
+//
+// SQL does not fix predicate evaluation order, so each of those answers is legal
+// in isolation. This project nevertheless asserts `optimized == --no-optimize`
+// (compare_against_sqlite.py's fourth mode, run_optimizer_invariant), so the two
+// legs DISAGREEING is the defect. THE PROPERTY BEING RESTORED IS THEREFORE
+// NARROW AND STATABLE: every conjunct is evaluated on exactly the ROW SET that
+// written order gives it, so it raises in the optimized leg if and only if it
+// raises in the `--no-optimize` leg.
+//
+// THE PRECONDITION, which was written down nowhere before:
+//
+//   Permuting conjuncts C1..Cn preserves both the result set and the error
+//   behaviour IFF every conjunct that can RAISE is evaluated on the same row set
+//   in both arrangements. AND is commutative over TOTAL conjuncts under SQL's
+//   three-valued logic (a filter keeps only TRUE), so the survivor set entering
+//   position k depends only on the SET {C1..C_{k-1}}, not on its order. Hence:
+//   freely permuting a prefix of TOTAL conjuncts is sound, and so is pushing any
+//   of them below an inner join (σ_p(R⋈S) ≡ σ_p(R)⋈S makes the join output set
+//   identical). Both stop being sound at the FIRST conjunct that can raise:
+//     - it must not move, or it sees rows written order never gave it;
+//     - nothing after it may move ahead of it or be pushed below the join, or it
+//       sees FEWER rows and a raise it owed is masked.
+//
+// So: `firstMayRaise` splits the conjunct list. Everything before that index is
+// optimized exactly as before. Everything from it on is FROZEN — kept in written
+// order and kept above the join. A query with no raising conjunct (every TPC-H
+// query, every query in both harnesses) is unaffected, which is why this costs
+// nothing measurable.
+//
+// mayRaise is a CONSERVATIVE over-approximation of "evaluate() can throw on some
+// row". Over-approximating costs plan quality on the queries it hits and nothing
+// else; under-approximating is a divergence, so the two errors are not
+// symmetric. What it does NOT have to cover, because `inferExprType`
+// (logical_plan.cc) decides it at PLAN time — in both legs, before any pass in
+// this file runs — is every TYPE error: STRING arithmetic, a non-STRING LIKE or
+// SUBSTRING operand, a mixed IN list, a CASE with mixed branches. Those raise
+// identically in both legs no matter how the conjuncts are arranged. What is
+// left is exactly the DATA-dependent raises:
+//
+//   * substringOf  — start < 1 or length < 0 (evaluator.cc). Only reachable with
+//     a COMPUTED position: inferExprType refuses a constant one at plan time, so
+//     a SUBSTRING whose start and length are both Literals cannot raise here.
+//     That carve-out is what keeps TPC-H Q22's `SUBSTRING(c_phone, 1, 2)` total.
+//   * checkedAdd/Sub/Mul/Div/Negate — INT overflow (checked_arith.h). Screened by
+//     OPERATOR rather than by inferred type: DOUBLE arithmetic cannot overflow,
+//     but deciding that needs a schema this function does not have, and post-
+//     folding an arithmetic conjunct in a WHERE is rare enough that the extra
+//     conservatism is free (no TPC-H query has one — Q19's `:QTY1 + 10` is two
+//     literals and folds).
+//   * integer division by zero is NOT in the list: it yields NULL (verified —
+//     `SELECT 100 / (lap_id - lap_id) FROM laps LIMIT 1` prints NULL). Only
+//     INT64_MIN / -1 raises, and that is covered by the operator screen anyway.
+//
+// IntervalLiteral and SubqueryExpr both throw unconditionally in evaluate();
+// neither can reach a built plan (foldConstants removes the first,
+// materializeSubqueries the second), and both are screened here rather than
+// argued about, since the cost of screening them is zero.
+//
+// Same dispatch as collectSlots/restampSlots. A MISSED subtype here answers
+// "total" and is therefore the unsafe direction — unlike dispatch site 8, whose
+// miss only costs pushdown. Keep the three in lockstep.
+bool mayRaise(const Expr* expr) {
+    if (!expr) return false;
+    if (dynamic_cast<const Literal*>(expr)) return false;
+    if (dynamic_cast<const ColumnRef*>(expr)) return false;
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        const std::string& op = bin->op;
+        if (op == "+" || op == "-" || op == "*" || op == "/") return true;
+        return mayRaise(bin->left.get()) || mayRaise(bin->right.get());
+    }
+    if (dynamic_cast<const UnaryExpr*>(expr)) return true;   // checkedNegate
+    if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) return mayRaise(isn->operand.get());
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) return mayRaise(in->operand.get());
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) return mayRaise(lk->operand.get());
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        // evaluate() short-circuits an untaken branch, but ExpressionExecutor
+        // declines to compile CaseExpr at all for exactly that reason, so which
+        // branches run is an ENGINE detail. Screen every arm.
+        for (const auto& w : c->when_clauses) {
+            if (mayRaise(w.condition.get()) || mayRaise(w.result.get())) return true;
+        }
+        return mayRaise(c->else_expr.get());
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        const bool const_start = dynamic_cast<const Literal*>(sub->start.get()) != nullptr;
+        const bool const_len = !sub->length
+                             || dynamic_cast<const Literal*>(sub->length.get()) != nullptr;
+        if (!const_start || !const_len) return true;
+        return mayRaise(sub->operand.get());
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) return mayRaise(agg->argument.get());
+    // IntervalLiteral, SubqueryExpr, and any Expr subtype added later.
+    return true;
+}
+
+// Index of the first conjunct that can raise, or conjuncts.size() when none can.
+// Everything from here on is frozen: see the screen's comment above.
+size_t firstMayRaise(const std::vector<std::unique_ptr<Expr>>& conjuncts) {
+    for (size_t i = 0; i < conjuncts.size(); ++i) {
+        if (mayRaise(conjuncts[i].get())) return i;
+    }
+    return conjuncts.size();
+}
+
 // Order conjuncts most-selective-first (smallest keep-fraction). Stable so ties
 // and stat-less predicates (fallback selectivity) keep their original order.
 // "Expected work" is modeled as selectivity only — optimal when per-predicate
@@ -244,10 +365,18 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
 // like IS NULL or col-vs-col) is deferred to Week 28, where join enumeration
 // gives the cost model per-predicate costs; Week 22 wired costs into join
 // selection only.
+//
+// Only the TOTAL PREFIX is sorted (seam audit pass 3, B3-2). The conjuncts from
+// the first one that can raise onward keep their written positions, because the
+// columnar predicate cascade evaluates the right conjunct only over the left's
+// survivors (columnar_eval.cc's AND) and per-row evaluation can throw — so their
+// order decides whether the query errors, not how fast it runs. See mayRaise.
 void orderByWork(std::vector<std::unique_ptr<Expr>>& conjuncts,
                  const LogicalPlanNode* scan_child, const Catalog& catalog) {
+    const size_t frozen = firstMayRaise(conjuncts);
+    if (frozen < 2) return;   // nothing sortable ahead of the frozen tail
     StatsContext ctx = scanStats(scan_child, catalog);
-    std::stable_sort(conjuncts.begin(), conjuncts.end(),
+    std::stable_sort(conjuncts.begin(), conjuncts.begin() + static_cast<long>(frozen),
         [&](const std::unique_ptr<Expr>& a, const std::unique_ptr<Expr>& b) {
             return CardinalityEstimator::selectivity(a.get(), ctx)
                  < CardinalityEstimator::selectivity(b.get(), ctx);
@@ -334,25 +463,74 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
     std::vector<std::unique_ptr<Expr>> conjuncts;
     splitConjuncts(std::move(filter->predicate), conjuncts);   // filter is now empty
 
+    // Seam audit pass 3, B3-2. The SECOND half of the totality screen, and the
+    // one a fix confined to orderByWork would have missed: pushing a conjunct
+    // below the join moves it to a point where it sees a DIFFERENT ROW SET
+    // (every row of one relation, rather than the join's survivors), so it can
+    // introduce a raise the written order never reached — and a conjunct pushed
+    // out from AHEAD of a raising one leaves that one with fewer rows, masking a
+    // raise it was owed. Both were reproduced on the shipped catalog; see
+    // mayRaise. Freezing the suffix in `residual` costs pushdown only on queries
+    // that contain a raising conjunct at all.
+    const size_t frozen = firstMayRaise(conjuncts);
+
     // std::map, not unordered_map: the leftover loop below must be deterministic
     std::map<int, std::vector<std::unique_ptr<Expr>>> by_slot;
-    std::vector<std::unique_ptr<Expr>> residual;
-    for (auto& c : conjuncts) {
-        int slot = soleSlot(c.get());
-        if (slot < 0) residual.push_back(std::move(c));
-        else          by_slot[slot].push_back(std::move(c));
+    // Each residual carries its WRITTEN index. See the restore below: the
+    // leftover path can reorder conjuncts relative to what the user wrote, and
+    // since B3-2 that order is load-bearing rather than cosmetic.
+    std::map<int, std::vector<size_t>> by_slot_written;
+    std::vector<std::pair<size_t, std::unique_ptr<Expr>>> residual;
+    for (size_t i = 0; i < conjuncts.size(); ++i) {
+        auto& c = conjuncts[i];
+        int slot = (i >= frozen) ? -1 : soleSlot(c.get());
+        if (slot < 0) residual.emplace_back(i, std::move(c));
+        else { by_slot[slot].push_back(std::move(c)); by_slot_written[slot].push_back(i); }
     }
 
     join = distribute(std::move(join), by_slot, catalog);
 
-    // Nothing should be left: slots come from the same range table the tree was
-    // built from. Anything unclaimed stays above the join — correct, just
-    // slower — so a future tree shape degrades instead of dropping a predicate.
-    for (auto& entry : by_slot)
-        for (auto& c : entry.second) residual.push_back(std::move(c));
+    // Anything unclaimed stays above the join — correct, just slower — so a
+    // future tree shape degrades instead of dropping a predicate. This is NOT
+    // unreachable: distribute deliberately leaves a bucket behind when the join
+    // at that slot is LEFT (Week 29) or semi/anti (Week 32), which is a shape the
+    // CLI can type.
+    //
+    // Seam audit pass 3, B3-2: it is therefore also not free. Appending a
+    // leftover after a FROZEN conjunct would put a written-earlier predicate
+    // after a written-later one, and the frozen conjunct would then see rows
+    // written order never gave it — reintroducing exactly the divergence the
+    // screen closes, on a LEFT JOIN. distribute either consumes a whole bucket
+    // (and erases it) or leaves it whole, so the parallel index vector still
+    // lines up, and re-sorting by written index makes "the residual is in
+    // written order" true by construction rather than by argument.
+    for (auto& entry : by_slot) {
+        const std::vector<size_t>& written = by_slot_written[entry.first];
+        for (size_t k = 0; k < entry.second.size(); ++k)
+            residual.emplace_back(written[k], std::move(entry.second[k]));
+    }
+    std::sort(residual.begin(), residual.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    // residuals (mixed / unresolved) stay above the join
-    return filterOnto(std::move(join), std::move(residual), catalog);
+    std::vector<std::unique_ptr<Expr>> residual_exprs;
+    residual_exprs.reserve(residual.size());
+    for (auto& r : residual) residual_exprs.push_back(std::move(r.second));
+
+    // residuals (mixed / unresolved / frozen) stay above the join
+    return filterOnto(std::move(join), std::move(residual_exprs), catalog);
+}
+
+// Re-enter every subtree hanging off a join spine that is NOT part of the spine:
+// each relation leaf, and a semi/anti join's body. Twin of the function of the
+// same name in join_enumeration.cc, and for the same reason — see
+// PredicatePushdown::apply below.
+void applyToSpineLeaves(LogicalPlanNode* node, const Catalog& catalog) {
+    auto* join = static_cast<LogicalJoin*>(node);
+    if (join->children[0]->type == LogicalNodeType::JOIN)
+        applyToSpineLeaves(join->children[0].get(), catalog);
+    else
+        join->children[0] = PredicatePushdown::apply(std::move(join->children[0]), catalog);
+    join->children[1] = PredicatePushdown::apply(std::move(join->children[1]), catalog);
 }
 
 } // namespace
@@ -364,7 +542,19 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
     if (node->type == LogicalNodeType::FILTER &&
         node->children[0]->type == LogicalNodeType::JOIN) {
         auto* f = static_cast<LogicalFilter*>(node.release());
-        return pushIntoJoin(std::unique_ptr<LogicalFilter>(f), catalog);
+        node = pushIntoJoin(std::unique_ptr<LogicalFilter>(f), catalog);
+        // SEAM AUDIT PASS 2, B-2. This used to `return` here, so a derived or
+        // subquery body below a joining outer block was never visited and its own
+        // FILTER-over-JOIN was never rewritten — the same silent decline
+        // JoinEnumeration::apply had, in the same shape and found in the same
+        // pass. Descending into the SPINE ITSELF would be wrong (and wasted):
+        // pushIntoJoin has already routed every conjunct it can, and the
+        // leftover/residual bookkeeping is written for one visit. The leaves are
+        // what was never reached.
+        LogicalPlanNode* spine = node->type == LogicalNodeType::FILTER
+                               ? node->children[0].get() : node.get();
+        applyToSpineLeaves(spine, catalog);
+        return node;
     }
 
     // A WHERE directly above a single scan is already at the lowest node, but

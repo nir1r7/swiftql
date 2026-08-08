@@ -52,7 +52,31 @@ REGRESSION_QUERIES = [
     "SELECT DISTINCT team, season FROM laps ORDER BY team, season LIMIT 10",
     "SELECT team, COUNT(*) FROM laps GROUP BY team ORDER BY COUNT(*) LIMIT 5",
     "SELECT team, AVG(speed) FROM laps WHERE speed IS NOT NULL GROUP BY team HAVING AVG(speed) > 305 ORDER BY team",
-    "SELECT season, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5",
+    # `, laps.lap_id` is not decoration, and neither is the ORDER BY. Written as
+    # a bare `LIMIT 5` this entry asked SQLite to adjudicate something SQL does
+    # not define: which five rows an UNORDERED `LIMIT` returns. It passed for
+    # years by COINCIDENCE -- both sides happened to probe `laps` in storage
+    # order, so both happened to cut the same five rows.
+    #
+    # The determinism fix ended the coincidence. Two invariants meet at a plain
+    # `LIMIT` and only one can hold: `optimized == --no-optimize` (the cut must
+    # not depend on the plan) or `swiftql == sqlite` (the cut must mimic
+    # SQLite's arbitrary pick). The project chose the first -- it is what this
+    # whole phase rests on -- so SwiftQL now cuts the canonically smallest five
+    # and SQLite still cuts whatever its scan reaches first. Both are correct;
+    # neither is an oracle for the other. Measured here: SwiftQL returned
+    # `280.03, 280.06, ...` against SQLite's `288.13, 293.12, ...`.
+    #
+    # DO NOT PUT THE UNORDERED FORM BACK IN THIS SUITE. It is not a stricter
+    # test, it is a test of a non-guarantee, and it will fail again. The entry
+    # was written to exercise a JOIN PROJECTION, not to pin a cut, and a total
+    # order lets it keep doing that against a real oracle -- same reasoning, and
+    # the same `, <unique column>` shape, as test_new_queries.py's
+    # `order_by_speed_asc`. The unordered shape is not lost: it lives in
+    # test_new_queries.py's TIE_STRADDLE_QUERIES, where the oracle is SwiftQL's
+    # other leg rather than SQLite.
+    "SELECT season, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id "
+    "ORDER BY season, speed, laps.lap_id LIMIT 5",
     "SELECT season, AVG(speed) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id GROUP BY season ORDER BY season",
     "SELECT season, COUNT(*) FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id WHERE speed > 300 GROUP BY season ORDER BY season",
     # SELECT * + JOIN regression (Week 18): the columnar Volcano path used to

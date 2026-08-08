@@ -1332,6 +1332,37 @@ TIE_STRADDLE_QUERIES = [
      "JOIN laps l2 ON l.lap_id = l2.driver_id "
      "JOIN drivers d ON l2.driver_id = d.driver_id LIMIT 5"),
 
+    # ...and the TWO-relation instance of the same shape, which arrives here
+    # from the other side: `compare_against_sqlite.py`'s join-projection entry
+    # was a bare `LIMIT 5` diffed against SQLite, which is a test of a
+    # non-guarantee. That entry was given a total order; the unordered shape
+    # belongs here, where the oracle is SwiftQL's own other leg.
+    #
+    # !! IT IS NOT THAT ENTRY'S TEXT, AND THE DIFFERENCE IS THE WHOLE POINT.
+    # The original — `laps JOIN drivers ON driver_id` with no WHERE — CANNOT
+    # DISCRIMINATE. Measured: with the LIMIT removed, so nothing sorts, the two
+    # legs emit all 10000 rows in BYTE-IDENTICAL ORDER despite planning
+    # different join algorithms (VecSimdLoopJoin optimized, VecHashJoin under
+    # --no-optimize). Both probe `laps`, both emit probe-major in storage order,
+    # so any `LIMIT n` cuts the same n rows in both legs whether or not the
+    # determinism fix exists. Copied across verbatim it would have been a green
+    # tick that proves nothing — the exact failure mode this block was built to
+    # end.
+    #
+    # `WHERE l.lap_id < 15` is what makes it real: the filtered cardinality (14)
+    # drops below `drivers` (20), so the optimized leg builds on the OTHER side
+    # from the `--no-optimize` leg and the two probe orders genuinely differ.
+    # Reconstructing the pre-fix cut exactly — pre-fix the LIMIT only truncated
+    # the stream, so the first 5 rows of the unsorted output ARE what it
+    # returned — the legs differ in FOUR of five rows:
+    #   optimized      2022 332.72 Driver_2 | 2024 287.99 Driver_2  | 2025 305.32 …
+    #   --no-optimize  2022 332.72 Driver_2 | 2022 320.38 Driver_20 | 2022 293.12 …
+    # With the deterministic cut they are identical.
+    ("b31_plain_limit_two_relations",
+     "SELECT l.season, l.speed, d.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.lap_id < 15 LIMIT 5"),
+
     # ── CONTROLS. Without these the block proves only that SOME 3-relation
     # ── query diverges, which is not the claim. Each removes exactly one of the
     # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both
