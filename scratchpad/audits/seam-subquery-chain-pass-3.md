@@ -211,3 +211,59 @@ resolved by `leftKeyIndices` against the enclosing spine's schema:
 ## Part A — execution
 
 (pending)
+
+Executed. Every level-2 shape I could construct is refused **by name**, and the
+message names the depth:
+
+```
+EXISTS (... l.driver_id = d.driver_id AND EXISTS (... l2.driver_id = d.driver_id))
+EXISTS (... l.driver_id = d.driver_id AND l.speed > (SELECT AVG(...) ... l2.driver_id = d.driver_id))
+d.age > (SELECT COUNT(*) ... l.driver_id = d.driver_id AND EXISTS (... l2.driver_id = d.driver_id))
+EXISTS (... AND EXISTS (... l2.lap_id = l.lap_id AND l2.season = d.age))      -- level 2 in a NON-key conjunct
+EXISTS (... AND EXISTS (... AND EXISTS (... l3.driver_id = d.driver_id)))     -- level 3
+(SELECT AVG(l2.speed) ... l2.team = l.team AND EXISTS (... l3.driver_id = l.driver_id))
+  -> Error: correlated subquery: a reference to a query block more than one
+     level out cannot be decorrelated here
+```
+
+One level-2 shape is caught EARLIER and correctly: a level-2 ref in the inner
+body's SELECT list is refused by `refuseSurvivingCorrelatedRefs`
+(`... survives in its SELECT list`), because that check runs before the body's
+list is replaced. Both are refusals, neither is a wrong answer.
+
+And every ONE-level shape runs and matches SQLite. The enumeration is by what
+the outer slot can name, because `outer_side->id.outward().localSlot()` is the
+value `leftKeyIndices` resolves against the enclosing spine:
+
+| outer slot names | probe | SwiftQL = SQLite |
+|---|---|---|
+| slot 0, single relation | `EXISTS (... = d.driver_id)` | 20 |
+| slot 1 of a 2-way join | `EXISTS (... l2.lap_id = l.lap_id ...)` | 770 |
+| slot 1 of a SELF-join, shared column names | `d2.age > (SELECT COUNT(*) ... = d2.driver_id)` vs `= d1.driver_id` | **5 vs 8** — the pair discriminates, and both match |
+| a DERIVED relation at slot 0 | `FROM (SELECT ...) x WHERE EXISTS (... = x.driver_id)` | 20 / 2 |
+| slot 2 of a 3-way join | `EXISTS (... = d3.driver_id ...)` | 0 |
+| inside a derived BODY (the W34xW35 joint) | both EXISTS and scalar forms | 20 / 2 |
+
+Nesting one level out at every depth also runs: EXISTS-in-EXISTS,
+scalar-in-EXISTS, EXISTS-in-scalar, scalar-in-scalar, NOT-EXISTS-in-EXISTS and
+a three-deep chain — all six match SQLite.
+
+**Where the guard sits relative to the other refusals**, since "can it be
+reached by something that is not a depth problem" also has a converse: two
+shapes that ARE one level out now reach a *different* refusal because of B-3's
+fix, and both messages are accurate:
+
+```
+(SELECT AVG(l2.speed) FROM laps l2 WHERE EXISTS (SELECT 1 FROM laps l3 WHERE l3.driver_id = l.driver_id))
+  -> correlated subquery: no equality links the scalar subquery to the enclosing
+     query, so there is no group key to decorrelate on            (SQLite: 4997)
+EXISTS (SELECT 1 FROM laps l WHERE EXISTS (SELECT 1 FROM laps l3 WHERE l3.driver_id = d.driver_id))
+  -> correlated subquery: no equality links the subquery to the enclosing query,
+     so there is no join key to decorrelate on                    (SQLite: 20)
+```
+
+These are the shapes whose ONLY correlation runs through a nested subquery: the
+node is `correlated`, but `splitCorrelation` — now correctly suppressing the
+nested flag — finds no key. The refusal is truthful and the class is the
+documented "decorrelation cannot express this" one. It is **not** in the
+README's enumeration of refused correlated shapes (see L-2).
