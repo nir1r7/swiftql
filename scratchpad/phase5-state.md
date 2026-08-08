@@ -1,4 +1,61 @@
 # Phase 5 orchestrator state
+Current: **PASS 4 COMPLETE — 4 BLOCKERS / 2 HIGH / 6 MEDIUM. FIX ROUND 4 RUNNING (2 agents).**
+Pass 5 is the LAST the skill allows. After fix round 4: gate -> pass 5 -> doc sweep -> q21 -> sf0.1.
+
+## !!! THE UNIFYING FINDING OF PASS 4 — read this before dispatching anything
+**THREE SEAMS INDEPENDENTLY FOUND INSTANCES OF ONE CLASS.** Stated once:
+> Per-row evaluation is NOT TOTAL — `evaluate()` can THROW on a row. So ANYTHING that changes
+> WHICH ROWS an expression is evaluated on can change whether a query raises.
+Fix round 3 recognised this and wrote a CORRECT precondition. **Every mechanism implementing or
+relying on that precondition is wrong somewhere**, and the same screen is ALSO wrong in the
+opposite direction (87x). The four instances:
+1. **The screen's carve-out cites a claim that was NEVER TRUE** (optimizer P4-1 == join-chain
+   P4-B2, found independently). `inferExprType` types a comparison as INT WITHOUT COMPARING
+   OPERAND TYPES (logical_plan.cc:159-171); the throw is per row in `Value`'s NUMERIC_COERCE
+   (value.cc:50-57), shared by all six comparison ops. So `team = 5` screens TOTAL and moves freely.
+2. **A raise site OUTSIDE the evaluator**: `ChunkPruner::canSkipChunk` compares against ZONE-MAP
+   metadata and `shouldSkip` walks conjuncts IN ORDER — order decides whether it throws BEFORE ANY
+   ROW IS READ.
+3. **The new descent screens the CONJUNCT but not the PROJECTION it moves below** (join-chain
+   P4-B1). `remapThroughProject`'s rule is a SET equivalence and true; it is not an ERROR-BEHAVIOUR
+   equivalence.
+4. **The two engines evaluate AND differently** (engine E-13): `evaluate()` computes BOTH operands
+   before the tri-state; `evalPredicate` CASCADES the selection vector. One errors where the other
+   answers, IN BOTH DIRECTIONS — and swapping the conjuncts makes the vectorized path disagree
+   WITH ITSELF on a commutative operator.
+**DISPATCHED AS ONE PROBLEM TO ONE AGENT.** Fixing these separately under three rules is how the
+class survived two fix rounds. That agent must choose and defend a coherent semantics for partial
+expressions; it is told that "this cannot close without scoping `optimized == --no-optimize`" is a
+LEGITIMATE answer to bring back.
+CORPUS BLINDNESS, MEASURED not theorised: 592 distinct SELECT literals, 11 use SUBSTRING, 5 sit
+under an AND, and ALL 5 have a CONSTANT start position. Green was always consistent with this.
+
+## FIX ROUND 4 — second agent: the INT->DOUBLE refusals pull BOTH WAYS
+UNDER-fires: the arming walk cannot cross the materialization cut -> silent wrong answer (10000 vs
+SQLite 0). OVER-fires: `taintWalk` arms both operands of `/` regardless of type so `x / 2.0` is
+refused; the magnitude refusal enforces a RENDERING bound on values never rendered; and **the
+derived-table form has NO WORKING MODE AT ALL** — a capability regression, since Volcano refuses
+derived tables and the vectorized path now refuses this shape.
+
+## HELD FOR WAVE C (collides on logical_plan.cc with the partiality agent)
+- **S-12**: the bounded top-N is wired to `deterministicCut` ONLY, so a DECLARED `ORDER BY … LIMIT
+  5` still sorts all 600865 rows. 8.3x + O(input) memory. **Fix is one argument.**
+- **S-10**: `LIMIT 0` is the MOST expensive cut (`row_cap=0` reads as unbounded).
+- **E-17 / S-11** (found independently by two seams): the cut's sort sits ABOVE the projection, so
+  adding a JOIN to a LIMIT query converts a correct Volcano answer into an ERROR, and adding an
+  ORDER BY that cannot change the answer decides whether the query RUNS AT ALL.
+- **E-15**: the cut's cost lands on the INJECTED `LIMIT 1` for an uncorrelated EXISTS where only
+  `!rows.empty()` is read — 17.25 s vs a 0.21 s control.
+- **S-9**: `narrowRows` still a plan-time lambda; second call site found in subquery
+  materialization (row plan 1.93 s vs columnar 0.49 s). Its TRUE end-to-end cost is +2.7%, NOT the
+  1540x pass 3 quoted over Plan+Execution only.
+- Doc sweep: a FOURTH copy of the retracted folding paragraph at development.md:606; each of the
+  last two passes found exactly one more copy than the one before.
+- `assert_refusal_pins_discriminate` covers 1 of the subquery seam's 18 rejection suites; running
+  the harness's OWN function over the other 17 reports 4 findings incl. a VACUOUS entry. One loop.
+- `random_diff.py` STILL cannot generate LIMIT-without-ORDER-BY; both stated reasons expired, and
+  it cites a `KNOWN_DIVERGENCES` suite that DOES NOT EXIST in the tree.
+
 
 ## PASS 4 — engine divergence: **1 BLOCKER / 3 MEDIUM / 2 LOW** (d20441d).
 **E-13 (BLOCKER) — the two engines evaluate expressions on DIFFERENT ROW SETS, IN BOTH DIRECTIONS.**
