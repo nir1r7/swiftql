@@ -227,3 +227,115 @@ data." The identical sentence applies here and no one checked the second axis.
 Volcano refuses three-way joins, so this is not observable as a Volcano-vs-vec difference — it is
 observable as the invariant the project actually gates on.
 
+
+---
+
+### A-1 (cont.) — is the "identical rows may stay tied" argument true? **Yes, and it is the one
+### part of the tie-break's reasoning that holds.**
+
+The argument is that rows equal in every compared column project identically, so whichever survives
+the cut the answer is the same. I looked for the counterexample the brief asks about — duplicate
+rows with different *provenance* — and it does not exist, for a structural reason worth stating:
+
+**everything that could distinguish two rows sits BELOW the sort, never above it.** Both builders
+place the sort at `... -> Sort -> Project -> Distinct -> Limit` (planner.cc:409, logical_plan.cc:1098),
+so the only consumers of a sorted stream are:
+
+- `ProjectNode`/`VecProjectNode` — evaluates against the sort's own schema, so it cannot read a
+  column the tie-break did not compare;
+- `DistinctNode`/`VecDistinctNode` — keys on every *output* column, so identical rows collapse
+  regardless of which came first;
+- `LimitNode`/`VecLimitNode` — a prefix.
+
+A join that multiplies rows, a `GROUP BY` that puts them in different groups, an aggregate over
+them: all of those are *inputs* to the sort. A block's sorted output escapes upward only as
+(a) the printed result, (b) a scalar subquery's `res.rows[0][0]`, (c) an `EXISTS`'s row count,
+(d) a derived relation. In every one of those, two rows equal in every column of the sort's schema
+are interchangeable.
+
+The remaining worry — the `min(schema.size(), a.size(), b.size())` truncation silently hiding
+columns — I could not reach. Every row-producing site builds exactly `schema.size()` values
+(`SeqScanNode` columnar loop, `VecSortNode::consumeAndSort`, join concatenation over
+`merged_schema`, `buildAggregateSchema`), and `narrowRows` (70570dc) closed the one site where a
+row was wider than its schema. The `min` is defensive, not load-bearing, today.
+
+So: **the tie-break is total on distinguishable rows in the sense it claims. Its defect is not
+incompleteness within one plan — it is that "distinguishable" is defined by a column ORDER the
+optimizer is free to permute (E-9), and that it is not consulted at all when there is no sort
+(E-8).**
+
+---
+
+### A-2 — "ascending regardless of `desc`": nothing downstream assumes tie-break direction.
+### **CLEAN.**
+
+Checked by exhaustion rather than argument. Grepped the tree for anything that could reverse,
+truncate-from-the-end, or otherwise read the sort's *direction*:
+
+- no `std::reverse` / `rbegin` / `partial_sort` / `nth_element` anywhere in `src/execution/` or
+  `src/planner/` except `join_enumeration.cc:374`, which reverses a DP *back-pointer chain* and
+  never touches rows;
+- no top-N / limit-into-sort pushdown exists — `VecSortNode` has no `limit_` member and the limit
+  is a separate node in both builders;
+- `CardinalityEstimator` reads `lim.limit` only to bound `estimated_rows` (:570), never to reshape;
+- the three consumers of a sorted stream (Project, Distinct, Limit) all read a *prefix in order*.
+
+The visible consequence, stated so it is not mistaken for a bug later: with a tie at the cut,
+`ORDER BY k DESC LIMIT n` and `ORDER BY k ASC LIMIT n` both keep the lexicographically SMALLEST full
+rows of their respective boundary tie-groups. That is surprising, but it is applied identically by
+both engines, so it is a dialect choice and not a seam divergence.
+
+---
+
+### A-3 — does the tie-break fire everywhere it must? **The site enumeration, and the result at
+### each.**
+
+| # | Site where a non-total order meets a cut | Status |
+|---|---|---|
+| 1 | `LimitNode`/`VecLimitNode` **with** a sort below | comparator fires; closed on the *values* axis, **OPEN on the schema-order axis — E-9** |
+| 2 | `LimitNode`/`VecLimitNode` **with no sort at all** (`LIMIT` without `ORDER BY`) | **OPEN — E-8.** Comparator cannot fire; the cut lands on raw plan order |
+| 3 | `runOnce`'s injected `LIMIT 1` on an `EXISTS` body (subquery_materialization.cc:198) | CLOSED — only `!res.rows.empty()` is read, so any row proves existence |
+| 4 | `runOnce`'s injected `LIMIT 2` on a `SCALAR` body (:201) | CLOSED **by design** — the cap is 2 precisely so `res.rows.size() > 1` THROWS (:229) instead of silently picking. It never cuts |
+| 5 | `buildReplacement` SCALAR `res.rows[0][0]` (:242) | CLOSED — guarded by #4's throw |
+| 6 | a **user-written** `LIMIT 1` in a scalar body | **OPEN — this is E-8/E-9's transport into arithmetic** |
+| 7 | `DistinctNode`/`VecDistinctNode` representative choice | CLOSED — the dedup key is every output column, so tied rows are identical in the output |
+| 8 | semi/anti join "first match" | CLOSED as a cut — each surviving probe row is emitted exactly once and the output SET is determined. Its *order* is probe order, which feeds #2 |
+| 9 | `HashAggregateNode`/`VecHashAggregateNode` group emission order | CLOSED as a cut (the group SET is determined); its order feeds #2 |
+| 10 | `ChunkPruner::shouldSkip` | CLOSED — skips whole chunks, cannot reorder |
+| 11 | `MIN`/`MAX` keeping the *argument* `Value` on a tie | see E-10 below — reachable, but the observable difference is the one E-10 names |
+
+One shared-dialect note from #4, not a seam finding: a user-written `LIMIT 5` on a scalar body
+becomes `LIMIT 2` and then raises "scalar subquery returned more than one row", where SQLite would
+silently take the first row. Both engines do this identically.
+
+---
+
+### A-4 — did any other consumer rely on the wide scan schema? **No. CLEAN.**
+
+Enumerated every consumer of the FROM/JOIN scan's schema and rows in `Planner::plan`:
+`merged_cols` for the join (planner.cc:349 — the row leg's merged schema is now as narrow as the
+columnar leg's, which is the *reduction* of a difference), `preserved_slots` /
+`pruningHintForPreservedSide` (already built from `scan_schema` before the fix, unchanged),
+`inferExprType` on WHERE / HAVING / ORDER BY, `buildAggregateSchema`, `HashJoinNode`'s bare-name key
+resolution, and the `select_star` expansion (which never narrows — `buildScanSchema` returns
+`full_schema` for `select_star` and for `has_subquery`).
+
+`buildScanSchema` (logical_plan.cc:294-335) collects from select list, WHERE, GROUP BY (including
+expression keys), HAVING, ORDER BY **and every `stmt.joins[].condition`** — and the ON walk matters
+here, because for a LEFT join the residual is deliberately *not* folded into `stmt.where`
+(planner.cc:167-178), so it would otherwise be uncollected. Order is right too: the ON
+decomposition runs before `buildScanSchema`, and `classifyJoinCondition` only reads (residuals are
+`cloneExpr`'d), so `stmt.joins[0].condition` is intact when the collector walks it.
+
+`narrowRows` itself is correct: positional (`full.indexOf(c.name)`), because the row path returns
+`&rows_[cursor_]` by position while the columnar path reconstructs by NAME
+(`columnar_table_.getValue(schema_.column(c).name, ...)`, plan_nodes.cc:76); it throws by name on a
+miss; and the `narrowed.size() == full.size()` early-out is sound because `narrowSchema` returns a
+subsequence, so equal size implies identity. Self-join is right too — the pre-scan copy is narrowed
+with `right_scan_schema`, and for a self-join both schemas are the same `buildScanSchema` result.
+
+Spot-checked with a six-query battery on the shapes that stress narrowing (LEFT JOIN with an ON
+residual and a null-extended `l.speed` in ORDER BY; ORDER BY on columns absent from the select list;
+GROUP BY + HAVING; DISTINCT over a join; `SELECT *` over a join; a LEFT join with a WHERE on the
+preserved side). All four modes byte-identical on all six.
+
