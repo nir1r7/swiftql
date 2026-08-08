@@ -174,3 +174,115 @@ places that read it:
 
 So the arming rule covers one of the three consumers that can see the difference, and the two it
 misses are the two that were argued away in prose rather than measured.
+
+**Measured as a class, not as five queries.** A generated matrix — 4 `CASE` shapes (mixed
+INT/REAL, INT/INT, REAL/REAL, and a 15-digit mixed one) x 12 consumers (`bare`, `+1`, `-1`, `*3`,
+`*987654321`, `/2.0`, `>1`, `=7`, `IN (7)`, unary `-`, `+9e15`, `*4e9`) x 2 shapes (scalar
+aggregate and `GROUP BY`), plus 47 empty/degenerate queries and 5 `DISTINCT` ones — **147 queries,
+12 divergent, and all 12 are this class.** The INT/INT and REAL/REAL `CASE` rows are clean in every
+consumer, which is the control that the mixing is the cause.
+
+The matrix also finds the **smallest possible instance — adding `1`:**
+```sql
+SELECT MAX(CASE WHEN lap_id = 1 THEN 999999999999999 ELSE 0.5 END) + 1 AS y FROM laps
+   4 Volcano modes  y = 1000000000000000      (SQLite: 1000000000000000)
+   2 vec modes      y = 1e+15
+```
+`999999999999999` is exactly one below `MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN`, so it stores; `+ 1`
+crosses the bound the store was checked against. **The three sub-classes have crisp boundaries**,
+which is what makes this a rule and not an anecdote:
+
+| result magnitude | what differs | example |
+|---|---|---|
+| `>= 1e15` (the `%.15g` cliff) | the **text** only — same number, different rendering | `999999999999999 + 1` -> `1000000000000000` vs `1e+15` |
+| `> 2^53` | the **value** — the double is no longer the integer | `123456789 * 987654321` |
+| `> INT64_MAX` | Volcano **throws**, vectorized answers | `7 * 9223372036854775807` |
+
+**`--no-optimize` cannot turn this off, and that is structural.** `main.cc:574` gates exactly three
+passes — `PredicatePushdown`, `JoinEnumeration`, `CardinalityEstimator`. `collectIntOrigins`, the
+pass that decides the arming, runs inside `VectorizedPlanBuilder::build`, **outside** the gate. So
+both vectorized legs give the identical wrong answer and `compare_against_sqlite.py`'s fourth mode
+(`run_optimizer_invariant`, "optimized == `--no-optimize`") is blind to it by construction — the
+same blindness pass 4 recorded for its own class, arriving by a different route.
+
+**Amplified where no cross-engine check exists at all.** Inside a derived table the same defect runs
+with Volcano refusing the shape by capability, so the only oracle is SQLite:
+```sql
+SELECT t.x + 1 AS y FROM (SELECT CASE WHEN lap_id = 1 THEN 999999999999999 ELSE 0.5 END AS x
+                          FROM laps WHERE lap_id < 2) t
+   4 Volcano modes  Error: derived tables … are not supported on the Volcano path
+   2 vec modes      y = 1e+15          (SQLite: 1000000000000000)
+```
+
+### B-2 FINDING **E-20 (HIGH)** — the round-4 chunk-pruner rule is REOPENED by the bare-name
+### fallback in `staticTypeOf`. A conjunct naming ANOTHER relation is screened against the SCANNING
+### relation's schema, and when the two share a column name the screen types the wrong column,
+### answers "cannot raise", and lets a later conjunct prune away the rows the raise was owed.
+
+Fix round 4 added the chunk-pruner half of the rule and stated its own soundness argument
+(`chunk_pruner.h`):
+
+> The screen … answers "may raise" for a conjunct this scan's schema cannot type — **which is every
+> conjunct naming another relation**, so an un-pushed WHERE handed to the FROM-side scan of a join
+> stops contributing hints at its first cross-relation conjunct.
+
+That is false whenever the other relation has a column of the same NAME. `staticTypeOf`'s
+`ColumnRef` arm (`expr_totality.h:68-77`) resolves **slot-first with a bare-name fallback**: the
+slot lookup misses (the conjunct's slot is not this scan's), the bare-name lookup then **hits the
+scanning relation's own column of that name**, and the conjunct is typed against a column it does
+not refer to.
+
+**(i) A row-vs-columnar split, no derived table.** Two tables sharing a column name with different
+types — `laps.season` INT and `alt.season` STRING (catalog at
+`/tmp/seam5-e13-priv/cat2.json`; `alt` is `data/drivers.csv` with its fifth column declared STRING):
+
+```sql
+SELECT COUNT(*) AS n FROM laps l JOIN alt a ON l.driver_id = a.driver_id
+WHERE a.season = 5 AND l.lap_id > 999999
+```
+```
+row/volcano        Error: Type mismatch in Value comparison
+row/volcano/noopt  Error: Type mismatch in Value comparison
+columnar/volcano   n = 0            <-- the zone map skipped every chunk
+columnar/volcano/noopt   n = 0
+columnar/vectorized      n = 0
+columnar/vectorized/noopt n = 0
+```
+The raising conjunct is written **FIRST**, which is exactly the case the rule's own proof calls
+unsound (*"j < k — C_j IS evaluated on rows of that chunk, and skipping removes them. Unsound; this
+walker stops before reaching C_k"*). It does not stop, because it believes `a.season` is
+`laps.season`, an INT, compared against an INT.
+
+**(ii) The SHIPPED catalog reaches it too, through a derived-table alias** — no custom schema, both
+vectorized legs, and no control in the project can see it:
+```sql
+SELECT COUNT(*) AS n FROM laps l
+JOIN (SELECT d.driver_id AS driver_id, d.name AS season FROM drivers d) x
+  ON l.driver_id = x.driver_id
+WHERE x.season = 5                            -> Error: Type mismatch in Value comparison
+WHERE x.season = 5 AND l.lap_id > 999999      -> n = 0
+WHERE l.lap_id > 999999 AND x.season = 5      -> n = 0
+```
+Adding a conjunct that can only **remove** rows turns the error into an answer, in **both**
+orders — including the order the rule explicitly forbids. Volcano refuses derived tables, so there
+is no cross-engine check; both vectorized legs agree, so the optimizer-invariant check is blind; and
+SQLite answers `0` for all three (it is dynamically typed and never raises), so the SQLite oracle
+flags the *control* rather than the defect.
+
+**Why the shipped catalog alone does not reach the row-vs-columnar form**, checked rather than
+assumed: `laps` and `drivers` collide on `driver_id` (INT/INT) and `team` (STRING/STRING) — same
+types both times, so the mistyping is harmless. Every other cross-relation reference (`d.name`,
+`d.age`, `d.nationality`, `l.speed`, `l.season`) is absent from the other schema, `staticTypeOf`
+fails, and the screen correctly answers "may raise". The hole is precisely *a same-named column of a
+different type*, which needs two tables written without a per-table column prefix — ordinary
+practice, and the reason TPC-H (`l_`, `o_`, `c_`) never hits it.
+
+**Ranked HIGH, not BLOCKER, and the reasoning is stated so it can be disagreed with.** Against
+BLOCKER: no silent wrong answer — every leg either errors or returns the SQL-correct row count for
+the rows that survive; and the cross-*engine* form needs a schema the shipped catalog does not have.
+Against MEDIUM: it reopens, in the same release, the exact class the fix under audit was written to
+close, with the same repro shape (`<raiser> AND <prunable>`) the fix's own comment uses; the
+soundness argument that carries it is stated in the code and is false; and form (ii) is on shipped
+data with **no** control able to detect it. It is a defect of the screen, not of the pruner: one
+`staticTypeOf` that refuses the bare-name fallback when the `ColumnRef` carries a resolved non-local
+slot would close both forms.

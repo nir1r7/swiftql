@@ -11,6 +11,43 @@ Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST 
   summary line), not merely free of failures.
 AFTER PASS 5: doc sweep -> q21 -> sf0.1 -> final gate.
 
+## PASS 5 — subquery chain: **1 BLOCKER / 2 HIGH / 2 MEDIUM / 2 LOW.**
+**B-1 (BLOCKER) — round 4's fix, ONE AST NODE DEEPER. One line fixes it.**
+`divWalk`'s `AggregateExpr` arm (`subquery_materialization.cc:268-275`) returns for `SUM`/`AVG`
+**without walking `agg->argument`**, while the walk it SAYS IT MIRRORS (`collectIntOrigins`,
+`vectorized_plan_builder.cc:426`) walks `spec.argument` for EVERY aggregate. So the arming request
+never reaches a division inside an aggregate:
+  HAVING SUM(l.round / (SELECT MAX(CASE WHEN l2.round>10 THEN 2 ELSE 0.5 END) FROM laps l2)) > 5900
+    col-vec both legs: **7 teams** | both Volcano + SQLite: **4 teams**
+  Threshold constructed from the two divisions' actual per-team sums so three teams straddle it —
+  not a round number picked to look decisive. Also AVG (6 vs 1) and reversed polarity (7 vs 1).
+  **`MAX`, whose arm DOES recurse, refuses on the identical body** — that is the discriminator.
+**B-2 (HIGH)** — `Binder::bind` types a derived relation via `blockOutputSchema` (binder.cc:287)
+  BEFORE materialization runs, so a subquery contributing to the derived body's OUTPUT SCHEMA hits
+  the internal-defect guard: a subquery in a derived body's SELECT list, or inside an aggregate
+  argument in its HAVING. **All four modes, NO working mode**, SQLite answers, and the HAVING form
+  answers correctly ONE LEVEL OUT. The guard's own "verified rather than assumed" reachability
+  comment is TRUE at top level and FALSE in a derived body.
+**B-3 (HIGH) — SAME CLASS AS THE OPTIMIZER SEAM'S P5-1.** Decorrelation lifts the correlated
+  equality into a JOIN KEY, removing it from the AND cascade, so a may-raise conjunct written after
+  it is evaluated on rows the written order excluded — **exactly what `expr_totality.h` says no plan
+  rewrite may do.** Discriminator is SwiftQL against itself: `d.driver_id = l.driver_id` as guard ->
+  raises; `d.driver_id = 1` in the same position -> answers. All three correlated lowerings.
+**B-4 (MEDIUM)** — `exprMayBeInt` passes `catalog = nullptr`, so the second derived level ALWAYS
+  answers INTEGER; **`MAX_TYPE_DEPTH = 3` is really 1**, and `t.s / (SELECT <mixed>)` over a REAL
+  column answers at one level and has NO WORKING MODE at two.
+**B-5 (MEDIUM)** — pin matrices re-measured: the gate's 7/17/5 includes 6 from the round-4 cut
+  family (this seam's new refusals, genuinely addressed). But of the seam's **19 pre-existing
+  rejection suites / 150 pins**, only ONE suite (7 pins) is in a matrix, and **the same four
+  findings pass 4 reported are unchanged**, including the vacuous WEEK34 entry 4.
+LOW: a materialized body's value gets the RENDERED 1e15 bound though its text is never printed —
+  round 4's UNRENDERED relaxation never reaches a body.
+VERIFIED CORRECT: all four expression slots that can hold a subquery, nesting to 4 levels, two
+  subqueries in one division, subquery-in-derived-body, both magnitude bounds, `/` arming only on
+  INT-INT, the derived-column typing fix and its siblings (NO under-arming found), NULL semantics
+  across IN/NOT IN/EXISTS/NOT EXISTS, cardinality and its documented divergence (has not widened),
+  zero-rows-is-NULL, correlation depth, and every refusal in the boundary table except the two above.
+
 ## PASS 5 — storage: **0 BLOCKER / 1 HIGH / 3 MEDIUM / 5 LOW.**
 **S-13 (HIGH) IS THE SAME BUG AS THE OPTIMIZER SEAM'S P5-2 — found INDEPENDENTLY, through a
 different door.** `conjunctMayRaise(expr, schema)` is handed the SCAN's schema; `staticTypeOf`'s
