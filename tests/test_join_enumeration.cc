@@ -893,3 +893,105 @@ TEST(JoinEnumeration, SemiAndAntiEstimatesNeverExceedTheLeftChild) {
         EXPECT_EQ(semi->on_residual, nullptr);
     }
 }
+
+// ── what the containment rule must NOT look at (seam audit pass 2, B-2) ─────
+
+// containsOuterJoin used to walk EVERY child, so it answered a question about a
+// DIFFERENT query block. A derived relation is an OPAQUE LEAF here —
+// countRelations counts it as one relation, decompose moves it out whole and
+// rebuild never looks inside — so an outer join sealed in its body cannot make
+// an ordering of the ENCLOSING spine illegal. Declining anyway cost the whole
+// query its ordering, which is the exact loss Week 29 added its decline string
+// for, in a shape the string then misattributed.
+TEST(JoinEnumeration, OuterJoinSealedInADerivedBodyDoesNotDeclineTheOuterBlock) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // The enclosing block is fully INNER and has three relations, and it is the
+    // shape the search reorders (see StarGraphJoinsTheSmallPivotRelationSecond).
+    // The LEFT JOIN lives only inside x's body.
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN (SELECT d2.driver_id, d2.team FROM drivers d2 "
+        "      LEFT JOIN laps l2 ON d2.driver_id = l2.driver_id) x "
+        "ON d.driver_id = x.driver_id", cat);
+
+    // WITHOUT THE FIX this is "join-ordering=skipped (outer join)".
+    EXPECT_NE(decisionOf(plan.get()).find("method=dp"), std::string::npos)
+        << decisionOf(plan.get());
+    EXPECT_EQ(decisionOf(plan.get()).find("skipped"), std::string::npos);
+
+    // CONTROL: the node's OWN join_type is still decisive. A LEFT join on THIS
+    // spine is a tree the pass must not touch, and narrowing the walk must not
+    // have weakened that.
+    auto outer = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "LEFT JOIN drivers d2 ON d.team = d2.team", cat);
+    EXPECT_EQ(decisionOf(outer.get()), "join-ordering=skipped (outer join)");
+}
+
+// A semi/anti join's children[1] is a subquery BODY, not a relation of this
+// block — the same fact countRelations already skips it for. Walking into it let
+// an outer join in the BODY report `(outer join)` for a tree whose real and
+// stronger cause is `(semi/anti join)`. A decline string that names the wrong
+// cause is worse than none: it is the surface a reader consults, and it sends
+// them to the wrong construct.
+TEST(JoinEnumeration, SemiJoinDeclineIsNotMisattributedToAnOuterJoinInItsBody) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    auto plan = optimize(
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN drivers d2 ON d.team = d2.team "
+        "WHERE l.lap_id IN (SELECT l3.lap_id FROM laps l3 "
+        "                   LEFT JOIN drivers d3 ON l3.driver_id = d3.driver_id)", cat);
+
+    // WITHOUT THE FIX this is "join-ordering=skipped (outer join)".
+    EXPECT_EQ(decisionOf(plan.get()), "join-ordering=skipped (semi/anti join)");
+}
+
+// ── descending past the topmost JOIN (seam audit pass 2, B-3) ──────────────
+
+// `apply` used to RETURN from the topmost JOIN, so a derived or subquery body's
+// join tree was enumerated only when the ENCLOSING block happened to have no
+// join. The comment that justified it named its own expiry ("there is exactly
+// one per statement until subqueries arrive in Week 30") and was never swept.
+TEST(JoinEnumeration, DerivedBodyIsEnumeratedUnderAJoiningOuterBlock) {
+    Catalog cat(CATALOG);
+    seedStats(cat);
+    // The body is the star shape of StarGraphJoinsTheSmallPivotRelationSecond,
+    // written the BAD way round (the two 1000-row relations first), so the DP has
+    // a real improvement to find and the outcome is visible as a slot swap. The
+    // outer block adds a join, which is what reached the old `return`.
+    static const char* SQL =
+        "SELECT COUNT(*) FROM drivers d0 JOIN "
+        "  (SELECT l.driver_id FROM laps l JOIN laps l2 ON l.driver_id = l2.driver_id "
+        "   JOIN drivers d ON l.driver_id = d.driver_id) x "
+        "ON d0.driver_id = x.driver_id";
+    auto plan = optimize(SQL, cat);
+
+    std::vector<const LogicalJoin*> joins;
+    collectJoins(plan.get(), joins);
+    // one outer join + two inside the body
+    ASSERT_EQ(joins.size(), 3u);
+
+    // WITHOUT THE FIX every one of these is empty: the body was never visited.
+    int decided = 0;
+    for (const LogicalJoin* j : joins) {
+        if (j->order_decision.find("method=dp") != std::string::npos) ++decided;
+    }
+    EXPECT_EQ(decided, 1) << "the body's top join should carry the search's decision";
+    // ...and it is the BODY's join, not the outer one (the outer block has two
+    // relations, below MIN_ENUMERATED_RELATIONS).
+    EXPECT_TRUE(joins.front()->order_decision.empty())
+        << "the two-relation outer block has no decision to report";
+
+    // AND THE ANSWER DOES NOT MOVE. This is the sequencing check the join-chain
+    // auditor asked for: widening where the DP runs permutes more merged
+    // schemas, which is exactly what the sort tie-break had to survive.
+    auto baseline = writtenOrder(SQL, cat);
+    std::vector<const LogicalJoin*> base_joins;
+    collectJoins(baseline.get(), base_joins);
+    ASSERT_EQ(base_joins.size(), 3u);
+    // the rebuilt body really did change shape — otherwise this test asserts
+    // nothing about preservation
+    EXPECT_NE(joins.back()->join_slot, base_joins.back()->join_slot);
+}
