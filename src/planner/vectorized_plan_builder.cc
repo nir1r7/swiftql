@@ -87,13 +87,34 @@ struct Lowering {
 // IntNarrowing::UNRENDERED and judged on the value alone (2^53) rather than on
 // %.15g (1e15) — see build() at the bottom of this file.
 //
-// Why `/` alone and not "consumed by any expression". Everything else in the
-// dialect either coerces or normalizes, and widening would move answers that
+// Why `/` alone is ARMED, and what covers the rest. Everything else in the
+// dialect either coerces or normalizes, and arming it would move answers that
 // pass today:
 //   - `+ - *` on INT/INT give an INT whose %.15g rendering is identical to the
-//     DOUBLE (`x+1` is "8" either way), so `WHERE x+1 > 3` and `SELECT x*2`
-//     agree across engines. They still PROPAGATE taint — `(x*2)/4` is 3 vs 3.5
-//     — which is why the walk returns an origin set instead of a bool;
+//     DOUBLE **while the RESULT stays below the bound** — `x+1` is "8" either
+//     way — so `SELECT x*2` still answers. They also PROPAGATE taint, since
+//     `(x*2)/4` is 3 against 3.5, which is why the walk returns an origin set
+//     rather than a bool.
+//
+//     !! THE SENTENCE THIS ONE REPLACES SAID THE RENDERING WAS "IDENTITICAL",
+//     FULL STOP, and that was a claim about the OPERAND while the %.15g cliff
+//     applies to the RESULT. A single `*` moves a value from 1.2e8 to 1.2e17,
+//     past 2^53, where the double is no longer the integer and its text is no
+//     longer the integer's text:
+//
+//       SELECT MAX(CASE WHEN lap_id=1 THEN 123456789 ELSE 0.5 END) * 987654321
+//         Volcano and SQLite   121932631112635269
+//         here, before Week 37 1.21932631112635e+17   <- silent wrong answer
+//
+//     Seam pass 5's E-19, ranked BLOCKER. It is NOT closed by arming — arming
+//     `+ - *` would refuse `SELECT x*2`, which is right today and which the
+//     paragraph below correctly prices as unacceptable. It is closed by asking
+//     the question where the answer is known: `taintWalk` now also returns
+//     `int_arith` ("Volcano computes this node in INTEGER and this engine in
+//     DOUBLE"), the column holding such a result is marked
+//     IntNarrowing::VOLCANO_INT, and vec_types.h's refuseDivergentVolcanoInt
+//     tests the DOUBLE against the same two bounds. Value-driven, so nothing
+//     that agrees today is refused;
 //   - comparisons coerce (Value::operator== / < promote INT against DOUBLE);
 //   - group keys, DISTINCT keys and join keys go through key_encoding.h, whose
 //     keyFieldText normalizes an integral double back to INT text — the same

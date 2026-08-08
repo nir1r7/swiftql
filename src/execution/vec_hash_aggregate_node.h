@@ -18,11 +18,14 @@ class VecHashAggregateNode : public VecPlanNode {
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
 
-        // Output columns whose INT -> DOUBLE narrowing is observable to a
-        // division above this node; MIN/MAX over a mixed-type CASE is the route
-        // that reaches it (MIN/MAX keep the argument's own Value and type).
-        // vectorized_plan_builder.cc computes the mask, vec_types.h's
-        // refuseObservableIntNarrowing enforces it. Empty (the default) = none.
+        // How each output column must judge a value narrowing into a DOUBLE
+        // ColumnVector. MIN/MAX over a mixed-type CASE is the route that reaches
+        // it, because they keep the argument's own Value AND type: the INT
+        // arrives here under a DOUBLE declaration (OBSERVABLE / RENDERED /
+        // UNRENDERED), and an aggregate over INT ARITHMETIC over such a column
+        // arrives as the DOUBLE of an exact integer instead (VOLCANO_INT).
+        // vectorized_plan_builder.cc computes the mask, vec_types.h's three
+        // refusals enforce it. Empty (the default) = every column RENDERED.
         void setIntNarrowingColumns(std::vector<IntNarrowing> mask) {
             int_narrowing_ = std::move(mask);
         }

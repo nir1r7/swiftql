@@ -15,14 +15,27 @@
 // distinct from zone map CHUNK_SIZE (8192)
 static constexpr int BATCH_SIZE = 1024;
 
-// What the plan knows about one materialized DOUBLE column, for the two
-// INT -> DOUBLE refusals below. Exactly one state per column; the vectorized
-// plan builder decides it from the LOGICAL plan (collectIntOrigins) and the two
-// materializing nodes stamp it onto the ColumnVector.
+// What the plan knows about one materialized DOUBLE column, for the three
+// refusals below. Exactly one state per column; the vectorized plan builder
+// decides it from the LOGICAL plan (collectIntOrigins) and the two materializing
+// nodes stamp it onto the ColumnVector.
+//
+// TWO INDEPENDENT QUESTIONS live in this one enum, and they are about two
+// different values:
+//   - the first three states judge an INT Value arriving at a DOUBLE column —
+//     is its VALUE, its TEXT, or its TYPE still recoverable;
+//   - the last two judge a DOUBLE that Volcano computed as an exact integer,
+//     which is what is left after the INT has already been consumed by an
+//     arithmetic node one level down.
+// A column can genuinely be in both situations (a CASE with one INT branch and
+// one tainted-arithmetic branch), and the VOLCANO_INT states are the strict
+// superset — they apply the same magnitude bound to the INT as RENDERED and
+// UNRENDERED do, and then ask the second question too. That is why build()
+// UPGRADES into them rather than choosing between them.
 //
 // RENDERED is the conservative default and the only state a column that the
 // builder said nothing about can be in, so a mask that is missing, short, or
-// never set behaves exactly as the engine did before either refusal existed.
+// never set behaves exactly as the engine did before any refusal existed.
 enum class IntNarrowing : uint8_t {
     // The value may reach the query's output text, so BOTH halves of
     // "indistinguishable from the INT it was" have to hold — including the
@@ -67,7 +80,8 @@ struct ColumnVector {
     std::vector<uint8_t> validity;
 
     // Plan-shape arming for the INT -> DOUBLE narrowing; see
-    // refuseObservableIntNarrowing and narrowToDoubleColumn below.
+    // refuseObservableIntNarrowing, narrowToDoubleColumn and
+    // refuseDivergentVolcanoInt below.
     // IntNarrowing::RENDERED — the default, and the value on every scan chunk,
     // join output and ExpressionExecutor result — is the conservative state:
     // the type is not observable and the value may be printed. The two nodes
@@ -398,13 +412,19 @@ inline void refuseDivergentVolcanoInt(const Value& v, bool unrendered) {
         + ". Re-run with --execution volcano, or give the branches the same type.");
 }
 
-// Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
-// narrows into a DOUBLE column through TWO refusals — refuseObservableIntNarrowing
-// (the value's TYPE is observable to a `/` whose other operand is also INT, at
-// any magnitude) and narrowToDoubleColumn (the value or its rendering changes,
-// above 1e15 — or above 2^53 when the plan proves the text is never read) — both
-// of which THROW rather than answer differently from Volcano and SQLite. Read
-// both comments before touching this. This comment called the conversion "lossless" from 85be432
+// Append one cell, NULL-aware. `cv.type` decides the storage type. A value
+// reaching a DOUBLE column passes THREE refusals, and which of them can see a
+// given divergence is decided by WHERE the INT still is:
+//   - refuseObservableIntNarrowing — the value IS an INT and its TYPE is
+//     observable to a `/` whose other operand is also INT, at any magnitude;
+//   - narrowToDoubleColumn — the value IS an INT and the value or its rendering
+//     changes, above 1e15, or above 2^53 when the plan proves the text is never
+//     read;
+//   - refuseDivergentVolcanoInt — the value is ALREADY A DOUBLE and Volcano
+//     computed it as an exact integer, so neither of the two above can see it
+//     (both are `if (v.type() != INT) return`). Seam pass 5's E-19.
+// All three THROW rather than answer differently from Volcano and SQLite. Read
+// all three comments before touching this. This comment called the conversion "lossless" from 85be432
 // (Week 24, the commit that added validity) until seam pass 3 found it. It is
 // not, above 1e15. Every other type disagreement is a planner/schema bug and
 // surfaces as bad_variant_access from the typed accessor, as it did before

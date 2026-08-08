@@ -18,7 +18,7 @@ class VecProjectNode : public VecPlanNode {
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
 
-        // How each output column must judge an INT Value narrowing into a
+        // How each output column must judge a value narrowing into a
         // DOUBLE column: OBSERVABLE (a `/` with an INTEGER partner reads it
         // above), UNRENDERED (its text is never printed, so only 2^53 binds), or
         // RENDERED. vectorized_plan_builder.cc computes the mask over the

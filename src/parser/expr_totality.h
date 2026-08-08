@@ -90,7 +90,7 @@
 // subtype this walker does not know — and every caller reads that as "may
 // raise". This is deliberately NOT inferExprType: that one THROWS on an
 // ill-typed tree (which is right for its job, deciding a query at plan time)
-// and lives in the planner, above two of the three consumers. This one is total
+// and lives in the planner, above two of the four consumers. This one is total
 // and answers "don't know" instead.
 inline bool staticTypeOf(const Expr* expr, const Schema& schema, TypeId& out) {
     if (!expr) return false;
