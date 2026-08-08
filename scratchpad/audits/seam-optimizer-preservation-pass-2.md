@@ -480,3 +480,99 @@ no query creates one — but the concentration is worth recording: the codebase 
 one load-bearing fact holding up three silent drops, and only one of the three
 (the semi/anti branch, fixed in `18af84f`) has a guard behind it.
 
+### B-5 — CONFIRMED BY EXECUTION
+
+Run on the shipped `catalog.json`, `--execution vectorized --storage columnar`.
+(Three single-query invocations only, in a window where `pgrep` showed no harness;
+no build, no harness, no TPC-H run was started by this audit.)
+
+```
+$ ./build/swiftql --catalog catalog.json --no-cache --execution vectorized \
+      --storage columnar --query "SELECT team, speed FROM laps ORDER BY 1 + 1 LIMIT 3"
+Error: ORDER BY 2: column ordinals are not supported; use a column name or a select-list alias
+
+$ ... --query "SELECT team, COUNT(*) FROM laps GROUP BY 1 + 1"
+Error: GROUP BY 2: column ordinals are not supported; use a column name or a select-list alias
+```
+
+Compare the genuinely-written ordinal, which produces the *same* message:
+
+```
+$ ... --query "SELECT team, speed FROM laps ORDER BY 1 LIMIT 3"
+Error: ORDER BY 1: column ordinals are not supported; use a column name or a select-list alias
+```
+
+Identical under `--no-optimize` (the pass is ungated), which is the point of B-1:
+the differential oracle cannot see this. The user wrote `1 + 1`; the engine reports
+`ORDER BY 2`. SQLite accepts both queries.
+
+## What I checked and found CLEAN
+
+Recorded so a later pass does not re-derive it, and so the negative results are on
+the record as results.
+
+- **The estimator's node coverage is now exhaustive** — nine of nine
+  `LogicalNodeType` values (A.2). Semi/anti/ANTI_NOT_IN are `JoinSemantics` on a
+  `LogicalJoin`, not node kinds, and the JOIN case handles them explicitly.
+- **Estimates cannot change an answer via the SIMD/hash choice.**
+  `VecSimdLoopJoinNode` skips NULL keys on both build (`:49`) and probe (`:158`),
+  exactly as `VecHashJoinNode` does (`:49-58`); SIMD is gated to single INT keys, so
+  `key_encoding.h`'s NaN rule cannot differ between them; and it is gated on
+  `!outer`, so no null-extension path is involved.
+- **The build-side swap is result-symmetric** for an inner equi-join: the output
+  schema stays in fixed logical order and `swapped` tells the operator to reassemble
+  (`vectorized_plan_builder.cc:600-631`). The one asymmetry is the dropped
+  `on_residual`, which is LATENT-1/B-8 and unreachable.
+- **`rebuild` cannot drop a join key** — every edge consumed exactly once, plus a
+  cross-product throw (B-8).
+- **Predicate pushdown's five classic hazards are all structurally or explicitly
+  checked** (B-6). `collectSlots`/`restampSlots` cover all twelve `Expr` subtypes,
+  and neither `InExpr::values` (a `vector<Value>`) nor `LikeExpr::pattern` (a
+  `std::string`) can hide a `ColumnRef` from the walker.
+- **`constant_folding.cc` is otherwise sound** — same evaluator, declines on NULL,
+  declines on throw, never folds `IS NULL` / aggregates, never descends into a
+  subquery body (B-5's closing paragraph).
+- **The `method=` field cannot lie** (`join_enumeration.cc:596-599`): derived from
+  `searched` and `kept_written`, the two facts that determine the printed order.
+- **`--no-optimize` genuinely disables the three passes it claims to**, at both the
+  top-level and nested-query entry points (B-0). The finding is about the six
+  passes it never claimed to, and the fact that nothing says so.
+- **Pass ordering is correct and stated**: pushdown must precede join enumeration
+  (`distribute` assumes written order), and it does, at both call sites (B-6).
+- **`foldConstants` is not run twice on a nested body** — `foldNode` declines a
+  `SubqueryExpr` and each scope folds in its own `bindQuery` (`binder.cc:178-181`).
+- I found **no shape on which `optimized` and `--no-optimize` return different
+  rows.** Every mechanism by which they could — order, build side, algorithm,
+  pruning, floor — is a plan-shape choice, and every semantic rewrite runs in both
+  legs (which is B-1's point, not a refutation of it).
+
+## Not reached
+
+- I did not measure the **magnitude** of B-2's lost enumeration (a derived body's
+  join order). That needs `--explain` on a derived-body-inside-a-join query in both
+  shapes, and I stopped invoking the binary once the gate turned out to still be
+  running TPC-H. The *existence* of the loss is settled from the code — `apply`
+  returns without recursing — and does not need a measurement.
+- I did not audit `subquery_materialization.cc` or `subquery_decorrelation.cc` for
+  their own internal correctness. B-1 establishes that the invariant harness does
+  not cover them; auditing them is a subquery-chain seam job and pass 1 of that
+  seam exists.
+- I did not construct an input that reaches LATENT-1 / B-8 (an INNER join carrying
+  an `on_residual`). I do not believe one exists today; `logical_plan.cc:938-945`
+  routes an inner join's ON residuals into the WHERE conjunction unconditionally.
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 0 | — |
+| **HIGH** | 0 | — |
+| **MEDIUM** | 4 | B-1 (the oracle is blind to six of nine passes), B-2 (neither pass descends into a derived body when the outer block has a join), B-4 (`development.md` wrong a third time — it still carries the false invariant `18af84f` retracted), B-5 (constant folding is ungated, its "cannot change results" comment is false, confirmed by execution) |
+| **LOW** | 4 | LATENT-1 / B-8 (three silent `on_residual` drops on one load-bearing fact; one estimate-driven), A.2's residual (no structural defence against a tenth node kind re-creating the -1 bug), B-3 (the derived body's top physical node never inherits its estimate), B-7 (`JoinEnumeration` is not idempotent; precondition half-checked) |
+
+**Verdict: the seam holds. Pass 1's fix is real, derived from the subplan, and the
+switch is now exhaustive; the four LOWs were fixed as called for and the false
+invariant's callers were traced and found not to depend on it. I found no wrong
+answer and no shape where `optimized` and `--no-optimize` disagree. The seam's
+weakness is not the passes — it is that the invariant only covers three of the nine
+that rewrite a plan, and nothing says so.**
