@@ -1491,9 +1491,17 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)",
      "single aggregate"),
+    # SEAM AUDIT pass 2, B-6 — one word, and it is the difference between a pin
+    # and a suffix. This used to read "LIMIT cannot be decorrelated", which is a
+    # tail of BOTH "a body with LIMIT cannot be decorrelated" (the EXISTS guard,
+    # decorr.cc:24) and "a scalar body with LIMIT cannot be decorrelated" (the
+    # scalar guard, :404). This is a SCALAR query so it hit the right one, but
+    # the assertion would have passed with the scalar guard deleted and the
+    # EXISTS one somehow reached. "scalar body with LIMIT" occurs at exactly one
+    # refusal in src/.
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team LIMIT 1)",
-     "LIMIT cannot be decorrelated"),
+     "scalar body with LIMIT cannot be decorrelated"),
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.speed > l.speed)",
      "only an equality between two columns can become a join key"),
