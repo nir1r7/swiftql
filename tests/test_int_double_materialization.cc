@@ -276,6 +276,36 @@ TEST(IntDoubleMaterialization, ThresholdIsExactlyTheBoundary) {
     // a value could survive the text test and still be a different integer.)
     EXPECT_LT(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN, TWO_53);
     EXPECT_NE(static_cast<int64_t>(static_cast<double>(TWO_53_PLUS)), TWO_53_PLUS);
+
+    // narrowToDoubleColumn screens on the DOUBLE's magnitude rather than the
+    // int64_t's, to keep one out-of-line call off the hot arm. That is only
+    // sound if the two tests agree on EVERY int64_t. The argument is that 1e15
+    // is a representable double and rounding to nearest is monotonic; the
+    // argument is not the evidence. This is.
+    const double bound = static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
+    auto agree = [&](int64_t i) {
+        const double d = static_cast<double>(i);
+        const bool by_int = i >= MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN ||
+                            i <= -MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN;
+        const bool by_double = !(d < bound && d > -bound);
+        return by_int == by_double;
+    };
+    for (int64_t i = MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN - 5000;
+         i <= MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN + 5000; ++i) {
+        ASSERT_TRUE(agree(i))  << "proxy disagrees at " <<  i;
+        ASSERT_TRUE(agree(-i)) << "proxy disagrees at " << -i;
+    }
+    uint64_t s = 99;
+    for (int n = 0; n < 200000; ++n) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        ASSERT_TRUE(agree(static_cast<int64_t>(s))) << "proxy disagrees at " << s;
+    }
+    for (int64_t i : {INT64_MIN, INT64_MAX, int64_t(0),
+                      MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN,
+                      -MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN,
+                      MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN - 1}) {
+        EXPECT_TRUE(agree(i)) << "proxy disagrees at extremum " << i;
+    }
 }
 
 
