@@ -334,3 +334,45 @@ takes this path.
 - **#10 chunk pruning**: skips whole chunks, so it cannot reorder. But see **E-13(c)** — pruning
   can remove the rows on which the *other* engine throws, which is an observable difference in
   behaviour even though it is not a reordering.
+
+### B-1 (cont.) — **E-13 has a SECOND mechanism, pointing the other way: a `LIMIT` bounds which
+### rows Volcano evaluates an expression on, and does not bound the vectorized path's.**
+
+Volcano is pull-based: `LimitNode` asks `ProjectNode` for `n` rows and `ProjectNode` calls
+`evaluate()` once per row it is asked for. `VecProjectNode` evaluates its expression over a whole
+`DataChunk` (up to 1024 rows) and `VecLimitNode` truncates afterwards. So the same throwing
+expression that E-13 reaches through `AND` is reached through `LIMIT` — with the engines swapped.
+
+```sql
+SELECT SUBSTRING(name, age - 34, 2) AS s FROM drivers LIMIT 3
+```
+```
+row-volcano / columnar-volcano   Dr | Dr | Dr
+col-vectorized / vec --no-opt    Error: SUBSTRING: start position must be >= 1
+```
+```sql
+SELECT lap_id * 9223372036854775807 AS x FROM laps ORDER BY lap_id LIMIT 1
+```
+```
+row-volcano / columnar-volcano   9223372036854775807
+col-vectorized / vec --no-opt    Error: integer overflow in '*' …
+```
+
+The `LIMIT` is load-bearing, checked: **without** it, `SELECT SUBSTRING(name, age - 34, 2) FROM
+drivers` errors in all four modes, which is the agreement the corpus sees. Adding `LIMIT 3` — a
+clause that can only ever REMOVE rows — makes two of the four modes start answering.
+
+So the class is not "Volcano is eager"; it is **the two engines evaluate expressions on different
+row sets, in both directions**: the scalar evaluator is eager where the chunk path short-circuits
+(`AND`), and the chunk path is eager where the scalar pipeline is lazy (`LIMIT`, and any
+row-at-a-time consumer above a projection). Every partial function in the engine — `SUBSTRING`'s
+two preconditions (evaluator.cc:61,63), `checkedAdd/Sub/Mul/Div/Negate`, `LIKE`/`SUBSTRING`'s
+STRING-operand checks — sits on that difference.
+
+**Corpus coverage of the class: measured 0.** Harvested every `SELECT` string literal from
+`compare_against_sqlite.py`, `test_new_queries.py` and `tpch_queries.py` — 592 distinct. 11 contain
+`SUBSTRING`; 5 of those have both a `WHERE` and an `AND`; **all 5 use a CONSTANT start position
+(`SUBSTRING(c_phone, 1, 2)`, `SUBSTRING(o_orderdate, 1, 4)`, `SUBSTRING(l_shipdate, 1, 4)`)**, so no
+corpus query has a partial function whose precondition depends on a guarded column. 6 literals carry
+a >= 15-digit constant and none of them multiplies. The gate is green on a corpus with no instance
+of the class — the same sentence pass 2 and pass 3 each had to write.
