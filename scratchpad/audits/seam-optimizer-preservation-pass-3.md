@@ -600,3 +600,108 @@ obligations rather than a patch: compare rows **in order** when the query has an
 `catalog.json` reaches `MIN_ENUMERATED_RELATIONS`, or point a leg at
 `data/tpch/sf0.01/catalog.json`); and include one query whose `ORDER BY` is
 deliberately **not a total order** with a `LIMIT` that cuts inside the tie.
+
+### B.5 Bounding the exposure — TPC-H is clean today, and why
+
+B3-1 needs a sort **directly above** a reordered multi-relation join. An
+aggregate between them immunises the query, because `buildAggregateSchema`'s
+output column order is a function of the GROUP BY and select lists, not of the
+join order (verified as a control in B3-1).
+
+Of the 22 TPC-H queries, exactly two have an `ORDER BY` with **no** `GROUP BY`:
+
+- **q20** — `ORDER BY s_name` over a 2-relation join. `MIN_ENUMERATED_RELATIONS`
+  is 3, so `reorder` returns the tree unchanged. Not reachable.
+- **q2** — `ORDER BY s_acctbal DESC, n_name, s_name, p_partkey LIMIT 100` over a
+  **5-relation** join with no aggregate. This is the shape. I ran it both ways on
+  `data/tpch/sf0.01/catalog.json`: **byte-identical output, 14 result rows.** The
+  declared key list ends in `p_partkey`, which is a key of the surviving
+  relation, so the declared order is effectively total and the tie-break is never
+  reached.
+
+So the recorded `TPC-H PASS (20/22 meaningful …)` and the unchanged baseline are
+**not** contradicted by B3-1, and q2 is the one query to re-check if the fix
+changes the comparator. The exposure is real but currently unhit by the
+benchmark, which is why it survived to pass 3.
+
+One accidental protection worth naming: pass 2's B-2 — `JoinEnumeration::apply`
+never descending into a derived body when the outer block has a join — means a
+derived body's join tree is never reordered, so a sort **inside** a derived body
+cannot hit B3-1 today. A fix for B-2 (a plan-quality fix) would widen B3-1's
+reach. They must be sequenced: comparator first.
+
+## What I checked this pass and found CLEAN
+
+Recorded as results, so pass 4 (if there is one) does not re-derive them.
+
+- **`written_ordinal` is complete and fails in the safe direction** (A.2), and the
+  refusal boundary is exactly what its comment claims — `1`, `(1)`, `- -1`
+  refused; `1 + 1`, `2 * 1`, `SELECT 1 AS one … ORDER BY one` accepted; nested
+  derived and subquery bodies enforced too. All by execution.
+- **The GROUP BY shapes the ordinal fix newly UNBLOCKED are correct.**
+  `SELECT 1 + 1, COUNT(*) FROM laps GROUP BY 1 + 1` → `2 | 10000`;
+  `SELECT team, COUNT(*) FROM laps GROUP BY 1 + 1` → correctly refused with
+  *"SELECT column 'team' must appear in GROUP BY"*. The `substituteInto`
+  early-return on a folded `Literal` (A.1 #5) does not break either.
+- **Folding's VALUE claim is true and earned** (A.1) — same evaluator, declines
+  on throw, on NULL, on `IS NULL`, on aggregates, on subquery bodies.
+- **Five of the six ungated passes are identical in both legs by construction**,
+  not by argument (A.3).
+- **`SELECT *` over a reordered join keeps written column order** — verified on
+  the 3-relation reordering query; the projection is built from the range table,
+  not from the join's merged schema. So B3-1's schema permutation is not visible
+  as a column-order change in output.
+- **`DISTINCT` over a reordered join is safe** — it hashes whole rows, and a
+  permutation of a row's columns does not change the SET of distinct rows.
+- **`LIMIT` with no `ORDER BY` over the reordered 3-relation join** returned
+  identical rows in both legs on the shapes I tried. Not a guarantee — nothing
+  makes it one — but not a finding either.
+- **`PredicatePushdown` is effectively idempotent** (B.2); `CardinalityEstimator`
+  is idempotent; `JoinEnumeration` is not, and nothing calls it twice (pass 2's
+  B-7, unchanged).
+- **Integer division by zero yields NULL, it does not throw**
+  (`SELECT 100 / (lap_id - lap_id) FROM laps LIMIT 1` → `NULL`), so B3-2's class
+  is narrower than it first looks — `SUBSTRING` and `checkedArith` overflow are
+  the raising per-row operations, not division.
+- **TPC-H q2, the one benchmark query with B3-1's shape, is identical in both
+  legs** (B.5).
+- **Nothing in the already-recorded list is worse than recorded.** I re-read
+  `development.md:854/855/808`, `join_enumeration.h:84-91` and pass 2's B-2, and
+  have nothing to add beyond the sequencing note in B.5.
+
+## Not reached
+
+- I did not build a repro of B3-1 on `catalog.json` itself (2 tables, so it needs
+  a 3-way self-join). I ran six such shapes; all agreed, because the first
+  discriminating column happened to coincide between the two schema orders. The
+  mechanism is data-dependent, not shape-dependent, so the absence of a
+  `catalog.json` repro is not evidence the invariant suite is safe once a
+  3-relation query is added to it — it is evidence that the failure is quiet.
+- I did not run the full gate. Every measurement here is a single-query CLI
+  invocation (`--no-cache`); no harness, no build, no TPC-H sweep was started by
+  this audit. `build/swiftql` was already newer than every file under `src/`, so
+  it is HEAD's binary.
+- I did not attempt a fix for anything. No source file was touched.
+- I did not re-audit `subquery_materialization.cc` internals; B3-1b is about the
+  flag it threads, not about the rewrite it performs.
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 1 | **B3-1** — `optimized != --no-optimize`, two demonstrated shapes. The Week-37 sort tie-break is positional over the sort input's schema, and `JoinEnumeration::rebuild` permutes that schema by design; the tie-break's own stated precondition ("the sort's INPUT row must be the same in every mode") is false for column ORDER. **B3-1b** is the amplification: `materializeSubqueries` threads the flag into the nested runner, so the same cut inside a scalar subquery's `LIMIT 1` substitutes a different constant and a query with no `ORDER BY` and no `LIMIT` of its own returns a different row (`EGYPT 4` vs `SAUDI ARABIA 20`) |
+| **HIGH** | 1 | **B3-2** — `orderByWork` reorders conjuncts on a selectivity estimate, and per-row evaluation is not total. Both directions run and confirmed: the optimizer MASKS a `SUBSTRING` error (`optimized` 0 rows, `--no-optimize` errors) and INTRODUCES one (`optimized` errors, `--no-optimize` 0 rows). The precondition that would make conjunct reordering safe is stated nowhere |
+| **MEDIUM** | 1 | **B3-3** — a third silent decline: predicate pushdown never enters a `LogicalDerived` body in ANY shape, including with no join present. Measured **9.4×** (18465 µs vs 1969 µs) on the simplest exhibiting query, with the body's projection materializing 10000 rows the filter discards to 174; zone-map pruning is lost too, and `--explain` says nothing |
+| **LOW** | 2 | **L-1** — folding's new comment is true about values but its census of shape-consumers says "there was exactly one" and there are four more; two of them (the SUBSTRING plan-time refusal, the output column NAME) change an outcome today (A.1). **L-2** — `foldConstants` is load-bearing for CORRECTNESS, not canonicalization: it is the only thing that removes an `IntervalLiteral`, which `logical_plan.cc:250` throws on. The pass's own comment calls it canonicalization, and moving it inside the `--no-optimize` gate on that word would break every interval query on the differential leg |
+
+**Verdict: the seam does NOT hold, and the audit does not end here. Two of the
+three passes `--no-optimize` gates can change what a query returns, and one of
+the ungated six carries the change into a query that has no order-dependence at
+all. Both blockers are new, both are the same failure mode the codebase has now
+hit three times — a precondition written down as a comment, at a moment when it
+was true, and not re-checked when a later week made it false. `JoinEnumeration`
+(Week 28) permutes the schema; the sort tie-break (Week 37) reads it. Nine weeks
+apart, and each is correct in isolation. The 119 invariant checks cannot see it
+for three independent reasons, the strongest being that no query in the suite has
+three relations, so the pass with the most surface in this seam is exercised by
+none of them.**
