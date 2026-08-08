@@ -693,3 +693,90 @@ Recorded as results so the record is complete.
   internals; the subquery-chain seam owns those. P5-1 is about WHERE the lowering
   puts its node, not about the lowering.
 
+---
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 0 | — |
+| **HIGH** | 1 | **P5-2** — `optimized != --no-optimize`, constructed and run. `staticTypeOf`'s ColumnRef **bare-name fallback** types a foreign relation's conjunct against the scanning relation's schema, so `collectSimplePredicates` walks past a raiser and a later conjunct's zone-map skip removes the rows it was owed. `SELECT a.k FROM a JOIN b ON b.k = a.k WHERE a.v = 5 AND b.v = 5 AND a.k > 999999` → **optimized: Error: Type mismatch in Value comparison; `--no-optimize`: 0 rows** (columnar/vectorized). Control with `a.k > 0` errors on both legs, isolating the cause to the skip. Round 4's guard on `canSkipChunk` is real; the guard on *reaching* it is not. Needs two tables sharing a column NAME with different TYPES — which no harness catalog has, and which ordinary schemas do |
+| **MEDIUM** | 3 | **P5-1** — the definition's absolute (*"nothing may change that set … not a plan rewrite"*) is false for two ungated passes: `lowerInSubqueries` and `lowerExistsSubqueries` delete their conjunct from the WHERE and interpose a row-reducing **semi-join below the filter**, so a raiser written EARLIER is evaluated on fewer rows. `WHERE raiser AND driver_id IN (999999)` errors; `WHERE raiser AND driver_id IN (SELECT …)` answers 0 rows. For a lowered conjunct, written position stops mattering. Both legs agree, so no harness can see it. **P5-3** — P4-2 is half closed: the DOUBLE spelling is genuinely fixed (byte-identical optimized plans, verified), the INT spelling still measures **90×** (38 847 µs vs 432 µs, five runs, wall-clock corroborated) and is still silent at all four movers. The freeze is CORRECT here; the silence is not. Reading "86× → 1.0×" as "P4-2 is closed" would be wrong. **P5-4** — the screen classifies a comparison against a **NULL literal** as may-raise, which the file's own comment proves impossible; measured **2.55×** (93 594 µs vs 36 676 µs) on a query that answers 0 rows. `evaluate()` propagates NULL before every raise site except AND/OR, and the screen models none of it |
+| **LOW** | 2 | **P5-5** — the header's safety claim (*"a MISSED Expr subtype must answer TRUE"*) holds at SUBTYPE granularity and **fails open at OPERATOR granularity**: `staticTypeOf`'s `BinaryExpr` arm types any unrecognised operator INT, `exprMayRaise`'s falls into the comparison test, and neither function tests `un->op` at all. A `||` or a `NOT` node added later is classified TOTAL from day one. **P5-6** — `INVARIANT_SCOPE` says 5+1 ungated passes; there are **9**. P4-4 named two of the three missing and was not acted on; round 4 added the third, `applyLimit`, which is the only ungated pass whose firing is decided by `exprMayRaise` |
+
+### Adjudication carried out, as instructed
+
+**Pass 4's P4-B2 is WITHDRAWN. The fixer was right.** Making `inferExprType`
+refuse a STRING-vs-numeric comparison at plan time (1) breaks
+`WHERE team > 'zzzzz' AND team = 5`, which answers 0 rows today on both legs —
+verified; (2) breaks every comparison against a NULL literal from a zero-row
+scalar subquery, e.g. `WHERE team = (SELECT MAX(age) FROM drivers WHERE age > 999)`,
+which answers 0 rows today — verified, `null_type` is INT and the column is
+STRING; and (3), the argument neither party made and the one I decide on, it
+**contradicts the definition round 4 shipped** — `expr_totality.h` says the row
+SET decides whether a query errors, and a plan-time refusal says the SCHEMA does.
+Both cannot be the rule. The screen approach is the right design; P5-2 is a bug in
+it, not a reason to revisit it.
+
+**The fixer's two open items both confirmed, one refined, and they are the same
+bug.** The declines are silent — six of them now, two added in round 4, and
+`LogicalScan`/`LogicalProject` have no field to stamp. The `--no-optimize`
+pruning loss reproduces at **+17.7%** by an isolated method (same conjunct set,
+same 398 rows, only written order differs) rather than the leg-to-leg ratio,
+which is 18× and would have been the `Execution:`-line trap. And the fix
+`chunk_pruner.h:50-57` proposes for the performance concession — thread the
+filter's child schema through `pruningHintForPreservedSide` — **is exactly the fix
+for P5-2**: with the right schema, `b.v` resolves to its STRING column, the walker
+stops, and the two legs agree. One change, a 17.7% recovery and a divergence
+closed.
+
+### Verdict
+
+**The seam does not hold, and the reason is worth stating precisely because this
+is the last pass: round 4 got the DESIGN right and the PLUMBING wrong.**
+
+The design is right and I could not break it. `expr_totality.h` states an
+evaluation order as a definition instead of leaving it to whichever engine runs
+the query; the precondition built on it — permute a total prefix freely, freeze
+from the first raiser on — is sound, and the partition that implements it is
+correct at all five sites, checked index by index rather than believed. The
+`exprMayRaise` enumeration is exact for every expression form the dialect has,
+including the comparison class that was pass 4's whole subject, and the raise-site
+set behind it is now closable in one `grep`. Four passes of this audit have been
+about a precondition written down as a comment at a moment when someone believed
+it; this is the first round where the precondition is a definition, is checked,
+and holds.
+
+What is wrong is that the screen is a function of a schema, and two callers hand
+it the wrong one. `ChunkPruner` gets the scanning relation's schema for a hint
+written against the join's, and the bare-name fallback — inherited from
+`resolveColumnIndex`, where it is correct — turns "I cannot type this" into "I
+typed it, wrongly", which is the one answer a conservative screen must never
+give. That is P5-2, and it is a live `optimized != --no-optimize` divergence. The
+same shape of mistake, benign direction, is P5-4: the NULL literal's *declared*
+type is handed to a test about its *behaviour*, and 2.55× is spent on an error
+that cannot occur. Sharing one function between a resolver and a screen is what
+merged the two rules, and it is the single thing I would change.
+
+And the definition is not yet enforced everywhere it claims to be. It says *"not
+a rewrite"*, and two ungated lowerings rewrite exactly that set — invisible to
+every harness, because both legs are wrong together. That is the residue of a
+contract that was strengthened faster than its consumers were enumerated:
+`predicate_pushdown.cc`, `chunk_pruner.h` and `logical_plan.cc`'s LIMIT rule were
+taught the rule; `lowerInSubqueries` and `lowerExistsSubqueries` were not, and
+nothing lists them as owing it.
+
+**Honest in the other direction: this is the best state this seam has been in.**
+Pass 3's two BLOCKERs are closed and stayed closed. Pass 4's P4-1 is closed in
+all four of its repros and its second raise site is guarded. P4-B1's derived-body
+hole is closed. The 87× is closed for the arithmetic type it was measured on. No
+finding in this pass is a wrong row, and none is a regression against pre-fix
+code. The audit closes with one live divergence, three measured conservatisms and
+a documented absolute that is not absolute — and with the fix for the divergence
+already written down, in the file that carries the bug, as a performance note.
+
+**One line: the definition is right, the partition is right, and the classifier
+is right — but it is asked about the wrong schema in one place and about a
+literal's declared type instead of its behaviour in another, and the first of
+those is a live `optimized != --no-optimize` divergence that no harness catalog
+can reach.**
