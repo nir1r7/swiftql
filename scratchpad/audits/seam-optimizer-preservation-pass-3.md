@@ -205,3 +205,110 @@ cross-ENGINE instance and left the optimizer instance open.
 
 Same BLOCKER, same root cause; recorded separately because it is the shape that
 makes the severity unarguable.
+
+## HIGH B3-2 — `orderByWork` reorders conjuncts on an estimate, and predicate evaluation is NOT total. The optimizer both MASKS and INTRODUCES a per-row error.
+
+`src/planner/predicate_pushdown.cc:239-255`:
+
+```cpp
+// Order conjuncts most-selective-first (smallest keep-fraction). Stable so ties
+// and stat-less predicates (fallback selectivity) keep their original order.
+void orderByWork(std::vector<std::unique_ptr<Expr>>& conjuncts, ...) {
+    std::stable_sort(conjuncts.begin(), conjuncts.end(), [&](a, b) {
+        return CardinalityEstimator::selectivity(a.get(), ctx)
+             < CardinalityEstimator::selectivity(b.get(), ctx); });
+}
+```
+
+`orderByWork` is called only from `filterOnto` and `PredicatePushdown::apply`,
+both inside the `--no-optimize` gate. So conjunct ORDER differs between the two
+legs. The columnar predicate cascade short-circuits — `columnar_eval.cc:143-146`,
+AND evaluates the right conjunct only over the left's survivors — and per-row
+evaluation **can throw**. Reordering therefore decides whether a throwing
+conjunct is ever reached.
+
+Both directions are reachable from the CLI on the shipped `catalog.json`,
+`--execution vectorized --storage columnar`.
+
+**Direction 1 — the optimizer MASKS an error.**
+
+```sql
+SELECT team FROM laps
+WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' AND speed = 333.3333
+```
+```
+optimized       (0 rows)
+--no-optimize   Error: SUBSTRING: start position must be >= 1
+```
+`--explain`: written `[(SUBSTRING(...) = x) AND (speed = 333.3333)]`, optimized
+`[(speed = 333.3333) AND (SUBSTRING(...) = x)]`. `speed = 333.3333` has a real
+NDV so its selectivity is ~1e-4; the SUBSTRING conjunct is a `=` with no
+`col op lit` shape, so it gets `FALLBACK_EQ_SELECTIVITY = 0.1`
+(`cardinality_estimator.h:14`, used at `:159`). The speed conjunct sorts first,
+keeps zero rows, and the SUBSTRING is never evaluated.
+
+**Direction 2 — the optimizer INTRODUCES the error.**
+
+```sql
+SELECT team FROM laps
+WHERE team LIKE 'zzz%' AND SUBSTRING(team, lap_id - lap_id, 2) = 'x'
+```
+```
+optimized       Error: SUBSTRING: start position must be >= 1
+--no-optimize   (0 rows)
+```
+`--explain`: written `[team LIKE 'zzz%' AND (SUBSTRING(...) = x)]`, optimized
+`[(SUBSTRING(...) = x) AND team LIKE 'zzz%']`. `LIKE` deliberately has no
+selectivity rule (`cardinality_estimator.cc:120`) and takes
+`FALLBACK_SELECTIVITY = 0.5`; the SUBSTRING conjunct's 0.1 sorts ahead of it, so
+a predicate that matched nothing is demoted below one that throws.
+
+This is the second direction that matters: the first can be argued as the
+optimizer being kinder, the second is the optimizer manufacturing a failure on
+a query that succeeds without it.
+
+### Mode census
+
+| mode | optimized | `--no-optimize` |
+|---|---|---|
+| `columnar` + `vectorized` | **Error** | 0 rows |
+| `columnar` + `volcano` | Error | Error |
+| `row` + `volcano` | Error | Error |
+| `row` + `vectorized` | refused (needs columnar), both legs | — |
+
+Volcano evaluates the whole WHERE per row with no cascade, so it throws in both
+legs; col-vec is where the divergence lives.
+
+### The precondition, and that it is BELIEVED rather than checked
+
+`orderByWork`'s comment argues only about COST — *"'Expected work' is modeled as
+selectivity only — optimal when per-predicate eval cost is uniform"* — and
+defers a cost-weighted ranking to Week 28. It never states the correctness
+precondition a reordering needs, which is that **conjunct evaluation is total**:
+that no conjunct can fail on a row another conjunct would have removed. That
+precondition is false today and has been since Week 25 added `SUBSTRING`, whose
+`substringOf` raises per row for a computed start < 1 (`evaluator.cc`; the
+plan-time twin at `logical_plan.cc:234-243` catches only the *constant* case, and
+says so: *"A computed position still raises at execution"*).
+
+Every other per-row raise is in the same class. `checkedArith` overflow throws;
+integer division by zero does **not** (it yields NULL — verified:
+`SELECT 100 / (lap_id - lap_id) FROM laps LIMIT 1` prints `NULL`), so the
+division case is safe by accident rather than by rule.
+
+### Why the harnesses do not see it
+
+`run_optimizer_invariant` catches an exception from either leg and records an
+ERROR — so this shape WOULD be caught if it were in the suite. It is not: no
+query in `test_new_queries.py` puts a computed-argument `SUBSTRING` in a `WHERE`
+alongside a second conjunct. `grep -rn "SUBSTRING" python_tools/` finds the
+function only in select lists and in fully-constant argument positions.
+
+### Ranking
+
+**HIGH, not BLOCKER.** `optimized != --no-optimize` on a CLI-typable query on
+the shipped catalog, in both directions, and the failing side is loud rather
+than silently wrong — an error is not a wrong answer. It is HIGH rather than
+MEDIUM because direction 2 means the optimizer can turn a working query into a
+failing one, which is the strongest form of "not result-preserving" short of a
+wrong row.
