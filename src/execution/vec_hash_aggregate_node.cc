@@ -293,6 +293,11 @@ void VecHashAggregateNode::fillChunk(int start, int count) {
 
     for (int c = 0; c < output_schema_.size(); ++c) {
         ColumnVector cv = makeColumnVector(output_schema_.column(c).type);
+        // Armed by the plan when an expression above divides with this column.
+        // MIN/MAX hand back the argument's own Value, so a mixed-type CASE
+        // argument arrives here as an INT under a DOUBLE declaration — see
+        // refuseObservableIntNarrowing in vec_types.h.
+        cv.int_observable = c < static_cast<int>(int_observable_.size()) && int_observable_[c];
         for (int i = start; i < start + count; ++i) {
             // a null aggregate result (SUM/AVG/MIN/MAX over a group with no
             // non-NULL input) is carried on the validity mask, not flattened

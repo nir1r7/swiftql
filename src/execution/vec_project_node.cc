@@ -47,6 +47,16 @@ void VecProjectNode::prepare(){
         if (compiled_[c] && compiled_[c]->type() != output_schema_.column(c).type) {
             compiled_[c].reset();
         }
+        // An ARMED column must take the per-value path: the refusal lives in
+        // appendColumnValue, and a compiled executor writes its typed vector
+        // directly without ever appending a Value. compileNode already declines
+        // every shape that can arm a column (it declines CaseExpr by name), so
+        // this makes a coincidence deliberate rather than inventing a
+        // requirement — and it costs nothing on the columns that are not armed,
+        // which is all of them in almost every plan.
+        if (compiled_[c] && intObservable(c)) {
+            compiled_[c].reset();
+        }
         if (!compiled_[c]) needs_row_ = true;
     }
 }
@@ -87,6 +97,7 @@ DataChunk* VecProjectNode::nextChunk(){
             // plain column: gather the selected rows, carrying validity across
             const ColumnVector& src = filtered->columns[src_col_[c]];
             ColumnVector out = makeColumnVector(output_schema_.column(c).type);
+            out.int_observable = intObservable(c);
             for (int i = 0; i < n_rows; ++i) {
                 appendColumnValue(out, valueAt(src, (*indices_ptr)[i]));
             }
@@ -97,7 +108,10 @@ DataChunk* VecProjectNode::nextChunk(){
             // so copy it whole instead of appending value by value
             out_chunk_.columns[c] = compiled_[c]->execute(*filtered, *indices_ptr);
         } else {
+            // Pass 2's column: the arming has to be stamped here, before the
+            // row loop below appends the first Value into it.
             out_chunk_.columns[c] = makeColumnVector(output_schema_.column(c).type);
+            out_chunk_.columns[c].int_observable = intObservable(c);
         }
     }
 

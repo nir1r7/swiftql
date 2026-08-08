@@ -18,11 +18,19 @@ class VecHashAggregateNode : public VecPlanNode {
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
 
+        // Output columns whose INT -> DOUBLE narrowing is observable to a
+        // division above this node; MIN/MAX over a mixed-type CASE is the route
+        // that reaches it (MIN/MAX keep the argument's own Value and type).
+        // vectorized_plan_builder.cc computes the mask, vec_types.h's
+        // refuseObservableIntNarrowing enforces it. Empty (the default) = none.
+        void setIntObservableColumns(std::vector<bool> mask) { int_observable_ = std::move(mask); }
+
     private:
         std::unique_ptr<VecPlanNode> child_;
         std::vector<GroupByColumn> group_by_cols_;
         std::vector<AggregateSpec> specs_;
         Schema output_schema_;
+        std::vector<bool> int_observable_;   // parallel to output_schema_ when non-empty
 
         struct Accumulator {
             int64_t count = 0;
