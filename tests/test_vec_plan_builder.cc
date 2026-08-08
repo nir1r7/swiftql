@@ -1461,3 +1461,4 @@ TEST(VecPlanBuilder, EveryPhysicalNodeUnderADerivedBodyCarriesItsEstimate) {
         "ON d.driver_id = dr.driver_id ORDER BY n LIMIT 5", cat);
     EXPECT_EQ(joined.first, 0u) << "unstamped physical nodes:" << joined.second;
 }
+

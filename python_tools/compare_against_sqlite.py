@@ -1357,6 +1357,45 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     # that dropped the predicate. This one returns a proper subset.
     "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
     "(SELECT 1.02 * AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)",
+
+    # SEAM AUDIT pass 2 — B-2. THE SAME PAIR WITH A COLUMN ALIAS ON THE BODY,
+    # which is where the "SAME plan" claim two comments up USED TO BE FALSE.
+    #
+    # The claim was asserted by this file and by README (twice) and verified in
+    # Week 36 on the UNALIASED pair only. With an alias the two forms did not
+    # merely differ, one of them DID NOT PLAN AT ALL:
+    #
+    #   (SELECT AVG(l2.speed) AS a ...)        -> Error: column not found:
+    #                                             'AVG(l2.speed)'   [SQLite 4994]
+    #   (SELECT 1.02 * AVG(l2.speed) AS a ...) -> 4037 = SQLite
+    #
+    # because the alias only reaches the moved node in the UNWRAPPED form (in the
+    # wrapped form it rides on the BinaryExpr, which is lifted out), so
+    # buildProjectSchema renamed the relation's column to `a` while the
+    # substituted outer reference still looked for `AVG(l2.speed)`. The lowering
+    # now clears the alias off the aggregate before rebuilding the body's select
+    # list, and all four forms are byte-identical under --explain again. These
+    # entries are what puts the claim under test instead of leaving it asserted.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
+    "(SELECT AVG(l2.speed) AS a FROM laps l2 WHERE l2.team = l.team)",
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > 1.02 * "
+    "(SELECT AVG(l2.speed) AS a FROM laps l2 WHERE l2.team = l.team)",
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
+    "(SELECT 1.02 * AVG(l2.speed) AS a FROM laps l2 WHERE l2.team = l.team)",
+    # ...and an aliased COUNT body, so the alias is exercised on the OTHER
+    # substitution path — the one that wraps the reference in `CASE WHEN ref IS
+    # NULL THEN 0 ELSE ref END` rather than assigning it bare. Every group here
+    # is empty (`speed > 999`), so the zero-row rule and the alias are both live
+    # at once: 20, not 0.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) AS c FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.speed > 999)",
+    # ...and an aliased body whose ROWS are compared, not just a count, so an
+    # alias that silently selected the WRONG column (rather than no column) would
+    # be visible. 66 rows.
+    "SELECT l.lap_id AS id FROM laps l WHERE l.speed > "
+    "(SELECT MAX(l2.speed) AS m FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.season = 2024) ORDER BY id",
     # !! THE WRAPPED-COUNT PAIR, and the reason the wrapper is lifted OUT of the
     # body rather than pushed through it. COUNT over an empty group is 0, not
     # NULL, so the substitution site wraps the reference in

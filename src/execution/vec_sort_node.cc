@@ -1,5 +1,6 @@
 #include "execution/vec_sort_node.h"
 #include "execution/evaluator.h"
+#include "execution/sort_comparator.h"
 #include "parser/expr_utils.h"
 #include <algorithm>
 #include <chrono>
@@ -39,18 +40,13 @@ void VecSortNode::consumeAndSort() {
         }
     }
 
-    // compareForSort, not Value::operator< — the SQL operators return false for
-    // every comparison against NULL, which makes NULL equivalent to every value
-    // and the equivalence non-transitive. That is not a strict weak ordering, so
-    // stable_sort's behaviour is undefined: it inverted non-NULL keys and dropped
-    // rows under LIMIT. See the comment on compareForSort in value.h.
+    // ONE comparator, shared with Volcano's SortNode — including the
+    // deterministic tie-break below the declared keys, which is what makes the
+    // row that survives a LIMIT cut independent of the plan shape (and so of the
+    // build side this engine chooses from cardinality estimates while Volcano
+    // chooses it from raw row counts). See execution/sort_comparator.h.
     std::stable_sort(flat_buffer_.begin(), flat_buffer_.end(), [&](const Row& a, const Row& b) {
-            for (const auto& item : order_by_) {
-                int c = compareForSort(evaluate(item.expr.get(), a, schema),
-                                       evaluate(item.expr.get(), b, schema));
-                if (c != 0) return item.desc ? c > 0 : c < 0;
-            }
-            return false;
+            return sort_comparator::rowLess(order_by_, schema, a, b);
         });
 }
 

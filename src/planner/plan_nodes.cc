@@ -1,6 +1,7 @@
 #include "plan_nodes.h"
 #include "execution/key_encoding.h"
 #include "execution/evaluator.h"
+#include "execution/sort_comparator.h"
 #include "parser/expr_utils.h"
 #include "storage/chunk_pruner.h"
 #include <algorithm>
@@ -519,16 +520,13 @@ void SortNode::open() {
     // sort — self-work only, no child calls
     auto t0 = std::chrono::high_resolution_clock::now();
     const Schema& schema = child_->outputSchema();
-    // compareForSort, not Value::operator< — see the comment in value.h. Comparing
-    // with the SQL operators is not a strict weak ordering once a sort key can be
-    // NULL, which is undefined behaviour in stable_sort, not just odd placement.
+    // ONE comparator, shared with VecSortNode — including the deterministic
+    // tie-break below the declared keys, which is what makes the row that
+    // survives a LIMIT cut independent of the plan shape. See
+    // execution/sort_comparator.h; a tie-break only one engine applies would be
+    // the same cross-engine divergence with a new cause.
     std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
-        for (const auto& item : order_by_) {
-            int c = compareForSort(evaluate(item.expr.get(), a, schema),
-                                   evaluate(item.expr.get(), b, schema));
-            if (c != 0) return item.desc ? c > 0 : c < 0;
-        }
-        return false;
+        return sort_comparator::rowLess(order_by_, schema, a, b);
     });
     cursor_ = 0;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();

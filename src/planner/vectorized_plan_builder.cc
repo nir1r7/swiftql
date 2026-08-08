@@ -273,7 +273,22 @@ double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
 
 // Week 23: every physical node inherits its logical counterpart's estimate so
 // EXPLAIN ANALYZE can print est= next to rows_out. The wrapper stamps once for
-// all eight cases (the JOIN case has two returns); -1 stays -1 under --no-optimize.
+// all NINE cases (the JOIN case has two returns); -1 stays -1 under
+// --no-optimize.
+//
+// !! Week 37. This said "eight" from Week 23 until now, and Week 34's DERIVED
+// case — the ninth — was added calling `lowerNode` directly, so the stamp it
+// promises did not reach the root of any derived body. Counted against the
+// switch below rather than trusted: `grep -c "case LogicalNodeType::"` is 9.
+// The invariant this comment states is only true if EVERY recursive call in
+// lowerNode goes through `lower`; that is the thing to re-check when a tenth
+// case arrives, not the number.
+//
+// Its blast radius is exactly EXPLAIN, and that is checkable rather than
+// assumed: VecPlanNode::estimated_rows has ONE writer (the line below) and its
+// only readers are main.cc's collectVecNodes, which builds the est= column.
+// The physical cost decisions in the JOIN case do NOT read it — they read the
+// LOGICAL children's estimates (join->children[i]->estimated_rows) directly.
 std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* pruning_where) {
     std::unique_ptr<VecPlanNode> phys = lowerNode(node, pruning_where);
     phys->estimated_rows = node->estimated_rows;
@@ -301,7 +316,18 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         // and every indexOf above this graft look the new names up.
         case LogicalNodeType::DERIVED: {
             auto* derived = static_cast<LogicalDerived*>(node);
-            auto child = lowerNode(derived->children[0].get(), nullptr);
+            // `lower`, NOT `lowerNode` — the wrapper, like every other case in
+            // this function. Week 34 added this case calling the inner function
+            // directly, so the body's ROOT physical node was the one node in
+            // the whole plan that never got estimated_rows stamped and printed
+            // blank under --explain. Seam-join-chain pass 2, B-4; it is visible
+            // unremarked in 17bfcea's own pasted evidence, which is the commit
+            // that claimed estimates now track actuals on EVERY node.
+            //
+            // `nullptr` for pruning_where stays: a derived body's own WHERE is
+            // inside the body, and the outer block's is not this subtree's to
+            // push into a scan.
+            auto child = lower(derived->children[0].get(), nullptr);
             if (derived->output_schema.size() != child->outputSchema().size()) {
                 throw std::runtime_error(
                     "internal: derived relation '" + derived->alias
