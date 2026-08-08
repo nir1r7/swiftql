@@ -101,6 +101,17 @@ It nearly took two files of an in-flight fix. Order after any restart notice: `u
 `git status`, then **snapshot anything loose as `wip:`**, and only then consider a reset — and
 only once `git merge-base --is-ancestor HEAD origin/<branch>` confirms it can lose nothing.
 
+**The 10-minute Bash cap, and the pattern that actually survives it.** Gates 3 and 5 both exceed
+it. The obvious fix — launch detached with `setsid`, then foreground-block with
+`tail --pid=$PID -f <outfile>` — **does not work**: plain `setsid` does not fork when the shell's
+child is not already a process-group leader, so the worker keeps your shell as its parent and dies
+with it at the cap. That is what produced a verifier reporting **"green"** on a run that had
+actually exited 143 two-thirds of the way through, with no failures *yet*. Use **`setsid --fork`**,
+which reparents the wrapper to PID 1; the waiter can then be killed at the cap while the run
+continues, and you re-block with `tail --pid` in the next call. Two consequences worth stating to
+every agent: **never `pkill -f <pattern>`** — it self-matches the issuing shell and kills your own
+tool call — and **check that a long run COMPLETED**, meaning an exit code and a final summary line,
+not merely an absence of failures. An incomplete run has no failures either.
 **Tell agents never to use background `until`/`sleep` waiter loops.** They are the first thing
 killed, they die silently, and an agent blocked on one cannot tell "still waiting" from "my
 waiter is gone". Foreground the command and let it block, or poll once per tool call.

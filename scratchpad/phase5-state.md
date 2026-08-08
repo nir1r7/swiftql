@@ -1,6 +1,27 @@
 # Phase 5 orchestrator state
-Current: **PASS 4 COMPLETE — 4 BLOCKERS / 2 HIGH / 6 MEDIUM. FIX ROUND 4 RUNNING (2 agents).**
-Pass 5 is the LAST the skill allows. After fix round 4: gate -> pass 5 -> doc sweep -> q21 -> sf0.1.
+Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST PASS ALLOWED.**
+  unit **910**; oracle **1722/0/0** (= 1602 + 120 new, exact); regression **340/0/0** (= 335 + 5,
+  and the harness NAMES the five: w37p_guard_first_substring, w37p_guard_first_overflow,
+  w37p_guard_first_type_mismatch, w37p_partial_projection_under_limit, w37p_derived_guard_inside_body
+  — its own labels, not my arithmetic); tpch PASS 20/22, baseline md5 unchanged.
+  Fingerprint 7a66562d93e35d88825482505b06c777 identical at start, after the touch, and after all
+  five gates. Staleness disproved BOTH ways again: rebuilt binaries **bit-identical** to existing.
+  **All three pin matrices clean: 7 (join-key) / 17 (INT-narrowing, pooled) / 5 (partial-expression).**
+  Rejection sweep 35 suites / 257 entries. Every long gate CONFIRMED COMPLETED (exit code + final
+  summary line), not merely free of failures.
+AFTER PASS 5: doc sweep -> q21 -> sf0.1 -> final gate.
+
+## !! THE `setsid` BUG — it explains an earlier false "green"
+The detached-plus-`tail --pid` pattern I propagated **does not survive the 10-minute Bash cap**.
+Plain `setsid` does NOT fork when the shell's child is not already a process-group leader, so the
+worker keeps the shell as PPID and dies with it. **This is what produced the "green, exit 143,
+two-thirds complete" report** — a broken pattern I handed out, not carelessness by that agent.
+FIX: **`setsid --fork`** (reparents to PID 1); the waiter can be killed at the cap while the run
+continues, then re-block with `tail --pid` next call. Gate 3 needs two such blocks.
+ALSO: **never `pkill -f <pattern>`** — it self-matches the issuing shell and kills your own tool
+call (observed, exit 144). Kill by PID.
+AND: **verify a long run COMPLETED** — exit code plus a final summary line. An incomplete run has
+no failures either, which is exactly how the false green read as real.
 
 ## !!! THE UNIFYING FINDING OF PASS 4 — read this before dispatching anything
 **THREE SEAMS INDEPENDENTLY FOUND INSTANCES OF ONE CLASS.** Stated once:

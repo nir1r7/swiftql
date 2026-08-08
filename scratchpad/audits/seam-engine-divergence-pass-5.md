@@ -140,3 +140,37 @@ aggregate.** All nine consume it through a comparison (`> 150`, `> 300`, `> 3`, 
 node. `tests/test_int_double_materialization.cc` and
 `tests/test_int_double_type_through_division.cc` pin the `/` arm and both magnitude bounds and
 contain the string "overflow" zero times.
+
+**A FIFTH face, and the one that leaks a C++ internal to the user.** `AND`/`OR` call `asInt()` on
+each operand, and `asInt()` on a DOUBLE is `std::bad_variant_access`. `expr_totality.h:185-189`
+documents that consumer exactly — *"asInt() on a non-INT operand raises std::bad_variant_access
+(evaluator.cc:112-113, value.cc:28)"* — so the totality screen knows about it and the arming pass
+does not:
+
+```sql
+SELECT MAX(CASE WHEN lap_id = 1 THEN 1 ELSE 0.5 END) AND 1 AS y FROM laps
+   4 Volcano modes  y = 1                                    (SQLite: 1)
+   2 vec modes      Error: std::get: wrong index for variant
+```
+The control that separates the ENGINE from the DIALECT: with the aggregate written bare in a
+`HAVING` — where Volcano also holds a DOUBLE, because the value came from the storage and not from a
+mixed `CASE` — all six modes give the same `std::get` error. It is only the materialization that
+splits them. (That both engines surface a raw `std::bad_variant_access` text rather than a SwiftQL
+diagnostic is a separate, smaller matter; it is recorded here because it is what the user of the
+diverging query sees.)
+
+**Every consumer, enumerated, so the finding is a class and not five queries.** The materialized cell
+differs from Volcano's `Value` in exactly one bit — INT versus DOUBLE — and the dialect has five
+places that read it:
+
+| consumer | armed by `taintWalk`? | diverges? |
+|---|---|---|
+| `/` with an INT partner | **yes** (`OBSERVABLE`) | no — refused, loudly |
+| `/` with a REAL partner | no, correctly | no — INT/REAL and REAL/REAL agree |
+| `+ - *` result past `2^53` | no | **YES — silent wrong answer** |
+| `+ - *` result past INT64 | no | **YES — Volcano throws, vectorized answers** |
+| `AND` / `OR` (`asInt()`) | no | **YES — Volcano answers, vectorized `std::get` error** |
+| `=`,`<`,`IN`,`ORDER BY`, group/DISTINCT keys | no, correctly | no — all coerce or normalize (re-run, clean) |
+
+So the arming rule covers one of the three consumers that can see the difference, and the two it
+misses are the two that were argued away in prose rather than measured.
