@@ -339,3 +339,86 @@ residual and a null-extended `l.speed` in ORDER BY; ORDER BY on columns absent f
 GROUP BY + HAVING; DISTINCT over a join; `SELECT *` over a join; a LEFT join with a WHERE on the
 preserved side). All four modes byte-identical on all six.
 
+
+---
+
+## Part B — the seam taken fresh
+
+### B-1 FINDING **E-10 (HIGH)** — the vectorized path coerces every value it re-materializes to
+### its schema-declared type; Volcano does not. The widening `appendColumnValue`'s own comment
+### calls "lossless" **is not**, and it changes a VALUE and a ROW COUNT.
+
+`vec_types.h:100-106`:
+
+> Append one cell, NULL-aware. `cv.type` decides the storage type. **An INT Value widens into a
+> DOUBLE column (lossless**, and the same promotion evaluate() does via toNumeric() — reachable when
+> a schema declares DOUBLE for a type-preserving MIN/MAX over an INT column). Every other type
+> disagreement is a planner/schema bug…
+
+INT -> DOUBLE is lossless only below 2^53. Above it, two distinct `int64_t` collapse onto one
+`double`. There are **seven** such coercion sites, one in every vectorized operator that rebuilds a
+`Row` into a typed `ColumnVector`: `vec_project_node.cc:86,97`, `vec_sort_node.cc:62`,
+`vec_distinct_node.cc:66`, `vec_hash_aggregate_node.cc:295`, `vec_hash_join_node.cc:156`,
+`vec_simd_loop_join_node.cc:120`. **Volcano has no equivalent site at all** — `ProjectNode` emits the
+`Value` the evaluator produced, untouched by the schema. That asymmetry is the seam.
+
+It is reachable whenever an expression's *inferred* type is DOUBLE while its *runtime* Value is INT.
+`CaseExpr` with one numeric branch of each type is the general route (`inferExprType` unifies to
+DOUBLE; `evaluate()` returns the taken branch verbatim).
+
+**(a) A different value. Run at HEAD:**
+
+```sql
+SELECT CASE WHEN round > 10 THEN 9007199254740993 ELSE 0.5 END AS c FROM laps LIMIT 2
+```
+```
+row-volcano       9007199254740993
+columnar-volcano  9007199254740993
+col-vectorized    9.00719925474099e+15     <-- 9007199254740992: a DIFFERENT integer
+SQLite            9007199254740993
+```
+Not a formatting artefact: 2^53+1 is not representable as a double, so the vectorized path returns
+an integer the query never mentions. Volcano and SQLite agree; the vectorized path is alone.
+
+(The *formatting* half of the divergence starts lower, at 1e15, where `%.15g` switches to exponent
+form while `std::to_string(int64_t)` does not — so `9007199254740992` prints as
+`9.00719925474099e+15` on the vectorized path even where the value survives. The harness compares
+text, so that alone would be a red diff.)
+
+**(b) A different ROW COUNT — the stronger form.** `VecDistinctNode` sits above `VecProjectNode`,
+so it dedups values that have already been coerced:
+
+```sql
+SELECT DISTINCT CASE WHEN lap_id = 2 THEN 9007199254740993
+                     WHEN lap_id = 8 THEN 9007199254740992
+                     ELSE 0.5 END AS c
+FROM laps WHERE lap_id < 10
+```
+```
+row-volcano       9007199254740993 | 9007199254740992 | 0.5     (3 rows)
+columnar-volcano  9007199254740993 | 9007199254740992 | 0.5     (3 rows)
+col-vectorized    9.00719925474099e+15 | 0.5                    (2 rows)
+col-vec-noopt     9.00719925474099e+15 | 0.5                    (2 rows)
+SQLite            3 rows
+```
+
+Two distinct inputs become one output row. And the vectorized path contradicts **itself** on the
+same expression — `COUNT(DISTINCT <same CASE>)` returns **3** in all four modes, because
+`VecHashAggregateNode` builds its distinct key from the pre-coercion `Value` via
+`appendGroupKeyField`. So within one engine, `SELECT DISTINCT e` says two groups and
+`COUNT(DISTINCT e)` says three.
+
+**Why passes 1 and 2 did not see it.** Pass 2's B3 checked type/precision by comparing the two
+*evaluators* — `evaluator.cc` against `expression_executor.cc`/`columnar_eval.cc` — and correctly
+found them aligned, including the architectural reason (the compiler returns `nullptr` and falls
+back to `evaluate()` for anything it cannot reproduce). The coercion is not in either evaluator. It
+is in the **materialization** step that only one engine has, one layer above where both passes
+looked. `CaseExpr` in particular is a shape the vectorized compiler *declines* — so the value is
+produced by the shared `evaluate()`, identically in both engines, and then changed on the way into
+the chunk.
+
+Ranked HIGH rather than BLOCKER for one reason only: no shipped dataset has an INT column at 1e15
+or above, so today it takes a literal to reach. The `checked_arith.h` guard means arithmetic cannot
+manufacture one either — it throws on overflow rather than producing a large magnitude silently.
+Nothing in the loader prevents such a column: `TypeId::INT` is `int64_t`.
+
