@@ -142,16 +142,20 @@ static constexpr int64_t MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN = 1000000000000000LL;
 //
 // The magnitude test runs on the DOUBLE, not on the int64_t, and that is a
 // measurement rather than a preference. `Value::type()` lives in value.cc and
-// does not inline, so asking it first put a second out-of-line call on the arm
-// that every ordinary DOUBLE cell takes: 3.6ms -> 7.3ms per million appends,
-// the same order as the 4.7ms this file's readColumnValue comment already
-// treats as worth avoiding. Testing the double keeps the one call this line
-// always made and adds two compares.
+// does not inline, so asking it FIRST put a second out-of-line call on the arm
+// every ordinary DOUBLE cell takes — 3.6ms -> 7.3ms per million on this
+// function in isolation, the same order as the 4.7ms readColumnValue's comment
+// above already treats as worth avoiding. This order keeps the single
+// toNumeric() call the line always made and adds two compares, which at the
+// appendColumnValue level measured within noise.
 //
-// It is an EXACT proxy, not an approximation: 1e15 is itself a representable
-// double and rounding to nearest is monotonic, so |(double)i| >= 1e15 exactly
-// when |i| >= 1e15. NaN and infinity fail both compares, fall through to the
-// type check, and pass — they are DOUBLEs, and this rule is only about INTs.
+// It is an EXACT proxy, not an approximation. The argument is that 1e15 is
+// itself a representable double and rounding to nearest is monotonic, so
+// |(double)i| >= 1e15 exactly when |i| >= 1e15 — but the argument is not the
+// evidence: `ThresholdIsExactlyTheBoundary` brute-forces the agreement over a
+// 10k window either side of the bound, 200k pseudo-random int64_t and the
+// extrema. NaN and infinity fail both compares, fall through to the type check,
+// and pass — they are DOUBLEs, and this rule is only about INTs.
 inline double narrowToDoubleColumn(const Value& v) {
     // STRING raises bad_variant_access from toNumeric(), as it did before.
     const double d = v.toNumeric();
