@@ -1966,6 +1966,116 @@ def assert_b32_pins_discriminate():
         print("  clean — every pin matches its own producer and no other")
     return findings
 
+# ─── E-10: the vectorized path REFUSES an INT it cannot materialize into a
+# ─── DOUBLE result column, instead of silently changing it ──────────────────
+#
+# A chunk column holds ONE type, so an expression whose branches mix INTEGER and
+# REAL (typically a CASE) is stored as REAL. `appendColumnValue`'s DOUBLE arm
+# used to convert the INT silently. It now throws (`narrowToDoubleColumn`,
+# src/execution/vec_types.h).
+#
+# THE BOUND IS 1e15, NOT 2^53, and the difference is the whole reason entry
+# `e10_render_witness` exists. TWO things have to survive a round trip, and they
+# fail at different magnitudes:
+#   * the VALUE — fails above 2^53 (9007199254740993 becomes ...92);
+#   * the RENDERING — `Value::toString()` uses `%.15g`, which flips to exponent
+#     form at 1e15, so 1000000000000001 prints as `1e+15` while the INT prints
+#     all sixteen digits.
+# 1e15 < 2^53, so the smaller bound is binding and one comparison covers both.
+# A suite that witnessed only 2^53 would miss the render half entirely —
+# `e10_render_witness` is BELOW 2^53 and is refused anyway.
+#
+# THE PAIRING IS THE USUAL `_VEC_ONLY` / `_VOLCANO_REJECTED` SHAPE WITH THE
+# SIDES SWAPPED. Everywhere else in this file the vectorized path is the capable
+# one and Volcano refuses. Here Volcano is the one that answers — it holds a
+# `Value`, not a typed column, so it never narrows — and the two VECTORIZED
+# modes are the ones pinned to refuse.
+#
+# !! THESE ARE NOT THE QUERIES AS FIRST SPECIFIED, AND THE DIFFERENCE IS
+# LOAD-BEARING. The first two were handed over as `ORDER BY c LIMIT 2` —
+# ASCENDING. Run: they do NOT refuse, and all four modes return `0.5, 0.5`
+# matching SQLite. The deterministic LIMIT cut is a BOUNDED TOP-N, so with an
+# ascending sort the two smallest rows win and the big integer is discarded
+# before anything materializes it. As written they would have been:
+#   * dead as refusal pins — pinned to a message that is never raised; and
+#   * VACUOUS as diffed entries — the Volcano leg's output is `0.5, 0.5`, which
+#     agrees with SQLite whether or not the integer survives, so the entry could
+#     not witness the thing it is named for.
+# `DESC` fixes both at once: the two LARGEST rows win, so the integer is IN the
+# output (the Volcano diff now actually compares 9007199254740993 against
+# SQLite's) and it reaches the materialization the vectorized path refuses.
+# The ascending form is kept — as `e10_guard_cut_before_materialize` below,
+# where it belongs, because the behaviour it pins is real and worth holding.
+E10_VOLCANO_ONLY = [
+    # THE VALUE WITNESS: above 2^53, so the double cannot hold it.
+    "SELECT CASE WHEN round > 10 THEN 9007199254740993 ELSE 0.5 END AS c "
+    "FROM laps ORDER BY c DESC LIMIT 2",
+
+    # THE RENDER WITNESS: BELOW 2^53 — the double holds this value exactly — but
+    # at/above 1e15, so %.15g renders it `1e+15` instead of all sixteen digits.
+    # This is the entry a 2^53-only bound would let through.
+    "SELECT CASE WHEN round > 10 THEN 1000000000000001 ELSE 0.5 END AS c "
+    "FROM laps ORDER BY c DESC LIMIT 2",
+
+    # THE ROW-COUNT WITNESS: ...93 and ...92 are distinct INTs that collapse to
+    # ONE double, so a silent conversion returns 2 rows where SQLite returns 3.
+    "SELECT DISTINCT CASE WHEN lap_id=2 THEN 9007199254740993 "
+    "WHEN lap_id=8 THEN 9007199254740992 ELSE 0.5 END AS c "
+    "FROM laps WHERE lap_id < 10 ORDER BY c",
+
+    # THE SECOND SITE: aggregate materialization, not VecProject. The guard has
+    # to be at appendColumnValue for this to be covered by the same fix.
+    "SELECT MAX(CASE WHEN lap_id=2 THEN 9007199254740993 ELSE 0.5 END) AS m "
+    "FROM laps WHERE lap_id < 10",
+]
+
+# Built from the list above BY IDENTITY so the two halves cannot drift: an edit
+# to a query there is an edit here. The pin is the stable clause of the message;
+# the integer that follows it differs per entry (entry 3 names ...92, not ...93,
+# because that is the value the column reaches first).
+E10_VECTORIZED_REFUSED = [
+    (query, "cannot materialize the integer") for query in E10_VOLCANO_ONLY
+]
+
+# ALL FOUR MODES, diffed against SQLite. Without these the block above shows only
+# that SOMETHING refuses; these are what show the refusal is exactly one integer
+# wide and does not fire where it must not.
+E10_BOUNDARY_GUARDS = [
+    # ONE BELOW THE BOUND. 999999999999999 is 15 digits, so %.15g still prints it
+    # in full and the double holds it exactly — every mode must ANSWER.
+    # DESC deliberately, for the same reason as above: ascending would return
+    # `0.5, 0.5` and this guard would pass without the integer ever appearing in
+    # the output it is meant to be guarding.
+    "SELECT CASE WHEN round > 10 THEN 999999999999999 ELSE 0.5 END AS c "
+    "FROM laps ORDER BY c DESC LIMIT 2",
+
+    # the ordinary mixed-type CASE, far below any bound: the common case must not
+    # have become an error
+    "SELECT DISTINCT CASE WHEN lap_id=2 THEN 1 WHEN lap_id=8 THEN 1.0 "
+    "ELSE 0.5 END AS c FROM laps WHERE lap_id < 10 ORDER BY c",
+
+    # THE LEG THAT WAS ALREADY CORRECT, and half of a self-contradiction. Before
+    # the fix the vectorized path answered `SELECT DISTINCT e` = 2 rows and
+    # `COUNT(DISTINCT e)` = 3 for the SAME expression, because COUNT(DISTINCT)
+    # keys off the pre-conversion `Value` and never narrows. Post-fix the DISTINCT
+    # leg refuses and this one still answers 3: one answer to the question, or
+    # none — never two. This must stay 3 in all four modes.
+    "SELECT COUNT(DISTINCT CASE WHEN lap_id=2 THEN 9007199254740993 "
+    "WHEN lap_id=8 THEN 9007199254740992 ELSE 0.5 END) AS n "
+    "FROM laps WHERE lap_id < 10",
+
+    # THE SCOPE OF THE REFUSAL, and the query that was handed over as a refusal
+    # pin. Same offending integer as the value witness, ASCENDING: the bounded
+    # top-N cuts those rows before anything materializes them, so all four modes
+    # answer `0.5, 0.5` and agree with SQLite. The refusal is scoped to values
+    # that REACH the output column, which is the correct scope and is worth
+    # pinning — a future change that widened it to "any INT anywhere in the
+    # expression" would fail here, and a future change that dropped the top-N
+    # would turn this into an error.
+    "SELECT CASE WHEN round > 10 THEN 9007199254740993 ELSE 0.5 END AS c "
+    "FROM laps ORDER BY c LIMIT 2",
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -3503,6 +3613,37 @@ def main():
         r_passed += rp
         r_failed += rf
         r_errors += re_
+
+    # E-10 — an INT that cannot be materialized into a DOUBLE result column.
+    # The usual split with the SIDES SWAPPED: Volcano ANSWERS (diffed against
+    # SQLite in its two modes), the two vectorized modes REFUSE.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, E10_VOLCANO_ONLY,
+            f"E-10 wide INT into a DOUBLE column — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            E10_VECTORIZED_REFUSED,
+            f"E-10 wide INT refused rather than changed — {label}",
+            extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    # ...and the boundary guards, in ALL FOUR modes: the refusal must be exactly
+    # one integer wide, must not fire below the bound, and must not have broken
+    # the COUNT(DISTINCT) leg that was already correct.
+    for label, extra in [("row storage, Volcano", None),
+                         ("columnar storage, Volcano", ["--storage", "columnar"]),
+                         *vec_modes]:
+        mp, mf, me = run_query_suite(
+            conn, E10_BOUNDARY_GUARDS,
+            f"E-10 boundary guards — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
 
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
