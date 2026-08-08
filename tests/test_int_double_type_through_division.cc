@@ -703,3 +703,42 @@ TEST_F(TypeThroughDivision, GuardAboveTwoToThe53TheUnprintedColumnStillRefuses) 
         "FROM laps WHERE lap_id < 4",
         catalog_);
 }
+
+
+// FAILS WITHOUT THE DERIVED ARM of the operand typing (it refuses instead).
+// Pre-arm run: refused; SQLite and the vectorized path both answer 3 rows.
+//
+// `t.s` names a DERIVED relation, which has no catalog schema — and the
+// conservative answer for an untypable operand is INTEGER, which refuses. That
+// cost a query that is right today, so the type question descends into the
+// body's select list instead. Both directions are pinned here: the REAL column
+// must answer and its INT twin must still refuse, which is what shows the
+// descent is TYPING the column rather than exempting derived relations.
+TEST_F(TypeThroughDivision, AREALColumnOfADerivedRelationBesideTheDivisionAnswers) {
+    expectSubqueryRowsBothWays(
+        "SELECT t.s FROM (SELECT l.speed AS s FROM laps l WHERE l.lap_id < 4) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) "
+        "> 150 ORDER BY t.s",
+        catalog_, {"308.91|", "310.17|", "312.45|"});
+    // `SELECT *` has no select list to match, so the name is resolved against
+    // the body's OWN range table — a second route to the same answer.
+    expectSubqueryRowsBothWays(
+        "SELECT t.speed FROM (SELECT * FROM laps l WHERE l.lap_id < 4) t "
+        "WHERE t.speed / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) "
+        "> 150 ORDER BY t.speed",
+        catalog_, {"308.91|", "310.17|", "312.45|"});
+}
+
+// GUARD. The INT twin of the pair above. `round` is INTEGER whichever route
+// reaches it, so the division truncates in Volcano and the flattened column
+// really does change the answer.
+TEST_F(TypeThroughDivision, GuardAnINTColumnOfADerivedRelationStillRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT t.s FROM (SELECT l.round AS s FROM laps l) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+        catalog_);
+    expectSubqueryRefusedBothWays(
+        "SELECT t.round FROM (SELECT * FROM laps l) t "
+        "WHERE t.round / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+        catalog_);
+}

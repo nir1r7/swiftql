@@ -131,44 +131,100 @@ void addTable(std::vector<std::string>& out, const std::string& name) {
 // either engine, so `speed / (SELECT ...)` and `x / 2.0` must NOT arm — that
 // half of the rule is the one fix round 3 left out, and it cost `x / 2.0` its
 // answer (E-14). Unknown answers INTEGER, which over-refuses rather than
-// under-refuses; a DERIVED relation's column is the reachable unknown.
+// under-refuses. What is left unknown is therefore worth keeping small, and the
+// two remaining cases are named rather than discovered: a correlated reference
+// (this walk has no enclosing scope) and a derived relation nested more than
+// MAX_TYPE_DEPTH levels deep.
 // ===================================================================
 
-// The statement's own range table, as catalog schemas in slot order. A DERIVED
-// relation contributes a null: its column types are not decidable here, and the
-// conservative answer is what a null produces.
-using RangeTable = std::vector<const Schema*>;
+// The statement's own range table in slot order. A catalog relation contributes
+// its schema; a DERIVED one contributes its BODY, whose select list is walked
+// for the one column being asked about — `FROM (SELECT l.speed AS s FROM laps)`
+// is a REAL column, and calling it unknown (and therefore INTEGER) refuses a
+// query that is right today. That was measured, not imagined: without the
+// derived arm, `t.s / (SELECT <mixed CASE>)` over exactly that body went from
+// 10000 rows to a refusal.
+struct RangeEntry {
+    const Schema* schema = nullptr;          // a catalog relation
+    const SelectStatement* body = nullptr;   // a derived one
+};
+using RangeTable = std::vector<RangeEntry>;
+
+// How many derived-relation levels the type question will descend before
+// answering INTEGER. Three is past every shape in the corpus (TPC-H's deepest is
+// one) and the budget exists to bound the walk, not to express a limit.
+constexpr int MAX_TYPE_DEPTH = 3;
+
+RangeTable rangeTableOf(const SelectStatement& stmt, const Catalog* catalog);
+bool exprMayBeInt(const Expr* e, const RangeTable& rt, int depth);
 
 RangeTable rangeTableOf(const SelectStatement& stmt, const Catalog* catalog) {
     RangeTable rt;
     if (!catalog) return rt;
     auto push = [&](const TableRef& ref) {
-        if (ref.isDerived()) { rt.push_back(nullptr); return; }
+        if (ref.isDerived()) { rt.push_back({nullptr, ref.body()}); return; }
         const std::string& name = ref.tableName("subquery division operand typing");
-        rt.push_back(catalog->hasTable(name) ? &catalog->getTable(name).schema : nullptr);
+        rt.push_back({catalog->hasTable(name) ? &catalog->getTable(name).schema : nullptr,
+                      nullptr});
     };
     push(stmt.from);
     for (const auto& j : stmt.joins) push(j.relation);
     return rt;
 }
 
+// The output-column names of a derived body, by the same three rules
+// buildProjectSchema uses (alias wins; then a ColumnRef's own name; then
+// aggregateOutputName). A `SELECT *` body has no select list to match, so it is
+// resolved against the body's OWN range table instead.
+bool derivedColumnMayBeInt(const SelectStatement& body, const std::string& name,
+                           const Catalog* catalog, int depth) {
+    if (depth <= 0) return true;   // nested derived tables: stop, conservatively
+    const RangeTable inner = rangeTableOf(body, catalog);
+    if (body.select_star || body.select_list.empty()) {
+        ColumnRef probe;
+        probe.column_name = name;
+        return exprMayBeInt(&probe, inner, depth - 1);
+    }
+    for (const auto& e : body.select_list) {
+        std::string out = e->alias;
+        if (out.empty()) {
+            if (auto* cr = dynamic_cast<const ColumnRef*>(e.get())) out = cr->column_name;
+            else if (auto* agg = dynamic_cast<const AggregateExpr*>(e.get()))
+                out = aggregateOutputName(agg);
+            else continue;   // exprToString names it; not worth re-deriving here
+        }
+        if (out == name) return exprMayBeInt(e.get(), inner, depth - 1);
+    }
+    return true;
+}
+
 // Same resolution order every consumer uses: by (slot, name) when the Binder
-// resolved it, by bare name otherwise. Unresolvable — a correlated reference, a
-// derived relation, an empty range table — is INTEGER, the conservative answer.
-bool columnMayBeInt(const ColumnRef& cr, const RangeTable& rt) {
+// resolved it, by bare name otherwise. Unresolvable — a correlated reference, an
+// empty range table, a name that is in no relation this walk can see — is
+// INTEGER, the conservative answer.
+bool columnMayBeInt(const ColumnRef& cr, const RangeTable& rt,
+                    const Catalog* catalog, int depth) {
+    auto lookIn = [&](const RangeEntry& e) -> int {
+        // -1 = not here, 0 = here and not INT, 1 = here and may be INT
+        if (e.schema) {
+            const int idx = e.schema->indexOf(cr.column_name);
+            return idx < 0 ? -1 : (e.schema->column(idx).type == TypeId::INT ? 1 : 0);
+        }
+        if (e.body) return derivedColumnMayBeInt(*e.body, cr.column_name, catalog, depth) ? 1 : 0;
+        return -1;
+    };
     if (rt.empty()) return true;
     if (cr.id.isResolved() && cr.id.isLocal()) {
         const int slot = cr.id.localSlot("subquery division operand typing");
-        if (slot >= 0 && slot < static_cast<int>(rt.size()) && rt[slot]) {
-            const int idx = rt[slot]->indexOf(cr.column_name);
-            if (idx >= 0) return rt[slot]->column(idx).type == TypeId::INT;
+        if (slot >= 0 && slot < static_cast<int>(rt.size())) {
+            const int r = lookIn(rt[slot]);
+            if (r >= 0) return r == 1;
         }
         return true;
     }
-    for (const Schema* s : rt) {
-        if (!s) continue;
-        const int idx = s->indexOf(cr.column_name);
-        if (idx >= 0) return s->column(idx).type == TypeId::INT;
+    for (const RangeEntry& e : rt) {
+        const int r = lookIn(e);
+        if (r >= 0) return r == 1;
     }
     return true;
 }
@@ -195,7 +251,8 @@ void addCarried(std::vector<const SelectStatement*>& into,
 }
 
 DivTaint divWalk(const Expr* e, const RangeTable& rt,
-                 std::unordered_set<const SelectStatement*>& observed) {
+                 std::unordered_set<const SelectStatement*>& observed,
+                 const Catalog* catalog, int depth) {
     DivTaint out;
     if (!e) return out;
 
@@ -205,7 +262,7 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
         return out;
     }
     if (auto* cr = dynamic_cast<const ColumnRef*>(e)) {
-        out.may_be_int = columnMayBeInt(*cr, rt);
+        out.may_be_int = columnMayBeInt(*cr, rt, catalog, depth);
         return out;
     }
     if (auto* agg = dynamic_cast<const AggregateExpr*>(e)) {
@@ -214,14 +271,14 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
         // input domain, so they inherit the argument's answer.
         if (agg->function_name == "COUNT") { out.may_be_int = true; return out; }
         if (agg->function_name == "SUM" || agg->function_name == "AVG") return out;
-        return divWalk(agg->argument.get(), rt, observed);
+        return divWalk(agg->argument.get(), rt, observed, catalog, depth);
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
-        return divWalk(un->operand.get(), rt, observed);
+        return divWalk(un->operand.get(), rt, observed, catalog, depth);
     }
     if (auto* sq = dynamic_cast<const SubqueryExpr*>(e)) {
         // Its operand belongs to this block and is walked for its own sake.
-        divWalk(sq->operand.get(), rt, observed);
+        divWalk(sq->operand.get(), rt, observed, catalog, depth);
         // Only a SCALAR node is replaced by a value. EXISTS becomes a 0/1
         // literal — an INT in both engines — and IN is lowered to a semi-join
         // and never materialized at all.
@@ -232,8 +289,8 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
         return out;
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
-        DivTaint l = divWalk(bin->left.get(), rt, observed);
-        DivTaint r = divWalk(bin->right.get(), rt, observed);
+        DivTaint l = divWalk(bin->left.get(), rt, observed, catalog, depth);
+        DivTaint r = divWalk(bin->right.get(), rt, observed, catalog, depth);
         const std::string& op = bin->op;
         if (op == "+" || op == "-" || op == "*" || op == "/") {
             const bool both = l.may_be_int && r.may_be_int;
@@ -249,35 +306,35 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
         return out;
     }
     if (auto* isn = dynamic_cast<const IsNullExpr*>(e)) {
-        divWalk(isn->operand.get(), rt, observed);
+        divWalk(isn->operand.get(), rt, observed, catalog, depth);
         out.may_be_int = true;
         return out;
     }
     if (auto* in = dynamic_cast<const InExpr*>(e)) {
-        divWalk(in->operand.get(), rt, observed);
+        divWalk(in->operand.get(), rt, observed, catalog, depth);
         out.may_be_int = true;
         return out;
     }
     if (auto* lk = dynamic_cast<const LikeExpr*>(e)) {
-        divWalk(lk->operand.get(), rt, observed);
+        divWalk(lk->operand.get(), rt, observed, catalog, depth);
         out.may_be_int = true;
         return out;
     }
     if (auto* sub = dynamic_cast<const SubstringExpr*>(e)) {
-        divWalk(sub->operand.get(), rt, observed);
-        divWalk(sub->start.get(), rt, observed);
-        divWalk(sub->length.get(), rt, observed);
+        divWalk(sub->operand.get(), rt, observed, catalog, depth);
+        divWalk(sub->start.get(), rt, observed, catalog, depth);
+        divWalk(sub->length.get(), rt, observed, catalog, depth);
         return out;   // STRING, never an INT
     }
     if (auto* c = dynamic_cast<const CaseExpr*>(e)) {
         for (const auto& w : c->when_clauses) {
-            divWalk(w.condition.get(), rt, observed);
-            DivTaint br = divWalk(w.result.get(), rt, observed);
+            divWalk(w.condition.get(), rt, observed, catalog, depth);
+            DivTaint br = divWalk(w.result.get(), rt, observed, catalog, depth);
             addCarried(out.carried, br.carried);
             out.may_be_int = out.may_be_int || br.may_be_int;
         }
         if (c->else_expr) {
-            DivTaint br = divWalk(c->else_expr.get(), rt, observed);
+            DivTaint br = divWalk(c->else_expr.get(), rt, observed, catalog, depth);
             addCarried(out.carried, br.carried);
             out.may_be_int = out.may_be_int || br.may_be_int;
         }
@@ -285,6 +342,17 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
     }
     out.may_be_int = true;
     return out;
+}
+
+// "Can this expression's Volcano Value be an INT?", with no interest in the
+// subqueries under it. One definition of the type question, used by the derived
+// arm of columnMayBeInt above and by divWalk itself.
+bool exprMayBeInt(const Expr* e, const RangeTable& rt, int depth) {
+    std::unordered_set<const SelectStatement*> ignored;
+    // The catalog reached this far through the RangeTable already; a body one
+    // level down is resolved against `rt`'s own entries, so nothing more is
+    // needed here than the depth budget.
+    return divWalk(e, rt, ignored, nullptr, depth).may_be_int;
 }
 
 } // namespace
@@ -505,9 +573,11 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run,
     const RangeTable range_table = rangeTableOf(stmt, catalog);
     std::unordered_set<const SelectStatement*> divided_by_int;
     forEachStatementExpr(stmt, [&](std::unique_ptr<Expr>& e) {
-        divWalk(e.get(), range_table, divided_by_int);
+        divWalk(e.get(), range_table, divided_by_int, catalog, MAX_TYPE_DEPTH);
     });
-    for (const auto& g : stmt.group_by) divWalk(g.expr.get(), range_table, divided_by_int);
+    for (const auto& g : stmt.group_by) {
+        divWalk(g.expr.get(), range_table, divided_by_int, catalog, MAX_TYPE_DEPTH);
+    }
 
     ResultCache cache;
     // Week 32: a Kind::IN node SURVIVES this pass. It is the one shape lowered
