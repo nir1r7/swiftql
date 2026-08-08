@@ -1,6 +1,26 @@
 # Phase 5 orchestrator state
 Current: **SEAM AUDIT COMPLETE — CLOSING GATE GREEN on fe9119a.** Next: q21 + doc sweep, then sf0.1.
 
+
+## !! CORRECTION — the "external reaper" finding is PARTLY MINE
+The harness agent reported four killed confirmation runs and concluded an EXTERNAL REAPER, on the
+evidence that two independent detached processes died 11 seconds apart. **Attempt 3 was me.**
+At ~21:58:50 I killed PIDs 24056/24057 in one command to clear the box for the q21 gate. Their
+ELAPSED was 01:29, so they launched ~21:57:21 — matching its "died ~2 minutes after launch". Their
+PPID was 1, i.e. detached, which is exactly its `setsid nohup` attempt 3. It could not have known:
+from its side, two independent detached runs died together, which reads precisely like a reaper.
+**What survives the correction, and what does not:**
+- **DOES NOT**: attempt 3's simultaneous death as evidence of a reaper. That was me.
+- **DOES**: attempt 1 (scratch directories deleted mid-run by another agent's cleanup — `run2` is
+  now a FILE where a directory was) and attempt 2 (died at 479 and 286 lines with 0 failures).
+  Both predate my kill and remain unexplained.
+- Two further exit-144s were the agent's OWN `pkill -f "until grep -qE"` matching the killing
+  shell's own command line — it put that on the record itself rather than folding it into the
+  environment story. **Third agent tonight to hit `pkill -f` self-match.**
+**LESSON FOR ME:** when clearing a box, say so somewhere the owning agent can see it. I killed
+another agent's work and it then reported the death as an environment finding — a false signal I
+introduced and nearly let stand.
+
 ## CLOSING GATE — GREEN, every count exact
 build 56 TUs 0 warnings; unit **959**/103 suites; oracle **1768** (1722+46) 0 failed 0 errors;
 regression **345** (340+5); tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous;
