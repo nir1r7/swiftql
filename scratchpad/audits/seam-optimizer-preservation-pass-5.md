@@ -303,3 +303,142 @@ functions) and nothing asserts it. Recorded as **LOW P5-5**: not wrong today,
 wrong by default on the next operator, and the header's own safety claim is what
 would stop a reader from checking.
 
+### The four movers, re-verified at this HEAD
+
+Pass 4 found B3-2 had three causes where the audit named one, so I re-derived the
+partition at every site from source rather than trusting the previous pass.
+
+| mover | how the boundary is enforced | verdict |
+|---|---|---|
+| `orderByWork` (`:437-447`) | `std::stable_sort(begin, begin + frozen)` — the frozen tail is not in the range | sound. Screened against `scan_child->output_schema`, which is the schema the conjuncts were written against at every call site (`filterOnto` is the only caller) |
+| `pushIntoJoin` (`:541-585`) | `int slot = (i >= frozen) ? -1 : soleSlot(c);` then the leftover buckets are re-merged carrying their WRITTEN index and `std::sort`ed by it | sound, and the re-sort is what makes "the residual is in written order" true by construction rather than by argument. A leftover bucket (LEFT / semi / anti) cannot land after a frozen conjunct |
+| `distribute` (`:526-527`) | `join_type == INNER && semantics == STANDARD`, spelled positively so a future RIGHT/FULL is refused by omission | sound. Run: the LEFT-join repro that diverged in pass 4 now agrees |
+| `pushIntoDerived` (`:623-641`) | `if (i >= frozen) … staying` | sound. A conjunct that fails `remapOntoDerivedBody` at `i < frozen` stays while a LATER total conjunct enters — that is a permutation of two TOTAL conjuncts and is exactly what the precondition permits |
+| FILTER-over-PROJECT descent (`:727-762`) | `projection_total && i < frozen && remapThroughProject(...)` | sound, **and the two screens use two DIFFERENT schemas on purpose**: `frozen` over `project->output_schema` (where the conjuncts are written) and `projection_total` over `project->children[0]->output_schema` (where the select list is evaluated). Getting that pair backwards would be silent; it is right |
+
+`projection_total` is all-or-nothing over the whole select list, which is
+necessary — the filter lands in ONE place, so one raising sibling stops every
+conjunct. Verified by execution: the `x.lap_id * 1000000000000000 AS big` body
+that P4-B1 was written about now agrees between the legs, and the `speed * 2 AS s2`
+body (DOUBLE, cannot raise) still descends.
+
+**The partition is not where the seam is broken. Both remaining defects are in
+the CLASSIFIER, and both are about which SCHEMA it is handed** — P5-2 (a schema
+the expression was not written against) and P5-4 (a NULL literal's declared type
+standing in for its behaviour).
+
+---
+
+## MEDIUM P5-3 — P4-2 is **half** closed. The DOUBLE spelling is fixed; the INT
+## spelling still measures **90×**, and it is still silent in `--explain`.
+
+The fix round reports "86× → 1.0×, byte-identical optimized plan". **I reproduced
+that and it is true** — the two spellings of the DOUBLE query produce optimized
+plans that `diff` reports as differing only in the *pre-optimization* section:
+
+```
+$ diff <(explain A) <(explain B)
+3c3
+<   LogicalFilter [((((l.speed * 2) > 688) AND (l.lap_id < 5)) AND (dr.age > 30))]
+---
+>   LogicalFilter [(((l.lap_id < 5) AND (dr.age > 30)) AND ((l.speed * 2) > 688))]
+```
+
+— the `=== Optimized Logical Plan ===` blocks are byte-identical, both pushing
+all three conjuncts. That is a real fix and the right one.
+
+**But `checkedMul` on INT/INT can genuinely overflow, so the INT spelling still
+freezes**, and P4-2's whole mechanism is intact for it. Same query shape, `lap_id`
+(INT) instead of `speed` (DOUBLE):
+
+```sql
+-- A: arithmetic first
+… WHERE l.lap_id * 2 > 8 AND l.lap_id < 5 AND dr.age > 30
+-- B: arithmetic last
+… WHERE l.lap_id < 5 AND dr.age > 30 AND l.lap_id * 2 > 8
+```
+
+```
+A:  LogicalFilter [((((l.lap_id * 2) > 8) AND (l.lap_id < 5)) AND (dr.age > 30))]
+      LogicalJoin              ← nothing pushed, laps chunks_skipped=0/2
+B:  LogicalFilter [((l.lap_id * 2) > 8)]
+      LogicalJoin
+        LogicalFilter [(l.lap_id < 5)]     ← laps chunks_skipped=1/2
+        LogicalFilter [(dr.age > 30)]
+```
+
+**Method** (stated because `benchmark.py::run_once` greps only the `Execution:`
+line and has reported regressed queries as faster): five runs each, debug
+`build/swiftql`, `--no-cache --storage columnar --execution vectorized
+--explain-analyze`, recording BOTH the `Execution:` line and the wall clock of
+the whole process, so a shift between phases cannot masquerade as a speed-up.
+Both spellings return 0 rows.
+
+| | `Execution:` median | `Execution:` range | wall median |
+|---|---|---|---|
+| A — frozen | **38 847 µs** | 38 177 – 45 932 | 244 ms |
+| B — pushed | **432 µs** | 412 – 506 | 203 ms |
+| A, `--no-optimize` | 48 957 µs | 47 147 – 50 322 | 254 ms |
+
+**90×**, and the wall-clock delta (41 ms) tracks the `Execution:` delta (38 ms),
+so the number is not an artefact of the grep. Optimized-A is within **1.26×** of
+its own `--no-optimize` leg — the optimizer has switched itself off on this
+query.
+
+The freeze here is **CORRECT** — `l.lap_id * 2` can overflow, and both other
+conjuncts change the join's output set, so pushing either of them would change
+the row set the raiser sees. This is the definition's price, not a defect. What
+IS a defect is that the price is invisible: `--explain` prints A's optimized plan
+as the written plan with **no decline line anywhere**, and the only clue is
+`chunks_skipped=0/2` in `--explain-analyze`, which a reader has to know to look
+for. Ranked MEDIUM rather than HIGH because, unlike pass 4's version, this is no
+longer a regression against pre-fix code on the common (DOUBLE) shape — it is the
+irreducible remainder, unreported.
+
+**Reading "86× → 1.0×" as "P4-2 is closed" would be wrong**, and that is the
+substance of this finding: the ratio was measured on the one arithmetic type the
+fix addressed.
+
+---
+
+## MEDIUM P5-4 — the screen classifies a comparison against a **NULL literal** as
+## may-raise. It provably cannot raise, the file's own comment says so, and it
+## costs a measured **2.55×**.
+
+`staticTypeOf` (`expr_totality.h:62-67`):
+
+```cpp
+// A NULL literal never raises in a comparison (Value's operators return
+// false when either side is null, before the type check), but its
+// declared type is what a consumer would compare against, so report it.
+out = lit->value.isNull() ? lit->null_type : lit->value.type();
+```
+
+Reporting `null_type` is right for `ChunkPruner` (which compares the literal
+against zone maps) and wrong for `exprMayRaise`'s comparison arm, which then
+sees `STRING` vs `INT` and answers TRUE for an expression the comment has just
+finished proving total. A zero-row scalar subquery is where this arrives:
+`subquery_materialization.cc:491` sets `null_type` from the body's output schema,
+so `l.team = (SELECT MAX(age) …)` over an empty result becomes
+`STRING = NULL:INT`.
+
+Constructed, run, `--explain` and `--explain-analyze` (median of 3, both 0 rows):
+
+| | optimized plan | `Execution:` |
+|---|---|---|
+| `WHERE l.team = (SELECT MAX(dr2.age) FROM drivers dr2 WHERE dr2.age > 999) AND l.speed > 300 AND dr.age > 30` | `LogicalFilter [(((l.team = NULL) AND (l.speed > 300)) AND (dr.age > 30))]` over a bare `LogicalJoin` — **nothing pushed** | **93 594 µs** |
+| the same three conjuncts, NULL comparison written last | both other conjuncts pushed to their own scans | **36 676 µs** |
+
+**2.55×**, on a conjunct that cannot raise. And the query **answers** — 0 rows,
+both legs, every mode — which is the whole point: the screen froze a plan for an
+error that cannot happen.
+
+The general statement is larger than the one case and is not written down
+anywhere: **`evaluate()` propagates NULL before every raise site except `AND`/`OR`**
+(`evaluator.cc:134`, and each of `IN`, `LIKE`, `SUBSTRING`, `CASE` short-circuits
+its own NULL first). So a NULL *literal* in any operand position makes the whole
+node total, statically decidable, at every one of those sites — not just
+comparison. `lap_id + NULL` is screened as INT/INT-may-overflow today for the
+same reason. The fix is one clause in each arm, or one `isNullLiteral(e)` test at
+the top of `exprMayRaise`; I did not write it.
+
