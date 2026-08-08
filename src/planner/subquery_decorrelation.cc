@@ -2,6 +2,7 @@
 #include "planner/subquery_materialization.h"   // forEachSubquery{,Const}
 #include "planner/predicate_pushdown.h"       // collectSlots (dispatch site 8)
 #include "parser/expr_utils.h"
+#include "parser/expr_totality.h"   // firstMayRaise — refuseUnguardedRaiser
 #include <unordered_set>
 #include <stdexcept>
 #include <utility>
@@ -113,14 +114,55 @@ bool reachesOutsideThisBody(std::unique_ptr<Expr>& e) {
 // conjuncts that stay inside the body. Refuses any correlated conjunct that is
 // not a key, rather than leaving it in the body where its level-1 ref would be
 // meaningless — that is the silent wrong answer this whole week is about.
+//
+// SEAM AUDIT PASS 5, subquery B-3 — `unguarded` is the fifth parameter and it
+// exists because LIFTING A CONJUNCT OUT OF A LIST IS A REWRITE OF THE CASCADE.
+// `expr_totality.h` says a conjunct is evaluated on the rows for which every
+// conjunct WRITTEN BEFORE IT evaluated TRUE. A correlated equality that becomes
+// a join key stops being a conjunct of the body at all: it is enforced by the
+// PROBE, above the body, so every body-local conjunct written AFTER it is now
+// evaluated on the body's WHOLE relation. That is more rows than the written
+// order gives it, which is the "introduce a raise" direction — the mirror of
+// P5-1's "mask a raise", and unfixable in place because the lifted equality
+// cannot stay in the body (its level-1 ref means nothing there).
+//
+// So the conjuncts that LOST a guard are handed back, in written order and as
+// clones, for `refuseUnguardedRaiser` to screen once the body's schema exists.
+// Clones rather than pointers: `local` is conjoined into `body.where` and then
+// MOVED into the plan, where a nested lowering may consume individual conjuncts.
 void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
                       std::vector<JoinKey>& keys,
                       std::vector<std::unique_ptr<Expr>>& body_key_refs,
-                      std::vector<std::unique_ptr<Expr>>& local) {
+                      std::vector<std::unique_ptr<Expr>>& local,
+                      std::vector<std::unique_ptr<Expr>>& unguarded) {
+    bool lifted_a_key = false;
     for (auto& c : body_conjuncts) {
         // Does this conjunct reach outside the body? See reachesOutsideThisBody
         // above for why that is not the same as "collectSlots yields -1".
-        if (!reachesOutsideThisBody(c)) { local.push_back(std::move(c)); continue; }
+        if (!reachesOutsideThisBody(c)) {
+            // Body-local, and written AFTER a key this loop already lifted: its
+            // guard is gone. Recorded for refuseUnguardedRaiser.
+            //
+            // NOT CLONED IF IT HOLDS A SUBQUERY, and this is not a shortcut —
+            // cloneExpr SHARES a SubqueryExpr's shared_ptr (the ownership shape
+            // planBody and lowerExistsSubqueries both turn on), so cloning such
+            // a conjunct raises `use_count` and the body's own lowering pass
+            // then refuses it as "a subquery body shared by two expressions".
+            // Measured: 12 ordinary nested-EXISTS oracle queries errored and 4
+            // refusal pins reported the wrong cause. Excluding them also avoids
+            // an over-refusal, since exprMayRaise answers TRUE for every
+            // SubqueryExpr — screening one would refuse every body holding a
+            // nested subquery after its correlated equality. The residue is a
+            // recorded gap, not a claim: a nested subquery whose OWN body can
+            // raise, written after a lifted key, is still unscreened here.
+            if (lifted_a_key) {
+                bool holds_subquery = false;
+                forEachSubqueryConst(c.get(), [&](const SubqueryExpr&) { holds_subquery = true; });
+                if (!holds_subquery) unguarded.push_back(cloneExpr(c.get()));
+            }
+            local.push_back(std::move(c));
+            continue;
+        }
 
         auto* bin = dynamic_cast<BinaryExpr*>(c.get());
         if (!bin || bin->op != "=")
@@ -208,6 +250,7 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
         keys.push_back(JoinKey{outer_side->column_name,
                                body_side->column_name,
                                outer_side->id.outward().localSlot("splitCorrelation")});
+        lifted_a_key = true;
 
         // The BODY side's full identity, kept rather than reduced to its name.
         // JoinKey has no field for it (join_condition.h's struct predates this
@@ -219,6 +262,64 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
         body_key_refs.push_back(cloneExpr(body_side));
     }
     body_conjuncts.clear();
+}
+
+// The schema the body's WHERE conjuncts were written against: the output of the
+// body's FROM/JOIN spine, which is the first SCAN / JOIN / DERIVED on the way
+// down from the body's root. LogicalPlanBuilder puts the WHERE filter directly
+// above that node, so this is the schema `evaluate()` will resolve them in —
+// taken from the plan rather than re-derived, so there is no second derivation
+// to drift (the same reason blockOutputSchema exists rather than a private copy
+// in the Binder).
+const Schema* bodySpineSchema(const LogicalPlanNode* n) {
+    while (n) {
+        if (n->type == LogicalNodeType::SCAN
+            || n->type == LogicalNodeType::JOIN
+            || n->type == LogicalNodeType::DERIVED) return &n->output_schema;
+        if (n->children.empty()) return nullptr;
+        n = n->children[0].get();
+    }
+    return nullptr;
+}
+
+// SEAM AUDIT PASS 5, subquery B-3. The other half of splitCorrelation's
+// `unguarded` — see the comment there for what was lost and why.
+//
+// The discriminator is SwiftQL against itself, on the shipped catalog. `drivers`
+// holds seven rows with age < 30, for which `d.age - 29 <= 0`:
+//
+//   ... AND EXISTS (SELECT 1 FROM drivers d
+//                   WHERE d.driver_id = l.driver_id                 -- guard
+//                     AND SUBSTRING(d.name, d.age - 29, 1) = 'D')   -- raiser
+//     -> Error: SUBSTRING: start position must be >= 1
+//   the same body with `d.driver_id = 1` in the guard's place       -> answers 0
+//
+// Same relation, same raiser, same position; the only difference is whether the
+// guard is the conjunct decorrelation takes away. The body-local form honours
+// the cascade, the correlated form does not.
+//
+// REFUSE rather than repair, and the choice is forced. P5-1's semi-join case can
+// be repaired by MOVING the earlier conjuncts down to where they belong, because
+// they are still conjuncts of a filter in the same block. Here the guard is a
+// correlated equality: inside the body its level-1 reference names nothing, so
+// there is no position in the body that reproduces the row set it gave. Keeping
+// it would need the residue to ride as an ON residual on the semi/anti join —
+// real operator work this engine's set-probe build side cannot do today, named
+// in the correlated-inequality refusal a few lines up and in docs/week-36-plan.md
+// Task 3. Refusing by name beats answering where the definition says raise.
+//
+// conjunctMayRaise via firstMayRaise, not exprMayRaise: a body conjunct is
+// truth-tested by the filter that holds it, so a non-INT static type raises on
+// its own.
+void refuseUnguardedRaiser(const std::vector<std::unique_ptr<Expr>>& unguarded,
+                           const LogicalPlanNode& body_plan) {
+    if (unguarded.empty()) return;
+    const Schema* schema = bodySpineSchema(&body_plan);
+    if (!schema) return;   // no spine to evaluate anything per row against
+    if (firstMayRaise(unguarded, *schema) < unguarded.size())
+        refuse("a conjunct that can raise is written after the correlated "
+               "equality this rewrite lifts into a join key, so decorrelating "
+               "would evaluate it on rows the written order excluded");
 }
 
 // Condition 2, enforced over the WHOLE body rather than only its WHERE.
@@ -452,7 +553,8 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             std::vector<JoinKey> keys;
             std::vector<std::unique_ptr<Expr>> body_key_refs;
             std::vector<std::unique_ptr<Expr>> local;
-            splitCorrelation(body_conjuncts, keys, body_key_refs, local);
+            std::vector<std::unique_ptr<Expr>> unguarded;
+            splitCorrelation(body_conjuncts, keys, body_key_refs, local, unguarded);
             if (keys.empty())
                 refuse("no equality links the scalar subquery to the enclosing "
                        "query, so there is no group key to decorrelate on");
@@ -547,6 +649,11 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             body.select_list.push_back(std::move(agg_expr));
 
             auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
+
+            // SEAM AUDIT PASS 5, subquery B-3. Screened HERE and not inside
+            // splitCorrelation because this is the first point at which the
+            // body's own schema exists, and the screen needs operand TYPES.
+            refuseUnguardedRaiser(unguarded, *body_plan);
 
             // THE SAME NODE FROM (subquery) produces, and the same normalization:
             // every column stamped slot 0, the outer slot applied by the merged
@@ -765,7 +872,8 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         std::vector<JoinKey> keys;
         std::vector<std::unique_ptr<Expr>> body_key_refs;
         std::vector<std::unique_ptr<Expr>> local;
-        splitCorrelation(body_conjuncts, keys, body_key_refs, local);
+        std::vector<std::unique_ptr<Expr>> unguarded;
+        splitCorrelation(body_conjuncts, keys, body_key_refs, local, unguarded);
         if (keys.empty())
             refuse("no equality links the subquery to the enclosing query, so "
                    "there is no join key to decorrelate on");
@@ -807,6 +915,17 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         body.select_list = std::move(body_key_refs);
         auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
 
+        // SEAM AUDIT PASS 5, subquery B-3. Screened HERE and not inside
+        // splitCorrelation because this is the first point at which the body's
+        // own schema exists, and the screen needs operand TYPES.
+        refuseUnguardedRaiser(unguarded, *body_plan);
+
+        // SEAM AUDIT PASS 5, P5-1 — the same screen lowerInSubqueries takes, for
+        // the same reason: this join goes BELOW the WHERE filter and removes
+        // rows, so a conjunct written before this one would be evaluated on its
+        // survivors. See logical_plan.h.
+        spine = guardLoweredConjunctPrefix(std::move(spine), kept);
+
         // !! output_schema is the LEFT child's, NOT a merged schema — the
         // invariant that keeps the body's slot numbering out of the outer plan
         // (Week 32). join_slot is -1: children[1] is not a relation of this
@@ -846,6 +965,9 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         //   - rightKeyIndices(positional) throws unless the build input's schema
         //     is exactly the key tuple.
         // Those three run on every semi/anti join the CLI builds.
+        //
+        // !! P4-M1 — the decline this copy forces, and why the fix is not one
+        // line, are recorded once at the twin paragraph in subquery_lowering.cc.
 
         spine = std::move(join);
         ++out.lowered;

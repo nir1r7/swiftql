@@ -71,6 +71,21 @@
 // complement for NOT IN). Restating it here would be the fourth copy of one
 // rule, which is how it came to be missing three times. Listed because a reader
 // of this header must know the refusal exists; do not add it to this file.
+// WHERE THIS PASS SITS RELATIVE TO THE WHERE FILTER, and what that costs
+// (seam audit pass 5, P5-1). The semi/anti join is interposed BELOW the
+// LogicalFilter the surviving conjuncts end up in — that position is
+// load-bearing (logical_plan.cc says why) and it is also row-REDUCING, so every
+// conjunct written EARLIER than the one this pass deletes would be evaluated on
+// the join's survivors instead of on the spine's rows. `expr_totality.h` forbids
+// exactly that for an expression that can raise, and both legs agree here (this
+// pass runs inside LogicalPlanBuilder::build, ahead of the --no-optimize gate),
+// so no harness could see it.
+//
+// The repair is guardLoweredConjunctPrefix (logical_plan.h), called once per
+// extraction with the conjuncts kept so far. It MOVES them below the join, which
+// is where the written order says they are evaluated — it does not refuse, and
+// it does nothing at all unless one of them can raise. Its one bounded decline
+// (a prefix conjunct that still holds a SubqueryExpr) is stated there.
 struct InLoweringResult {
     std::unique_ptr<LogicalPlanNode> plan;   // the spine, wrapped in one join per extraction
     int lowered = 0;                          // how many conjuncts were extracted

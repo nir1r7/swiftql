@@ -1005,3 +1005,141 @@ TEST(JoinKeyTypes, NumericAgainstNumericAndStringAgainstStringStayLegal) {
     EXPECT_NO_THROW(planLowered(
         "SELECT l.lap_id FROM laps l JOIN drivers d ON l.team = d.team", cat));
 }
+
+// ===== Seam audit pass 5 — the two lowering-side cascade breaks =====
+//
+// EACH TEST BELOW FAILS WITHOUT ITS FIX, and the assertion that fails is named
+// in its comment.
+
+namespace {
+
+// The plan node a lowered set-membership join probes.
+const LogicalPlanNode* probeSideOf(const LogicalPlanNode* plan) {
+    const LogicalJoin* j = findJoin(plan);
+    return j ? j->children[0].get() : nullptr;
+}
+
+} // namespace
+
+// P5-1. lowerInSubqueries DELETES its conjunct and interposes a row-REDUCING
+// semi-join BELOW the LogicalFilter the survivors end up in, so a conjunct
+// written EARLIER is evaluated on the join's survivors instead of the spine's
+// rows. `expr_totality.h` says nothing may change that set for an expression
+// that can raise. Measured on the shipped catalog: the same query with
+// `driver_id > 999999` or `driver_id IN (999999)` as the second conjunct raised,
+// and with `driver_id IN (SELECT ...)` answered 0 rows.
+//
+// WITHOUT THE FIX the semi-join's probe side is the bare LogicalScan and the
+// raiser sits in the filter ABOVE the join.
+TEST(SemiJoinLowering, ARaiserWrittenBeforeAnInConjunctIsEvaluatedBelowTheJoin) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(
+        "SELECT lap_id FROM laps WHERE lap_id * 1000000000000000 > 0 "
+        "AND driver_id IN (SELECT driver_id FROM drivers)", cat);
+    const LogicalPlanNode* probe = probeSideOf(plan.get());
+    ASSERT_NE(probe, nullptr);
+    EXPECT_EQ(probe->type, LogicalNodeType::FILTER)
+        << "a conjunct written before the lowered one must keep the row set the "
+           "written order gives it";
+    EXPECT_NE(probe->explain().find("1000000000000000"), std::string::npos);
+}
+
+// The same for the decorrelated form, which is a different pass in a different
+// file reaching the same shared screen.
+TEST(SemiJoinLowering, ARaiserWrittenBeforeAnExistsConjunctIsEvaluatedBelowTheJoin) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(
+        "SELECT l.lap_id FROM laps l WHERE l.lap_id * 1000000000000000 > 0 "
+        "AND EXISTS (SELECT 1 FROM drivers d WHERE d.driver_id = l.driver_id)", cat);
+    const LogicalPlanNode* probe = probeSideOf(plan.get());
+    ASSERT_NE(probe, nullptr);
+    EXPECT_EQ(probe->type, LogicalNodeType::FILTER);
+}
+
+// THE CONTROL, and it is what makes the fix free. A total prefix conjunct plants
+// nothing: the plan is byte-identical to what it was before the screen existed,
+// so an ordinary IN query neither gains a node nor loses its pushdown.
+TEST(SemiJoinLowering, ATotalPrefixConjunctPlantsNothingAndTheProbeSideIsTheBareSpine) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(
+        "SELECT lap_id FROM laps WHERE season = 2024 "
+        "AND driver_id IN (SELECT driver_id FROM drivers)", cat);
+    const LogicalPlanNode* probe = probeSideOf(plan.get());
+    ASSERT_NE(probe, nullptr);
+    EXPECT_EQ(probe->type, LogicalNodeType::SCAN);
+}
+
+// And written position matters again. A raiser written AFTER the lowered
+// conjunct is correctly evaluated on the join's survivors, so nothing is planted
+// and the probe side stays the bare spine. Before the fix BOTH orders answered
+// alike, which is the second-order consequence the audit named: for a lowered
+// conjunct, written position had stopped mattering at all.
+TEST(SemiJoinLowering, ARaiserWrittenAfterTheInConjunctPlantsNothing) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(
+        "SELECT lap_id FROM laps WHERE driver_id IN (SELECT driver_id FROM drivers) "
+        "AND lap_id * 1000000000000000 > 0", cat);
+    const LogicalPlanNode* probe = probeSideOf(plan.get());
+    ASSERT_NE(probe, nullptr);
+    EXPECT_EQ(probe->type, LogicalNodeType::SCAN);
+}
+
+// ===== Seam audit pass 5, subquery B-3 — decorrelation lifts the guard =====
+//
+// A correlated equality that becomes a join key stops being a conjunct of the
+// body: it is enforced by the probe, ABOVE the body, so a body-local conjunct
+// written after it is evaluated on the body's whole relation instead of on the
+// rows the guard admitted. Unfixable in place — the lifted equality's level-1
+// reference means nothing inside the body — so it is refused by name.
+//
+// The discriminator is SwiftQL against itself: the same raiser in the same
+// position with a BODY-LOCAL guard answers (the control two tests down).
+
+namespace {
+void expectUnguardedRaiserRefusal(const std::string& sql, Catalog& cat) {
+    try {
+        planLowered(sql, cat);
+        ADD_FAILURE() << "expected a refusal for: " << sql;
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string(e.what()).find(
+                      "written after the correlated equality"), std::string::npos)
+            << e.what();
+    }
+}
+} // namespace
+
+// WITHOUT THE FIX all three of these plan, and the SUBSTRING is evaluated on the
+// seven drivers rows the guard excludes.
+TEST(Decorrelation, ARaiserWrittenAfterTheLiftedEqualityIsRefused) {
+    Catalog cat(CATALOG);
+    expectUnguardedRaiserRefusal(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS (SELECT 1 FROM drivers d "
+        "WHERE d.driver_id = l.driver_id AND SUBSTRING(d.name, d.age - 29, 1) = 'D')", cat);
+    expectUnguardedRaiserRefusal(
+        "SELECT l.lap_id FROM laps l WHERE NOT EXISTS (SELECT 1 FROM drivers d "
+        "WHERE d.driver_id = l.driver_id AND SUBSTRING(d.name, d.age - 29, 1) = 'D')", cat);
+    expectUnguardedRaiserRefusal(
+        "SELECT l.lap_id FROM laps l WHERE (SELECT COUNT(*) FROM drivers d "
+        "WHERE d.driver_id = l.driver_id AND SUBSTRING(d.name, d.age - 29, 1) = 'D') > 0", cat);
+}
+
+// THE CONTROL PAIR. A raiser written BEFORE the lifted equality keeps its row
+// set — the written order already says it is evaluated on every body row — so it
+// must still plan; and an ordinary total body conjunct after the key must too,
+// or every correlated EXISTS with a second predicate is refused.
+TEST(Decorrelation, ARaiserWrittenBeforeTheLiftedEqualityAndATotalOneAfterItStillPlan) {
+    Catalog cat(CATALOG);
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS (SELECT 1 FROM drivers d "
+        "WHERE SUBSTRING(d.name, d.age - 29, 1) = 'D' AND d.driver_id = l.driver_id)", cat));
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS (SELECT 1 FROM drivers d "
+        "WHERE d.driver_id = l.driver_id AND d.age > 30)", cat));
+    // TPC-H Q4's shape: a two-column comparison after the key, total because
+    // both operands are the same type. This is the query the screen must not
+    // cost, and typing the comparison by OPERAND rather than by operator is what
+    // keeps it planning.
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS (SELECT 1 FROM drivers d "
+        "WHERE d.driver_id = l.driver_id AND d.name < d.nationality)", cat));
+}

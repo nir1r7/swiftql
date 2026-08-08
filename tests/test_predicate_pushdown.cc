@@ -1520,3 +1520,79 @@ TEST(PredicatePushdown, FilterStillDescendsBelowATotalProjection) {
     EXPECT_EQ(derived->children[0]->children[0]->type, LogicalNodeType::FILTER)
         << "DOUBLE arithmetic cannot raise, so the descent must still happen";
 }
+
+// ===== Seam audit pass 5, P5-B1 — the ON residual of a LEFT join =====
+//
+// EACH TEST BELOW FAILS WITHOUT THE FIX, and the assertion that fails is named
+// in its comment.
+//
+// A LEFT join's non-key ON conjuncts are not folded into the WHERE (Week 29);
+// they hang on the node and are evaluated ONCE PER CANDIDATE PAIR in the probe
+// loop. Pushing a WHERE conjunct into the preserved side shrinks that pair set,
+// so a raise the residual was owed is masked. σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) licenses
+// the push for the join's OUTPUT and says nothing about its candidate pairs.
+// Measured on the shipped catalog before this screen existed: optimized answered
+// 4 where --no-optimize and both Volcano legs raised.
+
+// WITHOUT THE FIX join->children[0] is a LogicalFilter and there is no filter
+// left above the join — the exact plan shape the control below still asserts.
+TEST(PredicatePushdown, RaisingOnResidualStopsThePushIntoThePreservedSide) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l LEFT JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND l.lap_id * 1000000000000000 > 0 "
+        "WHERE l.season = 2025", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(static_cast<const LogicalJoin*>(join)->join_type, JoinType::LEFT);
+    ASSERT_NE(static_cast<const LogicalJoin*>(join)->on_residual, nullptr);
+    // the preserved side is untouched: the conjunct did not descend
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN)
+        << "a WHERE conjunct must not shrink the candidate-pair set a raising "
+           "ON residual is evaluated on";
+    // and it degraded rather than being dropped — it is above the join
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->children[0]->type, LogicalNodeType::JOIN);
+}
+
+// THE CONTROL, and it is what keeps this a totality rule rather than "no
+// pushdown through an outer join". `speed` is DOUBLE, so the residual's
+// arithmetic takes the IEEE branch and cannot raise; the push must still happen,
+// or every ordinary LEFT-join query pays for this screen.
+TEST(PredicatePushdown, TotalOnResidualStillPushesIntoThePreservedSide) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l LEFT JOIN drivers d "
+        "ON l.driver_id = d.driver_id AND l.speed * 2 > 0 "
+        "WHERE l.season = 2025", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_NE(static_cast<const LogicalJoin*>(join)->on_residual, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(join->children[0]->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// PER JOIN, not once for the tree. The LEFT join carrying the raising residual
+// is at the BOTTOM of a three-relation spine, so the test has to be re-applied
+// on the way down — which is where distribute already re-applies its INNER/LEFT
+// test. WITHOUT THE FIX the left join's children[0] is a LogicalFilter.
+TEST(PredicatePushdown, RaisingOnResidualOnADeeperLeftJoinStillStopsThePush) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l "
+        "LEFT JOIN drivers d ON l.driver_id = d.driver_id "
+        "                   AND l.lap_id * 1000000000000000 > 0 "
+        "JOIN drivers d2 ON l.team = d2.team "
+        "WHERE l.season = 2025", cat);
+
+    const LogicalPlanNode* top = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(top, nullptr);
+    const LogicalPlanNode* left_join = top->children[0].get();
+    ASSERT_EQ(left_join->type, LogicalNodeType::JOIN);
+    EXPECT_EQ(static_cast<const LogicalJoin*>(left_join)->join_type, JoinType::LEFT);
+    EXPECT_EQ(left_join->children[0]->type, LogicalNodeType::SCAN)
+        << "the screen must be re-applied at every join on the way down";
+}

@@ -74,6 +74,14 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
 
         auto body_plan = planBody(sq, catalog);
 
+        // SEAM AUDIT PASS 5, P5-1. The semi/anti join goes BELOW the WHERE
+        // filter, and it removes rows — so every conjunct written before this
+        // one would be evaluated on its survivors instead of on the spine's
+        // rows. `guardLoweredConjunctPrefix` puts them where the written order
+        // says they are evaluated, and does nothing at all unless one of them
+        // can raise. See logical_plan.h for the rule and the measurement.
+        spine = guardLoweredConjunctPrefix(std::move(spine), kept);
+
         // One equi-join key. from_col/from_slot come from the OPERAND, which
         // belongs to the ENCLOSING query and is already bound at level 0 there —
         // so from_slot is a slot in the OUTER range table, exactly the domain
@@ -122,6 +130,54 @@ InLoweringResult lowerInSubqueries(std::unique_ptr<LogicalPlanNode> spine,
         //   - rightKeyIndices(positional) throws unless the build input's schema
         //     is exactly the key tuple.
         // Those three run on every semi/anti join the CLI builds.
+        //
+        // !! WHY THE CHECK CANNOT SIMPLY BE PUT BACK, and what it would take
+        // (seam audit pass 4 P4-M1, carried and re-sized in pass 5). The
+        // paragraph above is right that the deleted loop compared a copy with
+        // its own original. It is the SECOND half that matters now: the copy
+        // WOULD genuinely diverge from the object if JoinEnumeration ever
+        // reordered the spine below this node, because `rebuild` preserves the
+        // merged schema's (relation_slot, name) pair SET but PERMUTES its
+        // sequence. That is exactly why the enumerator declines the whole tree
+        // at a semi/anti join today — and the decline is measured, not
+        // hypothetical:
+        //
+        //   FROM laps l JOIN drivers d ON … JOIN drivers d2 ON d.team = d2.team
+        //     order=drivers@1,drivers@2,laps@0 cost=43104 (written=60637) method=dp
+        //   the same spine + WHERE l.driver_id IN (SELECT …)
+        //     LogicalSemiJoin … join-ordering=skipped (semi/anti join)
+        //       LogicalJoin [team@1 = team]   <- fully inner, 3 relations, NOT enumerated
+        //
+        //   1.58x on the spine's join time and 1.23x on total execution by
+        //   --explain-analyze; 1.41x by the model. Answers identical (32193).
+        //
+        // THE FIX IS NOT "RE-DERIVE THIS NODE'S SCHEMA AFTER ENUMERATING
+        // children[0]", and pass 5 established the extra reason by construction
+        // rather than by argument. This node is not always the top of its plan:
+        // lowerCorrelatedScalars attaches a LogicalLeftJoin ABOVE it, and that
+        // join's merged schema is a POSITIONAL CONCATENATION of this node's
+        // columns with the derived relation's (logical_plan.cc's merged_cols
+        // loop). Producible today:
+        //
+        //   … WHERE l.driver_id IN (SELECT …)
+        //     AND l.speed > (SELECT AVG(l2.speed) FROM laps l2
+        //                    WHERE l2.driver_id = l.driver_id)
+        //
+        //     LogicalLeftJoin [driver_id@0 = $k0]      <- merged, positional
+        //       LogicalSemiJoin [driver_id@0 = driver_id]
+        //         LogicalJoin [team@1 = team]          <- what would be permuted
+        //
+        // and LogicalFilter / Sort / Distinct / Limit each copy their child's
+        // schema at construction too. So permuting the spine invalidates every
+        // ancestor's stored schema up to the first PROJECT / AGGREGATE /
+        // DERIVED, and a correct fix is a plan-wide bottom-up schema
+        // re-derivation that reuses `rebuild`'s merge rather than opening a
+        // second copy of it — plus inverting test_join_enumeration.cc's
+        // assertion that ONLY the declining node carries an order_decision.
+        // That is a week's task, not a fix-round's, and it lands in
+        // join_enumeration.cc rather than here. Recorded, not attempted; the
+        // decline stays, because declining is always legal and the loss is plan
+        // quality only.
 
         spine = std::move(join);
         ++out.lowered;

@@ -187,6 +187,27 @@ struct LogicalJoin : LogicalPlanNode {
     // candidate fails this predicate is null-extended, not deleted. Resolves
     // against THIS node's merged output_schema, and is MOVED into the physical
     // operator at lowering (like LogicalFilter::predicate).
+    //
+    // !! IT IS EVALUATED PER CANDIDATE PAIR, NOT PER OUTPUT ROW, and that makes
+    // it the one per-row expression in the join layer that is not a conjunct of
+    // any list the totality screen reads (seam audit pass 5, P5-B1). Both probe
+    // loops run it on every preserved-side row against every build-side match
+    // (plan_nodes.cc's HashJoinNode::next, vec_hash_join_node.cc — both
+    // `passes()`), so ANY rewrite that removes a preserved-side row removes
+    // evaluations of this expression. PredicatePushdown::distribute therefore
+    // screens it with conjunctMayRaise before it will push a WHERE conjunct into
+    // children[0]; the INNER path needs no such screen because its residuals
+    // become ordinary WHERE conjuncts (below) and the screen sees them in the
+    // list. Anything else added that shrinks a LEFT join's preserved input owes
+    // the same screen.
+    //
+    // A SEPARATE, STILL-OPEN PROPERTY (pass 5, P5-M1): there is no conjunct
+    // CASCADE inside this expression. It is one Expr handed to evaluate(), which
+    // computes both operands of an AND before looking at the operator, so
+    // `ON k = k AND A AND B` evaluates B on rows where A is FALSE — which the
+    // same text in a WHERE, or on an INNER join, does not. All four legs agree,
+    // so it is not a divergence; it is expr_totality.h's central sentence being
+    // false for a construct the parser accepts. Not fixed here.
     std::unique_ptr<Expr> on_residual;
 
     // Week 32 — set-membership lowering (subquery_lowering.h). Set AFTER
@@ -298,6 +319,54 @@ struct LogicalLimit : LogicalPlanNode {
     }
     std::string explain() const override;
 };
+
+// SEAM AUDIT PASS 5, P5-1. The screen the two SET-MEMBERSHIP lowerings need,
+// and the third distinct SHAPE the one rule of parser/expr_totality.h takes.
+//
+// The rule: a conjunct of a filter is evaluated on the rows for which every
+// conjunct WRITTEN BEFORE IT evaluated TRUE, and nothing may change that set for
+// an expression that can raise. `firstMayRaise` states it for a conjunct list
+// that STAYS a conjunct list. lowerInSubqueries and lowerExistsSubqueries do
+// something that list has no vocabulary for: they DELETE their conjunct and
+// interpose a row-REDUCING semi/anti join BELOW the LogicalFilter the survivors
+// end up in. Every conjunct written EARLIER than the deleted one is then
+// evaluated on the join's survivors instead of on the spine's rows. Measured on
+// the shipped catalog before this existed:
+//
+//   WHERE l.lap_id * 9223372036854775807 > 0 AND l.driver_id > 999999
+//     -> Error: integer overflow in '*'          (the definition's answer)
+//   WHERE l.lap_id * 9223372036854775807 > 0 AND l.driver_id IN (999999)
+//     -> Error: integer overflow in '*'          (a constant IN stays a conjunct)
+//   WHERE l.lap_id * 9223372036854775807 > 0
+//         AND l.driver_id IN (SELECT d.driver_id FROM drivers d WHERE d.age > 999)
+//     -> 0 rows                                  (the semi-join moved underneath)
+//
+// Same rows, same predicates, opposite error behaviour, decided by which
+// spelling of the second predicate was written. Both legs agree — the lowerings
+// run inside LogicalPlanBuilder::build, ahead of the --no-optimize gate — so no
+// harness can see it.
+//
+// THE REMEDY IS THE RULE ITSELF, not a refusal: put the earlier conjuncts BELOW
+// the join, which is exactly where the written order says they are evaluated.
+// The result set is unchanged (conjunction), the answer is never lost, and the
+// prefix keeps its own pushdown because PredicatePushdown reaches a
+// FILTER-over-JOIN wherever it sits.
+//
+// Called once per extraction, with the conjuncts the lowering has kept so far.
+// Returns `spine` and `prefix` UNTOUCHED — no node added, no plan shape changed
+// — unless some prefix conjunct can raise, so an ordinary IN/EXISTS query plans
+// byte-identically to before.
+//
+// ONE BOUNDED DECLINE, stated rather than silent: a prefix conjunct that still
+// holds a SubqueryExpr is left where it is. It has to be — refuseUnloweredIn /
+// refuseUnloweredCorrelated and lowerCorrelatedScalars all run on what stays in
+// the caller's vector, and a conjunct moved out of it reaches none of them. That
+// leaves `raiser AND EXISTS(...) AND IN(...)` (a raiser with TWO lowerable
+// conjuncts after it, the first of which is not yet consumed) still masked, and
+// it is recorded as open rather than half-fixed.
+std::unique_ptr<LogicalPlanNode> guardLoweredConjunctPrefix(
+        std::unique_ptr<LogicalPlanNode> spine,
+        std::vector<std::unique_ptr<Expr>>& prefix);
 
 // logical schema helpers — shared by LogicalPlanBuilder and the Volcano
 // Planner (relocated from Planner in Week 18 so the logical layer no longer

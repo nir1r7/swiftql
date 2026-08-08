@@ -16,7 +16,10 @@
 // pushing a single-relation predicate onto its side preserves the result
 // (σ_p(R⋈S) ≡ σ_p(R)⋈S) on BOTH sides. For a LEFT join it holds on the preserved
 // side only, so since Week 29 distribute() declines to push into children[1] of
-// a LEFT join and such conjuncts stay above the whole join tree.
+// a LEFT join and such conjuncts stay above the whole join tree. Since Week 37
+// the PRESERVED side is conditional too — not because the identity fails there,
+// but because it is about the join's OUTPUT and a LEFT join's ON residual is
+// evaluated on its CANDIDATE PAIRS. See distribute().
 //
 // !! RESULT PRESERVATION IS NOT THE WHOLE OBLIGATION, and Week 37 is where that
 // stopped being an oversight. PER-ROW EVALUATION CAN THROW (substringOf,
@@ -25,16 +28,25 @@
 // the ERROR BEHAVIOUR is not, and `optimized != --no-optimize` was reproducible
 // in BOTH directions on the shipped catalog.
 //
-// THIS PASS MAKES FOUR MOVES, and the count is part of the claim rather than
-// prose around it: reordering a conjunct inside one filter, pushing it below an
-// inner join, pushing it into a derived body, and DESCENDING BELOW THAT BODY'S
-// PROJECTION. Seam audit pass 4's P4-B1 is what an earlier revision of this
-// paragraph cost: it listed three, stated the guarantee absolutely ("every move
-// this pass makes is now screened"), and the unlisted fourth was the unscreened
-// one. All four are screened now, and the fourth carries a SECOND screen the
-// others do not need — the projection it moves a conjunct below is itself
-// evaluated on fewer rows, so `project.exprs` is screened as well as the
-// conjuncts.
+// THE OBLIGATION IS NOT PER MOVE — IT IS PER EXPRESSION WHOSE ROW SET A MOVE
+// CHANGES, and that is a strictly larger set than the conjuncts this pass
+// touches. Two revisions of this paragraph enumerated MOVES, each was short by
+// one entry, and both times the missing entry was the divergence:
+//
+//   * pass 4's P4-B1 — the paragraph listed three moves and the unlisted fourth
+//     (descending below a derived body's projection) was the unscreened one;
+//   * pass 5's P5-B1 — the paragraph listed four moves, all four were screened,
+//     and the divergence was in an expression NO move touches. A LEFT join's ON
+//     residual is evaluated once per CANDIDATE PAIR inside the probe loop, and
+//     move 2 (pushing a conjunct into the preserved side) shrinks that pair set.
+//     It is not a conjunct of any list `firstMayRaise` reads, so an enumeration
+//     of moves could not have found it.
+//
+// So the count is no longer the claim. Every move is screened, and the two moves
+// that rest on a SET EQUIVALENCE about a node's OUTPUT carry a SECOND screen for
+// the expressions evaluated INSIDE that node: the PROJECT descent screens
+// `project.exprs`, and the push below a join screens `LogicalJoin::on_residual`.
+// The .cc states both, beside the identity each one is the missing half of.
 //
 // The screen is `exprMayRaise` / `firstMayRaise` in parser/expr_totality.h,
 // shared with ChunkPruner and with the LIMIT rule in logical_plan.cc, and the

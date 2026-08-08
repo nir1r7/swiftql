@@ -3,9 +3,31 @@
 #include "validator.h"
 #include "subquery_lowering.h"
 #include "subquery_decorrelation.h"
+#include "subquery_materialization.h"   // forEachSubqueryConst (dispatch site 19)
 #include "parser/expr_utils.h"
-#include "parser/expr_totality.h"   // exprMayRaise — see applyLimit below
+#include "parser/expr_totality.h"   // exprMayRaise / firstMayRaise — applyLimit
+                                    // below, and guardLoweredConjunctPrefix
 #include <unordered_set>
+
+// See the header for the rule, the measurement and the bounded decline.
+std::unique_ptr<LogicalPlanNode> guardLoweredConjunctPrefix(
+        std::unique_ptr<LogicalPlanNode> spine,
+        std::vector<std::unique_ptr<Expr>>& prefix) {
+    if (prefix.empty()) return spine;
+    // The prefix is written against the spine's output schema — for a semi/anti
+    // join that IS its left child's, so a second extraction screens against the
+    // same columns the first one did.
+    if (firstMayRaise(prefix, spine->output_schema) == prefix.size()) return spine;
+    for (const auto& c : prefix) {
+        bool holds_subquery = false;
+        forEachSubqueryConst(c.get(), [&](const SubqueryExpr&) { holds_subquery = true; });
+        if (holds_subquery) return spine;
+    }
+    auto guarded = std::move(prefix);
+    prefix.clear();
+    return std::make_unique<LogicalFilter>(std::move(spine), conjoinAll(std::move(guarded)));
+}
+
 
 
 // collecting column names from expressions

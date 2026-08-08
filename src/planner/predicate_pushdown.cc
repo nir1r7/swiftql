@@ -393,20 +393,36 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
 // query, every query in both harnesses) is unaffected, which is why this costs
 // nothing measurable.
 //
-// THE FOUR MOVES THIS PASS MAKES, all four screened — the list is exhaustive
-// and must stay that way, because pass 4 found the divergence in the one move
-// that had been added without being added to this list:
+// WHAT THE LIST HAS TO ENUMERATE, and pass 5 changed the answer. Two versions
+// of this paragraph have now been short by exactly one entry, and both times the
+// missing entry WAS the divergence — so the axis the list is drawn on is worth
+// more than the list:
 //
-//   1. reordering conjuncts inside one filter          (orderByWork)
-//   2. pushing a conjunct below an inner join          (distribute)
-//   3. pushing a conjunct into a derived body          (pushIntoDerived)
-//   4. descending below that body's projection         (apply's PROJECT arm)
+//   THE OBLIGATION IS NOT PER MOVE. It is per EXPRESSION WHOSE ROW SET A MOVE
+//   CHANGES, and that is a strictly larger set than the conjuncts the pass
+//   touches. Enumerating moves finds the conjunct that travels; it does not find
+//   the expression that stayed put while the rows underneath it changed.
 //
-// Move 4 needs a SECOND screen that the other three do not, and pass 4's P4-B1
-// is what happens without it: σ_p(π(R)) ≡ π(σ_p'(R)) is a SET equivalence, and
-// the expression whose row count changes is not the conjunct — it is the
-// SIBLING expression in the projection, which the conjunct never names. So the
-// PROJECT arm screens `project.exprs` as well. See remapThroughProject.
+// The four moves, and beside each the expressions whose row set it changes:
+//
+//   1. reordering conjuncts inside one filter   (orderByWork)
+//      -> the conjuncts after the one that moved.
+//   2. pushing a conjunct below a join          (distribute)
+//      -> the conjunct itself (fewer rows: one relation, not the survivors),
+//         AND the conjuncts it was written ahead of, AND — pass 5's P5-B1 —
+//         a LEFT join's ON RESIDUAL, which this pass never touches and which
+//         is not a conjunct of any list this file reads. See distribute.
+//   3. pushing a conjunct into a derived body   (pushIntoDerived)
+//      -> the conjunct, and everything that stays behind it.
+//   4. descending below that body's projection  (apply's PROJECT arm)
+//      -> the conjunct, AND — pass 4's P4-B1 — every SIBLING expression in
+//         `project.exprs`, which the conjunct never names.
+//
+// Moves 2 and 4 are the same lesson twice, one round apart. Each rests on a SET
+// equivalence — σ_p(R ⟕ S) ≡ σ_p(R) ⟕ S for 2, σ_p(π(R)) ≡ π(σ_p'(R)) for 4 —
+// and a set equivalence about a node's OUTPUT says nothing about the row sets of
+// the expressions evaluated INSIDE it. So each carries a second screen: the
+// PROJECT arm screens `project.exprs`, and distribute screens `on_residual`.
 //
 // The screen itself is `exprMayRaise` / `conjunctMayRaise`
 // (parser/expr_totality.h), shared with ChunkPruner and with the LIMIT rule in
@@ -473,10 +489,16 @@ std::unique_ptr<LogicalPlanNode> distribute(std::unique_ptr<LogicalPlanNode> nod
         // which is where WHERE semantics put it anyway ("degrade instead of drop",
         // as that loop already documents).
         //
-        // The recursion into children[0] below stays UNCONDITIONAL: the preserved
-        // side is safe (σ_p(R) ⟕ S ≡ σ_p(R ⟕ S)), and the test is re-applied at
-        // every join on the way down, so a conjunct owned by a relation that some
-        // deeper outer join null-supplies stops at that join.
+        // The recursion into children[0] below is CONDITIONAL, and σ_p(R) ⟕ S ≡
+        // σ_p(R ⟕ S) is only half of why. See the ON-residual screen below the
+        // children[1] block: that identity is about the join's OUTPUT and says
+        // nothing about its CANDIDATE PAIRS, which is what a LEFT join's ON
+        // residual is evaluated on. Where there is no residual (every INNER
+        // join, and every LEFT join whose ON is keys only) the identity IS the
+        // whole obligation and the recursion is unconditional as before. The
+        // test is re-applied at every join on the way down, so a conjunct owned
+        // by a relation that some deeper outer join null-supplies stops at that
+        // join.
         //
         // Written as `== INNER` rather than `!= LEFT` so a future RIGHT/FULL join
         // is refused by default rather than pushed through by omission.
@@ -504,6 +526,60 @@ std::unique_ptr<LogicalPlanNode> distribute(std::unique_ptr<LogicalPlanNode> nod
             join->children[1] = filterOnto(std::move(join->children[1]), std::move(it->second), catalog);
             by_slot.erase(it);
         }
+
+        // SEAM AUDIT PASS 5, P5-B1. THE THIRD SCREEN, and the only one that is
+        // not about a conjunct of any list.
+        //
+        // A LEFT join's non-key ON conjuncts are NOT folded into the WHERE the
+        // way an INNER join's are (logical_plan.cc's join-type split, Week 29):
+        // they hang on this node as `on_residual` and are evaluated ONCE PER
+        // CANDIDATE PAIR inside the probe loop (plan_nodes.cc's HashJoinNode
+        // and vec_hash_join_node.cc, both `passes()`). So the residual is a
+        // per-row expression whose row set is the join's CANDIDATE PAIRS —
+        // preserved-side rows × build side — and pushing a WHERE conjunct into
+        // children[0] shrinks it.
+        //
+        // σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) does not license that. It is a SET equivalence
+        // about the join's OUTPUT; it says nothing about which pairs the match
+        // test is run on, and the residual IS the match test. Measured on the
+        // shipped catalog before this screen existed:
+        //
+        //   SELECT COUNT(*) FROM laps l LEFT JOIN drivers d
+        //     ON l.driver_id = d.driver_id AND l.lap_id * 1000000000000000 > 0
+        //   WHERE l.lap_id < 5
+        //     optimized -> 4   --no-optimize -> Error: integer overflow in '*'
+        //
+        // and identically with SUBSTRING on a computed start, with the residual
+        // reading the NULL-SUPPLYING side, with a derived preserved side, and
+        // with the LEFT join at the bottom or in the middle of a 3-relation
+        // spine. The three legs that agreed with `--no-optimize` were exactly
+        // the three that never call PredicatePushdown.
+        //
+        // The INNER analogue is safe for the reason this one is not: its
+        // residual becomes a conjunct of the WHERE list, AHEAD of the written
+        // WHERE, so firstMayRaise freezes at index 0 in pushIntoJoin and no
+        // conjunct moves at all. This screen rejoins the LEFT path to that one.
+        //
+        // conjunctMayRaise, not exprMayRaise: `passes()` does
+        // `!v.isNull() && v.asInt() != 0`, so the residual is truth-tested
+        // exactly as a filter conjunct is and a non-INT static type raises on
+        // its own.
+        //
+        // DECLINE rather than repair: leaving the buckets in `by_slot` sends
+        // them to pushIntoJoin's leftover loop, which lifts them above the whole
+        // tree — the same "degrade instead of drop" path the LEFT/semi children[1]
+        // decline above already uses. It costs pushdown only on a query that has
+        // a raising ON residual at all; `on_residual` is assigned in exactly one
+        // place (logical_plan.cc, under jc.type == JoinType::LEFT), which is what
+        // bounds this screen to outer joins.
+        //
+        // PER JOIN, deliberately: the LEFT join carrying the residual need not
+        // be the top of the spine, and this test is re-applied at every join on
+        // the way down for the same reason the INNER/LEFT test above is.
+        if (join->on_residual
+            && conjunctMayRaise(join->on_residual.get(), join->output_schema))
+            return node;
+
         join->children[0] = distribute(std::move(join->children[0]), by_slot, catalog);
         return node;
     }

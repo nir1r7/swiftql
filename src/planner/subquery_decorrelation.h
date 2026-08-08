@@ -49,8 +49,31 @@
 //   4. at least one key was produced. A body correlated by nothing is
 //      uncorrelated and is materialized before planning; a body correlated ONLY
 //      by non-equalities has no join to build.
+//   6. NO BODY-LOCAL CONJUNCT THAT CAN RAISE IS WRITTEN AFTER A KEY (seam audit
+//      pass 5, subquery B-3). Lifting a correlated equality into a join key
+//      takes it out of the body's AND cascade: it is enforced by the PROBE,
+//      above the body, so every body-local conjunct written after it is
+//      evaluated on the body's whole relation instead of on the rows the guard
+//      admitted. `expr_totality.h` forbids exactly that for an expression that
+//      can raise, and this is the "introduce a raise" direction — the mirror of
+//      the semi-join's "mask a raise" (subquery_lowering.h). It is REFUSED and
+//      not repaired: the lifted equality's level-1 reference means nothing
+//      inside the body, so no position in the body reproduces the row set it
+//      gave. Keeping it would need the residue to ride as an ON residual on the
+//      semi/anti join — the operator work condition 2's message already names.
+//      Enforced by refuseUnguardedRaiser, at BOTH call sites, after the body's
+//      plan exists (the screen needs operand types). Its one recorded gap: a
+//      conjunct that itself HOLDS a subquery is not screened, because cloneExpr
+//      shares a SubqueryExpr's shared_ptr and screening one would refuse every
+//      nested-subquery body.
 // A shape failing any of these is REFUSED by name at the site, not silently
 // mis-rewritten. See docs/week-33-plan.md Task 5.
+//
+// AND THE SAME PASS OWES subquery_lowering.h's P5-1 SCREEN, for the join it
+// builds rather than for the body: lowerExistsSubqueries deletes its conjunct
+// and interposes a row-reducing semi/anti join BELOW the WHERE filter, so it
+// calls guardLoweredConjunctPrefix exactly as lowerInSubqueries does. Two
+// different halves of one rule, in one function.
 //
 //   5. every key pairs two STRING columns or two numeric ones. THIS ONE IS NOT
 //      ENFORCED AT THIS SITE and must not be added here: it is
