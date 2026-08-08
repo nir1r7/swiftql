@@ -139,21 +139,32 @@ static constexpr int64_t MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN = 1000000000000000LL;
 // refusal of "CASE with mixed numeric branches" would also reject
 // `CASE WHEN c THEN 1 ELSE 0.5 END`, which is correct today in every mode. The
 // runtime test rejects exactly the queries that are wrong today and no others.
+//
+// The magnitude test runs on the DOUBLE, not on the int64_t, and that is a
+// measurement rather than a preference. `Value::type()` lives in value.cc and
+// does not inline, so asking it first put a second out-of-line call on the arm
+// that every ordinary DOUBLE cell takes: 3.6ms -> 7.3ms per million appends,
+// the same order as the 4.7ms this file's readColumnValue comment already
+// treats as worth avoiding. Testing the double keeps the one call this line
+// always made and adds two compares.
+//
+// It is an EXACT proxy, not an approximation: 1e15 is itself a representable
+// double and rounding to nearest is monotonic, so |(double)i| >= 1e15 exactly
+// when |i| >= 1e15. NaN and infinity fail both compares, fall through to the
+// type check, and pass — they are DOUBLEs, and this rule is only about INTs.
 inline double narrowToDoubleColumn(const Value& v) {
-    // STRING lands on asDouble() and raises bad_variant_access, as before.
-    if (v.type() != TypeId::INT) return v.asDouble();
-    const int64_t i = v.asInt();
-    if (i >= MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN ||
-        i <= -MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN) {
-        throw std::runtime_error(
-            "vectorized execution cannot materialize the integer " +
-            std::to_string(i) + " into a DOUBLE result column without changing "
-            "it. A chunk column holds one type, so an expression that mixes "
-            "INTEGER and REAL results (typically a CASE) is stored as REAL, "
-            "which is exact and prints identically only below 1e15. Re-run with "
-            "--execution volcano, or give the branches the same type.");
-    }
-    return static_cast<double>(i);
+    // STRING raises bad_variant_access from toNumeric(), as it did before.
+    const double d = v.toNumeric();
+    const double bound = static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
+    if (d < bound && d > -bound) return d;
+    if (v.type() != TypeId::INT) return d;   // a genuine DOUBLE that big is fine
+    throw std::runtime_error(
+        "vectorized execution cannot materialize the integer " +
+        std::to_string(v.asInt()) + " into a DOUBLE result column without "
+        "changing it. A chunk column holds one type, so an expression that "
+        "mixes INTEGER and REAL results (typically a CASE) is stored as REAL, "
+        "which is exact and prints identically only below 1e15. Re-run with "
+        "--execution volcano, or give the branches the same type.");
 }
 
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value

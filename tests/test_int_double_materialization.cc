@@ -13,6 +13,8 @@
 #include "planner/plan_nodes.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -334,11 +336,28 @@ TEST(IntDoubleMaterialization, GuardEverythingBelowTheBoundaryStillRoundTrips) {
     EXPECT_EQ(valueAt(n, 1).asInt(), 9223372036854775807LL);
     EXPECT_TRUE(valueAt(n, 2).isNull());
 
-    // DOUBLE and STRING columns receiving their own type: untouched.
+    // DOUBLE and STRING columns receiving their own type: untouched. The large
+    // and non-finite entries are the ones the guard could wrongly catch — it
+    // screens on the DOUBLE's magnitude for speed, so every DOUBLE above the
+    // bound reaches the type check, and every one of them must pass. A DOUBLE
+    // is not an INT and this rule is only about INTs.
     ColumnVector dd = makeColumnVector(TypeId::DOUBLE);
     ASSERT_NO_THROW(appendColumnValue(dd, Value(1e300)));
     ASSERT_NO_THROW(appendColumnValue(dd, Value(static_cast<double>(TWO_53_PLUS))));
+    ASSERT_NO_THROW(appendColumnValue(dd, Value(
+        static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN))));
+    ASSERT_NO_THROW(appendColumnValue(dd, Value(-1e300)));
+    ASSERT_NO_THROW(appendColumnValue(dd, Value(
+        std::numeric_limits<double>::infinity())));
+    ASSERT_NO_THROW(appendColumnValue(dd, Value(
+        -std::numeric_limits<double>::infinity())));
+    ASSERT_NO_THROW(appendColumnValue(dd, Value(
+        std::numeric_limits<double>::quiet_NaN())));
     EXPECT_EQ(valueAt(dd, 0).asDouble(), 1e300);
+    EXPECT_EQ(valueAt(dd, 2).asDouble(),
+              static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN));
+    EXPECT_TRUE(std::isinf(valueAt(dd, 4).asDouble()));
+    EXPECT_TRUE(std::isnan(valueAt(dd, 6).asDouble()));
     ColumnVector s = makeColumnVector(TypeId::STRING);
     ASSERT_NO_THROW(appendColumnValue(s, Value(std::string("9007199254740993"))));
     EXPECT_EQ(valueAt(s, 0).asString(), "9007199254740993");
