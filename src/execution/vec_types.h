@@ -31,18 +31,18 @@ struct ColumnVector {
     std::vector<uint8_t> validity;
 
     // Plan-shape arming for the INT -> DOUBLE narrowing; see
-    // refuseObservableIntNarrowing below. false — the default, and the value on
-    // every scan chunk, join output and ExpressionExecutor result — means the
-    // narrowing cannot change an answer here and only the magnitude rule
-    // applies. The two nodes that materialize a `Value` into a column type
-    // declared BEFORE the value exists (VecProjectNode, VecHashAggregateNode)
-    // set it per column, from a mask the vectorized plan builder computes over
-    // the LOGICAL plan.
+    // refuseObservableIntNarrowing and narrowToDoubleColumn below.
+    // IntNarrowing::RENDERED — the default, and the value on every scan chunk,
+    // join output and ExpressionExecutor result — is the conservative state:
+    // the type is not observable and the value may be printed. The two nodes
+    // that materialize a `Value` into a column type declared BEFORE the value
+    // exists (VecProjectNode, VecHashAggregateNode) set it per column, from a
+    // mask the vectorized plan builder computes over the LOGICAL plan.
     //
     // It rides on the ColumnVector, not on the node, because appendColumnValue
     // is the single funnel every such write goes through; the cost is one
     // predictably not-taken branch on the DOUBLE arm.
-    bool int_observable = false;
+    IntNarrowing int_narrowing = IntNarrowing::RENDERED;
 
     int size() const {
         return std::visit([](const auto&v){

@@ -1,7 +1,8 @@
 #include "predicate_pushdown.h"
 #include "cardinality_estimator.h"
 #include "parser/ast.h"
-#include "parser/expr_utils.h"   // conjoinAll
+#include "parser/expr_utils.h"     // conjoinAll
+#include "parser/expr_totality.h"  // the totality screen: exprMayRaise / firstMayRaise
 #include <algorithm>
 #include <map>
 #include <unordered_set>
@@ -328,13 +329,14 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
     return ctx;
 }
 
-// ── THE TOTALITY SCREEN (seam audit pass 3, B3-2) ────────────────────────────
+// ── THE TOTALITY SCREEN (seam audit pass 3, B3-2; pass 4, P4-1/P4-2/P4-B1/P4-B2)
 //
 // PER-ROW EVALUATION IS NOT TOTAL: `evaluate()` can THROW on a row. That makes
-// every conjunct MOVE this pass performs — reordering inside one filter, and
-// pushing a conjunct below a join — a decision about whether a query ERRORS,
-// not only about how fast it runs. Measured at HEAD before this screen existed,
-// on the shipped `catalog.json`, in BOTH directions:
+// every conjunct MOVE this pass performs — reordering inside one filter,
+// pushing a conjunct below a join, pushing one into a derived body, and
+// descending below that body's projection — a decision about whether a query
+// ERRORS, not only about how fast it runs. Measured at HEAD before this screen
+// existed, on the shipped `catalog.json`, in BOTH directions:
 //
 //   MASKED    WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' AND speed = 333.3333
 //             optimized -> 0 rows,  --no-optimize -> Error
