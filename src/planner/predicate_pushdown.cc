@@ -168,56 +168,6 @@ int soleSlot(const Expr* conjunct) {
     return -1;
 }
 
-// Every ColumnRef of `expr` that belongs to THIS query block, in tree order.
-//
-// THE MUTABLE TWIN OF collectSlots, and it is ONE function on purpose: this file
-// had two copies of the same dispatch (collectSlots reading, restampSlots
-// writing) and the header already warns that they must stay in lockstep. Week 37
-// needed a THIRD writer — remapping a conjunct's refs onto a derived body's
-// schema — and a third open-coded copy is how a lockstep of two becomes a
-// lockstep of three that nobody checks. restampSlots and both remappers below
-// are now expressed in terms of this walker, so there is one place to add an
-// Expr subtype on the writing side.
-//
-// The two SCOPE decisions are the ones collectSlots already documents and are
-// repeated here because they are what makes "belongs to this block" true:
-//   * a SubqueryExpr's OPERAND is this block's and is visited; its BODY is
-//     another scope's range table and is NOT. Rewriting inside it would renumber
-//     a different block.
-//   * an AggregateExpr's argument is visited even though no conjunct containing
-//     one survives to pushdown today, because collectSlots descends there and
-//     the lockstep is only true if both do.
-template <typename F>
-void forEachLocalColumnRef(Expr* expr, F&& f) {
-    if (!expr) return;
-    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { f(*cr); return; }
-    if (auto* bin = dynamic_cast<BinaryExpr*>(expr)) {
-        forEachLocalColumnRef(bin->left.get(), f);
-        forEachLocalColumnRef(bin->right.get(), f);
-        return;
-    }
-    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { forEachLocalColumnRef(isn->operand.get(), f); return; }
-    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) { forEachLocalColumnRef(un->operand.get(), f); return; }
-    if (auto* in = dynamic_cast<InExpr*>(expr)) { forEachLocalColumnRef(in->operand.get(), f); return; }
-    if (auto* lk = dynamic_cast<LikeExpr*>(expr)) { forEachLocalColumnRef(lk->operand.get(), f); return; }
-    if (auto* c = dynamic_cast<CaseExpr*>(expr)) {
-        for (auto& w : c->when_clauses) {
-            forEachLocalColumnRef(w.condition.get(), f);
-            forEachLocalColumnRef(w.result.get(), f);
-        }
-        forEachLocalColumnRef(c->else_expr.get(), f);
-        return;
-    }
-    if (auto* sub = dynamic_cast<SubstringExpr*>(expr)) {
-        forEachLocalColumnRef(sub->operand.get(), f);
-        forEachLocalColumnRef(sub->start.get(), f);
-        forEachLocalColumnRef(sub->length.get(), f);   // nullptr-safe
-        return;
-    }
-    if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) { forEachLocalColumnRef(agg->argument.get(), f); return; }
-    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr)) { forEachLocalColumnRef(sq->operand.get(), f); }
-}
-
 // Re-stamp every ColumnRef in a pushed conjunct to the given slot. A conjunct
 // pushed below the join lives in a single-table subtree whose scan schema stamps
 // all columns slot 0, so the refs must match — this is also what lets ChunkPruner
@@ -576,8 +526,33 @@ std::unique_ptr<LogicalPlanNode> distribute(std::unique_ptr<LogicalPlanNode> nod
         // PER JOIN, deliberately: the LEFT join carrying the residual need not
         // be the top of the spine, and this test is re-applied at every join on
         // the way down for the same reason the INNER/LEFT test above is.
+        //
+        // WEEK 36 — TWO THINGS CHANGED HERE, AND ONLY ONE OF THEM IS VISIBLE.
+        //
+        // (1) The paragraph above says `on_residual` "is assigned in exactly one
+        //     place (logical_plan.cc, under jc.type == JoinType::LEFT), which is
+        //     what bounds this screen to outer joins". IT IS ASSIGNED IN TWO
+        //     PLACES NOW: subquery_decorrelation.cc sets it on a SEMI/ANTI node
+        //     (TPC-H q21's `l2.l_suppkey != l1.l_suppkey`). The screen is
+        //     UNCHANGED and correct for them, because the argument transfers
+        //     verbatim — distribute recurses into children[0] of a semi/anti
+        //     join exactly as it does for a LEFT one, and every probe row it
+        //     removes removes that row's residual evaluations. The bound is now
+        //     "every join that carries a residual", which is what this test
+        //     already reads.
+        //
+        // (2) THE SCHEMA: joinResidualSchema, not output_schema. For a LEFT join
+        //     they are the same schema and nothing changes. For a semi/anti join
+        //     output_schema IS the probe schema, and the residual also names the
+        //     body's projected columns as `$rN` — which resolves NOWHERE in the
+        //     probe schema, so staticTypeOf would answer "cannot type it",
+        //     conjunctMayRaise would answer TRUE, and this screen would freeze
+        //     pushdown for every q21-shaped query. Not a wrong answer, but a
+        //     silent permanent plan-quality loss caused by handing a screen the
+        //     wrong schema — the fault chunk_pruner.h records as E-20 / S-13 /
+        //     P5-2, in its safe direction rather than its dangerous one.
         if (join->on_residual
-            && conjunctMayRaise(join->on_residual.get(), join->output_schema))
+            && conjunctMayRaise(join->on_residual.get(), joinResidualSchema(*join)))
             return node;
 
         join->children[0] = distribute(std::move(join->children[0]), by_slot, catalog);

@@ -6,7 +6,7 @@
 #include <memory>
 #include <vector>
 
-// ── THE TOTALITY SCREEN — ONE FUNCTION, FOUR CONSUMERS ──────────────────────
+// ── THE TOTALITY SCREEN — ONE FUNCTION, FIVE CONSUMERS ──────────────────────
 //
 // THE RULE THIS FILE SERVES (seam audit pass 4; see predicate_pushdown.cc for
 // the full statement and the reproductions):
@@ -20,9 +20,19 @@
 //       conjunct WRITTEN BEFORE IT evaluated TRUE (evaluatePredicate() in
 //       evaluator.cc and evalPredicate() in columnar_eval.cc both implement
 //       exactly this cascade);
-//     * AN OUTER JOIN'S `ON` RESIDUAL is evaluated on every CANDIDATE PAIR the
-//       join keys matched — not on rows of either input, and not on rows of the
+//     * A JOIN'S `ON` RESIDUAL is evaluated on every CANDIDATE PAIR the join
+//       keys matched — not on rows of either input, and not on rows of the
 //       join's output, since a pair the residual rejects never becomes one.
+//       !! THIS BULLET READ "AN OUTER JOIN'S" UNTIL WEEK 36, and it was on the
+//       wrong axis: it named the PRODUCER that happened to exist rather than the
+//       construct. Decorrelation now puts a residual on a SEMI/ANTI join as well
+//       (TPC-H q21's `l2.l_suppkey != l1.l_suppkey`), where the candidate pair is
+//       probe row × build row and a rejected pair simply is not a witness. The
+//       rule is identical for both. What differs is only the SCHEMA the residual
+//       resolves in — joinResidualSchema (planner/logical_plan.h), which is the
+//       merged output schema for an outer join and probe ⊕ build for a semi/anti
+//       one — and a screen handed the wrong one of those answers about an
+//       expression that is not the one that runs.
 //       Both engines evaluate it EAGERLY, over the whole residual conjunction,
 //       in the probe loop against the assembled merged row (plan_nodes.cc's
 //       HashJoinNode::next and vec_hash_join_node.cc's probe hold the same
@@ -68,7 +78,7 @@
 // when the operand TYPES decide it. Hence the schema parameter. There is one
 // screen and it is precise; there is no second, coarser copy anywhere.
 //
-// THE FOUR CONSUMERS, and why each needs the same answer:
+// THE FIVE CONSUMERS, and why each needs the same answer:
 //   1. predicate_pushdown.cc — a conjunct that may raise is frozen: it does not
 //      move, and nothing may move across it.
 //   2. chunk_pruner.h — a zone-map skip removes rows before the filter runs, so
@@ -83,15 +93,31 @@
 //   3. logical_plan.cc — a LIMIT above a projection that may raise is placed
 //      BELOW it, so the plan (not the engine's laziness) says how many rows the
 //      projection is evaluated on.
-//   4. predicate_pushdown.cc AGAIN, at distribute — a LEFT join's ON residual.
-//      Not a conjunct of any list: it is a field on the join node, evaluated per
-//      CANDIDATE PAIR, and any rewrite that removes a preserved-side row removes
-//      evaluations of it. This is the entry the enumeration used to omit,
-//      together with the sentence that would have told a reader it could not
-//      exist — and it is the one that hid a blocker, because pushing a conjunct
-//      into the preserved side changes the row set of an expression the pass
-//      never touches. Consumers 1 and 4 are the SAME FILE and the same pass;
-//      counting consumers by file is how the fourth went missing.
+//   4. predicate_pushdown.cc AGAIN, at distribute — A JOIN'S ON RESIDUAL. Not a
+//      conjunct of any list: it is a field on the join node, evaluated per
+//      CANDIDATE PAIR, and any rewrite that removes a row from the input that
+//      supplies the pair's left half removes evaluations of it. This is the entry
+//      the enumeration used to omit, together with the sentence that would have
+//      told a reader it could not exist — and it is the one that hid a blocker,
+//      because pushing a conjunct into that input changes the row set of an
+//      expression the pass never touches. Consumers 1 and 4 are the SAME FILE and
+//      the same pass; counting consumers by file is how the fourth went missing.
+//      WEEK 36: this entry said "a LEFT join's ON residual" and the input said
+//      "preserved-side". Both are now "a LEFT join's preserved side OR a
+//      SEMI/ANTI join's PROBE side" — distribute recurses into children[0] for
+//      each alike. The screen itself did not change; the schema it is handed did
+//      (see consumer 2's warning, which is the same warning).
+//   5. subquery_decorrelation.cc — BOTH DIRECTIONS, at one rewrite. Lifting a
+//      correlated conjunct out of a body (into a join key OR into an ON
+//      residual) takes a guard away from every body-local conjunct written after
+//      it (refuseUnguardedRaiser: the "introduce a raise" direction) and GIVES
+//      the lifted residual guards it did not have, since those body-local
+//      conjuncts now run first, on the build side (refuseMaskedResidualRaiser:
+//      the "mask a raise" direction). Both refuse by name rather than repair,
+//      because the lifted conjunct's level-1 reference means nothing anywhere
+//      inside the body. THE COUNT IN THE HEADING ABOVE IS THEREFORE FIVE, NOT
+//      FOUR — and per the axis warning, these are two more CONSTRUCTS whose row
+//      set a rewrite changes, not merely two more call sites.
 //
 // Same dispatch as collectSlots / forEachLocalColumnRef in
 // predicate_pushdown.cc. A MISSED Expr subtype here must answer TRUE, which the

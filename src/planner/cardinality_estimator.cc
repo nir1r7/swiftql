@@ -470,10 +470,27 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // exactly why the product form joinCardinality computed above is the
             // wrong shape here and is overwritten rather than adjusted.
             if (join.semantics != JoinSemantics::STANDARD) {
-                if (join.on_residual) {
-                    throw std::runtime_error(
-                        "internal: a semi/anti join carries no ON residual");
-                }
+                // WEEK 36 — THIS WAS AN ASSERTION ("a semi/anti join carries no
+                // ON residual") AND THE FACT IT ASSERTED IS NOW FALSE: TPC-H q21
+                // decorrelates to a semi join and an anti join that each carry
+                // one. Deleted rather than relaxed, and the estimate is left
+                // UNADJUSTED, deliberately:
+                //
+                //   * a residual can only REJECT candidate pairs, so it moves a
+                //     SEMI join's row count DOWN and an ANTI join's UP. The two
+                //     directions are not one factor, and `selectivity()` (which
+                //     the LEFT arm below applies) is a magic-constant estimate
+                //     over the join's OUTPUT context — the wrong domain twice
+                //     over here, since a semi/anti residual reads build columns
+                //     that are in NO context this function holds.
+                //   * nothing consults this number for a semi/anti join anyway:
+                //     JoinEnumeration declines the whole tree
+                //     (hasSlotOutsideRangeTable fires on join_slot == -1), so the
+                //     estimate is reported by --explain and drives no decision.
+                //
+                // So the honest thing is an unadjusted semi-join estimate and
+                // this comment, not a factor invented to look adjusted. The
+                // clamp and the >=1 floor below still apply.
                 double frac = 1.0;
                 if (!join.keys.empty()) {
                     // The SAME lookups joinCardinality makes — slot-exact on the

@@ -1367,19 +1367,28 @@ TEST(DerivedTableAliasList, SelectStarExpandsToTheRenamedColumns) {
 
 // Seam audit (phase 5, engine-divergence pass 1), ISSUE 2. The semi/anti branch
 // used to pass `/*on_residual=*/nullptr` instead of forwarding
-// `join->on_residual`, which DEFEATS VecHashJoinNode's own constructor guard
-// ("a semi/anti join takes no ON residual"): a residual set by some future
-// decorrelation would be dropped silently instead of raising. Nothing sets one
-// today, so the two spellings behave identically on every shipped query — which
-// is exactly why the guard needs a test that plants the state by hand.
+// `join->on_residual`, which DEFEATS VecHashJoinNode's own constructor guard: a
+// residual set by some future decorrelation would be dropped SILENTLY instead of
+// reaching the operator.
 //
-// The CardinalityEstimator raises on the same state, so the estimator is
-// deliberately NOT run here: this asserts the BUILDER's leg of the check, the
-// one that runs under --no-optimize with no estimator in front of it.
-TEST(VecPlanBuilder, SemiJoinWithAnOnResidualIsRefusedByTheBuilder) {
+// WEEK 36 — THE "FUTURE DECORRELATION" ARRIVED, and forwarding is what made it
+// work rather than merely fail loudly. So this no longer plants a residual on a
+// plain SEMI node: that combination is LEGAL now, and is covered by
+// VecSemiJoin's residual fixtures and by q21 end to end. It plants one on the
+// combination that is STILL refused — a NOT IN anti-join, whose
+// build_had_unmatchable_key_ short-circuit is a claim about the KEY column that
+// a residual makes untrue — which keeps the original property under test: a
+// builder that dropped the predicate instead of forwarding it would build here
+// without a murmur.
+//
+// The CardinalityEstimator no longer raises on a semi/anti residual at all, so
+// it could not stand in for this even by accident; it is still deliberately not
+// run, because this asserts the BUILDER's leg, the one that runs under
+// --no-optimize with no estimator in front of it.
+TEST(VecPlanBuilder, ANotInAntiJoinWithAnOnResidualIsRefusedByTheBuilder) {
     Catalog cat(CATALOG);
     Parser parser("SELECT d.driver_id FROM drivers d "
-                  "WHERE d.driver_id IN (SELECT driver_id FROM laps)");
+                  "WHERE d.driver_id NOT IN (SELECT driver_id FROM laps)");
     auto stmt = parser.parse();
     Binder::bind(stmt, cat);
     auto tables = loadColumnar(stmt, cat);
@@ -1404,10 +1413,20 @@ TEST(VecPlanBuilder, SemiJoinWithAnOnResidualIsRefusedByTheBuilder) {
         };
     LogicalJoin* semi = findSemi(logical.get());
     ASSERT_NE(semi, nullptr) << logical->explain();
+    ASSERT_EQ(semi->semantics, JoinSemantics::ANTI_NOT_IN)
+        << "the point of this test is the enumerator that still refuses a residual";
     semi->on_residual = std::make_unique<Literal>(Value(int64_t(1)));
 
-    EXPECT_THROW(VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat),
-                 std::runtime_error);
+    try {
+        VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+        ADD_FAILURE() << "a NOT IN anti-join accepted an ON residual";
+    } catch (const std::runtime_error& e) {
+        // THE MESSAGE, not just the type: the builder's own arity check for a
+        // positional build input throws here too, and it would make this test
+        // green while the containment it names was gone.
+        EXPECT_NE(std::string(e.what()).find("NOT IN anti-join takes no ON residual"),
+                  std::string::npos) << e.what();
+    }
 }
 
 // !! Week 37, seam-join-chain pass 2 finding B-4. `Lowering::lower` is the
@@ -1462,3 +1481,94 @@ TEST(VecPlanBuilder, EveryPhysicalNodeUnderADerivedBodyCarriesItsEstimate) {
     EXPECT_EQ(joined.first, 0u) << "unstamped physical nodes:" << joined.second;
 }
 
+
+// ===== Week 36: the SEMI/ANTI ON residual, end to end from SQL (TPC-H q21) =====
+//
+// q21's two bodies are `l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey !=
+// l1.l_suppkey`: a good equi key with a correlated INEQUALITY beside it. Until
+// this week splitCorrelation refused the pair outright. The shape below is that
+// shape on the test catalog — a SELF-CORRELATED body whose residual names ONE
+// COLUMN THAT EXISTS ON BOTH SIDES.
+//
+// !! THESE ARE THE BY-SLOT TESTS AND THEY ARE BUILT TO FAIL LOUDLY UNDER NAME
+// RESOLUTION, not to fail by erroring. In the concatenated probe ⊕ build residual
+// schema `speed` occurs twice; indexOf(name) takes the first match, which is
+// always the PROBE half. A residual left to resolve by name therefore evaluates
+// `l.speed > l.speed` — constantly FALSE — and:
+//
+//                  correct        by name
+//   EXISTS         {2, 3}         {}            (a semi join with no witness)
+//   NOT EXISTS     {1, 4, 5}      {1,2,3,4,5}   (an anti join that keeps all)
+//
+// Both wrong answers are clean, error-free and plausible, and --explain is
+// identical either way. That is round 1's H-1 shape, and it is the reason
+// bindResidualRefs restamps by SLOT rather than trusting a name.
+//
+// The data (tests/data/test_laps_full.csv) and the arithmetic, so a future
+// reader can check the expectation without running anything:
+//   lap 1 Ferrari  312.45   the other Ferrari is slower  -> no witness
+//   lap 2 McLaren  308.91   McLaren 315.62 is faster     -> witness
+//   lap 3 Ferrari  310.17   Ferrari 312.45 is faster     -> witness
+//   lap 4 Mercedes 305.44   alone on its team            -> no witness
+//   lap 5 McLaren  315.62   the other McLaren is slower  -> no witness
+namespace {
+std::vector<int64_t> lapIds(const std::vector<Row>& rows) {
+    std::vector<int64_t> out;
+    for (const Row& r : rows) out.push_back(r[0].asInt());
+    std::sort(out.begin(), out.end());
+    return out;
+}
+const char* kResidualExists =
+    "SELECT l.lap_id FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.team = l.team AND l2.speed > l.speed)";
+const char* kResidualNotExists =
+    "SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.team = l.team AND l2.speed > l.speed)";
+} // namespace
+
+TEST(VecPlanBuilder, ACorrelatedInequalityBesideAKeyBecomesASemiJoinResidual) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(kResidualExists, cat);
+    EXPECT_EQ(lapIds(drainVec(*plan)), (std::vector<int64_t>{2, 3}))
+        << "by NAME both sides of the residual read the probe's `speed`, "
+           "`l.speed > l.speed` is constantly FALSE, and this answers {}";
+}
+
+TEST(VecPlanBuilder, ACorrelatedInequalityBesideAKeyBecomesAnAntiJoinResidual) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(kResidualNotExists, cat);
+    EXPECT_EQ(lapIds(drainVec(*plan)), (std::vector<int64_t>{1, 4, 5}))
+        << "by NAME the residual is constantly FALSE and this answers all five";
+}
+
+// The residual is VISIBLE, and the two same-named columns render DIFFERENTLY —
+// which is what stops a mis-binding from being invisible on the surface used to
+// debug it. The body side is renamed to `$rN` on its way into the projection
+// (`$` is not lexable, so no user column can collide), the probe side keeps its
+// written qualification.
+TEST(VecPlanBuilder, TheSemiJoinResidualRendersItsTwoSidesDistinctly) {
+    Catalog cat(CATALOG);
+    auto plan = buildVec(kResidualExists, cat);
+    std::function<const VecPlanNode*(const VecPlanNode*)> findSemi =
+        [&](const VecPlanNode* n) -> const VecPlanNode* {
+            if (!n) return nullptr;
+            if (n->explain().find("VecSemiHashJoin") == 0) return n;
+            for (const VecPlanNode* c : n->children())
+                if (const VecPlanNode* f = findSemi(c)) return f;
+            return nullptr;
+        };
+    const VecPlanNode* semi = findSemi(plan.get());
+    ASSERT_NE(semi, nullptr) << plan->explain();
+    const std::string e = semi->explain();
+    EXPECT_NE(e.find("residual=($r1 > l.speed)"), std::string::npos) << e;
+}
+
+// And the vectorized answer is the row-storage Volcano answer for the SAME
+// query... except that Volcano cannot answer it at all: Planner::plan builds one
+// join, and this needs the semi join decorrelation interposes. So the parity
+// claim for this shape is "vectorized-only, and it says so" rather than a
+// silently skipped comparison.
+TEST(VecPlanBuilder, TheResidualShapeIsVectorizedOnlyAndVolcanoSaysSo) {
+    Catalog cat(CATALOG);
+    EXPECT_THROW(runVolcanoRow(kResidualExists, cat), std::runtime_error);
+}

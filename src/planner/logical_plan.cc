@@ -806,6 +806,29 @@ std::string LogicalJoin::explain() const {
     return s;
 }
 
+// Week 36 — see the long note at kResidualBuildSlot (logical_plan.h). The build
+// half is re-stamped so the residual's body-side refs resolve to it by SLOT and
+// can never fall through to a same-named probe column. `hidden` is cleared for
+// the same reason it is set elsewhere: this schema feeds evaluate() and two
+// static screens, never a `SELECT *` expansion, so carrying the flag would only
+// invite a reader to think it meant something here.
+Schema joinResidualSchema(const Schema& probe, const Schema& build) {
+    std::vector<ColumnDef> cols = probe.columns();
+    cols.reserve(cols.size() + build.columns().size());
+    for (ColumnDef c : build.columns()) {
+        c.relation_slot = kResidualBuildSlot;
+        c.hidden = false;
+        cols.push_back(std::move(c));
+    }
+    return Schema(std::move(cols));
+}
+
+Schema joinResidualSchema(const LogicalJoin& join) {
+    if (join.semantics == JoinSemantics::STANDARD) return join.output_schema;
+    return joinResidualSchema(join.children[0]->output_schema,
+                              join.children[1]->output_schema);
+}
+
 
 // LogicalFilter
 std::string LogicalFilter::explain() const {

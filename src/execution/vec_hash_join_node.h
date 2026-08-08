@@ -35,10 +35,20 @@ public:
     // with the preserved side nulled out.
     //
     // on_residual: the non-key ON conjuncts, conjoined (LogicalJoin::on_residual,
-    // moved in). Evaluated against the ASSEMBLED output row and output_schema_.
-    // It filters the MATCH TEST, so a probe row whose every candidate fails it is
-    // null-extended rather than dropped. nullptr on every inner join — an inner
-    // join's residuals live in the WHERE conjunction (Week 27).
+    // moved in). It filters the MATCH TEST, so a probe row whose every candidate
+    // fails it is null-extended (LEFT) or counts as no match (SEMI/ANTI), never
+    // silently dropped. nullptr on every inner join — an inner join's residuals
+    // live in the WHERE conjunction (Week 27).
+    //
+    // residual_schema: the schema the residual resolves in, and since Week 36 it
+    // is NOT always output_schema_. For a LEFT join the two ARE the same merged
+    // schema and this is left empty. For a SEMI/ANTI join output_schema_ IS the
+    // probe schema (Week 32's containment, which does not move) while the
+    // residual also names the BODY's projected columns — so it is probe ⊕ build,
+    // built once by joinResidualSchema (planner/logical_plan.h) and handed to
+    // every consumer that must agree about it. Empty is REQUIRED, not merely
+    // allowed, wherever there is no semi/anti residual: the constructor checks
+    // the pairing rather than letting a stale schema sit beside a null predicate.
     // Week 32 — semantics: SEMI emits each probe row AT MOST ONCE when a match
     // exists, ANTI when none does. Both are structurally FILTERS: output_schema
     // IS the probe schema, no build-side column is ever emitted, and the build
@@ -48,17 +58,43 @@ public:
     // prevent (R semi S is pi_R(R join S) with duplicates COLLAPSED, not an
     // inner join with a projection on top).
     //
-    // Legal ONLY with swapped == false, left_outer == false and no residual: a
-    // hash semi-join emits PROBE-side rows, so the surviving side must be the
-    // probe input, and VectorizedPlanBuilder FORCES it rather than costing it —
-    // the same place Week 22's build-side decision does not apply that
-    // left_outer already carved out. The constructor throws on every illegal
-    // combination rather than emitting plausible-looking wrong rows.
+    // Legal ONLY with swapped == false and left_outer == false: a hash semi-join
+    // emits PROBE-side rows, so the surviving side must be the probe input, and
+    // VectorizedPlanBuilder FORCES it rather than costing it — the same place
+    // Week 22's build-side decision does not apply that left_outer already carved
+    // out. The constructor throws on every illegal combination rather than
+    // emitting plausible-looking wrong rows.
+    //
+    // WEEK 36 — "AND NO RESIDUAL" WAS THE THIRD ITEM IN THAT LIST AND IS GONE,
+    // for SEMI and ANTI. TPC-H q21 decorrelates to a semi join and an anti join
+    // that each carry `l2.l_suppkey != l1.l_suppkey` beside their key, and such a
+    // residual cannot be folded into the WHERE: `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)` is
+    // an INNER-join identity, and a semi join has already collapsed its matching
+    // build rows to a yes/no answer by the time `q` could apply.
+    //
+    // Two consequences inside this operator, both of them routing and neither a
+    // new data structure:
+    //   * the build side keeps ROWS, not keys. `build_keys_` (a set) cannot
+    //     answer a predicate over build columns, so a semi/anti join WITH a
+    //     residual fills `hash_table_` — the STANDARD path's own machinery —
+    //     and one WITHOUT a residual still fills `build_keys_`, unchanged.
+    //   * the match test becomes "SOME candidate passes", with an early break.
+    //     A semi join emits each probe row AT MOST ONCE, which is the whole
+    //     reason this operator exists, and the loop must not become an inner
+    //     join's multiply-emitting one.
+    //
+    // ANTI_NOT_IN STILL TAKES NO RESIDUAL, and that is a containment rather than
+    // an omission: build_had_unmatchable_key_ short-circuits the entire probe on
+    // the claim "S contains a NULL, so `x NOT IN S` is never TRUE" — a statement
+    // about the KEY column that a residual makes untrue, since a build row with a
+    // NULL key can no longer stand for "some row matched". `NOT IN` produces no
+    // residual (subquery_lowering.cc builds no residual at all), so the
+    // constraint costs nothing and the constructor enforces it.
     //
     // Trailing and defaulted so every existing construction and hand-built test
     // tree compiles unchanged, the same after-the-fact discipline left_outer and
     // on_residual used.
-    VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped = false, bool left_outer = false, std::unique_ptr<Expr> on_residual = nullptr, JoinSemantics semantics = JoinSemantics::STANDARD);
+    VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped = false, bool left_outer = false, std::unique_ptr<Expr> on_residual = nullptr, JoinSemantics semantics = JoinSemantics::STANDARD, Schema residual_schema = Schema({}));
 
     void open() override;
     DataChunk* nextChunk() override;
@@ -83,9 +119,26 @@ private:
     bool left_outer_;
     std::unique_ptr<Expr> on_residual_;
     JoinSemantics semantics_;
+    // Week 36 — probe ⊕ build, for a SEMI/ANTI residual only. Empty everywhere
+    // else, including every LEFT join, whose residual resolves in output_schema_
+    // because there the two are the same schema. PRIVATE, and that word is the
+    // containment: output_schema_ never widens, so no body column is in scope
+    // above this node however many the residual reads.
+    Schema residual_schema_;
+    // The concatenated probe ⊕ build row the residual is evaluated against,
+    // reused across candidates so the probe loop allocates once per probe row
+    // rather than once per pair. Same discipline as key_buf_.
+    Row residual_row_;
 
     // Week 32 — SEMI/ANTI build side: keys only, no payload. Disjoint from
     // hash_table_, which stays empty for these nodes.
+    //
+    // Week 36 — "for these nodes" is now "for these nodes WITHOUT a residual".
+    // A residual is a predicate over BUILD COLUMNS, which a set of serialized
+    // keys cannot answer, so a semi/anti join carrying one fills hash_table_
+    // instead. Exactly one of the two is populated, decided in open() by
+    // `on_residual_`, and the probe reads whichever open() filled — see
+    // buildSideMatches().
     std::unordered_set<std::string> build_keys_;
     // !! The one piece of state that is easy to forget and impossible to notice.
     // `x NOT IN S` is never TRUE when S contains a NULL — FALSE where x matches,
@@ -118,4 +171,8 @@ private:
     void fillOutChunk(int start, int count);
     // one preserved-side row with no surviving match, null-extended
     void emitNullExtended(const DataChunk& probe_chunk, int r);
+    // Week 36 — the SEMI/ANTI match test, for a key that serialized. "Does SOME
+    // build row under this key satisfy the residual?" — which with no residual
+    // degenerates to "is this key present", the pre-Week-36 question.
+    bool buildSideMatches(const Row& probe_row);
 };

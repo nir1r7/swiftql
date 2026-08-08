@@ -435,7 +435,24 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
             // build throws before anything runs.
             if (j->on_residual) {
                 std::vector<IntOrigin> armed;
-                taintWalk(j->on_residual.get(), node->output_schema, out, armed);
+                if (j->semantics == JoinSemantics::STANDARD) {
+                    taintWalk(j->on_residual.get(), node->output_schema, out, armed);
+                } else {
+                    // Week 36 — a SEMI/ANTI residual reads BOTH sides, and `out`
+                    // is the LEFT child's alone (the output schema is). Walking
+                    // it against the probe schema would silently under-arm: a
+                    // body column would resolve to nothing, contribute no
+                    // origin, and an integer division inside the residual over a
+                    // build column would go unnoticed — the same under-arming
+                    // this pass's own JOIN arm guards against by width. So the
+                    // walk is given the residual's OWN schema and the matching
+                    // concatenated origin sets, and `out` is returned unchanged
+                    // because the residual contributes no OUTPUT column.
+                    OriginSets both = out;
+                    both.insert(both.end(), right.begin(), right.end());
+                    taintWalk(j->on_residual.get(),
+                              joinResidualSchema(*j), both, armed);
+                }
                 armAll(armed);
             }
             return out;
@@ -653,18 +670,41 @@ std::vector<int> leftKeyIndices(const Schema& left_schema, const std::vector<Joi
 // order — subquery_decorrelation.cc projects the body to its key columns, and
 // Week 32's IN body has exactly one output column by the Validator's arity
 // rule. Nothing is looked up by name, so nothing can shadow it.
+//
+// Week 36 — `has_residual` LOOSENS THE ARRANGEMENT BY EXACTLY ONE CLAUSE and no
+// more. A semi/anti join carrying an ON residual has the residual's body-side
+// columns APPENDED to the same projection, after the keys, so the build input is
+// [key0..key{k-1}, $r0..$r{m-1}]. The key indices are still positional 0..k-1 —
+// that is what "appended, never inserted" buys — but the schema may be wider, so
+// the exact-size check would fire on every q21-shaped plan. It stays EXACT for a
+// node with no residual, which is every semi/anti join shipped before this week,
+// and that is the whole loosening: one comparison operator, on one branch.
 std::vector<int> rightKeyIndices(const Schema& right_schema, const std::vector<JoinKey>& keys,
-                                bool positional = false) {
+                                bool positional = false, bool has_residual = false) {
     std::vector<int> idx;
     idx.reserve(keys.size());
     if (positional) {
         // Loud rather than latent: the lowering owns this arrangement, so a
         // mismatch is a planner bug and says so like every other check of its
         // kind.
-        if (right_schema.size() != static_cast<int>(keys.size())) {
+        // `>=`, not `>`: a residual whose refs are ALL level-1 (an outer-only
+        // predicate, e.g. `l1.a > l1.b` written inside the body) appends no body
+        // column at all, so a residual node can legitimately be exactly the key
+        // tuple. Requiring a wider schema would refuse that shape, and — since
+        // this check runs BEFORE the operator is constructed — it would also
+        // shadow the constructor's own "a NOT IN anti-join takes no ON residual"
+        // with a message about arity, which is the wrong cause for the right
+        // refusal.
+        const bool ok = has_residual
+            ? right_schema.size() >= static_cast<int>(keys.size())
+            : right_schema.size() == static_cast<int>(keys.size());
+        if (!ok) {
             throw std::runtime_error(
-                "internal: a semi/anti join's build input must output exactly its "
-                "key columns (got " + std::to_string(right_schema.size())
+                "internal: a semi/anti join's build input must output its key "
+                "columns first"
+                + std::string(has_residual ? ", then the residual's body columns"
+                                           : " and nothing else")
+                + " (got " + std::to_string(right_schema.size())
                 + " for " + std::to_string(keys.size()) + " keys)");
         }
         for (size_t i = 0; i < keys.size(); ++i) idx.push_back(static_cast<int>(i));
@@ -1032,8 +1072,12 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // POSITIONAL for a semi/anti join: both lowerings arrange the body's
             // output to BE the key tuple, so nothing is matched by name against a
             // schema that name was not resolved in (round 1 H-1, H-2, M-3).
+            // Week 36: and the body's output is the key tuple FOLLOWED BY the
+            // residual's body columns when there is a residual — appended, so
+            // the key indices are unchanged.
             std::vector<int> right_idx = rightKeyIndices(
-                jn_schema, join->keys, join->semantics != JoinSemantics::STANDARD);
+                jn_schema, join->keys, join->semantics != JoinSemantics::STANDARD,
+                join->on_residual != nullptr);
 
             // Week 32 — SEMI/ANTI. The side is FORCED, not costed: a hash
             // semi-join emits PROBE-side rows, so the outer spine must be the
@@ -1051,21 +1095,33 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // and printing one would make --explain claim an optimizer decision
             // that never happened (the discipline at LogicalJoin::order_decision).
             //
-            // `on_residual` is FORWARDED, not replaced with nullptr. Nothing
-            // sets it on a semi/anti node today (only LogicalPlanBuilder does,
-            // and only on a JoinType::LEFT node), so both spellings behave
-            // identically right now. They stop behaving identically the moment a
-            // future decorrelation produces an inequality residual: forwarding
-            // makes VecHashJoinNode's own guard ("a semi/anti join takes no ON
-            // residual") fire at plan time, while passing nullptr DEFEATS that
-            // guard and drops the predicate silently. A constructor check the
-            // caller routes around is not a check.
+            // `on_residual` is FORWARDED, not replaced with nullptr. THE MOMENT
+            // THAT MATTERED HAS ARRIVED: this comment used to say the two
+            // spellings behaved identically because nothing set a residual on a
+            // semi/anti node, and that forwarding would make the operator's own
+            // guard fire "the moment a future decorrelation produces an
+            // inequality residual". Week 36's decorrelation produces exactly
+            // that, and because the call forwards, the predicate reaches the
+            // operator instead of being dropped where no test would have seen it.
+            // A constructor check the caller routes around is not a check — and
+            // a caller that routes around it is not found by reading the
+            // constructor.
+            //
+            // The residual schema is built from the LOWERED children's schemas,
+            // not the logical node's, for the reason stated above the size check:
+            // these are the schemas the operator will actually index into. The
+            // sizes are proven equal a few lines up, and joinResidualSchema is
+            // the single derivation PredicatePushdown and the taint walk also
+            // ask, so all three screen the expression that runs.
             if (join->semantics != JoinSemantics::STANDARD) {
+                Schema residual_schema = join->on_residual
+                    ? joinResidualSchema(from_schema, jn_schema) : Schema({});
                 return std::make_unique<VecHashJoinNode>(
                     std::move(from_child), std::move(join_child),
                     std::move(left_idx), std::move(right_idx),
                     join->output_schema, /*swapped=*/false, /*left_outer=*/false,
-                    std::move(join->on_residual), join->semantics);
+                    std::move(join->on_residual), join->semantics,
+                    std::move(residual_schema));
             }
 
             // Week 22 (build side) + Week 23.5 (algorithm): cost every legal

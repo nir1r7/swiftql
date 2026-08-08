@@ -14,6 +14,7 @@
 #include "storage/rle_column.h"
 #include "storage/dictionary_encoder.h"
 #include "planner/plan_nodes.h"
+#include "planner/logical_plan.h"
 #include "common/schema.h"
 #include "common/value.h"
 #include "parser/ast.h"
@@ -4322,20 +4323,25 @@ TEST(VecSemiJoin, RefusesEveryIllegalCombination) {
     Schema merged       = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
     std::vector<Row> rows_a = {{Value(int64_t(1))}};
     auto make = [&](Schema out, bool swapped, bool left_outer,
-                    std::unique_ptr<Expr> resid) {
+                    std::unique_ptr<Expr> resid,
+                    JoinSemantics sem = JoinSemantics::SEMI,
+                    Schema resid_schema = Schema({})) {
         return VecHashJoinNode(makeScan(probe_schema, rows_a), makeScan(build_schema, rows_a),
                                std::vector<int>{0}, std::vector<int>{0}, std::move(out),
                                swapped, left_outer, std::move(resid),
-                               JoinSemantics::SEMI);
+                               sem, std::move(resid_schema));
     };
-    // The MESSAGE, not just the type. Four guards, four distinct messages, one
-    // exception type: EXPECT_THROW alone passes whenever *some* guard fires, so
-    // reordering them — or deleting one whose case another happens to catch —
+    // The MESSAGE, not just the type. Several guards, several distinct messages,
+    // one exception type: EXPECT_THROW alone passes whenever *some* guard fires,
+    // so reordering them — or deleting one whose case another happens to catch —
     // leaves the test green while the guard it named is gone.
     auto message = [&](Schema out, bool swapped, bool left_outer,
-                       std::unique_ptr<Expr> resid) {
+                       std::unique_ptr<Expr> resid,
+                       JoinSemantics sem = JoinSemantics::SEMI,
+                       Schema resid_schema = Schema({})) {
         try {
-            make(std::move(out), swapped, left_outer, std::move(resid));
+            make(std::move(out), swapped, left_outer, std::move(resid), sem,
+                 std::move(resid_schema));
             return std::string("<no throw>");
         } catch (const std::runtime_error& e) {
             return std::string(e.what());
@@ -4345,11 +4351,159 @@ TEST(VecSemiJoin, RefusesEveryIllegalCombination) {
               "internal: a semi/anti join requires the probed side on the probe input");
     EXPECT_EQ(message(probe_schema, false, true,  nullptr),
               "internal: a semi/anti join cannot also be a left outer join");
-    EXPECT_EQ(message(probe_schema, false, false, col("pid")),
-              "internal: a semi/anti join takes no ON residual");
     EXPECT_EQ(message(merged,       false, false, nullptr),
               "internal: a semi/anti join's output schema must be the probe schema");
     EXPECT_NO_THROW(make(probe_schema, false, false, nullptr));
+
+    // WEEK 36 — "a semi/anti join takes no ON residual" WAS THE THIRD ENTRY IN
+    // THIS LIST and is gone for SEMI/ANTI, because q21 needs one. What replaces
+    // it is not a weaker check but four narrower ones, each pinned by its own
+    // message so that removing any of them turns this test red rather than
+    // leaving another to catch its case.
+    //
+    // (a) ANTI_NOT_IN still takes none, and that is a containment: its
+    //     build_had_unmatchable_key_ short-circuit answers "S holds a NULL, so
+    //     `x NOT IN S` is never TRUE" — a claim about the KEY column that a
+    //     residual makes untrue.
+    EXPECT_EQ(message(probe_schema, false, false, col("pid"),
+                      JoinSemantics::ANTI_NOT_IN, merged),
+              "internal: a NOT IN anti-join takes no ON residual");
+    // (b) a residual without the schema it resolves in. This is the shape that
+    //     would read a body column off the probe schema — the wrong-column class
+    //     the whole restamping exists to prevent — or throw per row at depth.
+    EXPECT_EQ(message(probe_schema, false, false, col("pid")),
+              "internal: a semi/anti join's residual schema must be its probe "
+              "schema followed by its build schema");
+    // (c) and the reverse, so a stale schema cannot sit beside a null predicate
+    //     looking harmless.
+    EXPECT_EQ(message(probe_schema, false, false, nullptr, JoinSemantics::SEMI, merged),
+              "internal: a semi/anti join was given a residual schema without a residual");
+    // (d) a STANDARD join's residual resolves in its OWN output schema, so a
+    //     second one handed here would be two schemas for one expression.
+    EXPECT_EQ(message(merged, false, true, col("pid"), JoinSemantics::STANDARD, merged),
+              "internal: a standard join's ON residual resolves in its output schema");
+    // THE LEGAL COMBINATION Week 36 ADDS, asserted here so the list above reads
+    // as a boundary and not as a ban.
+    EXPECT_NO_THROW(make(probe_schema, false, false, col("pid"),
+                         JoinSemantics::SEMI, merged));
+}
+
+// ===== Week 36: the SEMI/ANTI ON residual (TPC-H q21) =====
+//
+// HAND-SIMULATED ON CONCRETE ROWS, and the shape is q21's own: BOTH SIDES CARRY
+// A COLUMN CALLED `sup`, because q21's residual is `l3.l_suppkey !=
+// l1.l_suppkey` — one name, two aliases of one table, one on each side of the
+// join. That is the whole hazard, and it is why the columns here are not given
+// convenient distinct names.
+//
+// The four cases the plan asks for, all four in one fixture, because a semi/anti
+// join's failure mode is a MISSING row and a missing row is invisible in a spot
+// check:
+//
+//   pid=1  key matches, and one of its two candidates PASSES the residual
+//   pid=2  key matches, and its only candidate FAILS the residual
+//   pid=3  key matches NOTHING
+//   pid=4  key matches, and its only candidate makes the residual NULL
+//
+// SEMI keeps {1}. ANTI keeps {2,3,4} — including 4, which is guidance item 4:
+// an UNKNOWN residual is not a witness, so NOT EXISTS keeps the row exactly as
+// it would with no candidate at all. One sign flip away is the Week 33 round-2
+// failure (applying NOT IN's three-valued collapse to an anti-join).
+namespace {
+// A ColumnRef bound to a specific relation slot — which is the ONLY thing that
+// tells `sup` on the build side from `sup` on the probe side.
+std::unique_ptr<Expr> slotCol(const std::string& name, int slot) {
+    auto r = std::make_unique<ColumnRef>();
+    r->column_name = name;
+    r->id = ColumnId::local(slot);
+    return r;
+}
+
+// build `sup != sup`, build side on the left, probe side on the right — q21's
+// residual, spelled at the operator's level.
+std::unique_ptr<Expr> supNeSup() {
+    return binOp("!=", slotCol("sup", kResidualBuildSlot), slotCol("sup", 0));
+}
+
+std::unique_ptr<VecHashJoinNode> residualSemiJoin(JoinSemantics sem) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"sup", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"sup", TypeId::INT}});
+    // NullableSourceNode, never makeScan: pid=4's candidate carries a real SQL
+    // NULL, and a ColumnarTable cannot express one (invariant 14) — it would
+    // come back as a plain 0 and the UNKNOWN case would test nothing.
+    std::vector<Row> probe_rows = {
+        {Value(int64_t(1)), Value(int64_t(10))},
+        {Value(int64_t(2)), Value(int64_t(10))},
+        {Value(int64_t(3)), Value(int64_t(10))},
+        {Value(int64_t(4)), Value(int64_t(10))}};
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(int64_t(10))},   // pid=1: fails (10 != 10)
+        {Value(int64_t(1)), Value(int64_t(20))},   // pid=1: PASSES (20 != 10)
+        {Value(int64_t(2)), Value(int64_t(10))},   // pid=2: fails, and it is the only one
+        {Value(int64_t(4)), Value::null()}};       // pid=4: residual is NULL
+    return std::make_unique<VecHashJoinNode>(
+        std::make_unique<NullableSourceNode>(probe_schema, std::move(probe_rows)),
+        std::make_unique<NullableSourceNode>(build_schema, std::move(build_rows)),
+        std::vector<int>{0}, std::vector<int>{0},
+        probe_schema,           // !! STILL the probe schema, unmerged
+        /*swapped=*/false, /*left_outer=*/false, supNeSup(), sem,
+        joinResidualSchema(probe_schema, build_schema));
+}
+} // namespace
+
+// !! THIS IS THE BY-SLOT TEST, and it is constructed so that NAME resolution
+// gives a DIFFERENT, WRONG, PLAUSIBLE answer rather than an error.
+//
+// `sup` occurs twice in the residual schema. indexOf(name) takes the first
+// match, which is always the PROBE half — so a residual left to resolve by name
+// reads the probe's `sup` on both sides, evaluates `10 != 10` for every
+// candidate, and the residual is constantly FALSE. SEMI would then emit NOTHING
+// and ANTI would emit ALL FOUR. Both are clean, error-free, and wrong, and
+// --explain is identical either way (round 1's H-1 shape).
+//
+// Run against a tree whose residual refs are stamped with slot 0 on both sides,
+// this test reports {} instead of {1} and {1,2,3,4} instead of {2,3,4}.
+TEST(VecSemiJoin, TheResidualReadsTheBuildSideColumnAndNotTheSameNamedProbeColumn) {
+    auto semi = residualSemiJoin(JoinSemantics::SEMI);
+    EXPECT_EQ(pids(drainRows(*semi)), (std::vector<int64_t>{1}))
+        << "by NAME both sides read the probe's `sup`, the residual is 10 != 10 "
+           "for every candidate, and a SEMI join emits nothing";
+}
+
+TEST(VecAntiJoin, TheResidualReadsTheBuildSideColumnAndNotTheSameNamedProbeColumn) {
+    auto anti = residualSemiJoin(JoinSemantics::ANTI);
+    EXPECT_EQ(pids(drainRows(*anti)), (std::vector<int64_t>{2, 3, 4}))
+        << "by NAME the residual is constantly FALSE and an ANTI join emits all "
+           "four probe rows";
+}
+
+// A duplicate build key must STILL not duplicate the probe row once a residual
+// enters the loop — pid=1 has TWO candidates and one of them passes. This is the
+// week's own version of "THE test of the week" above: the residual scan is the
+// first loop in this operator that iterates build rows for a semi join, so it is
+// the first place the multiply-emitting inner-join shape could reappear.
+TEST(VecSemiJoin, TwoPassingCandidatesStillEmitTheProbeRowExactlyOnce) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}, {"sup", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"sup", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1)), Value(int64_t(10))}};
+    std::vector<Row> build_rows = {{Value(int64_t(1)), Value(int64_t(20))},
+                                   {Value(int64_t(1)), Value(int64_t(30))}};
+    VecHashJoinNode join(
+        std::make_unique<NullableSourceNode>(probe_schema, std::move(probe_rows)),
+        std::make_unique<NullableSourceNode>(build_schema, std::move(build_rows)),
+        std::vector<int>{0}, std::vector<int>{0}, probe_schema,
+        /*swapped=*/false, /*left_outer=*/false, supNeSup(), JoinSemantics::SEMI,
+        joinResidualSchema(probe_schema, build_schema));
+    EXPECT_EQ(pids(drainRows(join)), (std::vector<int64_t>{1}));
+}
+
+// The residual appears in --explain, which is what makes a mis-binding visible
+// on the surface used to debug it: the two same-named columns render
+// differently because the body side was renamed on its way into the projection.
+TEST(VecSemiJoin, ExplainShowsTheResidual) {
+    const std::string s = residualSemiJoin(JoinSemantics::ANTI)->explain();
+    EXPECT_NE(s.find("VecAntiHashJoin"), std::string::npos) << s;
+    EXPECT_NE(s.find("residual="), std::string::npos) << s;
 }
 
 TEST(VecSemiJoin, ExplainNamesTheKind) {

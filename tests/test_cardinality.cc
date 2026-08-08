@@ -758,18 +758,33 @@ TEST(Cardinality, SemiJoinContextCarriesNoBodyColumns) {
     EXPECT_DOUBLE_EQ(join->estimated_rows, 200.0);
 }
 
-// A semi/anti join carries no ON residual — the lowering pass builds none — and
-// the estimator asserts that rather than quietly handling a case that cannot
-// occur. An assertion that never fires is only worth keeping if something
-// proves it fires when violated.
-TEST(Cardinality, SemiJoinWithAnOnResidualIsAnInternalError) {
+// WEEK 36 — THIS TEST HELD THE OPPOSITE ASSERTION, AND THE FACT IT PINNED IS
+// NOW FALSE. It read "a semi/anti join carries no ON residual — the lowering
+// pass builds none — and the estimator asserts that rather than quietly handling
+// a case that cannot occur", and it EXPECT_THREW. Decorrelation builds one now
+// (TPC-H q21), so that throw would fire on a legal plan.
+//
+// What replaces it is the property that actually matters, and it is stronger
+// than "does not throw": the estimate is IDENTICAL with and without a residual.
+// That is the honest statement of what the estimator decided — leave the
+// semi-join rule unadjusted, because a residual moves a SEMI count DOWN and an
+// ANTI count UP, `selectivity()` is neither, and it cannot read build columns
+// that are in no context this pass holds. Equality pins that decision; "no
+// throw" alone would pass just as happily if somebody later applied a wrong
+// factor.
+TEST(Cardinality, SemiJoinWithAnOnResidualEstimatesExactlyAsItDoesWithoutOne) {
     Catalog cat(CATALOG);
     seedLapsStats(cat);
     seedDriversStats(cat);
+
+    auto plain = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
+    CardinalityEstimator::estimateSubtree(*plain, cat);
+    const double baseline = plain->estimated_rows;
+
     auto join = semiJoinOverLapsAndDrivers(JoinSemantics::SEMI);
-    auto lit = std::make_unique<Literal>(Value(int64_t(1)));
-    join->on_residual = std::move(lit);
-    EXPECT_THROW(CardinalityEstimator::estimateSubtree(*join, cat), std::runtime_error);
+    join->on_residual = std::make_unique<Literal>(Value(int64_t(1)));
+    ASSERT_NO_THROW(CardinalityEstimator::estimateSubtree(*join, cat));
+    EXPECT_DOUBLE_EQ(join->estimated_rows, baseline);
 }
 
 // ===== Seam audit (phase 5, pass 1) — DERIVED =====

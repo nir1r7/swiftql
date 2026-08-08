@@ -127,3 +127,60 @@ const Expr* pruningHintForPreservedSide(const Expr* hint, JoinType join_type,
 // unresolved ref, or a correlated reference inside a subquery, whose slot is a
 // position in another block's range table.
 void collectSlots(const Expr* expr, std::unordered_set<int>& out);
+
+// Week 36 — HOISTED OUT OF THE .cc's ANONYMOUS NAMESPACE, unchanged. The
+// decorrelation pass needs the same writing walk (it restamps a semi/anti join's
+// ON residual: the body-side refs onto the appended body projection, the
+// level-1 refs one scope outward), and a private copy there would be exactly the
+// third open-coded dispatch the comment below says must not exist. Moving it is
+// the smaller change than a twentieth site: nothing about the function changed,
+// only where it is visible from.
+// Every ColumnRef of `expr` that belongs to THIS query block, in tree order.
+//
+// THE MUTABLE TWIN OF collectSlots, and it is ONE function on purpose: this file
+// had two copies of the same dispatch (collectSlots reading, restampSlots
+// writing) and the header already warns that they must stay in lockstep. Week 37
+// needed a THIRD writer — remapping a conjunct's refs onto a derived body's
+// schema — and a third open-coded copy is how a lockstep of two becomes a
+// lockstep of three that nobody checks. restampSlots and both remappers below
+// are now expressed in terms of this walker, so there is one place to add an
+// Expr subtype on the writing side.
+//
+// The two SCOPE decisions are the ones collectSlots already documents and are
+// repeated here because they are what makes "belongs to this block" true:
+//   * a SubqueryExpr's OPERAND is this block's and is visited; its BODY is
+//     another scope's range table and is NOT. Rewriting inside it would renumber
+//     a different block.
+//   * an AggregateExpr's argument is visited even though no conjunct containing
+//     one survives to pushdown today, because collectSlots descends there and
+//     the lockstep is only true if both do.
+template <typename F>
+void forEachLocalColumnRef(Expr* expr, F&& f) {
+    if (!expr) return;
+    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { f(*cr); return; }
+    if (auto* bin = dynamic_cast<BinaryExpr*>(expr)) {
+        forEachLocalColumnRef(bin->left.get(), f);
+        forEachLocalColumnRef(bin->right.get(), f);
+        return;
+    }
+    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { forEachLocalColumnRef(isn->operand.get(), f); return; }
+    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) { forEachLocalColumnRef(un->operand.get(), f); return; }
+    if (auto* in = dynamic_cast<InExpr*>(expr)) { forEachLocalColumnRef(in->operand.get(), f); return; }
+    if (auto* lk = dynamic_cast<LikeExpr*>(expr)) { forEachLocalColumnRef(lk->operand.get(), f); return; }
+    if (auto* c = dynamic_cast<CaseExpr*>(expr)) {
+        for (auto& w : c->when_clauses) {
+            forEachLocalColumnRef(w.condition.get(), f);
+            forEachLocalColumnRef(w.result.get(), f);
+        }
+        forEachLocalColumnRef(c->else_expr.get(), f);
+        return;
+    }
+    if (auto* sub = dynamic_cast<SubstringExpr*>(expr)) {
+        forEachLocalColumnRef(sub->operand.get(), f);
+        forEachLocalColumnRef(sub->start.get(), f);
+        forEachLocalColumnRef(sub->length.get(), f);   // nullptr-safe
+        return;
+    }
+    if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) { forEachLocalColumnRef(agg->argument.get(), f); return; }
+    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr)) { forEachLocalColumnRef(sq->operand.get(), f); }
+}
