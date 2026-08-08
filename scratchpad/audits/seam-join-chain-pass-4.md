@@ -771,3 +771,22 @@ the same predicate, and because it means "what written order gives a conjunct" i
 engine-dependent, which the screen's property statement ("evaluated on exactly the ROW SET
 that written order gives it") quietly assumes away. The blocker I am ranking is the
 optimized-vs-`--no-optimize` pair, which is the invariant this project asserts.
+
+### P4-M1 — the fix is NOT one line, and that is part of the finding
+
+Calling `apply` on a declined semi/anti node's `children[0]` is legal for the reason A.1
+establishes (the reordered merged schema keeps its `(relation_slot, name)` pairs, so
+`leftKeyIndices` still resolves), but it is not sufficient. A semi/anti join stores a COPY
+of the spine's schema as its own output schema (`subquery_lowering.cc:92-95`,
+`Schema left_schema = spine->output_schema;` — and `subquery_decorrelation.cc:814` does the
+same), and `subquery_lowering.cc:106-109` records that a loop comparing the two was DELETED
+precisely because it could not fail. Reordering the spine underneath after that copy is
+taken makes it fail: the stored schema would carry the WRITTEN column order while the child
+emits the DP's order, and `VectorizedPlanBuilder` only checks the two agree in SIZE
+(`vectorized_plan_builder.cc:846-851`). So the fix has to re-derive the semi/anti node's
+output schema after the descent — and the deleted equality check is exactly the assertion
+that would have to come back.
+
+This is why P4-M1 is MEDIUM and not "an easy win left on the table": the loss is real and
+measured (43104 vs 60637), the enabling property holds, and there is a second edit the
+change requires that today's code has explicitly argued itself out of needing.
