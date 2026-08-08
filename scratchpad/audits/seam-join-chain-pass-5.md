@@ -19,7 +19,7 @@ file in the checkout is touched. Four legs per shape — `columnar/vectorized`
 
 ### A.1 — P4-B1, the FILTER-over-PROJECT descent — **FIXED, both halves**
 
-The fix is at `predicate_pushdown.cc:730-756`: before any conjunct is offered to
+The fix is at `predicate_pushdown.cc:751-756`: before any conjunct is offered to
 `remapThroughProject`, `apply()`'s PROJECT arm screens **every** expression in
 `project->exprs` with `exprMayRaise` against `project->children[0]->output_schema`
 (the projection's INPUT schema, which is where those expressions are evaluated),
@@ -150,7 +150,7 @@ to the node (`lj->on_residual`) and evaluated **inside the probe loop**, once pe
 candidate pair (`plan_nodes.cc:736-742, 778`; the vectorized join does the same).
 
 `distribute` then recurses into `children[0]` **unconditionally** for a LEFT
-join, on the identity σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) (`predicate_pushdown.cc:474-480`).
+join, on the identity σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) (`predicate_pushdown.cc:476-483`).
 That identity is exactly the same kind of claim P4-B1 turned on: **it is a SET
 equivalence and it is only half the obligation.** It preserves the join's
 OUTPUT; it does not preserve the set of CANDIDATE PAIRS, and the ON residual is
@@ -159,7 +159,7 @@ pairs means a raise the residual was owed is masked.
 
 Nothing screens `on_residual`. `firstMayRaise` is applied to the WHERE conjunct
 list in `pushIntoJoin` (`:541`), to the derived-body list in `pushIntoDerived`
-(`:625`) and to the descent list in `apply` (`:735`). `on_residual` is not a
+(`:623`) and to the descent list in `apply` (`:727`). `on_residual` is not a
 conjunct of any of those lists — it is a field on the join node — and no consumer
 of `expr_totality.h` looks at it. `expr_totality.h`'s own statement of the rule
 enumerates **three** consumers (predicate_pushdown, chunk_pruner, the LIMIT rule
@@ -201,7 +201,7 @@ same "degrade instead of drop" path the LEFT/semi decline already uses. That
 costs pushdown only on a query that has a raising ON residual at all.
 
 Two sweeps go with it, per the standing rule:
-* `predicate_pushdown.cc:474-486` — the paragraph that justifies the
+* `predicate_pushdown.cc:467-486` — the paragraph that justifies the
   unconditional `children[0]` recursion cites σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) as if it
   settled the question. It must say that the identity is about the join's OUTPUT
   and that the ON residual is evaluated on the join's CANDIDATE PAIRS, which the
@@ -280,7 +280,7 @@ ways). The cost model's own 43104 / 60637 is 1.41x, so the measurement and the
 model agree on direction and roughly on size.
 
 **The fix is still not one line, and both halves of pass 4's reason survive at
-HEAD.** `subquery_lowering.cc:92-95` still does `Schema left_schema =
+HEAD.** `subquery_lowering.cc:92-94` still does `Schema left_schema =
 spine->output_schema;` and hands the copy to the join as its output schema
 (`subquery_decorrelation.cc:813` likewise), and `subquery_lowering.cc:100-112`
 still records that the loop comparing the two was DELETED because "it compared a
@@ -563,7 +563,7 @@ top of the spine:
           LogicalScan [laps, 2 columns]
 
 `distribute` already recurses join by join and already re-applies its INNER/LEFT
-test at each one (`predicate_pushdown.cc:477-479` says so explicitly), so the new
+test at each one (`predicate_pushdown.cc:476-483` says so explicitly), so the new
 condition goes in the same place and inherits that property. Nothing else changes.
 
 **No existing pin can catch it, and the control pin stays green.**
