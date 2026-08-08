@@ -201,6 +201,14 @@ C1 is the finding stated the other way round: the INNER path is safe *because*
 the residual becomes a conjunct in the list the screen reads. The LEFT path was
 split off from it in Week 29 and never rejoined it.
 
+**The attribution is airtight, because the three legs that agree are exactly the
+three that do no predicate pushdown.** `Planner::plan` — the Volcano path — never
+calls `PredicatePushdown::apply` at all (`main.cc` invokes it only on the
+vectorized path, at `:138` and `:579`), and `--no-optimize` gates the same call.
+So `noop`, `rvol` and `cvol` all evaluate the residual on the full candidate-pair
+set and all raise; the one leg that pushes a conjunct below the join is the one
+leg that answers.
+
 ### Why the gate is green
 
 No harness query has a partial expression in an ON clause. TPC-H's one residual
