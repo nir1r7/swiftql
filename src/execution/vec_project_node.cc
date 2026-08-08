@@ -40,7 +40,10 @@ void VecProjectNode::prepare(){
         // derives the output type from the same function — but only take the
         // whole-column path when they agree exactly. A mismatch (e.g. a hand-built
         // schema declaring DOUBLE for an INT expression) falls back to the
-        // per-value append, which widens INT into a DOUBLE column.
+        // per-value append, which narrows INT into a DOUBLE column and REFUSES
+        // the narrowing when it would be observable (narrowToDoubleColumn,
+        // vec_types.h). This is Pass 2's route for a mixed-branch CASE, which
+        // compileNode declines on other grounds.
         if (compiled_[c] && compiled_[c]->type() != output_schema_.column(c).type) {
             compiled_[c].reset();
         }

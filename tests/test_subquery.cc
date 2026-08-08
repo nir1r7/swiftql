@@ -879,3 +879,119 @@ TEST(InLowering, AnUncorrelatedInIsStillLoweredAfterTheCorrelatedOneIsDeclined) 
     ASSERT_NE(j, nullptr);
     EXPECT_EQ(j->semantics, JoinSemantics::SEMI);
 }
+
+// ===== B3-2: the join-key type rule reaches all four JoinKey producers =====
+//
+// Week 29 refused a STRING key against a numeric one and wrote the loop inside
+// `Validator::validate`'s `for (stmt.joins)`. `stmt.joins` is ONE of four things
+// that produce a JoinKey; the other three (IN/NOT IN lowering, EXISTS/NOT EXISTS
+// decorrelation, the correlated-scalar rewrite) all shipped later and were
+// uncovered, so the text encoding decided and half-matched: on a zero-padded
+// STRING id against an INT, exactly the one row whose text is already canonical
+// matched, and the NOT forms returned the complement. Seam audit pass 3, B3-2.
+//
+// EVERY TEST BELOW FAILS WITHOUT THE FIX, and they fail in the honest direction:
+// planLowered RETURNS A PLAN instead of throwing, so the ADD_FAILURE branch is
+// the one that runs. Verified by running them against the tree before
+// Validator::validateJoinKeyTypes existed.
+
+namespace {
+
+// The refusal is one rule with one message; only the leading context word says
+// which construct produced the key. Pinning the shared phrase is what makes an
+// entry fire for any of the four, and pinning the context word is what tells
+// them apart.
+void expectJoinKeyRefusal(const std::string& sql, Catalog& cat, const char* context) {
+    try {
+        auto plan = planLowered(sql, cat);
+        ADD_FAILURE() << "a plan was built for " << sql
+                      << "; the key is compared as text, which half-matches "
+                      << "('16' matches the INT 16, '016' does not) and disagrees "
+                      << "with SQLite in both directions"
+                      << (findJoin(plan.get()) ? " [and it contains a join]" : "");
+    } catch (const std::runtime_error& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("cannot join a STRING column with a numeric one"),
+                  std::string::npos) << what;
+        EXPECT_NE(what.find(context), std::string::npos)
+            << "the message must name the construct that produced the key: " << what;
+    }
+}
+
+} // namespace
+
+// Producer 2 — subquery_lowering.cc. `laps.team` is STRING, `drivers.driver_id`
+// is INT.
+TEST(JoinKeyTypes, InLoweringRefusesAStringKeyAgainstANumericOne) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT lap_id FROM laps WHERE team IN "
+                         "(SELECT driver_id FROM drivers)", cat, "IN subquery");
+}
+
+// Same producer, the ANTI_NOT_IN branch. Worth its own case because the
+// three-valued rule returns the COMPLEMENT of the wrong row set, so the defect
+// shows up as extra rows rather than missing ones.
+TEST(JoinKeyTypes, NotInLoweringRefusesAStringKeyAgainstANumericOne) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT lap_id FROM laps WHERE team NOT IN "
+                         "(SELECT driver_id FROM drivers)", cat, "NOT IN subquery");
+}
+
+// Producer 3 — subquery_decorrelation.cc::splitCorrelation, via
+// lowerExistsSubqueries.
+TEST(JoinKeyTypes, CorrelatedExistsRefusesAStringKeyAgainstANumericOne) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE EXISTS "
+                         "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
+                         cat, "EXISTS subquery");
+}
+
+TEST(JoinKeyTypes, CorrelatedNotExistsRefusesAStringKeyAgainstANumericOne) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
+                         "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
+                         cat, "NOT EXISTS subquery");
+}
+
+// Producer 4 — the correlated-scalar rewrite's `$scalarN` LEFT join. It is a
+// STANDARD join, so it gets the generic context word; the key is still the
+// correlated equality splitCorrelation extracted.
+TEST(JoinKeyTypes, CorrelatedScalarRewriteRefusesAStringKeyAgainstANumericOne) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE "
+                         "(SELECT COUNT(*) FROM drivers d WHERE d.driver_id = l.team) > 0",
+                         cat, "join key");
+}
+
+// Producer 1 — the written JOIN, which Week 29 already covered. Kept as a
+// REGRESSION on the hoist: the rule now has two call sites (the AST loop, which
+// is the Volcano path's only cover, and the plan walk), and this is the one that
+// proves the AST loop still fires. No C++ test pinned it before B3-2; only
+// python_tools/compare_against_sqlite.py's rejection suite did.
+TEST(JoinKeyTypes, AWrittenJoinOnIsStillRefused) {
+    Catalog cat(CATALOG);
+    expectJoinKeyRefusal("SELECT l.lap_id FROM laps l JOIN drivers d "
+                         "ON l.team = d.driver_id", cat, "JOIN ON");
+}
+
+// THE CONTROL, and it is what keeps this a type rule rather than a blanket one.
+// keyFieldText routes an integral DOUBLE through the integer path so 7.0 and 7
+// join, matching SQLite's affinity (audit C3-4), and the rule is coarse on
+// purpose — both STRING or both numeric — so an INT key against a DOUBLE one
+// must still plan, through the lowering as well as through a written JOIN.
+TEST(JoinKeyTypes, NumericAgainstNumericAndStringAgainstStringStayLegal) {
+    Catalog cat(CATALOG);
+    // INT operand, DOUBLE body column, through the IN lowering
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l WHERE l.driver_id IN "
+        "(SELECT AVG(d.driver_id) FROM drivers d GROUP BY d.driver_id)", cat));
+    // STRING against STRING, through the correlated EXISTS decorrelation
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l WHERE EXISTS "
+        "(SELECT 1 FROM drivers d WHERE d.team = l.team)", cat));
+    // and the written JOIN both ways
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat));
+    EXPECT_NO_THROW(planLowered(
+        "SELECT l.lap_id FROM laps l JOIN drivers d ON l.team = d.team", cat));
+}

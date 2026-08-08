@@ -557,6 +557,91 @@ def run_suite(conn, queries, mode_label, extra_args=None):
     return passed, failed, errors, fail_list
 
 
+def normalize_ordered(rows):
+    """normalize() WITHOUT the final sort — rows compared in emission order.
+
+    Seam audit pass 3 (B.4.1): `normalize()` ends in `sorted(...)`, so every
+    divergence that is an ORDER difference and not a SET difference is invisible
+    to the invariant by construction. That is exactly half of blocker B3-1: a
+    reordered join permutes the sort input's schema, the positional tie-break in
+    `sort_comparator.h` reads that schema, and the two legs emit the same rows in
+    a different order. Without a LIMIT to turn the order difference into a set
+    difference, the sorted comparison passes it.
+
+    Used only where the query DECLARES an order (`ORDER BY`), because that is
+    the only case where SQL gives emission order any meaning at all. See
+    `_invariant_compare` for the split and for what it deliberately still cannot
+    see.
+    """
+    NULL_TOKEN = "\x00NULL"
+
+    def coerce(v):
+        if v is None or v == "NULL":
+            return NULL_TOKEN
+        try:
+            return round(float(v), 6)
+        except (ValueError, TypeError):
+            return str(v)
+    return [tuple(coerce(v) for v in row.values()) for row in rows]
+
+
+def _invariant_compare(query, rows):
+    """Pick the comparison the query's own text licenses.
+
+    ORDER BY present  → ORDERED (positional). Strictly stronger; measured
+                        against the whole suite before it was turned on, and all
+                        65 pre-existing ORDER BY entries already agreed under it,
+                        so it costs nothing and closes B.4's first obligation.
+    no ORDER BY       → SET (sorted), unchanged. A query with no declared order
+                        has no specified emission order, and a reordered join
+                        legitimately emits in a different one.
+
+    WHAT THIS STILL CANNOT SEE, stated rather than implied: a `LIMIT` with no
+    `ORDER BY` selects an unspecified subset, and both comparisons will call a
+    genuine plan-dependent subset change a difference — which is why that shape
+    lives in KNOWN_DIVERGENCES below and not here.
+    """
+    if re.search(r"\bORDER\s+BY\b", query, re.IGNORECASE):
+        return normalize_ordered(rows)
+    return normalize(rows)
+
+
+# What `optimized == --no-optimize` does and does not certify. Printed with the
+# result, because a number reported without its scope gets read as a bigger claim
+# than it is — which is how B3-1 stayed invisible behind "119 checks, 0
+# divergences".
+#
+# Established by seam audit pass 3, A.3 and B.4, and re-checked against
+# src/cli/main.cc:566 and :134 while this banner was written:
+#
+#   * `--no-optimize` gates EXACTLY THREE passes — PredicatePushdown,
+#     JoinEnumeration, CardinalityEstimator (main.cc:566-...). Those three, and
+#     only those, are what the two legs differ by.
+#   * SIX further passes run in both legs. FIVE of them — foldConstants,
+#     lowerInSubqueries, lowerExistsSubqueries, lowerCorrelatedScalars, derived
+#     normalization — run strictly BEFORE the gate on an input the flag cannot
+#     have touched, so their output is identical in both legs BY CONSTRUCTION.
+#     This differential is blind to a bug in any of them: both legs would be
+#     wrong identically. compare_against_sqlite.py is the check that sees those.
+#   * THE SIXTH IS NOT LIKE THE OTHER FIVE. `materializeSubqueries`
+#     (main.cc:500-543) EXECUTES the nested query and threads the flag into the
+#     nested runner (`runVectorizedToRows(..., args.no_optimize)`, main.cc:521),
+#     so the body is optimized in one leg and not in the other. It is ungated but
+#     its OUTPUT is gate-dependent, which is deliberate — a runner that always
+#     optimized would hand both legs the same sub-result and quietly stop testing
+#     the sub-plan. The consequence is that this differential DOES reach inside a
+#     subquery body, and a plan-dependent body turns into a different
+#     materialized constant (b31_subquery_* below).
+INVARIANT_SCOPE = (
+    "  scope: --no-optimize gates exactly 3 passes (pushdown, join enumeration,\n"
+    "         estimation). 5 further passes are identical in both legs BY\n"
+    "         CONSTRUCTION and are therefore NOT tested here — a bug in those is\n"
+    "         wrong in both legs and only the SQLite oracle can see it. The 6th,\n"
+    "         materializeSubqueries, threads the flag into the nested runner, so\n"
+    "         subquery BODIES are covered. ORDER BY queries compare positionally;\n"
+    "         the rest compare as sets.")
+
+
 def run_optimizer_invariant(queries):
     """Week 21: the optimizer must be result-preserving — vectorized output must be
     identical with and without --no-optimize. Compares SwiftQL to itself, no oracle."""
@@ -564,10 +649,11 @@ def run_optimizer_invariant(queries):
     passed, failed, errors = 0, 0, 0
     fail_list = []
     print(f"\n--- Optimizer invariant (vectorized: optimized == --no-optimize) ---")
+    print(INVARIANT_SCOPE)
     for label, query in queries:
         try:
-            opt = normalize(run_swiftql(query, VEC))
-            noopt = normalize(run_swiftql(query, VEC + ["--no-optimize"]))
+            opt = _invariant_compare(query, run_swiftql(query, VEC))
+            noopt = _invariant_compare(query, run_swiftql(query, VEC + ["--no-optimize"]))
             if opt == noopt:
                 print(f"  PASS  [{label}]  {query[:66]}")
                 passed += 1

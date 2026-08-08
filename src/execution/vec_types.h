@@ -3,6 +3,7 @@
 #include "common/type_id.h"
 #include "common/value.h"
 #include <string>
+#include <stdexcept>
 #include <variant>
 #include <vector>
 #include <cstdint>
@@ -97,12 +98,73 @@ inline Value valueAt(const ColumnVector& cv, int row) {
     return out;
 }
 
+// The largest magnitude an INT Value may carry into a DOUBLE column and still
+// be indistinguishable from the INT it was. Both halves of "indistinguishable"
+// bite, and the SMALLER bound is the one that decides:
+//
+//   - VALUE. Above 2^53 (9007199254740992) consecutive int64_t collapse onto one
+//     double: 2^53 and 2^53+1 both become 9007199254740992.0.
+//   - TEXT. `Value::toString()` renders a DOUBLE with `%.15g`, which switches to
+//     exponent form at 1e15 — so 1000000000000001 prints as "1e+15" while
+//     `std::to_string(int64_t)` prints all sixteen digits. The double is exact
+//     there; the rendering is not.
+//
+// 1e15 < 2^53, so the text bound subsumes the value bound and one comparison
+// covers both. Verified by construction, not by argument, in
+// tests/test_int_double_materialization.cc (`ThresholdIsExactlyTheBoundary`),
+// which walks outward from the constant and asserts it is the first magnitude
+// that fails either half — so a change to `%.15g` in Value::toString() breaks a
+// test rather than silently widening this window.
+static constexpr int64_t MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN = 1000000000000000LL;
+
+// The INT -> DOUBLE narrowing, refused when it would be observable.
+//
+// This is NOT the promotion `evaluate()` does via toNumeric(). That one is a SQL
+// semantic: `9007199254740993 * 1.0` is REAL arithmetic and every engine —
+// Volcano, vectorized, SQLite — loses the same bits, so it agrees. THIS one is a
+// storage artifact of the columnar batch: a ColumnVector holds one type, so a
+// value whose runtime type is INT under a schema that says DOUBLE has to be
+// converted to be stored at all. Volcano has no equivalent step — ProjectNode
+// emits the Value the evaluator produced, untouched by the schema — so wherever
+// the conversion is visible, the two engines answer differently and SQLite sides
+// with Volcano.
+//
+// The conversion is reachable whenever an expression's INFERRED type is DOUBLE
+// while its runtime Value is INT; `CASE` with one numeric branch of each kind is
+// the general route (inferExprType unifies to DOUBLE, evaluate() returns the
+// taken branch verbatim), and MIN/MAX over such a CASE reaches it a second way,
+// through the aggregate's own materialization.
+//
+// Refusing per VALUE rather than per EXPRESSION is deliberate. A plan-time
+// refusal of "CASE with mixed numeric branches" would also reject
+// `CASE WHEN c THEN 1 ELSE 0.5 END`, which is correct today in every mode. The
+// runtime test rejects exactly the queries that are wrong today and no others.
+inline double narrowToDoubleColumn(const Value& v) {
+    // STRING lands on asDouble() and raises bad_variant_access, as before.
+    if (v.type() != TypeId::INT) return v.asDouble();
+    const int64_t i = v.asInt();
+    if (i >= MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN ||
+        i <= -MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN) {
+        throw std::runtime_error(
+            "vectorized execution cannot materialize the integer " +
+            std::to_string(i) + " into a DOUBLE result column without changing "
+            "it. A chunk column holds one type, so an expression that mixes "
+            "INTEGER and REAL results (typically a CASE) is stored as REAL, "
+            "which is exact and prints identically only below 1e15. Re-run with "
+            "--execution volcano, or give the branches the same type.");
+    }
+    return static_cast<double>(i);
+}
+
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
-// widens into a DOUBLE column (lossless, and the same promotion evaluate() does
-// via toNumeric() — reachable when a schema declares DOUBLE for a type-
-// preserving MIN/MAX over an INT column). Every other type disagreement is a
-// planner/schema bug and surfaces as bad_variant_access from the typed
-// accessor, as it did before validity existed.
+// narrows into a DOUBLE column through narrowToDoubleColumn above, which THROWS
+// rather than change the value or its rendering — read that comment before
+// touching this; the widening was called "lossless" here for three weeks and it
+// is not, above 1e15. Every other type disagreement is a planner/schema bug and
+// surfaces as bad_variant_access from the typed accessor, as it did before
+// validity existed. (Checked, not assumed: DOUBLE or STRING into an INT column
+// and any number into a STRING column all reach a std::get of the wrong
+// alternative. INT -> DOUBLE was the only silent one.)
 inline void appendColumnValue(ColumnVector& cv, const Value& v) {
     if (v.isNull()) {
         // first NULL in this column: back-fill the all-valid prefix so
@@ -129,7 +191,7 @@ inline void appendColumnValue(ColumnVector& cv, const Value& v) {
         case TypeId::INT:
             std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
         case TypeId::DOUBLE:
-            std::get<std::vector<double>>(cv.data).push_back(v.toNumeric()); break;
+            std::get<std::vector<double>>(cv.data).push_back(narrowToDoubleColumn(v)); break;
         case TypeId::STRING:
             std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
     }

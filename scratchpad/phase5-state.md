@@ -1,5 +1,43 @@
 # Phase 5 orchestrator state
-Current: **SEAM PASS 3 RUNNING — join-chain reported 2 BLOCKERS. Audit does NOT end at pass 3.**
+Current: **PASS 3 COMPLETE (all 5 seams). FIX ROUND 3 WAVE A RUNNING — 4 agents.**
+  Pass 3 tally: 4 blockers (3 distinct roots), 2 HIGH, 2 MEDIUM, 11 LOW. Subquery chain CLEAN;
+  storage 0/0/1/3. **Every pass so far has returned blockers — 3 for 3.**
+  WAVE A (disjoint files): (1) comparator — canonical plan-independent column identity + EVERY cut
+    site; (2) harness — third catalog table + multi-relation coverage + random_diff TRAP-1;
+    (3) join-key type refusal — Week 29's guard reaches 1 of 4 JoinKey producers;
+    (4) value coercion — 7 vectorized re-materialization sites, INT->DOUBLE above 2^53.
+  WAVE B (HELD until wave A lands): `orderByWork` conjunct reordering (masks AND introduces
+    errors); pushdown never entering a derived body (9.4x); **S-9 `narrowRows` perf**; and pass 2's
+    B-2/B-3 — held because one is the ACCIDENTAL CONTAINMENT on the comparator's blast radius.
+  THEN: gate -> seam pass 4 (cap 5 passes) -> doc+coverage sweep -> q21 -> sf0.1 -> final gate.
+  ESTIMATE GIVEN TO USER at 04:50 UTC: optimistic 9h, likely **12-14h**, on measured historicals
+  (audit pass 35-54min, gate 22-34min, fix round 55-95min, ~5min per transition; full cycle ~3h).
+
+## PASS 3 — storage: 0 BLOCKER / 0 HIGH / 1 MEDIUM / 3 LOW (45522ca)
+`narrowRows` is CORRECT: no aliasing (the vector was always moved by value; `SeqScanNode` owns
+  `rows_` and `&rows_[cursor_]` points into its own member); no catalog-position indexing survives
+  (`grep` for catalog/getTable in plan_nodes.cc and evaluator.cc returns ZERO — the execution layer
+  structurally cannot see a catalog schema); no `hidden` interaction. 1588 query x cell comparisons
+  across the three real cells + --no-optimize, **0 divergences**, incl. 37 shapes built specifically
+  to break the new symmetry. (The commit's own example is BENIGN because driver_id is column 0 in
+  both legs; the discriminating shape is a tie WITHIN a repeated key.)
+**S-9 (MEDIUM) — and the instrument reports the WRONG SIGN.** `narrowRows` was landed as
+  "acceptable at this project's scale". Measured 6748cfc vs 922ca15, Release, TPC-H sf0.1:
+  `SELECT l_quantity FROM lineitem LIMIT 1` plan **64us -> 109312us**, total **1540x slower**.
+  Three of four measured queries got slower end to end; one sort-heavy got 1.75x faster, so it is a
+  genuine TRADE, not a pure loss. **`benchmark.py::run_once` greps `Execution:` only, so it reports
+  ALL FOUR faster — including the three that regressed.** The regression is not merely unmeasured;
+  the instrument reports the opposite sign. Fix: move the narrowing into `SeqScanNode::next()` as a
+  `keep_` index vector, mirroring the columnar branch's existing `reconstructed_row_`.
+L-1: S-8's duplicate-column refusal is now load-bearing for a SECOND reason — it is the only thing
+  stopping `narrowRows` double-moving on a duplicate name — and its comment states only the
+  columnar reason. L-2: `tables_.emplace` first-wins is reachable but behaves IDENTICALLY in all
+  three cells, so it is catalog input validation, not a storage divergence.
+Week 37 `VecScanNode`: slightly HARDER as written (+~15 lines to hoist `narrowRows` out of
+  `Planner::plan`), but EASIER if S-9 is fixed first — the fill loop becomes `row[keep_[i]]`.
+  **Do them in that order.**
+Sharper than recorded: both IN-subquery pins in `VOLCANO_BOUNDARIES` never matched their message at
+  all (`subqueries` vs `subquery`) — never live, rather than merely redundant.
   Fix round 2 gate was **GREEN** on 922ca15 (carries 70570dc): build genuine recompile 56 TUs
   0 warnings; unit 823/823; oracle 1496/0/0 (22 suites / 205 rejection entries); regression 318
   incl. 119 invariant, 0 divergences; tpch PASS 20/22 meaningful; baseline md5 unchanged both ends;
