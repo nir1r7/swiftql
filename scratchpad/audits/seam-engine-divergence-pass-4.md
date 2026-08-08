@@ -376,3 +376,165 @@ STRING-operand checks — sits on that difference.
 corpus query has a partial function whose precondition depends on a guarded column. 6 literals carry
 a >= 15-digit constant and none of them multiplies. The gate is green on a corpus with no instance
 of the class — the same sentence pass 2 and pass 3 each had to write.
+
+### B-2 FINDING **E-17 (MEDIUM)** — `deterministicCut` widens the row set an expression is
+### evaluated over, so adding a `JOIN` to a `LIMIT` query now turns a correct Volcano answer into
+### an error. Same root as E-13; a NEW instance, created by the fix under audit.
+
+The cut inserts its keyless sort **above** the projection (`--explain` confirms:
+`LogicalLimit [1] / LogicalSort [canonical row order] / LogicalProject [...] / LogicalJoin`). A sort
+is a pipeline breaker: it pulls every row of its child. So the projection beneath a cut is now
+evaluated over the WHOLE join output, where before the `LimitNode` asked it for `n` rows.
+
+```sql
+SELECT SUBSTRING(d.name, d.age - 34, 2) AS s FROM drivers d LIMIT 1
+   row-volcano / columnar-volcano   Dr
+   vectorized (both)                Error  (E-13, mechanism 2)
+
+SELECT SUBSTRING(d.name, d.age - 34, 2) AS s
+FROM drivers d JOIN laps l ON d.driver_id = l.driver_id LIMIT 1
+   ALL FOUR MODES                   Error: SUBSTRING: start position must be >= 1
+```
+
+The only structural difference between the two is the join — and a join cannot change which values
+of `SUBSTRING(d.name, d.age-34, 2)` are well-defined. It changes the answer because it changes
+`orderIsPlanStable` to false and so inserts the sort. Volcano answered the first before this phase
+and answers neither now.
+
+This is also the honest general form of **E-15**'s cost: the cut does not merely make a `LIMIT`
+slower, it makes the projection beneath it TOTAL. Wherever an expression is defined only on the rows
+a `LIMIT` would have kept, the cut converts an answer into an error.
+
+### B-3 FINDING **E-16 (LOW)** — `sort_comparator.h` justifies its duplicate-pair fallback with a
+### sentence that is false.
+
+> Where it is NOT unique — a projected schema with two identically named output columns — the sort
+> is stable, so those columns keep their schema order, and a PROJECTED schema's order is a function
+> of the SELECT list rather than of the plan.
+
+A `SELECT *` projection's order is NOT a function of the SELECT list: the star expansion copies the
+child schema's columns in the child's order (logical_plan.cc:1204-1216, planner.cc:433-445), and for
+a join that is the DP-permuted merged order. The fallback is nevertheless safe, for a different
+reason the comment does not give: the star copies whole `ColumnDef`s so `relation_slot` survives,
+and a duplicate `(slot, name)` pair needs two same-named columns inside ONE relation, which
+`derivedRelationSchema` (logical_plan.cc:503-511) and the catalog both refuse outright. Same class
+as pass 3's E-12: a comment that invites being checked, and fails the check, written by the fix
+under audit.
+
+### B-4 FINDING **E-18 (LOW)** — `random_diff.py`, the one brute-force differ, still cannot
+### generate `LIMIT`-without-`ORDER BY`, and both reasons it gives for that are now expired. Its
+### own docstring narrates this exact failure mode about the form one paragraph above.
+
+`random_diff.py:286-300` declines to emit `LIMIT n` with no `ORDER BY`, giving two reasons:
+
+> "no sort node exists in such a plan, so the deterministic tie-break cannot reach it and nothing
+> has changed about its unspecified-ness"
+
+False at HEAD: `deterministicCut` inserts exactly that sort node, and `--explain` prints it
+(`LogicalSort [canonical row order]`). The form is no longer unspecified — the legs are now
+*required* to agree, which is the same status change that made the file start generating the tied
+form.
+
+> "two hand-written instances of it are pinned in test_new_queries.py's KNOWN_DIVERGENCES, which
+> asserts they still diverge"
+
+`KNOWN_DIVERGENCES` does not exist anywhere in the tree — `grep -rn KNOWN_DIVERGENCE python_tools/`
+returns exactly one hit, this comment. The instances were promoted into `TIE_STRADDLE_QUERIES`
+(`b31_plain_limit_no_order_by`, test_new_queries.py:1330) and a comment at :1460-1467 records the
+move, so the pins are real — but the compensating control this file cites is a dangling name, and
+what it claims the pins assert ("they still diverge") is now the opposite of what they assert.
+
+The consequence is the one the file's own docstring writes out for the tied form: *"it was not that
+the generator missed the shape; it was forbidden from emitting it, in writing, for a reason that had
+expired."* One paragraph below, the next form along is in the same state.
+
+Run at HEAD as a control, 4 seeds x 60 shapes (240 queries, 3-8 relations, sf-small):
+`result-preserving 60/60` on every seed, 0 divergences — a true measurement of a generator that
+still cannot emit the shape pass 3 called a BLOCKER.
+
+---
+
+## What came back CLEAN — results, not gaps
+
+- **Both pass-3 blockers are closed** and stay closed under 108 mechanically generated
+  join+`LIMIT` shapes (three projection forms x four TPC-H relation pairs x every predicate subset),
+  a 13-shape hand battery, and 15 derived-table / correlated-scalar / semi-join shapes under a cut.
+- **The `(relation_slot, name)` argument holds.** All six `relation_slot` producers enumerated; the
+  two routes to a duplicate pair are closed by explicit refusals (`derivedRelationSchema`'s
+  "produced twice", the catalog's own duplicate check) rather than by luck. See A-2 and E-16.
+- **`orderIsPlanStable`'s per-node table is correct**, the switch is exhaustive over the 9-member
+  enum, and Volcano's local rule (`planner.cc:412`) agrees with it on every shape Volcano can build
+  (A-3).
+- **`MIN`/`MAX`'s order-dependent representative is not reachable** as a divergence: the only
+  compare-equal / render-different pairs are INT vs DOUBLE (which `%.15g` renders identically) and
+  INT above 2^53 (which the new magnitude refusal now rejects before it can be compared).
+- **`VecSimdLoopJoinNode` is correct on the adversarial shapes**, not just on ordering: 17 queries
+  covering duplicate build keys, duplicate keys on BOTH sides, a self-join on a non-unique key, an
+  empty build side, an empty probe side, aggregates over its output, cascading filters on both
+  inputs, an ON residual, and the two `LEFT JOIN` orientations it must decline — all four modes
+  identical. (`use_simd_` reaches `probeKeyScalar` on this box: CMakeLists sets no `-mavx2`/NEON
+  flag, so both intrinsic bodies compile out. The AVX2 body remains unexercised, as its own comment
+  says.)
+- **76 NULL-bearing and degenerate queries** — NULLs manufactured the only two ways the loader
+  allows (LEFT-JOIN null-extension against a never-matching ON, and division by zero) — across
+  10 expression shapes, 9 predicate shapes and 7 aggregates, each in `SELECT`, `DISTINCT`,
+  `COUNT/MIN/MAX`, `GROUP BY` and `HAVING` positions, plus empty-input scalar aggregates: **0
+  divergent**.
+- **The `LIMIT 0` degenerate case is not a cost trap**: `deterministicCut` gives its sort
+  `row_cap = 0`, which `VecSortNode` reads as UNBOUNDED — but `VecLimit [0]` returns before pulling,
+  measured at 0.22 s against 17.6 s for `LIMIT 1` on the same 5M-row self-join.
+- **`random_diff.py` 4 seeds x 60 shapes: 240 queries, 0 result-preservation failures.**
+- **Pass 3's E-10 is closed by refusal and the bound is EXACT**: `9007199254740993` and
+  `9007199254740992` under `SELECT DISTINCT` now raise on the vectorized path instead of collapsing
+  to 2 rows, while the same query at `999999999999999` / `999999999999998` returns 3 rows in all
+  four modes.
+
+---
+
+## SUMMARY
+
+```
+BLOCKER   1   E-13
+MEDIUM    3   E-14, E-15, E-17
+LOW       2   E-16, E-18
+```
+
+| # | Rank | Finding | Concrete failing shape? |
+|---|---|---|---|
+| **E-13** | **BLOCKER** | The two engines evaluate expressions on **different row sets**, in both directions. `evaluate()` computes both operands of `AND` before applying the tri-state (evaluator.cc:99-111) while `evalPredicate` cascades the selection vector (columnar_eval.cc:143-146); and `VecProjectNode` evaluates a whole chunk while Volcano's pull-based `LimitNode` asks its projection for `n` rows. Every partial function in the engine — `SUBSTRING`'s two preconditions, all five `checked_arith` operators — sits on that difference. | Yes — run. `SELECT name, age FROM drivers WHERE age > 30 AND SUBSTRING(name, age-30, 3) = 'er_'`: Volcano **errors**, vectorized returns the correct 3 rows. Swapping the two conjuncts flips the vectorized path to an error, so it disagrees with ITSELF on a commutative operator. `SELECT SUBSTRING(name, age-34, 2) FROM drivers LIMIT 3`: Volcano `Dr/Dr/Dr`, vectorized errors — and without the `LIMIT` all four agree. A pruning variant makes the two Volcano legs disagree with each other. |
+| **E-14** | MEDIUM | Both new INT->DOUBLE refusals fire on queries that are correct today. `taintWalk` arms both operands of `/` with no test on their types, so `x / 2.0` — where truncation is impossible — is refused; and the magnitude refusal enforces the `%.15g` **rendering** bound on values that are never rendered, where the double is exact. Not the residue the comments admit. | Yes — run. `SELECT MAX(CASE WHEN lap_id=1 THEN 7 ELSE 0.5 END) / 2.0 FROM laps`: Volcano `3.5`, vectorized refuses. `SELECT MAX(CASE WHEN lap_id=1 THEN 2000000000000000 ELSE 0.5 END) > 1 FROM laps`: Volcano `1`, vectorized refuses. The derived-table form of the first has **no** working mode. |
+| **E-15** | MEDIUM | The deterministic cut's cost lands on `materializeSubqueries`' INJECTED `LIMIT 1` for an uncorrelated `EXISTS`, where only `!res.rows.empty()` is ever read, so the chosen row's identity is provably unused. The user wrote no `LIMIT`. | Yes — measured (Debug build; ratios are the claim). `EXISTS (SELECT … FROM laps a JOIN laps b ON driver_id)` = 17.25 s, the same as the top-level `LIMIT 1`, and **2.2x slower than counting the entire join** (7.73 s). Control: the same `EXISTS` over a plan-stable SCAN is 0.21 s. |
+| **E-17** | MEDIUM | The cut's sort sits ABOVE the projection, so the projection beneath a `LIMIT` became TOTAL. Adding a `JOIN` to a `LIMIT` query now converts a correct Volcano answer into an error. New, caused by the fix under audit; same root as E-13. | Yes — run. `SELECT SUBSTRING(d.name, d.age-34, 2) FROM drivers d LIMIT 1` -> Volcano `Dr`. Add `JOIN laps l ON d.driver_id = l.driver_id` -> **all four modes error**. |
+| **E-16** | LOW | `sort_comparator.h`'s justification for the duplicate-`(slot,name)` fallback — "a PROJECTED schema's order is a function of the SELECT list rather than of the plan" — is false for `SELECT *`, whose expansion inherits the DP-permuted merged order. The fallback is safe for a different reason. | No — documentation, checked against the code |
+| **E-18** | LOW | `random_diff.py` still refuses to generate `LIMIT`-without-`ORDER BY`, and both stated reasons expired: the sort node it says cannot exist is now inserted by `deterministicCut`, and the `KNOWN_DIVERGENCES` suite it cites as the compensating control does not exist in the tree. Its own docstring narrates this failure mode about the form one paragraph above. | No — a coverage gap, measured (240 generated queries, 0 of the shape) |
+
+### Verdict
+
+**The seam is not clean, but for the first time the defect is not the one the previous fix left
+behind.** Fix round 3 closed both of pass 3's blockers, and closed them as a CLASS rather than as
+instances: 108 mechanically generated join+`LIMIT` shapes, 15 derived/correlated/semi shapes, four
+`random_diff` seeds and the E-8/E-9 repros themselves are all identical in all four modes, and the
+`(relation_slot, name)` argument survives being attacked at every one of its six producers.
+
+What pass 4 found instead is a different axis entirely, and one that no previous pass looked along:
+**the two engines do not agree about WHICH ROWS an expression is evaluated on.** The scalar
+evaluator is eager where the chunk path short-circuits (`AND`); the chunk path is eager where the
+scalar pipeline is lazy (`LIMIT` over a projection). The project has already reasoned about exactly
+this class once — README:782 and development.md:442 state it for `CASE`, and `compileNode` declines
+`CASE` because of it — but the rule was written as a property of `CASE` rather than of *any
+construct whose two implementations disagree about which sub-expressions get evaluated*, so the
+connective and the pipeline shape both escaped it. Volcano, the declared correctness baseline, is
+the engine that fails the `AND` case; the vectorized path fails the `LIMIT` case; and the vectorized
+path additionally disagrees with itself on `A AND B` versus `B AND A`.
+
+Fix round 3 also added a third instance of the same class without anyone noticing (**E-17**): its
+sort sits above the projection, so a `LIMIT` over a join now evaluates the projection totally, and a
+query Volcano answered before the fix errors after it.
+
+The gate being green is consistent with all of this and is not evidence against it, measured rather
+than assumed: of 592 distinct `SELECT` literals in the corpus, 11 use `SUBSTRING`, 5 of those under
+an `AND`, and **all 5 use a constant start position**; 6 carry a >= 15-digit constant and none
+multiplies. The corpus contains zero instances of the class, exactly as it contained zero instances
+of pass 2's and pass 3's.
+
+**This pass does not end the audit.**
