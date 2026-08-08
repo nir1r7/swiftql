@@ -68,10 +68,31 @@ Its gates, in a scratch worktree at 689ea9a + its change ONLY: unit **892** (874
 both sides.
 **!! DO NOT GATE THE BRANCH YET — the partiality agent's partial work is in the shared tree and
 `test_storage.cc` DOES NOT COMPILE right now.** Wait for it to report.
-16 oracle entries owed, listed in its report — 5 rejection (pin `"that another expression divides"`),
-**only #3 is a non-vacuous Volcano diff** (7085; #1/#2/#4 are 0 in Volcano so diffing them asserts
-nothing), 8 four-mode guards, 3 vec-only derived guards. Prefer a NEW family `TYPEFIX_CUT_*` so the
-existing `assert len(TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED) == 6` stays about the single-plan family.
+Oracle entries: **DONE, in `TYPEFIX_CUT_*` (bb67beb).** 120/120 new entries pass across their modes.
+**MY OWN DURABILITY FAILURE, recorded so it is not repeated:** I wrote here that the 16 entries were
+"listed in its report" — but that report was a TRANSIENT TASK NOTIFICATION, never committed. The
+harness agent found a forward-reference to a section that does not exist and had to RECONSTRUCT
+every shape from the fixer's 28 GoogleTest cases in `tests/test_int_double_type_through_division.cc`.
+**Never record "see its report" in this file. Paste the payload or it does not exist.**
+**AND THE RECONSTRUCTION CAUGHT A WRONG NUMBER I RELAYED**: entry #3's expected value is **9605, not
+7085**. `round / (SELECT MAX(CASE…)) > 0` returns 9605 in row-Volcano, col-Volcano AND SQLite —
+exactly the rows with `round >= 2`, which is what integer truncation predicts. 7085 belonged to
+some other fixture. Measured, not taken on trust.
+It also pinned something NOBODY ASKED FOR: round 4 split the magnitude bound in two (1e15 for
+printable text, 2^53 otherwise) and NOTHING in the oracle covered that. Three entries now do —
+2e15 reaching only a filter ANSWERS; the same magnitude in the output REFUSES; 2^53+1 unprinted
+STILL REFUSES. All four pre-existing E-10 entries re-verified against the new rule, no regression.
+The INT-narrowing pin matrix now spans magnitude, division AND cut refusals in ONE matrix (17 pins),
+since they share an opening sentence — the rot vector that bit once already.
+**IT CAUGHT ONE OF ITS OWN ENTRIES**: it put the derived swapped-twin in the four-mode rejection
+list; both Volcano modes refuse the derived table by CAPABILITY before the partial expression is
+reached. Split into two lists with two pins, plus two controls proving the divergence is specific
+to the OUTER position (the same conjunct inside the body answers 8), so the rejection cannot be
+misread as "derived bodies can't do this".
+**IT ALSO CORRECTED ITS OWN EARLIER REPORT, AND MINE**: the oracle run it previously called green
+had actually hit its 3000s timeout INCOMPLETE (exit 143), 0 failures across roughly two-thirds of
+the suite. I relayed that as green. Timeout now 5400s. `test_storage.cc` compiles — the state
+file's warning about it was stale.
 
 ## HELD FOR WAVE C (collides on logical_plan.cc with the partiality agent)
 - **P4-M1**: the fully-inner spine BELOW a declined semi/anti join is still never enumerated —
