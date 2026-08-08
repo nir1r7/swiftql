@@ -107,9 +107,12 @@ class CardinalityEstimator {
         // evaluation not being total, a wrong number here used to decide whether
         // the query ERRORS. The rule is therefore not "this may be inaccurate":
         // it is that a conjunct that CAN RAISE must never be ranked at all.
-        // PredicatePushdown enforces it (firstMayRaise), not this function, and
-        // any new caller of selectivity() that reorders evaluation owes the same
-        // screen.
+        // PredicatePushdown enforces it, not this function, and any new caller
+        // of selectivity() that reorders evaluation owes the same screen —
+        // `firstMayRaise` in parser/expr_totality.h, which is now shared with
+        // ChunkPruner and with logical_plan.cc's LIMIT rule rather than private
+        // to the pushdown pass. Pass 4 found the same defect in all three, so
+        // there is deliberately only one copy to call.
         static double selectivity(const Expr* pred, const StatsContext& ctx);
 
         // Estimate ONE subtree in isolation: stamps estimated_rows bottom-up and
