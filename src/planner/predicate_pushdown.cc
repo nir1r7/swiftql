@@ -520,6 +520,19 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
     return filterOnto(std::move(join), std::move(residual_exprs), catalog);
 }
 
+// Re-enter every subtree hanging off a join spine that is NOT part of the spine:
+// each relation leaf, and a semi/anti join's body. Twin of the function of the
+// same name in join_enumeration.cc, and for the same reason — see
+// PredicatePushdown::apply below.
+void applyToSpineLeaves(LogicalPlanNode* node, const Catalog& catalog) {
+    auto* join = static_cast<LogicalJoin*>(node);
+    if (join->children[0]->type == LogicalNodeType::JOIN)
+        applyToSpineLeaves(join->children[0].get(), catalog);
+    else
+        join->children[0] = PredicatePushdown::apply(std::move(join->children[0]), catalog);
+    join->children[1] = PredicatePushdown::apply(std::move(join->children[1]), catalog);
+}
+
 } // namespace
 
 std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<LogicalPlanNode> node,
@@ -529,7 +542,19 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
     if (node->type == LogicalNodeType::FILTER &&
         node->children[0]->type == LogicalNodeType::JOIN) {
         auto* f = static_cast<LogicalFilter*>(node.release());
-        return pushIntoJoin(std::unique_ptr<LogicalFilter>(f), catalog);
+        node = pushIntoJoin(std::unique_ptr<LogicalFilter>(f), catalog);
+        // SEAM AUDIT PASS 2, B-2. This used to `return` here, so a derived or
+        // subquery body below a joining outer block was never visited and its own
+        // FILTER-over-JOIN was never rewritten — the same silent decline
+        // JoinEnumeration::apply had, in the same shape and found in the same
+        // pass. Descending into the SPINE ITSELF would be wrong (and wasted):
+        // pushIntoJoin has already routed every conjunct it can, and the
+        // leftover/residual bookkeeping is written for one visit. The leaves are
+        // what was never reached.
+        LogicalPlanNode* spine = node->type == LogicalNodeType::FILTER
+                               ? node->children[0].get() : node.get();
+        applyToSpineLeaves(spine, catalog);
+        return node;
     }
 
     // A WHERE directly above a single scan is already at the lowest node, but
