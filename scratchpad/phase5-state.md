@@ -1,4 +1,64 @@
 # Phase 5 orchestrator state
+
+## !! PENDING MERGE — `claude/typefix-wt` @ 070e01a (pushed to origin, durable)
+Type-through-division fix is DONE but **NOT on the working branch**. Merge it as soon as the
+optimizer wave-B agent finishes — not before, because it is live in the shared worktree and the
+merge touches files under its build. `070e01a` already merges the shared branch at 451c0d9.
+**FRAMING (sharper than my brief's):** the question is not "is this column read by another
+expression" but **"can this column's INT-ness reach an operand of `/`"** — `/` is the ONLY operator
+in the dialect whose VALUE depends on operand types. Everything else coerces (comparisons), renders
+identically (`x+1` is "8" from both 8 and 8.0), or normalizes (`keyFieldText` for group/DISTINCT/
+join keys; ORDER BY compares numerically). Widening to "any expression" would refuse `WHERE x > 3`
+and `SELECT x*2`, correct today — the blanket refusal one step out.
+**ARM AT THE ORIGIN, NOT THE CONSUMER.** In `SELECT y/4 FROM (SELECT x*2 AS y FROM (CASE…7…) t) u`
+the value is already 14.0 by the time `y` materializes, so arming `y` fires on nothing; only `x`,
+one level down, sees the INT. Hence an ORIGIN SET per output column, taint-walked back through
+`+ - * /`, derived tables, joins and MIN/MAX. Arming at the producer also makes the rule
+independent of who divides — the `WHERE x/2 > 3` case is consumed by `VecFilterNode`, which the
+agent does not own and never touched, and it refuses anyway.
+**BOTH HALVES REQUIRED:** plan shape AND an INT actually arriving. Plan-shape alone would refuse
+`WHERE lap_id = 99` where no row takes the INT branch and today's answer is right; the runtime test
+alone is the blanket refusal.
+ONE CAUSE, two sites (the same two E-10 named): VecProject's Pass-2 `evaluate()` path and
+`VecHashAggregate::fillChunk`'s MIN/MAX arm — MIN/MAX are ORDER STATISTICS, so they hand back the
+argument's own Value AND TYPE. Proof it is one cause: a test stacking the derived-table consumer on
+the HAVING producer needed no third fix.
+11 tests written against the PUBLIC PLANNER API ONLY so they compile and run unchanged on b13a96a:
+  **6 failed / 5 passed pre-fix; 11 pass post-fix.** Every witness is 7 and 0.5; largest number in
+  the file is 8. The 5 Guards pass both ways and are NAMED as the fence, not as evidence.
+Gates on the merged tree: unit 868/868, oracle 1556/0, regression 330/0, tpch PASS 20/22 verbatim.
+On b13a96a the oracle output was **BYTE-IDENTICAL** with and without the fix — no passing answer moved.
+COST STATED: it also refuses a division that happens to be EXACT (`THEN 6` over `/2` gives 3 either
+way, right today). Closing that needs the question asked at the division site
+(`expression_executor.cc` / `evaluator.cc`), deliberately not reached into. Also left open:
+checked-INT overflow (`x * <huge>` throws in Volcano, yields a double here) — a magnitude story like
+`narrowToDoubleColumn`'s, and arming for it would refuse `SELECT x*2`, right today.
+
+### Oracle entries owed for the typefix — SEQUENCE AFTER THE MERGE, not before
+**PIN STRING: `"that another expression divides"`. Do NOT use `"cannot materialize the integer"` —
+E-10's magnitude refusal also emits that.** All verified against 070e01a.
+(a) Refusal-only, NO Volcano leg (Volcano cannot run derived tables):
+  1. `SELECT x / 2 FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x FROM laps WHERE lap_id < 4) t` — SQLite `3, 0.25, 0.25`
+  2. `SELECT x FROM (… same body …) t WHERE x / 2 > 3` — SQLite 0 rows (consumer is VecFilterNode)
+  3. `SELECT y / 4 FROM (SELECT x * 2 AS y FROM (… same body …) t) u` — taint through `*` and two derived levels
+(b) Volcano-answers / vectorized-refuses (the E10_VOLCANO_ONLY + _VECTORIZED_REFUSED pairing):
+  4. `SELECT team, MAX(CASE WHEN lap_id=2 THEN 7 ELSE 0.5 END) / 2 AS m FROM laps WHERE lap_id < 4 GROUP BY team ORDER BY team`
+     — SQLite AND both Volcano modes: AlphaTauri 3 / McLaren 0.25 / RedBull 0.25. **THE NON-VACUOUS
+     VALUE WITNESS — this one carries the diff.**
+  5. the HAVING row-count witness — SQLite 0 rows, both Volcano 0 rows. **Its Volcano leg is EMPTY so
+     the harness will flag it vacuous: add as a REFUSAL PIN ONLY and let #4 carry the diff.**
+(c) Boundary guards, ALL FOUR MODES must answer and match SQLite:
+  6. the bare mixed CASE -> `7, 0.5, 0.5`
+  7. `THEN 1 ELSE 0.5` -> `1, 0.5, 0.5` — **the named answer a blanket refusal would have cost**
+  8. the aggregate produced but NOT divided -> AlphaTauri 7 / McLaren 0.5 / RedBull 0.5
+(d) Boundary guards, _VEC_ONLY (derived tables), both vec modes answer and match SQLite:
+  9. `… WHEN lap_id = 99 …` armed shape where NO INT reaches it -> `0.25 x3`. **This is the entry
+     that fails if anyone converts the rule to a plan-time-only refusal.**
+  10. `THEN 7.0` -> `3.5, 0.25, 0.25`
+  11. `SELECT x + 1 …` -> `8, 1.5, 1.5` — **fails if the rule is ever widened past `/`**
+Entries 9-11: row ORDER differs between SQLite and SwiftQL on data/laps.csv (no ORDER BY) — use
+unordered comparison or add an ORDER BY.
+
 Current: **PASS 3 COMPLETE (all 5 seams). FIX ROUND 3 WAVE A RUNNING — 4 agents.**
   Pass 3 tally: 4 blockers (3 distinct roots), 2 HIGH, 2 MEDIUM, 11 LOW. Subquery chain CLEAN;
   storage 0/0/1/3. **Every pass so far has returned blockers — 3 for 3.**
