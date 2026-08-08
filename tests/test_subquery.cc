@@ -897,10 +897,17 @@ TEST(InLowering, AnUncorrelatedInIsStillLoweredAfterTheCorrelatedOneIsDeclined) 
 
 namespace {
 
-// The refusal is one rule with one message; only the leading context word says
-// which construct produced the key. Pinning the shared phrase is what makes an
-// entry fire for any of the four, and pinning the context word is what tells
-// them apart.
+// The refusal is one rule with one message; only the leading context clause says
+// which construct produced the key. TWO needles, and they are different jobs:
+// the shared phrase proves it is THIS refusal and not some other throw the query
+// happens to trigger, and the context clause proves the message names the right
+// construct.
+//
+// `context` is pinned WITH its trailing ": cannot join" on purpose. The bare
+// words do not discriminate — "EXISTS subquery" is a substring of both
+// "IN / EXISTS subquery" and "NOT EXISTS subquery", so a NOT-EXISTS pin would
+// have been satisfied by the wrong message and passed for the wrong reason. Each
+// full clause below is producible by exactly one branch of joinKeyContext().
 void expectJoinKeyRefusal(const std::string& sql, Catalog& cat, const char* context) {
     try {
         auto plan = planLowered(sql, cat);
@@ -925,7 +932,7 @@ void expectJoinKeyRefusal(const std::string& sql, Catalog& cat, const char* cont
 TEST(JoinKeyTypes, InLoweringRefusesAStringKeyAgainstANumericOne) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT lap_id FROM laps WHERE team IN "
-                         "(SELECT driver_id FROM drivers)", cat, "IN subquery");
+                         "(SELECT driver_id FROM drivers)", cat, "IN / EXISTS subquery: cannot join");
 }
 
 // Same producer, the ANTI_NOT_IN branch. Worth its own case because the
@@ -934,23 +941,26 @@ TEST(JoinKeyTypes, InLoweringRefusesAStringKeyAgainstANumericOne) {
 TEST(JoinKeyTypes, NotInLoweringRefusesAStringKeyAgainstANumericOne) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT lap_id FROM laps WHERE team NOT IN "
-                         "(SELECT driver_id FROM drivers)", cat, "NOT IN subquery");
+                         "(SELECT driver_id FROM drivers)", cat, "NOT IN subquery: cannot join");
 }
 
 // Producer 3 — subquery_decorrelation.cc::splitCorrelation, via
-// lowerExistsSubqueries.
+// lowerExistsSubqueries. The context clause is "IN / EXISTS" and NOT "EXISTS":
+// both lowerings build a SEMI join and nothing on the node distinguishes them,
+// so the message names both rather than guessing one. Naming the wrong cause for
+// the right refusal is a defect this tree has logged three times.
 TEST(JoinKeyTypes, CorrelatedExistsRefusesAStringKeyAgainstANumericOne) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE EXISTS "
                          "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
-                         cat, "EXISTS subquery");
+                         cat, "IN / EXISTS subquery: cannot join");
 }
 
 TEST(JoinKeyTypes, CorrelatedNotExistsRefusesAStringKeyAgainstANumericOne) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
                          "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
-                         cat, "NOT EXISTS subquery");
+                         cat, "NOT EXISTS subquery: cannot join");
 }
 
 // Producer 4 — the correlated-scalar rewrite's `$scalarN` LEFT join. It is a
@@ -960,7 +970,7 @@ TEST(JoinKeyTypes, CorrelatedScalarRewriteRefusesAStringKeyAgainstANumericOne) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT l.lap_id FROM laps l WHERE "
                          "(SELECT COUNT(*) FROM drivers d WHERE d.driver_id = l.team) > 0",
-                         cat, "join key");
+                         cat, "join key: cannot join");
 }
 
 // Producer 1 — the written JOIN, which Week 29 already covered. Kept as a
@@ -971,7 +981,7 @@ TEST(JoinKeyTypes, CorrelatedScalarRewriteRefusesAStringKeyAgainstANumericOne) {
 TEST(JoinKeyTypes, AWrittenJoinOnIsStillRefused) {
     Catalog cat(CATALOG);
     expectJoinKeyRefusal("SELECT l.lap_id FROM laps l JOIN drivers d "
-                         "ON l.team = d.driver_id", cat, "JOIN ON");
+                         "ON l.team = d.driver_id", cat, "JOIN ON: cannot join");
 }
 
 // THE CONTROL, and it is what keeps this a type rule rather than a blanket one.

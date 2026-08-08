@@ -138,17 +138,22 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
 //
 // Coarse on purpose — both STRING or both numeric — matching `Value::operator==`,
 // which coerces INT/DOUBLE and throws only across the STRING boundary.
+// `join_desc` is ALREADY QUOTED by the caller, because one caller has a name the
+// user did not write: the correlated-scalar rewrite renames its key columns to
+// `$kN` (they are the derived relation's group keys). Quoting that verbatim would
+// diagnose legal SQL by naming a column that does not appear in it — the
+// wrong-cause class seam audit pass 2 logged as B-2 on this same rewrite.
 void requireJoinKeyTypes(const char* context,
                          const Schema& left, int li,
                          const Schema& right, int ri,
                          const std::string& from_col,
-                         const std::string& join_col) {
+                         const std::string& join_desc) {
     const bool l_str = left.column(li).type  == TypeId::STRING;
     const bool r_str = right.column(ri).type == TypeId::STRING;
     if (l_str == r_str) return;
     throw std::runtime_error(
         std::string(context) + ": cannot join a STRING column with a numeric one ('"
-        + from_col + "' and '" + join_col + "'). Keys are matched as serialized "
+        + from_col + "' and " + join_desc + "). Keys are matched as serialized "
         "text, which carries no type tag, so the STRING would match only when it "
         "is already the number's canonical rendering ('16' matches the INT 16, "
         "'016' does not) while SQLite's affinity converts and matches both. "
@@ -199,8 +204,11 @@ void Validator::validateJoinKeyTypes(const LogicalPlanNode& plan) {
         // A MISS IS NOT THIS RULE'S TO REPORT: leftKeyIndices and rightKeyIndices
         // throw on it by name at lowering, with the message that owns it.
         if (li < 0 || ri < 0 || ri >= right.size()) continue;
+        const std::string join_desc =
+            key.join_col.rfind('$', 0) == 0 ? "the subquery's key column"
+                                            : "'" + key.join_col + "'";
         requireJoinKeyTypes(joinKeyContext(join), left, li, right, ri,
-                            key.from_col, key.join_col);
+                            key.from_col, join_desc);
     }
 }
 
@@ -413,7 +421,7 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
                 int ri = right_schema->indexOf(k.join_col);
                 if (li < 0 || ri < 0) continue;  // existence is validateJoinCondition's
                 requireJoinKeyTypes("JOIN ON", *left_schema, li, *right_schema, ri,
-                                    k.from_col, k.join_col);
+                                    k.from_col, "'" + k.join_col + "'");
             }
         }
     }
