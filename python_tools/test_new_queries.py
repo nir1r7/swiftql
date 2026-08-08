@@ -1419,6 +1419,46 @@ TIE_STRADDLE_QUERIES = [
      "WHERE d.nationality = 'Zzz' "
      "AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'"),
 
+    # ── Round 4: partial expressions under a DEFINED evaluation order ───────
+    # A conjunct is evaluated only on rows where every conjunct WRITTEN BEFORE
+    # it was TRUE. That makes `p AND q` and `q AND p` different programs when `q`
+    # can raise, and it makes CONJUNCT ORDER an optimizer-visible property: any
+    # pass that reorders conjuncts can turn an answer into an exception. That is
+    # exactly what this runner sees, because it records an exception from either
+    # leg as an ERROR.
+    #
+    # The guarded orders below must ANSWER in both legs. Their swapped twins
+    # correctly raise and therefore live in compare_against_sqlite.py's rejection
+    # suite — an entry whose right answer is "both legs error" cannot be asserted
+    # here without reading as a failure.
+    ("w37p_guard_first_substring",
+     "SELECT COUNT(*) AS n FROM drivers WHERE age > 30 "
+     "AND SUBSTRING(name, age - 30, 3) = 'er_'"),
+
+    # the overflow shape: `lap_id > 999999` is false everywhere, so the
+    # multiplication is never evaluated. If pushdown or `orderByWork` hoists the
+    # arithmetic conjunct ahead of the guard, this leg raises and the entry
+    # reports an ERROR — which is the whole point of holding it here as well as
+    # in the oracle.
+    ("w37p_guard_first_overflow",
+     "SELECT COUNT(*) AS n FROM laps WHERE lap_id > 999999 "
+     "AND lap_id * 9223372036854775807 > 0"),
+
+    # LIKE first, so the type error in `team = 5` is never reached
+    ("w37p_guard_first_type_mismatch",
+     "SELECT COUNT(*) AS n FROM laps WHERE team LIKE 'zzz%' AND team = 5"),
+
+    # a partial SELECT-list expression bounded by LIMIT: only the first three
+    # rows are computed. A LIMIT that stopped bounding the projection would raise.
+    ("w37p_partial_projection_under_limit",
+     "SELECT SUBSTRING(name, age - 34, 2) AS s FROM drivers LIMIT 3"),
+
+    # the derived-body control: the guard moved INSIDE the body answers 8, where
+    # the same conjunct written OUTSIDE raises. Both legs must agree on the 8.
+    ("w37p_derived_guard_inside_body",
+     "SELECT COUNT(*) AS n FROM (SELECT name, age, SUBSTRING(name, age - 34, 2) "
+     "AS s FROM drivers WHERE age > 34) d"),
+
     # ── CONTROLS. Without these the block proves only that SOME 3-relation
     # ── query diverges, which is not the claim. Each removes exactly one of the
     # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both

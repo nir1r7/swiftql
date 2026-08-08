@@ -2274,6 +2274,283 @@ TYPEFIX_SUBSTRING_START_REFUSED = [
      "SUBSTRING: start position must be >= 1"),
 ]
 
+# ─── Round 4: the type-through-division rule ACROSS THE MATERIALIZATION CUT ──
+#
+# A SEPARATE FAMILY FROM `TYPEFIX_DIV_*` ON PURPOSE. Those entries live in one
+# plan; these cross `materializeSubqueries`, which cuts a query into two
+# independent builds so no single walk spans them. Folding these in would also
+# push `assert len(TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED) == 6` to 10 and quietly
+# change what that assert is about.
+#
+# The mechanism, because it decides which entries are non-vacuous: the ARMING
+# REQUEST travels INWARD. "Can an INT reach this value" is only knowable after
+# the body runs; "does a `/` with an INTEGER partner consume it" is only knowable
+# before, from the outer AST. So the outer side asks, the body arms its own
+# columns, and the refusal still fires on the VALUE that arrives.
+#
+# Pin is the shared `TYPEFIX_DIV_PIN` — same rule, same message — so
+# `assert_refusal_pins_discriminate`'s equal-pin exemption covers the family.
+# The messages differ only by the integer (`2` vs `7`), which is not a producer
+# difference and must not be pinned as one.
+
+# ONLY THIS ONE IS A NON-VACUOUS VOLCANO DIFF. `round` is an INT column, so
+# `round / 2` TRUNCATES in Volcano and SQLite — measured 9605 rows on the shipped
+# catalog, which is exactly the rows with `round >= 2`. Flatten the body to REAL
+# and `round / 2.0 > 0` admits `round = 1` as well, so the count moves. The other
+# four cut entries all return 0 in Volcano, and 0 == 0 asserts nothing, so they
+# are refusal-only — the same standard as the existing HAVING row-count witness.
+TYPEFIX_CUT_VOLCANO_ONLY = [
+    "SELECT COUNT(*) AS n FROM laps WHERE round / "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+]
+
+TYPEFIX_CUT_VECTORIZED_REFUSED = [
+    (q, TYPEFIX_DIV_PIN) for q in TYPEFIX_CUT_VOLCANO_ONLY
+] + [
+    # the AGGREGATE materialization site, reached across the cut
+    ("SELECT COUNT(*) AS n FROM laps WHERE 7 / "
+     "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+     TYPEFIX_DIV_PIN),
+
+    # the PROJECT site — no aggregate anywhere, so the cut is not a property of
+    # VecHashAggregateNode
+    ("SELECT COUNT(*) AS n FROM laps WHERE 7 / "
+     "(SELECT CASE WHEN lap_id = 2 THEN 2 ELSE 0.5 END FROM laps WHERE lap_id = 2) > 3",
+     TYPEFIX_DIV_PIN),
+
+    # the subquery as the DIVIDEND rather than the divisor — both polarities,
+    # one rule
+    ("SELECT COUNT(*) AS n FROM laps WHERE "
+     "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 7 ELSE 0.5 END) FROM laps l2) / 2 > 3",
+     TYPEFIX_DIV_PIN),
+
+    # the cut INSIDE a derived body: materializeSubqueries recurses into the body
+    # before the outer statement, so the request is per-statement, not per-query.
+    # Volcano cannot adjudicate this one at all, which is why the wrong answer
+    # survived four audit passes.
+    ("SELECT COUNT(*) AS n FROM (SELECT lap_id AS k FROM laps WHERE 7 / "
+     "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3) t",
+     TYPEFIX_DIV_PIN),
+]
+
+# ALL FOUR MODES. The fence: each is an answer that is correct today and that a
+# shape-only refusal at the cut would have destroyed.
+TYPEFIX_CUT_GUARDS_ALL_MODES = [
+    # MIN picks the REAL branch, so the Value crossing the cut is 0.5 — armed
+    # body, no INT arrives, still answers. The refusal is fired by the value.
+    "SELECT COUNT(*) AS n FROM laps WHERE 7 / "
+    "(SELECT MIN(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+
+    # `THEN 2.0` — no INT branch at all, nothing to lose
+    "SELECT COUNT(*) AS n FROM laps WHERE 7 / "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2.0 ELSE 0.5 END) FROM laps l2) > 3",
+
+    # NON-VACUOUS DESPITE ANSWERING 0, and the reason is worth keeping: COUNT(*)
+    # is an INT-declared body column, so nothing narrows and `7 / 10000` is 0 in
+    # both engines — `0 > 0` is false, no rows. Narrow that COUNT to REAL and
+    # `7 / 10000.0` is 0.0007, which IS > 0, and the answer becomes 10000. The
+    # zero is a measurement, not an absence.
+    "SELECT COUNT(*) AS n FROM laps WHERE 7 / (SELECT COUNT(*) FROM laps l2) > 0",
+
+    # THE ANSWER THE CONSERVATIVE VERSION OF THIS FIX WOULD HAVE COST. `speed` is
+    # REAL, so the division is REAL in Volcano too and the body's stored type
+    # cannot reach the answer. Arming on "the subquery is under a `/`" without
+    # typing the OTHER operand refuses this, and it is right in all four modes.
+    "SELECT COUNT(*) AS n FROM laps WHERE speed / "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 150",
+
+    # the literal form of the same fact
+    "SELECT COUNT(*) AS n FROM laps WHERE 7.0 / "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+
+    # only COMPARED, which coerces — nothing observable, so the body must not be
+    # armed at all
+    "SELECT COUNT(*) AS n FROM laps WHERE speed > "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2)",
+
+    # only ADDED — INT+REAL and REAL+REAL agree
+    "SELECT COUNT(*) AS n FROM laps WHERE speed + "
+    "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 300",
+
+    # divided by a REAL LITERAL: `7 / 2.0` and `7.0 / 2.0` are both 3.5, so the
+    # stored type cannot reach this answer either
+    "SELECT MAX(CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END) / 2.0 AS y "
+    "FROM laps WHERE lap_id < 4",
+]
+
+# Both vectorized modes answer; Volcano refuses the shape by capability.
+TYPEFIX_CUT_GUARDS_VEC_ONLY = [
+    # the derived form of "divided by a REAL literal". Before round 4 this had NO
+    # WORKING MODE — refused on the vec path, refused on Volcano by capability.
+    "SELECT x / 2.0 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END "
+    "AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+
+    # the taint reaches a `/`, but by then the value is REAL in BOTH engines —
+    # `x + 0.5` is 7.5 whether x was the INT 7 or the double 7.0 — so there is no
+    # truncation left to lose and dropping the origin is correct
+    "SELECT (x + 0.5) / 2 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 "
+    "END AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+    "SELECT (x * 2.0) / 4 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 "
+    "END AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+
+    # THE PASSING ANSWER ROUND 3 HAD MOVED AND NO AUDIT CAUGHT. `t.s` is a REAL
+    # column of a DERIVED relation; the AST-level operand typing had no schema
+    # there, answered INTEGER conservatively, armed the body and refused a query
+    # that answers 10000. The type question now descends into the body's select
+    # list.
+    "SELECT COUNT(*) AS n FROM laps WHERE (SELECT MAX(t.s) FROM "
+    "(SELECT l.speed AS s FROM laps l WHERE l.lap_id < 4) t) / 2 > 100",
+
+    # THE ONE-CHARACTER TWIN THAT MUST STILL REFUSE IS NOT HERE — it is in
+    # TYPEFIX_CUT_DERIVED_STILL_REFUSED below, so the pair reads together.
+]
+
+# `/ 2` instead of `/ 2.0`, one character from the first vec-only guard, and it
+# must still REFUSE: INTEGER division truncates in Volcano and SQLite, so the
+# flattened column really does change the answer (3 against 3.5). Getting the
+# over-firing fix right means this one does not come with it.
+TYPEFIX_CUT_DERIVED_STILL_REFUSED = [
+    ("SELECT x / 2 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END "
+     "AS x FROM laps WHERE lap_id < 4) t ORDER BY d", TYPEFIX_DIV_PIN),
+]
+
+# Every derived-table shape in this family, refused by Volcano for the CAPABILITY
+# rather than for the type rule. Selected by the structural fact that decides it,
+# with the count asserted so a selector matching nothing cannot pass as empty.
+TYPEFIX_CUT_DERIVED_VOLCANO_REJECTED = [
+    (q, VOLCANO_DERIVED)
+    for q in (TYPEFIX_CUT_GUARDS_VEC_ONLY
+              + [q for q, _ in TYPEFIX_CUT_VECTORIZED_REFUSED]
+              + [q for q, _ in TYPEFIX_CUT_DERIVED_STILL_REFUSED])
+    if "FROM (SELECT" in q
+]
+assert len(TYPEFIX_CUT_DERIVED_VOLCANO_REJECTED) == 6, (
+    "expected 4 vec-only guards + 1 cut-in-derived + 1 still-refused, got "
+    f"{len(TYPEFIX_CUT_DERIVED_VOLCANO_REJECTED)}")
+
+# ─── Round 4: the magnitude bound is now TWO bounds, split by RENDERABILITY ──
+#
+# E-10 enforced the `%.15g` rendering bound (1e15) on every narrowed INT. Round 4
+# narrowed that: the origin sets of the PLAN ROOT's output columns are exactly
+# the values whose text can be printed, and those keep the 1e15 bound; everything
+# else is judged on the VALUE alone (2^53). Nothing in the oracle pinned that
+# split, so these three do.
+E10_UNRENDERED_GUARD_VEC_ONLY = [
+    # 2e15 — above the RENDERING bound, below 2^53 — reaching only a FILTER, so
+    # its text is never printed. Answers now; refused before round 4.
+    "SELECT COUNT(*) AS n FROM (SELECT CASE WHEN lap_id = 2 THEN 2000000000000000 "
+    "ELSE 0.5 END AS x FROM laps WHERE lap_id < 4) t WHERE t.x > 1",
+]
+E10_UNRENDERED_VOLCANO_ONLY = [
+    # the SAME magnitude in the OUTPUT still refuses, because %.15g really does
+    # change it there
+    "SELECT MAX(CASE WHEN lap_id = 2 THEN 2000000000000000 ELSE 0.5 END) AS m "
+    "FROM laps WHERE lap_id < 4",
+    # ...and above 2^53 the unprinted column refuses too, on the value alone —
+    # which is what stops the round-4 narrowing from becoming a hole
+    "SELECT MAX(CASE WHEN lap_id = 2 THEN 9007199254740993 ELSE 0.5 END) > 1 AS big "
+    "FROM laps WHERE lap_id < 4",
+]
+E10_UNRENDERED_VECTORIZED_REFUSED = [
+    (q, "without changing it") for q in E10_UNRENDERED_VOLCANO_ONLY
+]
+
+# ─── Round 4: PARTIAL EXPRESSIONS AND DEFINED EVALUATION ORDER ───────────────
+#
+# THE NEW LANGUAGE RULE, because it is what makes these entries readable: a
+# conjunct is evaluated only on rows where every conjunct WRITTEN BEFORE IT was
+# TRUE. So `p AND q` and `q AND p` are DIFFERENT PROGRAMS when `q` can raise —
+# as in C, and as in SQLite. Several shapes below therefore have two orders with
+# two different correct answers, and an entry that assumed commutativity would
+# read as a bug.
+#
+# THIS CLASS HAD ZERO INSTANCES IN THE CORPUS before these entries. The fixer's
+# own 45-shape battery is a script, not a gate, so this is the coverage rather
+# than a supplement to it.
+PARTIALITY_GUARDED_QUERIES = [
+    # the GUARD-FIRST order: `age > 30` eliminates every row on which
+    # `SUBSTRING(name, age - 30, 3)` would ask for start position <= 0. 3 rows.
+    "SELECT COUNT(*) AS n FROM drivers WHERE age > 30 "
+    "AND SUBSTRING(name, age - 30, 3) = 'er_'",
+
+    # THE INTEGER-OVERFLOW SHAPE, GUARD FIRST. `lap_id > 999999` is false for
+    # every row, so `lap_id * 9223372036854775807` is never evaluated and the
+    # overflow never happens. 0 rows, and the 0 is load-bearing — see the twin in
+    # the rejection suite.
+    "SELECT COUNT(*) AS n FROM laps WHERE lap_id > 999999 "
+    "AND lap_id * 9223372036854775807 > 0",
+
+    # LIKE first, so the type error in `team = 5` is never reached
+    "SELECT COUNT(*) AS n FROM laps WHERE team LIKE 'zzz%' AND team = 5",
+
+    # a partial expression in a SELECT list, bounded by LIMIT: only the first
+    # three rows are computed, and `age - 34 >= 1` holds on them
+    "SELECT SUBSTRING(name, age - 34, 2) AS s FROM drivers LIMIT 3",
+]
+
+# The SWAPPED twins. Each is legal SQL that SQLite ANSWERS, and each raises in
+# SwiftQL because the guarding conjunct is now written after the partial one.
+# THAT IS THE DIALECT, NOT A BUG — recorded here rather than silently omitted, so
+# the divergence is a decision on the record instead of a gap.
+#
+# `lap_id * 9223372036854775807` is also THE STORAGE-MODE DIFFERENTIAL NOTHING
+# ELSE IN THIS HARNESS MAKES. Before the fix, row storage RAISED and columnar
+# returned 0 rows — same leg, same optimizer setting, different storage. Running
+# it in all four modes is what pins that the two storages now agree, and the
+# reason this entry is not vectorized-only.
+PARTIALITY_SWAPPED_REFUSED = [
+    ("SELECT COUNT(*) AS n FROM drivers WHERE SUBSTRING(name, age - 30, 3) = 'er_' "
+     "AND age > 30", "SUBSTRING: start position must be >= 1"),
+
+    ("SELECT COUNT(*) AS n FROM laps WHERE lap_id * 9223372036854775807 > 0 "
+     "AND lap_id > 999999", "integer overflow in '*'"),
+
+    ("SELECT COUNT(*) AS n FROM laps WHERE team = 5 AND team LIKE 'zzz%'",
+     "Type mismatch in Value comparison"),
+
+    # the SELECT-list expression with no LIMIT to bound it: row 4 has age 34, so
+    # `age - 34` is 0 and the expression raises. SQLite answers because its
+    # SUBSTRING tolerates a 0 start.
+    ("SELECT SUBSTRING(name, age - 34, 2) AS s FROM drivers",
+     "SUBSTRING: start position must be >= 1"),
+]
+
+# THE DERIVED TWIN, SPLIT OUT BECAUSE ITS TWO HALVES REFUSE FOR DIFFERENT
+# REASONS — and the harness caught that rather than my reading it off the shape.
+# Written into the four-mode list above it FAILED on both Volcano modes, which
+# refuse the derived table by CAPABILITY before the partial expression is ever
+# reached. Two lists, two pins: the vectorized modes see the real behaviour, the
+# Volcano modes pin the capability boundary that hides it.
+#
+# The shape: a derived body with a partial SELECT-list expression, guarded only
+# by an OUTER conjunct. The body's select list is evaluated for every body row
+# and `d.age > 34` is written outside it, so the guard does not reach and the
+# expression raises on the age-34 row. SQLite answers 8. Verified specific to the
+# OUTER position — moving the same conjunct inside the body answers 8, and so
+# does dropping the partial expression; both are pinned as guards below.
+PARTIALITY_DERIVED_SWAPPED_VEC_REFUSED = [
+    ("SELECT COUNT(*) AS n FROM (SELECT name, age, SUBSTRING(name, age - 34, 2) "
+     "AS s FROM drivers) d WHERE d.age > 34",
+     "SUBSTRING: start position must be >= 1"),
+]
+
+# The two controls for that last entry, vectorized-only (Volcano refuses derived
+# tables). Without them the rejection above would look like "derived bodies
+# cannot do this" rather than "the guard has to be written before the partial
+# expression it guards".
+PARTIALITY_DERIVED_GUARDS_VEC_ONLY = [
+    # same query, conjunct moved INSIDE the body — answers 8
+    "SELECT COUNT(*) AS n FROM (SELECT name, age, SUBSTRING(name, age - 34, 2) "
+    "AS s FROM drivers WHERE age > 34) d",
+    # same outer conjunct, partial expression removed — answers 8
+    "SELECT COUNT(*) AS n FROM (SELECT name, age FROM drivers) d WHERE d.age > 34",
+]
+PARTIALITY_DERIVED_GUARDS_VOLCANO_REJECTED = [
+    (q, VOLCANO_DERIVED)
+    for q in (PARTIALITY_DERIVED_GUARDS_VEC_ONLY
+              + [q for q, _ in PARTIALITY_DERIVED_SWAPPED_VEC_REFUSED])
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -3896,6 +4173,82 @@ def main():
         r_failed += rf
         r_errors += re_
 
+    # Round 4 — the type rule across the materialization cut.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_CUT_VOLCANO_ONLY,
+            f"cut: INT-column witness — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_CUT_VECTORIZED_REFUSED + TYPEFIX_CUT_DERIVED_STILL_REFUSED,
+            f"cut: refused across materialization — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in [("row storage, Volcano", None),
+                         ("columnar storage, Volcano", ["--storage", "columnar"]),
+                         *vec_modes]:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_CUT_GUARDS_ALL_MODES,
+            f"cut: guards — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_CUT_GUARDS_VEC_ONLY + E10_UNRENDERED_GUARD_VEC_ONLY,
+            f"cut: guards over derived, and the unrendered bound — {label}",
+            extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_CUT_DERIVED_VOLCANO_REJECTED,
+            f"cut: derived shapes refused earlier — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+
+    # Round 4 — the rendering/value bound split.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, E10_UNRENDERED_VOLCANO_ONLY,
+            f"printed magnitude still refused — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            E10_UNRENDERED_VECTORIZED_REFUSED,
+            f"printed magnitude refused — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+
+    # Round 4 — partial expressions under a DEFINED evaluation order. All four
+    # modes on both halves: the guarded orders must answer and match SQLite, and
+    # the swapped twins must raise. The overflow pair is also the storage-mode
+    # differential (row raised, columnar returned 0 rows, before the fix), which
+    # is why it runs in row AND columnar rather than vectorized-only.
+    for label, extra in [("row storage, Volcano", None),
+                         ("columnar storage, Volcano", ["--storage", "columnar"]),
+                         *vec_modes]:
+        mp, mf, me = run_query_suite(
+            conn, PARTIALITY_GUARDED_QUERIES,
+            f"partial expressions, guard written first — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+        rp, rf, re_ = run_rejection_suite(
+            PARTIALITY_SWAPPED_REFUSED,
+            f"partial expressions, guard written second — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, PARTIALITY_DERIVED_GUARDS_VEC_ONLY,
+            f"partial expressions in a derived body, controls — {label}",
+            extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+        rp, rf, re_ = run_rejection_suite(
+            PARTIALITY_DERIVED_SWAPPED_VEC_REFUSED,
+            f"partial expression guarded only from OUTSIDE the body — {label}",
+            extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            PARTIALITY_DERIVED_GUARDS_VOLCANO_REJECTED,
+            f"partial-expression derived controls refused earlier — {label}",
+            extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
     findings = sweep_rejection_suites()
@@ -3908,7 +4261,16 @@ def main():
     # put them in the same matrix.
     findings += assert_refusal_pins_discriminate(
         "INT-narrowing family",
-        E10_VECTORIZED_REFUSED + TYPEFIX_DIV_VECTORIZED_REFUSED,
+        E10_VECTORIZED_REFUSED + E10_UNRENDERED_VECTORIZED_REFUSED
+        + TYPEFIX_DIV_VECTORIZED_REFUSED + TYPEFIX_CUT_VECTORIZED_REFUSED
+        + TYPEFIX_CUT_DERIVED_STILL_REFUSED,
+        ["--execution", "vectorized", "--storage", "columnar"])
+    # The partiality refusals are four DIFFERENT producers (SUBSTRING, overflow,
+    # type mismatch, SUBSTRING again) whose messages share no tail, so they get
+    # their own matrix rather than being assumed distinct.
+    findings += assert_refusal_pins_discriminate(
+        "partial-expression refusals",
+        PARTIALITY_SWAPPED_REFUSED + PARTIALITY_DERIVED_SWAPPED_VEC_REFUSED,
         ["--execution", "vectorized", "--storage", "columnar"])
     mode_census()
 
