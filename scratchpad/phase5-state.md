@@ -236,6 +236,56 @@ Swept: validator.cc's "closed here / covers all four modes"; README's Limitation
   a dated plan record and editing it would falsify the history that makes the finding legible.
 Oracle entries SEQUENCED to the harness agent (7 queries x 2 suites, vec-only + Volcano-rejected).
 
+## Wave A — E-10 value coercion: **CLOSED**, and it found a WIDER LIVE BUG it did not fix
+FIX: `appendColumnValue`'s DOUBLE arm goes through `narrowToDoubleColumn` (vec_types.h), which
+  **THROWS** rather than convert an INT `Value` whose conversion would be observable. Below the
+  bound it is bit-for-bit the old code. 12 new tests; **8 of 12 fail** against a scratch build with
+  the guard reduced to `return v.toNumeric();`. The other 4 pass both ways ON PURPOSE and are
+  LABELLED so — 1 derives the constant, 3 pin what the fix must not move; neither kind is offered
+  as evidence the fix works.
+**THE BOUND IS 1e15, NOT 2^53** — two things must survive and it MEASURED both: the VALUE (fails
+  above 2^53) and the RENDERING (`Value::toString()` uses `%.15g`, which flips to exponent form at
+  1e15, so `1000000000000001` prints `1e+15` while the INT prints all sixteen digits). 1e15 < 2^53,
+  so the smaller bound binds and one comparison covers both. `ThresholdIsExactlyTheBoundary` walks
+  outward and asserts it is the FIRST failing magnitude, so a change to `%.15g` breaks a test
+  instead of silently widening the window.
+THE SEVEN SITES, verdict each — the deciding invariant is that a chunk's column types always equal
+  the producing node's `outputSchema()` types, verified for every producer. **2 of 7 create the
+  divergence** (VecProject's evaluate() path and the aggregate's MIN/MAX arm — both pre-allocate a
+  declared type BEFORE the first value exists), 1 more can in principle, 4 are structurally
+  incapable of loss. `VecDistinct` INHERITED the wrong values from the project site but creates none.
+SELF-CONTRADICTION RESOLVED: pre-fix one engine gave `SELECT DISTINCT e` = 2 and `COUNT(DISTINCT e)`
+  = 3. `COUNT(DISTINCT)` was ALREADY RIGHT (it keys off the pre-conversion Value). Post-fix the
+  DISTINCT leg refuses and COUNT(DISTINCT) still answers 3 — one answer or none, never two.
+REJECTED, with reasons: making Volcano coerce identically (satisfies `optimized == --no-optimize` by
+  BREAKING `== SQLite` — one wrong engine becomes two); refusing mixed-type CASE at plan time (would
+  reject `CASE WHEN c THEN 1 ELSE 0.5 END`, correct in all four modes today — moves a passing
+  answer); choosing the column type from values seen (chunk-dependent, and cannot handle mixing
+  WITHIN a chunk). The guard is PER-VALUE, not per-expression, exactly so it rejects only what is
+  wrong today.
+Neighbours checked BY RUN: DOUBLE->INT, STRING->numeric, numeric->STRING are all already loud
+  (`bad_variant_access`) — INT->DOUBLE was the ONLY silent one. Unsigned does not exist (`TypeId` is
+  {INT,DOUBLE,STRING}). `SUM(<large int>)` diverges from SQLite in BOTH engines — shared dialect,
+  pre-existing, not a seam.
+
+### !! NEW, LIVE, UNFIXED — the same class but WIDER, and it bites at value 7
+**The conversion does not merely lose precision; it changes the TYPE, and type is load-bearing for
+`/` (INT/INT truncates).** Any value out of a mixed CASE is at risk the moment another expression
+reads the materialized column, so the 1e15 bound does not touch it. Both verified PRE-EXISTING
+(identical on a build with the E-10 fix reverted):
+  SELECT x / 2 FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x
+                     FROM laps WHERE lap_id < 4) t        -> SQLite 3, vectorized 3.5
+    (control with both branches INT gives 3 vectorized too, isolating materialization as the cause)
+  SELECT team, MAX(CASE ...) AS m FROM laps WHERE lap_id < 4 GROUP BY team
+    HAVING MAX(CASE WHEN lap_id=2 THEN 7 ELSE 0.5 END)/2 > 3
+    -> row-volcano 0 rows | SQLite 0 rows | **vectorized 1 row** — a ROW COUNT divergence, and here
+       Volcano CAN adjudicate.
+LEFT UNFIXED DELIBERATELY: extending the refusal to all INT->DOUBLE narrowing would reject
+  `CASE WHEN c THEN 1 ELSE 0.5 END`, correct today in every mode — moving a passing answer. The
+  distinction that matters ("is this column read by another expression, or is it the query's
+  output?") is a PLAN-SHAPE fact `appendColumnValue` cannot see; it lives in
+  `vectorized_plan_builder.cc`. **WAVE B / ROUND 4 OWNS THIS.**
+
 ## !! WAVE A INTRODUCED A 200x REGRESSION — must not ship unremarked
 Commit `d085230` ("a LIMIT cuts a determined order") fixes the plain-LIMIT shape CORRECTLY, but the
 **`--no-optimize` leg of a plain LIMIT over a `driver_id` self-join went 0.32s -> 64s** (two runs
