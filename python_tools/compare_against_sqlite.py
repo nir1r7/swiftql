@@ -1678,6 +1678,135 @@ SEAM2_STAR_OVER_LOWERED_SUBQUERY_VOLCANO_REJECTED = [
     for q in SEAM2_STAR_OVER_LOWERED_SUBQUERY_VEC_ONLY
 ]
 
+# SEAM AUDIT (subquery chain, pass 2) — B-3. A CORRELATED SUBQUERY NESTED INSIDE
+# A CORRELATED BODY.
+#
+# Every one of these was refused before the fix, with a message about a
+# correlated INEQUALITY that none of them contains:
+#
+#     correlated subquery: only an equality between two columns can become a
+#     join key (a correlated inequality has no equi-join to lower to; ...)
+#
+# splitCorrelation asked "does this conjunct reach outside the body?" as
+# `collectSlots(c) contains -1`, and collectSlots has a THIRD producer of -1 its
+# comment did not enumerate: a nested CORRELATED SubqueryExpr. That flag means
+# "reaches outside the INNER body", and for a one-level reference the block it
+# names is the body being split — body-local. The identical nesting under an
+# UNCORRELATED IN ran and was right (three entries in
+# WEEK34_CORRELATED_SCALAR_VEC_ONLY), which is what proved the shape was
+# supportable and only the classification wrong.
+#
+# NO SUITE HELD THIS SHAPE, in either direction — checked WEEK33_DECORRELATED,
+# WEEK33_CORRELATED_BINDS, WEEK34_CORRELATED_SCALAR_*,
+# WEEK35_SUBQUERY_IN_DERIVED_BODY. The only nesting anywhere was
+# uncorrelated-outer / correlated-inner.
+#
+# Row sets are PARTIAL by construction (11, 9, 13, 11 of 20; 2329 of 10000), not
+# 0 and not all: a nesting that silently dropped the inner subquery would answer
+# 20 here, and one that dropped the outer would answer 0.
+SEAM2_NESTED_CORRELATION_VEC_ONLY = [
+    # correlated EXISTS inside a correlated EXISTS body. The inner one keys on
+    # `l.lap_id`, a column of the MIDDLE body's relation, which is what makes it
+    # level 1 there and therefore lowerable by the middle body's own build().
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND EXISTS (SELECT 1 FROM laps l2 "
+    "WHERE l2.lap_id = l.lap_id AND l2.speed > 344.9)) ORDER BY nm",
+    # ...and the ANTI polarity of the OUTER one. SEMI and ANTI part company in
+    # the operator, so a nesting that worked for one is not evidence for the
+    # other. 9 rows, the complement of the 11 above.
+    "SELECT d.name AS nm FROM drivers d WHERE NOT EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND EXISTS (SELECT 1 FROM laps l2 "
+    "WHERE l2.lap_id = l.lap_id AND l2.speed > 344.9)) ORDER BY nm",
+    # the inner EXISTS keyed on a DIFFERENT column of the middle relation, with
+    # a local predicate beside it in the middle body — so the middle body's own
+    # WHERE holds both a lowered subquery and an ordinary conjunct.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.speed > 344 AND EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.season = 2024 AND l2.speed > 344.5)) ORDER BY nm",
+    # a correlated SCALAR inside a correlated EXISTS body: the other lowering,
+    # reached by the same classification. Two different rewrites stacked on two
+    # different spines, the inner one running during the middle body's build().
+    # 1.104 rather than a round number because 1.09 returns all 20 rows and would
+    # pass against an engine that dropped the predicate.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.speed > 1.104 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)) ORDER BY nm",
+    # THE OTHER NESTING ORDER — a correlated EXISTS inside a correlated SCALAR
+    # body, which is not the same code path: the scalar lowering rewrites the
+    # body's select list and GROUP BY around whatever its WHERE was left holding.
+    # DISCRIMINATING: the same query without the inner EXISTS answers 2555, so
+    # the 2329 here is evidence the inner subquery ran and changed the groups,
+    # not merely that the outer one did.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > 1.05 * "
+    "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team "
+    "AND EXISTS (SELECT 1 FROM drivers d3 WHERE d3.driver_id = l2.driver_id "
+    "AND d3.age > 30))",
+    # a correlated scalar inside a correlated EXISTS where the inner body reads
+    # the middle relation in BOTH the key and a local predicate, and the outer
+    # comparison spans two seasons — 9 rows.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l "
+    "WHERE l.driver_id = d.driver_id AND l.season = 2024 AND l.speed > "
+    "(SELECT MAX(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.season = 2023)) ORDER BY nm",
+]
+
+SEAM2_NESTED_CORRELATION_VOLCANO_REJECTED = [
+    (q, VOLCANO_CORRELATED) for q in SEAM2_NESTED_CORRELATION_VEC_ONLY
+]
+
+# !! THE COUPLED HALF OF B-3, and the entry that matters most in this file.
+#
+# The depth refusal (`outer_side->id.level() != 1` in splitCorrelation) was
+# UNREACHABLE before the fix above — pass 2's B-5.3 enumerated every route to a
+# level-2 reference and found each one closed by something earlier, the nearest
+# being B-3's own misclassification. Fixing B-3 OPENS that route, and this guard
+# is what keeps it safe: levels are NOT decremented when the middle body is
+# decorrelated, so a stale level-2 reference would otherwise reach
+# leftKeyIndices and be read as a slot of the wrong range table.
+#
+# It had ZERO coverage — no diffed entry, no rejection entry, nothing — because
+# nothing could make it fire. A reachable guard that is untested is strictly
+# worse than an unreachable one that is wrong, so these entries are the
+# condition on which B-3 closes at all.
+#
+# THE PIN IS SPECIFIC TO THIS GUARD, not a shared tail: grep says "more than one
+# level out" occurs at exactly one refusal in src/. Three distinct states make
+# these entries FAIL, which is the question worth asking of a brand-new pin:
+#   1. the pre-fix engine — verified: it answers the CORRELATED-INEQUALITY
+#      message for both of these, so the pin fails rather than passing for the
+#      wrong reason. That is the demonstration, not an argument;
+#   2. the guard deleted — the level-2 id reaches
+#      `localSlot("splitCorrelation")`, which throws "internal: splitCorrelation
+#      read a correlated column reference as a local relation slot (query level
+#      2)". Different message, entry fails;
+#   3. the query ceasing to BE two levels out (an edit to `d.` here) — it then
+#      returns rows and run_rejection_suite reports "expected a rejection, got
+#      rows".
+#
+# Vectorized only, same reason as WEEK34_CORRELATED_SCALAR_REFUSED: the Volcano
+# path refuses a correlated subquery outright and would assert the wrong
+# refusal. SQLite answers both of these (20 each), so each is a recorded
+# divergence, not a claim about SQL.
+SEAM2_CORRELATION_DEPTH_REFUSED = [
+    # EXISTS nested in EXISTS, inner ref reaching TWO blocks out (`d`, not `l`).
+    # One character apart from the first SEAM2_NESTED_CORRELATION entry's family
+    # and on the other side of the boundary, which is the point.
+    ("SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+     "(SELECT 1 FROM laps l WHERE l.driver_id = d.driver_id "
+     " AND EXISTS (SELECT 1 FROM laps l2 WHERE l2.driver_id = d.driver_id))",
+     "more than one level out"),
+    # ...and the SCALAR family, pinned separately for the same reason
+    # WEEK36_CORRELATED_RESIDUAL_REFUSED pins its scalar entry separately:
+    # splitCorrelation is SHARED, so a future change to the depth rule for
+    # EXISTS changes this query's behaviour too and must not do so silently.
+    ("SELECT COUNT(*) FROM drivers d WHERE EXISTS "
+     "(SELECT 1 FROM laps l WHERE l.driver_id = d.driver_id "
+     " AND l.speed > (SELECT AVG(l2.speed) FROM laps l2 "
+     "                WHERE l2.driver_id = d.driver_id))",
+     "more than one level out"),
+]
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -3106,6 +3235,36 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
+
+    # SEAM AUDIT pass 2 — B-3. A correlated subquery nested inside a correlated
+    # body: diffed where it now runs, and PINNED where it now refuses. The
+    # refusal half is the coupled guard the fix made reachable, and it is
+    # vectorized-only for the same reason WEEK34_CORRELATED_SCALAR_REFUSED is —
+    # the Volcano capability refusal fires first and would assert the wrong one.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, SEAM2_NESTED_CORRELATION_VEC_ONLY,
+            f"Seam pass 2 — correlated subquery inside a correlated body — {label}",
+            extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        mp, mf, me = run_rejection_suite(
+            SEAM2_NESTED_CORRELATION_VOLCANO_REJECTED,
+            f"Seam pass 2 — correlated subquery inside a correlated body refused "
+            f"— {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            SEAM2_CORRELATION_DEPTH_REFUSED,
+            f"Seam pass 2 — a reference more than one level out — {label}",
+            extra_args=extra)
+        m_passed += rp
+        m_failed += rf
+        m_errors += re_
 
     # Week 33 — decorrelated EXISTS / NOT EXISTS. Same split, same reason as
     # Week 32's: the capability difference is real, so BOTH halves are asserted.
