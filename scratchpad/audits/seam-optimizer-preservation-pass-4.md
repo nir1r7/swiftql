@@ -438,3 +438,253 @@ Error: derived table 'd': column 'team' is produced twice; give one of them an a
 With the alias list (`AS d(a,b)`) the names differ. So the pair is unique on
 every schema a sort can see, and the `stable_sort` fallback is unreachable there.
 Not a finding; recorded so pass 5 does not re-derive it.
+
+---
+
+## Part B — the passes, enumerated from source at this HEAD
+
+### B.1 The census has grown from six ungated passes to EIGHT. The conclusion holds; the count printed by the harness does not.
+
+`--no-optimize` still gates **exactly three** — `main.cc:566-588` (top level) and
+`main.cc:133-138` (`runVectorizedToRows`), re-read this pass. Everything else
+that rewrites a plan runs in both legs:
+
+| # | pass | site | in both legs? | why |
+|---|---|---|---|---|
+| 1 | `PredicatePushdown` | `main.cc:571` / `:135` | **gated** | — |
+| 2 | `JoinEnumeration` | `main.cc:583` / `:136` | **gated** | — |
+| 3 | `CardinalityEstimator` | `main.cc:587` / `:137` | **gated** | — |
+| 4 | `foldConstants` | `binder.cc:259` | ungated, identical BY CONSTRUCTION | runs inside `Binder::bind`, before `build`, before the gate |
+| 5 | `substituteGroupKeyRefs` | `logical_plan.cc:1014` | ungated, identical BY CONSTRUCTION | **NOT in the harness's census** |
+| 6 | derived normalization (`buildRelation`) | `logical_plan.cc:1018`, `:1034` | ungated, identical BY CONSTRUCTION | — |
+| 7 | `lowerInSubqueries` | `logical_plan.cc:1110` | ungated, identical BY CONSTRUCTION | — |
+| 8 | `lowerExistsSubqueries` | `logical_plan.cc:1116` | ungated, identical BY CONSTRUCTION | — |
+| 9 | `lowerCorrelatedScalars` | `logical_plan.cc:1131` | ungated, identical BY CONSTRUCTION | — |
+| 10 | `deterministicCut` | `logical_plan.cc:1231` | ungated, identical BY CONSTRUCTION | **NOT in the harness's census**; A.6 |
+| 11 | `materializeSubqueries` | `main.cc:500-543` | ungated, **output IS gate-dependent** | executes the body through `runVectorizedToRows(..., args.no_optimize)` |
+
+`INVARIANT_SCOPE` (`python_tools/test_new_queries.py:635-643`) says *"5 further
+passes are identical in both legs BY CONSTRUCTION … The 6th,
+materializeSubqueries"*. It is short by two — `substituteGroupKeyRefs` and
+`deterministicCut`, both of which arrived after the sentence was written. Neither
+changes the conclusion (both are identical by construction, for the same reason
+as the other five), so this is **LOW P4-4** — but it is the exact mechanism this
+codebase's own doctrine warns about: a pass absent from an enumerated list reads
+as considered-and-dismissed. `deterministicCut` is the one that matters, because
+it INSERTS A SORT NODE and is therefore the ungated pass most capable of changing
+an answer.
+
+Pass 3's three obligations for the invariant harness are all **discharged**, and
+I re-checked each against source rather than the commit message:
+`normalize_ordered` + `_invariant_compare` compare `ORDER BY` queries positionally
+(`test_new_queries.py:560-608`); `TIE_STRADDLE_QUERIES` (`:1228+`) supplies
+3-relation shapes on the 2-table `catalog.json` via a `drivers`/`drivers` self
+join, so `MIN_ENUMERATED_RELATIONS = 3` is now reachable; and
+`b31_tie_order_only_no_set_change` pins the ordered comparison against a
+set-preserving order divergence.
+
+### B.2 Precondition table, refreshed
+
+| pass / rule | precondition for result preservation | CHECKED or BELIEVED | can a later shape reach it? |
+|---|---|---|---|
+| `distribute` — inner/standard only | pushed side not null-supplying, not a semi/anti body | **checked** (`:522-524`, spelled positively) | — |
+| `distribute` — assumes WRITTEN order | pushdown must precede `JoinEnumeration` | **believed**, guaranteed only by call order at `main.cc:571/583` | — |
+| never below AGGREGATE / SORT / DISTINCT / LIMIT | structural | **checked structurally** — `apply` rewrites only FILTER over JOIN / SCAN / DERIVED / PROJECT, and a `LIMIT` body has `LIMIT` as its ROOT so the PROJECT rule cannot see it | no |
+| `pushIntoDerived` ENTRY | the body root's rows ARE the derived relation's rows | **checked structurally** (`derivedRelationSchema` renames and re-stamps only) | — |
+| `remapThroughProject` DESCENT | every named column is a plain passthrough | **checked** (`dynamic_cast<ColumnRef*>`, all-or-nothing) | — |
+| `remapOntoDerivedBody` | positional 1:1 between derived schema and body schema | **checked** (size guard + `resolveInSchema` per ref, all-or-nothing) | — |
+| **the totality screen** | **every conjunct that CAN RAISE stays put; nothing crosses it** | partition **checked** (index-based at all four sites); **classifier `mayRaise` INCOMPLETE — P4-1** | **YES — an ill-typed comparison. Reachable today** |
+| `mayRaise` precision | over-approximating is free | **BELIEVED, and FALSE — P4-2, 87×** | yes |
+| `rebuild` — same relation | each edge consumed once + cross-product throw | **checked** | — |
+| `rebuild` — no consumer reads schema POSITION | column identity, not position | **checked** since the tie-break moved to `(relation_slot, name)`; verified unique by execution (A.6) | — |
+| `containsOuterJoin` / `slotDeclineReason` | declines outer and semi/anti spines | **checked**, over-declining | — |
+| written-cost floor | bounds a misestimate | **checked** | — |
+| `CardinalityEstimator::selectivity` | *decides conjunct ORDER, which is not shape-only* | **still not stated anywhere** — the screen bounds the damage to error behaviour, but the rule that `selectivity` may only affect plan quality is written down nowhere | yes |
+| `foldConstants` | folded node has the same VALUE; no downstream consumer tests SHAPE unsafely | **believed**; census of 5 in `binder.cc` is correct as written but is now short by one — see B.4 | yes |
+| `deterministicCut` | the inserted sort's input schema is plan-independent | **checked** (A.6) | — |
+| `materializeSubqueries` | the body's result is plan-independent | **checked as of the tie-break fix** — B3-1b's repro now agrees | — |
+
+### B.3 Idempotency and ordering, re-checked after round 3's edits
+
+* **`PredicatePushdown` is still effectively idempotent**, and round 3's two new
+  rules do not break it: a second `apply` over the rewritten tree sees
+  `FILTER`(residual) over `JOIN` (every residual still has `soleSlot < 0` or is
+  frozen), and the planted body filter is `FILTER` over `SCAN`/`JOIN`, handled by
+  the existing branches. The one genuinely non-idempotent write is
+  `LogicalDerived::pushdown_decision`, which is a string, is only ever
+  overwritten with the same value, and is never read by the pass.
+* **`JoinEnumeration` is still not idempotent** (pass 2's B-7), and round 3's
+  `applyToSpineLeaves` was written specifically so `apply` does not hand a
+  rebuilt spine back to `decompose` — the descent steps OVER spine joins and into
+  their leaves only. I traced it: `children[1]` of a left-deep spine join is
+  never a `JOIN` except for a semi/anti body, which `reorder` declines on its own
+  account. Correct.
+* **Ordering**: pushdown before enumeration is still the one load-bearing
+  dependency, still guaranteed only by call order. `foldConstants` before
+  `LogicalPlanBuilder::build` is the second, and both `binder.cc:189-191` and
+  `logical_plan.cc:253-262` now say so explicitly. Nothing enforces either.
+
+### B.4 LOW P4-5 — the folding census is complete as of when it was written, and the SAME ROUND added a sixth shape consumer that does not appear in it
+
+`binder.cc:219-249` lists five downstream consumers that test SHAPE and closes
+with:
+
+> The obligation this comment carries forward, now stated against a census that
+> is complete: a new rule that tests for a Literal in a position the user could
+> have written an expression in must ask what the user WROTE, or gate itself
+> ahead of this call.
+
+`mayRaise` (`predicate_pushdown.cc:431-437`), added in the same fix round, is
+exactly such a rule:
+
+```cpp
+const bool const_start = dynamic_cast<const Literal*>(sub->start.get()) != nullptr;
+const bool const_len   = !sub->length
+                       || dynamic_cast<const Literal*>(sub->length.get()) != nullptr;
+if (!const_start || !const_len) return true;
+```
+
+It tests Literal-ness in a position the user can write an expression in, it runs
+downstream of folding, and it does neither of the two things the obligation
+demands. It is nonetheless **SAFE**, for a third reason its own comment states:
+`inferExprType` refuses a constant out-of-domain start/length AT PLAN TIME in
+both legs, so the only trees that reach `mayRaise` with a folded literal start
+are ones already proven in-domain. Verified: `SUBSTRING(team, 1 + 1, 2)` is
+accepted and treated as total; `SUBSTRING(team, 1 - 1, 2)` is refused at plan
+time in both legs.
+
+A second-order note worth recording: folding now decides **whether a conjunct
+freezes**. `WHERE speed > 2020 + 4` folds and stays total; a fold that DECLINES
+(an overflowing constant) leaves a `BinaryExpr` and freezes everything after it.
+Both legs fold identically so this is not a divergence, but it is a new way for
+`foldConstants` to change a PLAN, and neither file mentions it.
+
+### B.5 MEDIUM P4-6 — the retracted folding sentence has a FOURTH copy, and it is the one in `development.md`
+
+`binder.cc` withdrew *"folding cannot change results, so it is canonicalization
+rather than a cost-based decision"* by execution (pass 2's B-5).
+`constant_folding.h` was swept this round — it now carries the sentence only in
+quotation marks, as a retraction (`constant_folding.h:40-47`). `join_enumeration.h`
+was swept for the other retracted paragraph.
+
+`development.md:604-607` still asserts it, verbatim and unqualified:
+
+> `foldConstants` … is unconditional — **folding cannot change results, so it is
+> canonicalization rather than a cost-based decision**, and both execution paths
+> and `--no-optimize` get it.
+
+This is the only surviving unqualified statement of the claim in the repository
+(`grep -rn "cannot change results"` over `src/`, `docs/` and `*.md` returns
+exactly three hits: the two retractions and this one). It matters more than an
+ordinary stale doc for a reason the source itself spells out —
+`logical_plan.cc:253-262` names the exact reader this sentence produces:
+
+> A reader who took `constant_folding.h`'s old word "canonicalization" at face
+> value and gated the pass would land here, on the `--no-optimize` leg only.
+
+The header they would consult has been fixed. The prose document, which the same
+paragraph in `development.md` is the canonical version of, has not. Ranked
+MEDIUM, not LOW, because the consequence is specific and named: every TPC-H
+interval predicate errors on the differential leg.
+
+While here: `development.md:808` still reads *"The decline is silent, in the same
+shape as the <3-relation one"* for `hasSlotOutsideRangeTable`, which `18af84f`
+made false. Already recorded by the join-chain seam's pass 2; not re-counted.
+
+### B.6 Silent declines — the complete list at this HEAD, and one is new and large
+
+Phase 5 has found three. Enumerating every point where a pass refuses a move:
+
+| decline | reported? | verdict |
+|---|---|---|
+| `reorder`, `n < 3` and `n > 32` | silent | honest — no decision existed |
+| `containsOuterJoin` | `join-ordering=skipped (outer join)` | reported |
+| `slotDeclineReason` (semi/anti, out-of-range slot) | `join-ordering=skipped (…)` | reported |
+| `pushIntoDerived` entry refusal | `pushdown=skipped (…)` on `LogicalDerived` | reported; one of its two reasons appears unreachable (P4-3) |
+| `remapThroughProject` descent refusal | **silent** | argued from a false premise (P4-3) |
+| `distribute` leaving a null-supplying bucket | **silent** | the conjunct genuinely cannot move; the SCAN does lose its zone-map hint, but nothing better is available |
+| **the `firstMayRaise` freeze** — at `orderByWork`, `pushIntoJoin`, `pushIntoDerived` and the PROJECT descent | **silent, at all four** | **NEW, and measured at 87× (P4-2).** `--explain` shows the written plan and says nothing. This is the largest unreported decline in the seam's history and it was introduced by the fix that closed B3-2 |
+
+### B.7 What I checked this pass and found CLEAN
+
+Recorded as results so pass 5 does not re-derive them.
+
+* **Pass 3's two BLOCKERs are closed.** B3-1 (`ORDER BY n.n_regionkey LIMIT 5`
+  over the 3-relation TPC-H join) and B3-1b (the same cut inside a scalar
+  subquery) both return **identical output in both legs** on
+  `data/tpch/sf0.01/catalog.json` at this HEAD. So do both of B3-2's SUBSTRING
+  shapes on `catalog.json`.
+* **B3-3's fix is real and its side claims hold**: the body's scan regains
+  `chunks_skipped=0/2` and the body's projection carries 174 rows instead of
+  10000 (A.4).
+* **The freeze partition is sound at all four sites** — no conjunct crosses the
+  boundary in either direction (P4-2, last paragraph).
+* **`inferExprType` DOES decide, at plan time and in both legs, every type error
+  in arithmetic, LIKE, SUBSTRING, IN and CASE** — verified case by case against
+  `logical_plan.cc:159-247`. Only comparison is unguarded (A.2).
+* **`deterministicCut` runs in both legs and in both engines**, and cannot
+  diverge (A.6). `(relation_slot, name)` is unique on every schema a sort can
+  see — `derivedRelationSchema` REFUSES a repeated name, verified by execution.
+* **The derived-body pushdown preserves results on seven body shapes** —
+  passthrough, computed projection, `GROUP BY` filtered on a key, `GROUP BY`
+  filtered on an aggregate output, `DISTINCT`, `ORDER BY … LIMIT` (the shape
+  where descending would be a wrong answer), and a joining body with an alias
+  list. All `optimized == --no-optimize`.
+* **13 further cross-shape queries agree between the legs** — 3-relation joins
+  with `ORDER BY … LIMIT`, a derived relation inside a 3-relation join, a
+  derived body that itself joins, a `LEFT JOIN` with a null-supplying-side
+  predicate, an `IN` subquery beside a pushable conjunct, and an aggregate-bodied
+  derived relation with two conjuncts.
+* **`mayRaise` is complete for every raise EXCEPT the comparison class** — full
+  enumeration in A.2, including the two I could not turn into a divergence
+  (`asInt()` on a bare DOUBLE predicate; `Column not found in schema`).
+* **TPC-H contains no conjunct that the freeze would catch** — all 22 rendered
+  and checked; Q11's product is in a HAVING and Q22's SUBSTRING is
+  constant-argument, so the screen's carve-out holds. This is why the gate is
+  green and why P4-2 is invisible to it.
+* **The invariant harness's three pass-3 obligations are discharged** (B.1).
+* **`applyToSpineLeaves` cannot re-decompose a rebuilt spine** (B.3).
+* **`--no-optimize` gates the VECTORIZED optimizer only.** The Volcano path
+  plans through `Planner::plan` and ignores the flag entirely, so both Volcano
+  rows of every mode census in this seam are not differentials at all. Worth
+  stating once: a "4-mode" census contains two modes that cannot, in principle,
+  show an optimizer divergence.
+
+### B.8 Not reached
+
+* I did not run any harness or the gate. Every number here is a single-query CLI
+  invocation with `--no-cache` against `build/swiftql`, which was newer than
+  every file under `src/`. No source file was touched and no build was started.
+* I did not construct a WRONG-ROW divergence. P4-1's four repros are all
+  error-vs-rows; I looked for a row divergence through the pruner (`shouldSkip`
+  is order-independent except for the throw) and through the freeze (the
+  partition is sound) and found none. Absence of a repro is not a proof.
+* I did not measure P4-2 on a Release build. The 87× is the debug binary; A.4
+  documents that ratios on this shape are build-sensitive by roughly 3×, so the
+  Release figure should be independently taken before it is quoted.
+* I did not re-audit `subquery_materialization.cc` or `subquery_decorrelation.cc`
+  internals; the subquery-chain seam owns those.
+
+---
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 0 | — |
+| **HIGH** | 2 | **P4-1** — `mayRaise` is under-approximate: it classifies a type-mismatched COMPARISON (`team = 5`, `5 = team`) as total, and such a comparison raises per row from `Value`'s operators AND from `ChunkPruner::canSkipChunk`. Four measured divergences on the shipped catalog, both directions, through `orderByWork`, `distribute` under a LEFT join, and the new `pushIntoDerived`. The precondition the fix wrote down — *"`inferExprType` decides every TYPE error at plan time"* — is false: `inferExprType`'s comparison branch never compares its two operand types. **P4-2** — the screen's over-approximation is not free: any arithmetic conjunct freezes every conjunct written after it, out of the join and off its scan, with **no decline line anywhere**. Measured **87×** (39.9 ms vs 0.45 ms) between two queries whose only difference is the order the same three predicates were written in. A regression against the pre-fix code, invisible to every correctness harness |
+| **MEDIUM** | 1 | **P4-6** — the retracted sentence *"folding cannot change results, so it is canonicalization"* has a fourth copy, in `development.md:606`, and it is now the only unqualified statement of it in the repo. `logical_plan.cc:253-262` names the exact failure this sentence causes |
+| **LOW** | 3 | **P4-3** — the argument for not stamping a PROJECT-boundary refusal is false as written (`--explain` prints output NAMES, not expressions, so `LogicalProject [t, s2]` is byte-identical for a computed and a passthrough column); plus one apparently-unreachable refusal reason and a last-wins reason string. **P4-4** — the harness's `INVARIANT_SCOPE` census says six ungated passes; there are eight (`substituteGroupKeyRefs`, `deterministicCut`). Conclusion unaffected, count wrong. **P4-5** — folding's census, declared "complete", was made short by one in the same round: `mayRaise`'s Literal test is a new shape consumer that neither asks what the user wrote nor gates ahead of folding (it is safe, for a third reason) |
+
+**Verdict: the seam does not hold, and the audit should not end here. Pass 3's
+two BLOCKERs are genuinely closed — both repros now agree, and the tie-break's
+move from column POSITION to column IDENTITY is the right fix, checked rather
+than argued. What did not close is B3-2. The fix wrote down the precondition for
+the first time, and the precondition is correct; the CLASSIFIER that implements
+it is wrong in both directions at once. It is too coarse where arithmetic is
+concerned — 87× and silent — and too fine where comparison is concerned, because
+it rests on a sentence about `inferExprType` that is false for the one operator
+class it names. That is the same failure this codebase has now hit four times: a
+precondition stated as a comment at a moment when the reader believed it, and not
+checked against the code it names. The difference this time is that the sentence
+was never true, not that it expired.**
