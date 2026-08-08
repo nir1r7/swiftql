@@ -232,3 +232,33 @@ Severity **MEDIUM**: no wrong answer, and row storage is the correctness baselin
 than the performance path. It is not LOW because the regression is unbounded in the data
 size, it is paid by `--explain`, and the project's own instruments are structurally
 unable to see it — which is how it survived a green gate.
+
+#### A.6b Before/after, measured — and the benchmark moves the WRONG way
+
+To stop guessing, `6748cfc` (the commit immediately before the planner half of the fix)
+was checked out into a detached worktree under `scratchpad/` and built Release with the
+same compiler and flags. Nothing in the working tree was touched; the worktree was
+removed afterwards. Both binaries, `--storage row --execution volcano
+--explain-analyze --no-cache`, TPC-H sf0.1:
+
+| query | PRE plan | PRE exec | PRE total | POST plan | POST exec | POST total | total |
+|---|---|---|---|---|---|---|---|
+| `SELECT l_quantity FROM lineitem LIMIT 1` | 64 µs | 7 µs | **71 µs** | 109 312 µs | 63 µs | **109 375 µs** | **1540x slower** |
+| `SELECT COUNT(*) FROM lineitem WHERE l_quantity > 30` | 49 µs | 234 890 µs | **234 939 µs** | 104 160 µs | 177 396 µs | **281 556 µs** | 1.20x slower |
+| `SELECT l_returnflag, l_linestatus, SUM(l_quantity) ... GROUP BY ... ORDER BY ...` | 55 µs | 271 837 µs | **271 892 µs** | 114 948 µs | 224 150 µs | **339 098 µs** | 1.25x slower |
+| `SELECT l_orderkey FROM lineitem ORDER BY l_orderkey LIMIT 5` | 40 µs | 1 748 114 µs | **1 748 154 µs** | 104 703 µs | 892 029 µs | **996 732 µs** | 1.75x **faster** |
+
+Two things fall out of this table that neither the commit nor the gate could have known.
+
+1. **The change is not uniformly a cost.** Where the plan has a sort or a join above the
+   scan, narrower rows are genuinely cheaper to carry and the narrowing pays for itself
+   (row 4: 1.75x faster end to end). Where the plan is a bare scan/aggregate, or where a
+   `LIMIT` means almost nothing is read, it is pure loss (rows 1-3). It is a *trade*, and
+   it was landed as if it were free.
+
+2. **In all four rows `benchmark.py`'s number moves in the flattering direction.** Its
+   `run_once` reads `Execution:` only, so it would report 24% faster, 17% faster, 51%
+   faster and 9x faster respectively — including for the three queries that got *slower*.
+   The regression is not merely unmeasured; the instrument the project would reach for
+   actively reports the opposite sign. That is the substance of S-9, and it is now
+   measured rather than argued.
