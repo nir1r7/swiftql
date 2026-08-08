@@ -422,3 +422,90 @@ or above, so today it takes a literal to reach. The `checked_arith.h` guard mean
 manufacture one either — it throws on overflow rather than producing a large magnitude silently.
 Nothing in the loader prevents such a column: `TypeId::INT` is `int64_t`.
 
+
+---
+
+### B-2 — how much of the corpus can express E-8 at all? **Measured: none of it.**
+
+Same method as pass 2's B8, applied to the new class. Harvested every `SELECT` string literal from
+`compare_against_sqlite.py` and `test_new_queries.py`:
+
+```
+distinct SELECT literals harvested : 211
+  with LIMIT                       :  28
+  LIMIT and NO ORDER BY            :   6
+  ... and containing a JOIN        :   1
+```
+
+The single one is
+`SELECT season, speed FROM laps JOIN drivers ON laps.driver_id = drivers.driver_id LIMIT 5` — **no
+WHERE clause**, so pushdown moves no estimate and the two build-side rules provably coincide. It is
+exactly the blind spot pass 2 named in `ENGINE_AGREEMENT_QUERIES` ("both queries have no WHERE
+clause, so the join-side rule provably coincides across all four modes"), reproduced in the only
+corpus query that could otherwise have caught E-8. Verified: all four modes byte-identical on it.
+
+So the corpus contains **zero** queries able to express E-8, and green on 1496 + 318 + 823 is a true
+statement about a corpus with no instance of the class — the same finding pass 2 made about its
+predecessor, one class along.
+
+### B-3 — how PREVALENT is E-8? **Measured: 2 of 45 ordinary generated queries. ~4%.**
+
+Not reasoned. Generated every `SELECT <two cols> FROM a JOIN b ON <key> WHERE <subset of ordinary
+single-column predicates> LIMIT 3` over three TPC-H relation pairs (customer/orders,
+supplier/partsupp, part/partsupp) — 45 queries that all four modes execute. Compared optimized
+against `--no-optimize`, and row-Volcano against optimized vectorized:
+
+```
+join+WHERE+LIMIT3 queries run : 45
+  optimized != --no-optimize  :  2
+  volcano   != optimized vec  :  2
+```
+
+The two:
+```
+SELECT c.c_name, o.o_orderkey FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey
+  WHERE o.o_orderstatus = 'F' AND o.o_orderpriority = '1-URGENT' [AND o.o_shippriority = 0] LIMIT 3
+  opt   : Customer#000000004 13388 | Customer#000000005  1090 | Customer#000000005 11941
+  noopt : Customer#000000404     2 | Customer#000000752    36 | Customer#000000607    45
+```
+
+Nothing in either is contrived. This is not a class that needs a pathological estimator input; it
+needs a WHERE clause selective enough to move one side's estimate across the other side's raw count,
+which two ordinary equality predicates on a 10x-larger table achieve.
+
+### B-4 — is there a SHIPPED instance? TPC-H swept: **no. 21 of 22 agree, 1 refused.**
+
+Rendered all 22 TPC-H templates and ran each optimized against `--no-optimize` at sf0.01:
+21 agree byte-for-byte, q21 refused by both. **0 divergent.** So E-8 and E-9 have no instance in the
+shipped benchmark, which is why the gate is green and why the TPC-H baseline md5 is unchanged.
+TPC-H's `ORDER BY` clauses are deliberately near-total and its `LIMIT`s always follow one — the same
+structural reason pass 2 gave for finding no TPC-H instance of E-2.
+
+Stated plainly: **the gate being green is consistent with both blockers. It is not evidence against
+them.**
+
+### B-5 — the vec-only families, re-hunted against SQLite directly. **CLEAN — 42 of 45.**
+
+Pass 2's E-2 is that the four Volcano-refused families rest on SQLite as a single oracle. I ran that
+oracle myself rather than trusting the harness's selection, on 45 hand-written queries chosen to be
+adversarial exactly where the harness is thin — NULL-bearing data manufactured the only two ways the
+loader allows (outer-join null-extension and division producing NULL), inside shapes only the
+vectorized path executes. Both vectorized modes, diffed against an in-process SQLite over the same
+CSVs, sorted comparison.
+
+Covered: `IN`/`NOT IN` where the subquery result CONTAINS NULLs (`SELECT l.driver_id / 0`) and where
+it is EMPTY; `NOT IN` over a null-extended outer-join column; correlated `EXISTS`/`NOT EXISTS`;
+derived tables that are empty, that aggregate, that carry `HAVING`, that are `DISTINCT`, and that sit
+on the null-supplying side of a LEFT join; `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(DISTINCT)` over an
+all-NULL column; `GROUP BY` on a nullable column; three-relation joins mixing INNER and LEFT;
+`IN` and `NOT IN` conjoined in one WHERE; nested derived-inside-`NOT IN`.
+
+**Result: 42 clean, 3 flagged — and all 3 are declared refusals, not wrong answers:**
+- `SELECT`-list subqueries (2 queries) — "subqueries are supported in WHERE and HAVING only";
+- a correlated INEQUALITY (1) — refused with a full explanation of why it has no equi-join to lower to.
+
+No NULL, type, DISTINCT, empty-input or three-valued-logic divergence found in the vec-only families.
+This confirms pass 2's B2/B3/B4 against an independent oracle and an independent query set, and it is
+a result rather than an absence of effort: pass 2 reached the same conclusion by reading the two
+evaluators, and E-10 is the one thing that method could not see, because it lives above both.
+
