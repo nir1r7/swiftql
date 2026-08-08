@@ -11,6 +11,36 @@ Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST 
   summary line), not merely free of failures.
 AFTER PASS 5: doc sweep -> q21 -> sf0.1 -> final gate.
 
+## PASS 5 — engine divergence: **1 BLOCKER / 1 HIGH / 0 MEDIUM / 1 LOW.**
+**VERDICT LINE:** *"Fix round 4 is the strongest of the four and closed E-13 as a class, but it
+governed which ROWS an expression sees and left which TYPE the value has when it gets there."*
+**E-19 (BLOCKER) — SILENT WRONG ANSWER ON THE SHIPPED CATALOG.** `MIN`/`MAX` over a type-mixed
+`CASE` is an INT `Value` in Volcano and a DOUBLE cell in the vectorized engine; **both narrowing
+refusals check the STORED value while the divergence appears at the RESULT.**
+  SELECT MAX(CASE WHEN lap_id=1 THEN 123456789 ELSE 0.5 END) * 987654321 FROM laps
+    Volcano (4 modes) + SQLite: **121932631112635269**
+    vectorized (2 modes):       **1.21932631112635e+17**
+  Minimal form is `+ 1`. Five faces (`+ - *` past 1e15 / 2^53 / INT64_MAX, and AND/OR leaking a raw
+  `std::bad_variant_access`). 147-query matrix: 12 divergent, ALL this class; INT/INT and REAL/REAL
+  CASE rows clean. Corpus has 9 `MIN|MAX(CASE` literals and **NONE** with `+ - *` above.
+  **The arming pass runs OUTSIDE the `--no-optimize` gate, so the optimizer-invariant mode is blind
+  BY CONSTRUCTION.**
+**E-20 (HIGH) — the bare-name fallback, found INDEPENDENTLY BY A THIRD SEAM.** Round 4's pruner rule
+  is reopened: a cross-relation conjunct types against the scanning relation's same-named column,
+  answers "cannot raise", and lets a later conjunct prune the rows the raise was owed — **with the
+  raiser written FIRST, the case the rule's own proof calls unsound.** Row storage errors, all four
+  columnar modes answer 0. **Reachable on the SHIPPED catalog via a derived-table alias**, where no
+  control can see it. (Storage S-13 and optimizer P5-2 are the same bug. THREE seams, ONE FIX.)
+**PART A — IT WITHDREW ALL THREE OF ITS OWN DISPUTED FINDINGS**, agreeing with the fixer: E-17
+  withdrawn (all six modes agree; *"my pass-4 self was wrong to rank it"*), E-13(b) withdrawn as
+  misnamed, E-14 verified fixed in both halves and the new UNRENDERED relaxation attacked and found
+  sound. **E-13 is closed in all five faces** and closed as a DEFINITION obeyed by four independent
+  mechanisms, not as a patch. All eleven `evaluate(` call sites classified. The `NULL AND FALSE`
+  inexactness proved unobservable by MONOTONICITY (over-approximates upward; both callers read
+  `== 1` only) AND by measurement.
+CLEAN: 92 NULL queries, 47 empty/degenerate, DISTINCT, `applyLimit` on every shape it reaches, and
+  the unarmed-but-safe type consumers (`=`, `<`, `IN`, `ORDER BY`, group/DISTINCT keys) — 0 divergent.
+
 ## PASS 5 — subquery chain: **1 BLOCKER / 2 HIGH / 2 MEDIUM / 2 LOW.**
 **B-1 (BLOCKER) — round 4's fix, ONE AST NODE DEEPER. One line fixes it.**
 `divWalk`'s `AggregateExpr` arm (`subquery_materialization.cc:268-275`) returns for `SUM`/`AVG`
