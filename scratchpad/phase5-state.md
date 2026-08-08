@@ -27,7 +27,74 @@ GATE on fix round 1: **GREEN** (log scratchpad/gates/seam-fix-round-1.log, uncom
   code surface was byte-identical at both ends (`git diff ee9c9d7..HEAD -- . ':(exclude)scratchpad/'`
   empty; code fingerprint 785a8d3094304eea958f78998dc467fc at both). Verdict stands for both SHAs.
 
-PASS 2 results so far — **0 BLOCKERS, 0 HIGH** in both completed seams:
+PASS 2 results — **1 BLOCKER** (subquery chain). 4 of 5 seams reported; engine-divergence still running.
+
+**THE BLOCKER — B-1, subquery chain.** `SELECT *` over a block holding a correlated scalar
+  subquery emits the SYNTHETIC relation's columns:
+    SELECT * FROM drivers d WHERE d.age > (SELECT COUNT(*) FROM laps l WHERE l.driver_id =
+      d.driver_id AND l.speed > 999)
+    SwiftQL: 7 cols ... age $k0 COUNT(*)   |   SQLite: 5 cols
+  Inside a derived body the same defect surfaces as `internal: derived table 'x' was bound
+  against a 5-column schema but planned to 7 columns`. A **Week 34** defect — `blockOutputSchema`
+  models no subquery lowering, so the star expands over the merged join schema. NOT introduced by
+  8a23b9d. Invisible to the oracle because **all 31 WEEK34_CORRELATED_SCALAR_VEC_ONLY entries name
+  their select list** — not one uses `SELECT *`.
+  => Pass 2 returned a blocker, so the audit does NOT stop here. Fix round 2, gate, then PASS 3.
+
+storage (27fd886, 28655b4): **0/0/0/2 — and it REFUTED S-0.** Pass 1 overstated it; re-ranked LOW.
+  1. There are **three** storage×engine cells, not four: `--storage row --execution vectorized` is
+     refused for every query (main.cc:548, confirmed by running it). The harness's fourth "mode" is
+     `--no-optimize`, an optimizer flag. So the row/columnar oracle is Volcano-only, always.
+  2. **The oracle DOES span Phase 5**: `QUERIES` holds 89 Phase 5 queries out of 168, including all
+     17 WEEK29_OUTER_JOIN_QUERIES. Week 29's `pruningHintForPreservedSide` is the one Phase 5 change
+     existing only to protect chunk pruning, so the storage-critical Phase 5 path IS differentially
+     oracled. 6/6 byte-identical row vs columnar.
+  3. The two storage modes differ in exactly ONE node — `SeqScanNode`. The four shapes Volcano
+     refuses are rejected BEFORE any scan is built, so none can reach it. Row storage is a
+     `vector<Row>` with an index: no chunks, encodings, zone maps or pruning to break.
+  CHEAPEST FIX for W37: give `VecScanNode` a row-backed constructor and delete main.cc:548.
+    ~70-90 lines, no planner change, no refusal relaxed. The row leg has no zone maps, so it becomes
+    a pruning-on vs pruning-off oracle on exactly the shapes that have none. Every alternative
+    (lifting a Volcano refusal) is larger and buys less.
+  NEW S-8 (LOW): a duplicate column name in catalog.json is a SILENT WRONG ANSWER in columnar only.
+    `ColumnarTable::columns` is keyed by name, so both columns land in one vector.
+    `SELECT k FROM t` -> row `1,2,3` vs columnar `1,100,2`. No error at any layer. Needs a
+    hand-malformed catalog, but it is the ONLY input found in two passes that makes the formats
+    disagree, and the engine already refuses the identical shape for derived relations
+    (logical_plan.cc:494). ~4 lines in catalog.cc.
+  Also closed pass 1's not-reached gap: 144-query zone-map boundary sweep over DOUBLE and STRING
+    (plus INT) x 3 cells vs a Python oracle, 0 mismatches; first runtime proof pruning is live on
+    the Volcano columnar path (chunks_skipped=2/3); scan order identical across formats, so
+    87c08a2's GROUP BY fix is sound across STORAGE too.
+  TPC-H refusal pins are weak (owner: the TPC-H reporting seam, not storage): run_tpch.py:81-88 has
+    a DEAD entry ("IN (subquery) is lowered" vs the engine's "IN subqueries are lowered") and a
+    LOOSE one ("IN subquery" also matches two LANGUAGE refusals firing in all four modes,
+    mislabelling a dialect gap as boundary coverage).
+  NULL, proved not inferred: `CSVToColumnar::convert` is the only ColumnarTable producer,
+    `parseField` has no NULL production, and `ColumnArray` has NO VALIDITY CONCEPT. So NULL
+    representation has never been differentially tested across storage — and cannot be, because
+    columnar has no representation to disagree with. NULL *semantics* are well covered (38
+    NULL-bearing queries in both storage modes). W37: if a loader ever learns `\N`, columnar needs
+    a validity representation that does not exist, and that day has ZERO harness coverage.
+
+subquery-chain (c6830f1): 1 BLOCKER (above), 2 MEDIUM, 5 LOW. Part A: 8a23b9d's collision is
+  IMPOSSIBLE, not unlikely — three independent reasons, incl. `$` being outside the lexer's
+  identifier alphabet with no quoted-identifier production. The guard is dead on this call site and
+  alive where it belongs (user-written `FROM (...) AS d`) — the fix removed the routing, not the
+  problem. One correction: the commit cites `buildAggregateSchema`; the schema actually renamed is
+  the terminal `LogicalProject`'s. Cost: `$k0`/`$k1` leak into `--explain`; nothing pins them.
+  B-2 MEDIUM: a column alias on an UNWRAPPED correlated scalar body breaks it (`column not found:
+    'AVG(l2.speed)'`, SQLite 4994) while the wrapped form with the same alias returns 4037 —
+    contradicting the "same plan" claim in both the README and the suite.
+  B-3 MEDIUM: `collectSlots` has a third `-1` producer (`if (sq->correlated)`) that
+    `splitCorrelation`'s comment does not enumerate, so any conjunct merely CONTAINING a nested
+    correlated subquery is refused with a message about a correlated inequality the query lacks.
+  LOWs: a Week-33-deleted refusal still asserted in development.md AND main.cc:475
+    (`has_correlated_subquery` written and never read); three guards that cannot fire, one
+    (`level() != 1`) load-bearing the moment B-3 is fixed; a rejection pin on a shared message tail;
+    and **none of the 17 NOT IN oracle entries has a NULL-bearing body**.
+
+Earlier two seams — 0 BLOCKERS, 0 HIGH:
   join-chain (532183e): 3 MEDIUM, 2 LOW. Corrected pass 1: the DERIVED phantom manufactured the
     join-order *margin*, NOT the order — the order was byte-identical and already the better one.
     28 constructed shapes, three-way differential vs SQLite, 0 disagreements. DP search space is
@@ -80,20 +147,38 @@ CONSTRUCTION — including the entire subquery lowering path — and nothing any
 Every reassuring subquery number comes from SQLite agreement alone, never from the invariant.
 This changes what "0 divergences" means and must be written down wherever that figure is quoted.
 
-## STOP CRITERION
+## STOP CRITERION — pass 2 FAILED it
 The skill: repeat the seam pass up to 5 times, stopping as soon as a pass returns NO BLOCKERS.
-Pass 2 has returned no blockers in 2 of 5 seams so far. If the remaining three also return none,
-the seam audit ENDS after a fix round 2 for the above + a closing gate. **Then stop and report.
-Week 37 is the user's.**
+**Pass 2 returned a blocker (B-1).** So: fix round 2 → gate → **PASS 3**. Only if pass 3 is
+blocker-free does the audit end. Week 37 is the user's either way.
+
+## TPC-H 22/22 — the user's stated goal. The two gaps are UNRELATED.
+- **q21 — a real engine gap, 0 of 4 modes.** Blocker: a correlated INEQUALITY has no equi-join to
+  lower to (`l2.l_suppkey != l1.l_suppkey`). But each correlation has TWO conjuncts — an equi one
+  (`l2.l_orderkey = l1.l_orderkey`) AND the inequality. So the equi key DOES exist; the open
+  question is whether the lowering can split the correlation and carry `!=` as a join RESIDUAL
+  rather than refusing the whole predicate. Residual forwarding was one of 18af84f's four lows,
+  which makes that path more plausible than it was. NOT asserted — sized for W37.
+  The query itself is fine: the harness confirms it DISCRIMINATING against SQLite on this data.
+- **q18 — NOT a gap.** SwiftQL answers it in 2 modes and matches SQLite; the answer is empty on
+  both sides. MEASURED on the actual files (not trusting the comment): 15000 orders, max
+  SUM(l_quantity) per order = **295.0**, orders over 300 = **0**, max lineitems/order = 7, max
+  single quantity = 50. Domains are right (ceiling 7x50=350); no order hit both maxima at once —
+  a DISTRIBUTION artifact, exactly what PROVENANCE.txt warns about. 290 -> DISCRIMINATING.
+  **THE THRESHOLD MUST NOT MOVE**: 300 is already the lowest of the spec's three Q18 quantities
+  (300/312/315), so lowering it invents a value the spec does not contain — unlike q2's SIZE and
+  q19's BRANDs, which were re-chosen from WITHIN the spec's own domains.
+  Honest route: **more data, not a smaller number.** sf0.1 gives ~150k orders and the tail that
+  stops at 295 today would clear 300. Cost: sf0.1 needs its OWN baseline, since which queries are
+  vacuous is a property of the data. **This is the user's call, not mine.**
 
 ## CARRY TO WEEK 37
-- **S-0** — the row/columnar oracle does NOT span any Phase 5 shape (vectorized needs columnar;
-  Volcano refuses derived/multi-way/semi/correlated), so the two storage modes never execute the
-  same Phase 5 query and this phase's storage safety rests on hand-computed answers. The storage
-  pass-2 auditor is settling its truth, severity, and the cheapest fix.
-- **The CSV loader cannot express NULL.** Any NULL test not manufacturing its NULLs via an outer
-  join is testing NULL handling against data containing none.
-- q21 unported (correlated inequality has no equi-join to lower to); q18 vacuous BY CHOICE.
+- **S-0 is REFUTED** — see the storage entry above. Re-ranked LOW. The real storage item is the
+  ~70-90 line `VecScanNode` row-backed constructor.
+- **NULL has no columnar representation at all** — `ColumnArray` has no validity concept. If a
+  loader ever learns `\N`, columnar needs a representation that does not exist, with zero harness
+  coverage. Bigger than "the CSV loader cannot express NULL", which is the symptom.
+- q21 and q18 — see the TPC-H section above.
 - Pre-existing "BetweenExpr would cost 17 dispatch sites" drift in three files.
 - `ColumnId {level, slot}` — still deferred. 87 non-comment mentions / 6 source layers.
 

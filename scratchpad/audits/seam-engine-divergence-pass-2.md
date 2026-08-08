@@ -621,3 +621,17 @@ Two things follow:
 LIMIT 20`, could not have its ORDER BY key resolved by the probe — it orders on a select
 alias and a base column together. Inspected by hand: the twenty rows are all
 `('AlphaTauri', <same g>)`, an immaterial tie.)
+
+### B9. Scan order — the third link in A2's chain, verified
+
+`SeqScanNode::next` (plan_nodes.cc:57-93) and `VecScanNode::nextChunk`
+(vec_scan_node.cc:17-35) both walk `row_cursor_` strictly ascending and both call the same
+`ChunkPruner::shouldSkip` at `cursor_ % CHUNK_SIZE == 0`. Pruning only *skips whole chunks*;
+neither can reorder. So "both engines encounter scan rows in the same order" holds — but by
+two independent implementations of the same loop, with no assertion tying them together now
+that the property is load-bearing.
+
+One row-vs-columnar asymmetry inside Volcano, noted for completeness and **not** an engine
+divergence: `Planner::plan` gives the columnar scan the NARROWED `scan_schema` and the row
+scan the FULL `meta.schema` (planner.cc:236-240). Column order above is by name, so results
+agree; it means the two Volcano modes do different amounts of work, not different work.
