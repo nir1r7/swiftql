@@ -24,6 +24,35 @@ Catalog::Catalog(const std::string& catalog_path){
 
         for (auto& col : table_json["columns"]){
             ColumnDef colDef {col["name"].get<std::string>(), parseTypeId(col["type"].get<std::string>())};
+            // Week 37, seam-storage pass 2 finding S-8. A repeated column name
+            // is the ONE input found across two audit passes that makes the two
+            // storage formats disagree, and it disagrees SILENTLY:
+            //
+            //   catalog: t(k INT, k INT)   data: k,k / 1,100 / 2,200 / 3,300
+            //   SELECT k FROM t            row 1,2,3   columnar 1,100,2
+            //   SELECT COUNT(*), SUM(k)    row 3,6     columnar 3,103
+            //
+            // Row storage is positional (csv_loader.cc) and picks the first `k`.
+            // ColumnarTable::columns is keyed by NAME (columnar_table.h), so
+            // CSVToColumnar's pass 1 emplaces one vector for both schema entries
+            // and pass 2 pushes BOTH values of every row into it — the vector
+            // interleaves while num_rows stays 3, and getValue("k", r) reads
+            // element r, i.e. row 1 gets row 0's second column.
+            //
+            // Refused here rather than repaired downstream, and refused for the
+            // reason the engine ALREADY refuses the identical shape one layer up
+            // for a derived relation (logical_plan.cc, "column '<c>' is produced
+            // twice"): a schema with two same-named columns has no answer to
+            // "which one is `k`". The catalog was the one place that shape could
+            // still get in. Exact-match, because Schema::indexOf is exact-match
+            // and ColumnarTable's map is keyed on the same bytes.
+            for (const ColumnDef& seen : cols) {
+                if (seen.name != colDef.name) continue;
+                throw std::runtime_error(
+                    "catalog: table '" + table_json["name"].get<std::string>() +
+                    "': column '" + colDef.name + "' is declared twice; "
+                    "give one of them a distinct name");
+            }
             cols.push_back(colDef);
         }
 
