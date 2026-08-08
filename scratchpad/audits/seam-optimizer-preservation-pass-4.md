@@ -232,9 +232,11 @@ B:  LogicalFilter [((l.speed * 2) > 688)]
 harness can report it, and `--explain` prints **no decline line at all** — A's
 optimized plan is the written plan with nothing said about why.
 
-This is a **regression introduced by the fix round**: before the screen existed,
-`soleSlot` routed `l.lap_id < 5` to slot 0 and `dr.age > 30` to slot 1 and both
-were pushed. The optimized leg is now within 15% of the `--no-optimize` leg on
+This is a **regression introduced by the fix round**, established from the diff
+rather than inferred: at `5d5f188` (the last commit before the screen)
+`pushIntoJoin`'s loop reads `int slot = soleSlot(c.get());` with no `frozen`
+term, so `l.lap_id < 5` went to slot 0 and `dr.age > 30` to slot 1 and both were
+pushed regardless of what preceded them. The optimized leg is now within 15% of the `--no-optimize` leg on
 this shape — i.e. the optimizer has effectively switched itself off, silently.
 
 Two things make it worth a HIGH rather than a MEDIUM:
