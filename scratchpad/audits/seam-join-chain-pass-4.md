@@ -732,3 +732,42 @@ SQLite 20), while the same shape with `l2.team = d.age` is refused by name and b
   leftover cannot land behind a frozen conjunct.
 * `rebuild`'s key re-orientation is symmetric with respect to the type rule, so no
   reordering can produce a key pair the validator did not already see (A.2.2).
+
+---
+
+## Addenda to the two blockers
+
+### P4-B1 — why no existing pin can catch it
+
+`tests/test_predicate_pushdown.cc:1280` (`ComputedProjectionStopsTheDescentButNotTheEntry`)
+is the closest pin and it pins the case that WORKS:
+
+    SELECT d.s2 FROM (SELECT team, speed * 2 AS s2 FROM laps) d WHERE d.s2 > 780
+      … the descent stops at the computed column
+
+i.e. the conjunct NAMES the computed column, so `remapThroughProject` declines — my P7. The
+failing shape is the mirror of it: the conjunct names a PASSTHROUGH while a SIBLING column
+is computed and PARTIAL. The eleven derived-pushdown pins added this round
+(`:1184`–`:1341`) are all about which node the filter lands on; none has a partial
+expression in the body's select list, and the totality pins (`:1048`–`:1161`) all put the
+partial expression in a CONJUNCT. A pin for P4-B1 must put it in the PROJECTION.
+
+### P4-B2 — a third behaviour, which belongs to a different seam
+
+The same query answers three ways, and the third one is not mine to rank:
+
+    SELECT COUNT(*) FROM laps l WHERE l.team LIKE 'zzz%' AND l.team = l.lap_id
+      columnar/vectorized                -> Error   (orderByWork moved it; P4-B2)
+      columnar/vectorized --no-optimize  -> 0
+      row/volcano                        -> Error
+      columnar/volcano                   -> Error
+
+Volcano raises with no optimizer involved because `evaluate()` computes BOTH operands of an
+`AND` before it looks at the operator (`evaluator.cc:99-101`), so it has no cascade to
+protect the right conjunct, while `columnar_eval`'s AND evaluates the right one only over
+the left's survivors. That is an ENGINE divergence on a written-order query and is the
+engine-divergence seam's to rank, not the join chain's — recorded here only because it is
+the same predicate, and because it means "what written order gives a conjunct" is itself
+engine-dependent, which the screen's property statement ("evaluated on exactly the ROW SET
+that written order gives it") quietly assumes away. The blocker I am ranking is the
+optimized-vs-`--no-optimize` pair, which is the invariant this project asserts.
