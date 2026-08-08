@@ -159,8 +159,9 @@ inline double narrowToDoubleColumn(const Value& v) {
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
 // narrows into a DOUBLE column through narrowToDoubleColumn above, which THROWS
 // rather than change the value or its rendering — read that comment before
-// touching this; the widening was called "lossless" here for three weeks and it
-// is not, above 1e15. Every other type disagreement is a planner/schema bug and
+// touching this. This comment called the conversion "lossless" from 85be432
+// (Week 24, the commit that added validity) until seam pass 3 found it. It is
+// not, above 1e15. Every other type disagreement is a planner/schema bug and
 // surfaces as bad_variant_access from the typed accessor, as it did before
 // validity existed. (Checked, not assumed: DOUBLE or STRING into an INT column
 // and any number into a STRING column all reach a std::get of the wrong

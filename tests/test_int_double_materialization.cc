@@ -45,11 +45,16 @@
 // any answer that is right today.
 //
 // DISCRIMINATION, MEASURED, NOT ASSERTED. Every test below was run in a scratch
-// worktree of this same tree with `narrowToDoubleColumn` reverted to the old
-// `v.toNumeric()` — byte-for-byte the semantics the vectorized path had before
-// this change. The failures are recorded per test. Three tests are marked GUARD:
-// they pass both before and after on purpose, because their job is to pin what
-// the fix must NOT move. Nine tests discriminate; three guard.
+// worktree of this same tree with `narrowToDoubleColumn` reverted to a bare
+// `return v.toNumeric();` — byte-for-byte the semantics the vectorized path had
+// before this change. 8 of the 12 FAILED there, each with the divergence the
+// audit recorded, and the observed text is quoted in the comment above each one.
+//
+// The other 4 pass both before and after ON PURPOSE and are named so:
+// `ThresholdIsExactlyTheBoundary` derives the constant rather than testing the
+// fix (it cannot fail pre-fix — the constant does not exist there), and the
+// three `Guard*` tests pin what the fix must NOT move. Neither kind is offered
+// as evidence the fix works. Eight is the number that discriminates.
 
 namespace {
 
