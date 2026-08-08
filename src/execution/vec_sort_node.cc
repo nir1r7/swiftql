@@ -45,8 +45,13 @@ void VecSortNode::consumeAndSort() {
     // row that survives a LIMIT cut independent of the plan shape (and so of the
     // build side this engine chooses from cardinality estimates while Volcano
     // chooses it from raw row counts). See execution/sort_comparator.h.
+    //
+    // The canonical column order is computed ONCE here, not inside the
+    // comparator — and it is what makes the tie-break independent of the column
+    // ORDER of the merged join schema, which JoinEnumeration permutes.
+    const std::vector<int> tie_order = sort_comparator::tieBreakOrder(schema);
     std::stable_sort(flat_buffer_.begin(), flat_buffer_.end(), [&](const Row& a, const Row& b) {
-            return sort_comparator::rowLess(order_by_, schema, a, b);
+            return sort_comparator::rowLess(order_by_, schema, tie_order, a, b);
         });
 }
 

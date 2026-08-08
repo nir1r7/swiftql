@@ -5,6 +5,7 @@
 #include "parser/ast.h"
 #include "execution/evaluator.h"
 #include <algorithm>
+#include <numeric>
 #include <vector>
 
 // THE SORT COMPARATOR, SHARED BY BOTH ENGINES.
@@ -46,12 +47,14 @@
 // ---------------------------------------------------------------------------
 // THE RULE, AND WHAT IT DOES AND DOES NOT GUARANTEE
 //
-// When every declared key ties, compare the whole row, column by column, in
-// schema order, ascending. Properties:
+// When every declared key ties, compare the whole row, column by column, in the
+// CANONICAL column order `tieBreakOrder` computes, ascending. Properties:
 //
-//   * It is a function of the row's VALUES alone. It cannot consult arrival
-//     order, hash bucket layout, chunk boundaries, or which side built the hash
-//     table — precisely the things that differ between the legs.
+//   * It is a function of the row's VALUES and of each column's QUERY IDENTITY.
+//     It cannot consult arrival order, hash bucket layout, chunk boundaries,
+//     which side built the hash table, or the POSITION a column happens to
+//     occupy in the plan's row — precisely the things that differ between the
+//     legs.
 //   * It is a total order on DISTINGUISHABLE rows. Rows that remain tied after it
 //     are equal in every column, so whichever survives the cut, the result is the
 //     same. (This is the audit's "material tie" notion: an immaterial tie cannot
@@ -64,16 +67,41 @@
 // `compareForSort` on the first column of the tie-break — no evaluation, no
 // allocation — and stops. Rows that do tie pay up to one `compareForSort` per
 // column, against the `evaluate()` call per key per comparison the declared keys
-// already cost, which is far more expensive.
+// already cost, which is far more expensive. `tieBreakOrder` is computed ONCE
+// per sort by the caller, never per comparison.
 //
-// THE PRECONDITION IT RESTS ON, STATED SO IT CAN BE CHECKED: the sort's INPUT
-// row must be the same in every mode. It is, for every shape this can decide,
-// because ORDER BY is planned directly above the aggregate/filter/join and below
-// the projection in both builders, and an aggregate's output schema
-// (`buildAggregateSchema`) is the same in all four modes.
+// !! WHY THE COMPARISON ORDER IS NOT THE SCHEMA'S ORDER (seam audit pass 3:
+// engine E-9, join-chain B3-1, optimizer B3-1 — one defect, three routes).
+// The paragraph that stood here stated the precondition as "the sort's INPUT row
+// must be the same in every mode", and that is FALSE the moment a multi-way join
+// sits under the sort. `JoinEnumeration::rebuild` builds the merged schema in
+// the DP's CHOSEN order — its own comment concedes that a slot-sorted canonical
+// order "is not available (invariant 1)", because `VecHashJoinNode`'s two output
+// blocks must stay contiguous. So the two legs hand this comparator the same row
+// VALUES as a PERMUTED SEQUENCE, and a lexicographic order over a permuted tuple
+// is a DIFFERENT TOTAL ORDER. Measured: a 3-relation TPC-H join with
+// `ORDER BY n_regionkey LIMIT 5` returned five ALGERIA suppliers optimized and
+// ALGERIA/MOZAMBIQUE/MOROCCO/MOROCCO/ALGERIA under `--no-optimize`. Both legs
+// ran the tie-break; both were deterministic; they disagreed.
 //
-// !! THE ONE PLACE IT WAS NOT, AND WHY THAT IS NOW A FACT RATHER THAN AN
-// ARGUMENT. Row storage under Volcano used to hand `SeqScanNode` the FULL
+// The precondition is therefore restated as the thing the code now enforces:
+// THE COMPARISON ORDER MUST BE DERIVED FROM COLUMN IDENTITY, NEVER FROM COLUMN
+// POSITION. `tieBreakOrder` derives it from `(relation_slot, name)`:
+//   * `relation_slot` is the BINDER's range-table position — 0 for FROM, i+1 for
+//     the i-th JOIN in WRITTEN order. `rebuild` re-stamps it as `order[k]`, i.e.
+//     with that same written-order slot, and copies whole `ColumnDef`s, so the
+//     SET of `(slot, name)` pairs is identical on both legs and only the
+//     SEQUENCE differs. Sorting by the pair recovers the sequence.
+//   * the pair is unique on any schema a sort can see: two relations cannot
+//     share a slot, and one relation cannot repeat a column name (the catalog
+//     refuses duplicate names, and so does `derivedRelationSchema`). Where it is
+//     NOT unique — a projected schema with two identically named output columns —
+//     the sort is stable, so those columns keep their schema order, and a
+//     PROJECTED schema's order is a function of the SELECT list rather than of
+//     the plan.
+//
+// !! THE OTHER PLACE THE PRECONDITION FAILED, AND WHY THAT IS NOW A FACT RATHER
+// THAN AN ARGUMENT. Row storage under Volcano used to hand `SeqScanNode` the FULL
 // catalog schema while every columnar mode handed it the narrowed
 // `buildScanSchema`, so the two legs tie-broke over different column sets. The
 // paragraph that stood here argued the difference was immaterial (the extra
@@ -91,8 +119,15 @@
 // every mode. The DISTINCT entry stays — it is still the only entry whose sort
 // input is a raw join row, so it is still where a future re-divergence would
 // show up — but it is now a regression test rather than a standing hazard.
-// `tests/test_sort_tiebreak.cc` pins the comparator's own rules; it cannot see
-// this one, because it builds one schema.
+//
+// !! AND THE CUT THIS COMPARATOR CANNOT REACH AT ALL. Nothing requires a sort
+// beneath a `LIMIT`. `LIMIT n` with no `ORDER BY` cuts a join's raw probe order,
+// which is plan-dependent for exactly the reasons listed above, and no edit to
+// this file can see it. That half is closed where the cut is — `LogicalPlanBuilder`
+// and `Planner::plan` insert a sort with NO declared keys (so `rowLess` falls
+// straight through to this tie-break) directly beneath a `LIMIT` whose input
+// order is not already plan-independent. See `orderIsPlanStable` in
+// planner/logical_plan.cc.
 namespace sort_comparator {
 
 // compareForSort, widened so it can never throw. compareForSort refuses STRING
@@ -109,6 +144,25 @@ inline int compareForTieBreak(const Value& a, const Value& b) {
     return compareForSort(a, b);
 }
 
+// The CANONICAL order in which the tie-break visits a schema's columns: column
+// INDICES sorted by `(relation_slot, name)`, i.e. by what the column IS in the
+// query rather than by where the plan happened to put it. See the header for why
+// schema order is not usable and why the pair is both stable and (where it
+// matters) unique. Compute once per sort; it allocates.
+inline std::vector<int> tieBreakOrder(const Schema& schema) {
+    std::vector<int> order(static_cast<size_t>(schema.size()));
+    std::iota(order.begin(), order.end(), 0);
+    // stable: identical (slot, name) pairs keep schema order, which is a
+    // function of the SELECT list wherever such pairs can occur.
+    std::stable_sort(order.begin(), order.end(), [&schema](int x, int y) {
+        const ColumnDef& a = schema.column(x);
+        const ColumnDef& b = schema.column(y);
+        if (a.relation_slot != b.relation_slot) return a.relation_slot < b.relation_slot;
+        return a.name < b.name;
+    });
+    return order;
+}
+
 // The strict weak ordering handed to std::stable_sort by both engines.
 //
 // compareForSort, not Value::operator< — the SQL operators return false for every
@@ -116,8 +170,14 @@ inline int compareForTieBreak(const Value& a, const Value& b) {
 // equivalence non-transitive. That is not a strict weak ordering, so
 // stable_sort's behaviour is undefined: it inverted non-NULL keys and dropped
 // rows under LIMIT. See the comment on compareForSort in value.h.
+//
+// `tie_order` must be `tieBreakOrder(schema)`. It is a parameter rather than
+// something this function derives so that the O(n log n) it costs is paid once
+// per sort instead of once per comparison — and so that the caller cannot
+// silently fall back to schema order, which is the defect this closes.
 inline bool rowLess(const std::vector<OrderByItem>& order_by,
                     const Schema& schema,
+                    const std::vector<int>& tie_order,
                     const Row& a,
                     const Row& b) {
     for (const auto& item : order_by) {
@@ -125,13 +185,26 @@ inline bool rowLess(const std::vector<OrderByItem>& order_by,
                                evaluate(item.expr.get(), b, schema));
         if (c != 0) return item.desc ? c > 0 : c < 0;
     }
-    // every declared key ties — see the header comment
-    const int n = std::min(schema.size(), static_cast<int>(std::min(a.size(), b.size())));
-    for (int i = 0; i < n; ++i) {
+    // every declared key ties — see the header comment. `tie_order`'s entries are
+    // schema indices by construction; the bound is on the ROWS, defensively, for
+    // the same reason the schema-order loop carried one.
+    const int n = static_cast<int>(std::min(a.size(), b.size()));
+    for (int i : tie_order) {
+        if (i >= n) continue;
         int c = compareForTieBreak(a[i], b[i]);
         if (c != 0) return c < 0;
     }
     return false;
+}
+
+// One-shot form, for a single comparison (and for the unit tests, which compare
+// two rows at a time). Never call it from inside a sort — it rebuilds the
+// canonical order on every comparison.
+inline bool rowLess(const std::vector<OrderByItem>& order_by,
+                    const Schema& schema,
+                    const Row& a,
+                    const Row& b) {
+    return rowLess(order_by, schema, tieBreakOrder(schema), a, b);
 }
 
 }  // namespace sort_comparator

@@ -525,8 +525,13 @@ void SortNode::open() {
     // survives a LIMIT cut independent of the plan shape. See
     // execution/sort_comparator.h; a tie-break only one engine applies would be
     // the same cross-engine divergence with a new cause.
+    //
+    // The canonical column order is computed ONCE here, not inside the
+    // comparator: it is O(n log n) in the column count, and deriving it per
+    // comparison would be the same answer at a much worse price.
+    const std::vector<int> tie_order = sort_comparator::tieBreakOrder(schema);
     std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
-        return sort_comparator::rowLess(order_by_, schema, a, b);
+        return sort_comparator::rowLess(order_by_, schema, tie_order, a, b);
     });
     cursor_ = 0;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
