@@ -58,6 +58,15 @@
 // fix (it cannot fail pre-fix — the constant does not exist there), and the
 // three `Guard*` tests pin what the fix must NOT move. Neither kind is offered
 // as evidence the fix works. Eight is the number that discriminates.
+//
+// FIX ROUND 4 SPLIT THE BOUND IN TWO, and `ValueBoundIsExactlyTwoToThe53`
+// derives the second one. "Both halves bite, and the smaller decides" is a
+// statement about a column that is PRINTED; seam pass 4 (E-14) ran one that is
+// not — `SELECT MAX(CASE WHEN c THEN 2000000000000000 ELSE 0.5 END) > 1`, which
+// Volcano answers 1 and this refused for a rendering that never happens. When
+// the plan proves the text is never read the bound is 2^53, the VALUE half
+// alone. Everything above is unchanged for a column that reaches the output,
+// which is every query in this file except that one.
 
 namespace {
 

@@ -55,12 +55,22 @@
 // vectorized_plan_builder.cc computes it (collectIntOrigins) and arms the
 // column; vec_types.h refuses only on an armed one.
 //
-// DISCRIMINATION, MEASURED. Every test named ...Refuses... below was run against
-// a scratch worktree built from the parent commit (b13a96a) with none of this
-// change in it. All SIX failed there, each producing the divergent answer quoted
-// in its comment. This file uses nothing but the public planner API precisely so
-// that it compiles and runs unchanged against that pre-fix tree — a test that
-// cannot be built without the fix cannot be evidence for it.
+// DISCRIMINATION, MEASURED. Every test named ...Refuses... in sections 1 and 2
+// below was run against a scratch worktree built from the parent commit
+// (b13a96a) with none of this change in it. All SIX failed there, each producing
+// the divergent answer quoted in its comment. This file uses nothing but the
+// public planner API precisely so that it compiles and runs unchanged against
+// that pre-fix tree — a test that cannot be built without the fix cannot be
+// evidence for it.
+//
+// FIX ROUND 4 ADDED SECTIONS 4 TO 7 and re-measured them the same way, against
+// 689ea9a: the five cross-cut reproductions and the four over-firing answers all
+// failed there, and every Guard passed on both sides. Sections 4 and 5 need the
+// `int_type_observable` argument, which does not exist pre-fix, so their
+// counterfactual run adapted exactly two call sites (the runner's second
+// parameter and build()'s fourth argument) and left the ENGINE untouched. The
+// row counts quoted in each comment are from that run, and every expectation in
+// this file was re-checked against SQLite over the same five rows.
 //
 // The tests named Guard... pass BOTH before and after, on purpose. They are not
 // evidence the fix works; they are the fence around it, and each one names the
@@ -319,7 +329,9 @@ TEST_F(TypeThroughDivision, ProjectionDividingAnAggregateOfAMixedCaseRefuses) {
 // SQLite: 4.0, 0, 4.0 — `2 / 7` is INTEGER division.
 //
 // The DIVISOR decides too. A rule that armed only the dividend would leave this
-// one silently wrong, which is why taintWalk arms both operands of `/`.
+// one silently wrong, which is why taintWalk arms both operands of `/` — once it
+// has decided the division is INTEGER at all. The literal `2` here is what makes
+// it one; `2.0 / x` is not armed, and section 6 pins that.
 TEST_F(TypeThroughDivision, MixedCaseUsedAsTheDIVISORRefuses) {
     expectRefusedBothWays("SELECT 2 / x FROM " + std::string(MIXED_BODY), catalog_);
 }

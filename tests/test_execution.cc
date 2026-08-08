@@ -1496,3 +1496,85 @@ TEST(EvaluateWeek25, CaseNeverEvaluatesTheUntakenBranch) {
 
     EXPECT_EQ(evaluate(c.get(), row, schema).asInt(), 42);   // no throw
 }
+
+
+// ===== evaluatePredicate — the cascade, in the scalar engine =====
+//
+// SEAM AUDIT PASS 4, E-13. evaluate() computes BOTH operands of an AND before
+// applying the tri-state rule; columnar_eval.cc's evalPredicate cascades the
+// selection vector and evaluates the right conjunct only over the rows the left
+// kept. Per-row evaluation is not total, so those are two different semantics,
+// and the two engines answered differently on the shipped `drivers` table:
+// Volcano errored where the vectorized path returned the correct rows.
+//
+// evaluatePredicate is the scalar half of ONE rule: a conjunct is evaluated on
+// the rows for which every conjunct written before it evaluated TRUE.
+
+// `age > 30 AND SUBSTRING(name, age - 30, 3) = 'er_'` on a row with age 25. The
+// guard is exactly what makes `age - 30 >= 1` well-defined.
+static std::unique_ptr<Expr> guardedSubstringPredicate() {
+    auto sub = std::make_unique<SubstringExpr>();
+    sub->operand = colRef("name");
+    sub->start = makeBinary("-", colRef("age"), lit(Value(int64_t(30))));
+    sub->length = lit(Value(int64_t(3)));
+    return makeBinary("AND",
+        makeBinary(">", colRef("age"), lit(Value(int64_t(30)))),
+        makeBinary("=", std::move(sub), lit(Value(std::string("er_")))));
+}
+
+TEST(EvaluatePredicate, AndDoesNotEvaluateTheRightOperandOnARowTheLeftRejected) {
+    Schema schema = makeSchema({{"name", TypeId::STRING}, {"age", TypeId::INT}});
+    Row row{Value(std::string("Driver_1")), Value(int64_t(25))};
+    auto pred = guardedSubstringPredicate();
+
+    // THE COUNTERFACTUAL, asserted rather than described: the eager evaluate()
+    // still throws on this row, which is what FilterNode used to call.
+    EXPECT_THROW(evaluate(pred.get(), row, schema), std::runtime_error);
+    // and the predicate entry point rejects the row without reaching the
+    // SUBSTRING at all
+    EXPECT_EQ(evaluatePredicate(pred.get(), row, schema), 0);
+}
+
+TEST(EvaluatePredicate, AndStillEvaluatesTheRightOperandOnARowTheLeftKept) {
+    Schema schema = makeSchema({{"name", TypeId::STRING}, {"age", TypeId::INT}});
+    auto pred = guardedSubstringPredicate();
+
+    Row match{Value(std::string("Driver_1")), Value(int64_t(35))};   // SUBSTRING -> "er_"
+    EXPECT_EQ(evaluatePredicate(pred.get(), match, schema), 1);
+
+    Row miss{Value(std::string("Xxxxxxxx")), Value(int64_t(35))};
+    EXPECT_EQ(evaluatePredicate(pred.get(), miss, schema), 0);
+}
+
+// OR is EAGER in both engines — sv_union needs both sides over the same input
+// rows and cannot cascade — so the scalar twin must be eager too, or the two
+// would disagree in the other direction.
+TEST(EvaluatePredicate, OrIsEagerJustAsTheSelectionVectorUnionIs) {
+    Schema schema = makeSchema({{"name", TypeId::STRING}, {"age", TypeId::INT}});
+    Row row{Value(std::string("Driver_1")), Value(int64_t(25))};
+
+    auto sub = std::make_unique<SubstringExpr>();
+    sub->operand = colRef("name");
+    sub->start = makeBinary("-", colRef("age"), lit(Value(int64_t(30))));
+    sub->length = lit(Value(int64_t(3)));
+    auto pred = makeBinary("OR",
+        makeBinary("<", colRef("age"), lit(Value(int64_t(99)))),   // TRUE
+        makeBinary("=", std::move(sub), lit(Value(std::string("er_")))));
+
+    EXPECT_THROW(evaluatePredicate(pred.get(), row, schema), std::runtime_error);
+}
+
+// AND's VALUE is untouched: three-valued logic still says FALSE dominates, and a
+// SELECT list or CASE arm that reads `a AND b` gets the exact answer. Only the
+// FILTER path cascades, and there FALSE and UNKNOWN both reject the row.
+TEST(EvaluatePredicate, TheAndVALUEIsStillExactThreeValuedLogic) {
+    Schema schema = makeSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
+    Row row{Value::null(), Value(int64_t(0))};
+    auto pred = makeBinary("AND", colRef("a"), colRef("b"));
+
+    Value v = evaluate(pred.get(), row, schema);
+    ASSERT_FALSE(v.isNull()) << "NULL AND FALSE is FALSE, not UNKNOWN";
+    EXPECT_EQ(v.asInt(), 0);
+    // and as a PREDICATE both spellings reject the row, which is all a filter asks
+    EXPECT_NE(evaluatePredicate(pred.get(), row, schema), 1);
+}

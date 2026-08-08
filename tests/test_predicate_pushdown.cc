@@ -1359,3 +1359,164 @@ TEST(PredicatePushdown, ConjunctRoutesToItsOwnRelationInsideAJoiningBody) {
     ASSERT_NE(col, nullptr);
     EXPECT_EQ(col->column_name, "speed");
 }
+
+
+// ===== The totality screen, seam audit pass 4 (P4-1/P4-B2, P4-2, P4-B1) =====
+//
+// Pass 3 wrote the precondition down and it is correct. The CLASSIFIER that
+// implemented it was wrong in BOTH directions at once, and one of the four
+// moves it governs was not screened at all. These pins are written against the
+// same property the B3-2 pins above are — a conjunct is evaluated on the row set
+// WRITTEN ORDER gives it — and each names the assertion that fails without the
+// fix.
+
+// P4-1 / P4-B2. `inferExprType` types a comparison as INT WITHOUT comparing its
+// operands, so a STRING-vs-numeric comparison is not decided at plan time; it
+// raises PER ROW from Value's NUMERIC_COERCE. The old screen answered "total"
+// for it — a ColumnRef and a Literal, no arithmetic — and it was then permuted
+// freely. Reproduced from the CLI on the shipped catalog: this exact shape
+// answered 0 rows under --no-optimize and errored optimized.
+TEST(PredicatePushdown, TypeMismatchedComparisonIsScreenedAsRaising) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT team FROM laps WHERE team LIKE 'zzz%' AND team = 5", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    ASSERT_EQ(root_and->op, "AND");
+    // WITHOUT THE FIX this is the `team = 5` comparison: FALLBACK_EQ_SELECTIVITY
+    // 0.1 sorts it ahead of LIKE's 0.5, and it is then evaluated on every row
+    // instead of on the (empty) set the LIKE keeps.
+    EXPECT_NE(dynamic_cast<const LikeExpr*>(root_and->left.get()), nullptr)
+        << "a comparison across the STRING boundary raises per row, so it must "
+           "keep its written position";
+}
+
+// The same class through the SECOND mover. `l.team = l.lap_id` names one
+// relation, so distribute() pushed it onto the laps scan and it saw every row of
+// laps rather than the join's survivors.
+TEST(PredicatePushdown, TypeMismatchedComparisonIsNotPushedBelowTheJoin) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE d.nationality = 'French' AND l.team = l.lap_id", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER)
+        << "WITHOUT THE FIX the ill-typed comparison is single-slot and is pushed "
+           "onto the laps scan, leaving no residual filter here at all";
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// THE CONTROL for the pair above, and the reason the screen is type-aware rather
+// than shape-aware: a comparison whose operands are BOTH numeric cannot raise,
+// so it still sorts and still pushes.
+TEST(PredicatePushdown, WellTypedComparisonStaysTotal) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT team FROM laps WHERE team LIKE 'zzz%' AND season = 2021", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    const auto* root_and = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(root_and, nullptr);
+    const auto* left = dynamic_cast<const BinaryExpr*>(root_and->left.get());
+    ASSERT_NE(left, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(left->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "season")
+        << "both operands numeric: nothing can raise, so the sort keeps working";
+}
+
+// P4-2 — THE OVER-APPROXIMATION, measured at 87x from the CLI (39.9 ms against
+// 0.45 ms) between two queries whose only difference is the order the SAME three
+// predicates were written in. The old screen judged arithmetic by OPERATOR, so
+// `l.speed * 2` answered "may raise" and froze every conjunct written after it
+// out of the join AND off its scan. speed is DOUBLE; evaluate() takes the double
+// branch without calling checkedMul at all, so it cannot overflow.
+TEST(PredicatePushdown, DoubleArithmeticDoesNotFreezeTheConjunctsAfterIt) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.speed * 2 > 688 AND l.lap_id < 5 AND d.age > 30", cat);
+
+    // WITHOUT THE FIX every conjunct is frozen: the whole WHERE stays above the
+    // join as one residual filter and neither scan carries a filter of its own.
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::JOIN)
+        << "nothing here can raise, so nothing is frozen and no residual remains";
+    const LogicalPlanNode* join = plan->children[0].get();
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+}
+
+// THE CONTROL that keeps the previous test from reading as "arithmetic is
+// always total": INT * INT goes through checkedMul and CAN overflow, so it
+// freezes exactly as before.
+TEST(PredicatePushdown, IntArithmeticStillFreezesTheConjunctsAfterIt) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "WHERE l.lap_id * 2 > 688 AND l.season < 2021 AND d.age > 30", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    EXPECT_EQ(plan->children[0]->type, LogicalNodeType::FILTER)
+        << "INT arithmetic can overflow, so the suffix stays above the join";
+}
+
+// P4-B1 — THE FOURTH MOVE. Descending below the body's projection is a SET
+// equivalence and not an ERROR-BEHAVIOUR one: the expression whose row count
+// changes is the SIBLING in the select list, which the conjunct never names.
+// Reproduced from the CLI on the shipped catalog: 99 optimized, integer-overflow
+// Error under --no-optimize.
+TEST(PredicatePushdown, FilterDoesNotDescendBelowAPartialProjection) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT COUNT(*) FROM "
+        "(SELECT l.lap_id AS lap_id, l.lap_id * 1000000000000000 AS big FROM laps l) x "
+        "WHERE x.lap_id < 100", cat);
+
+    const LogicalPlanNode* derived = findNode(plan.get(), LogicalNodeType::DERIVED);
+    ASSERT_NE(derived, nullptr);
+    // WITHOUT THE FIX the body is PROJECT over FILTER over SCAN: the conjunct
+    // named only the passthrough `lap_id`, so remapThroughProject accepted it
+    // and `big` was evaluated on 99 rows instead of 10000.
+    EXPECT_EQ(derived->children[0]->type, LogicalNodeType::FILTER)
+        << "a select-list expression that can raise must keep the row count it "
+           "was written with";
+    ASSERT_EQ(derived->children[0]->children[0]->type, LogicalNodeType::PROJECT);
+}
+
+// THE CONTROL, and it is what makes the screen affordable: a computed column in
+// a derived body is the ORDINARY case, and DOUBLE arithmetic cannot raise. Under
+// an operator-only screen this rule would have cost B3-3's whole 9.4x on exactly
+// the body shape B3-3 is about.
+TEST(PredicatePushdown, FilterStillDescendsBelowATotalProjection) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT COUNT(*) FROM "
+        "(SELECT l.driver_id AS k, l.speed * 2 AS v FROM laps l) x "
+        "WHERE x.k < 5", cat);
+
+    const LogicalPlanNode* derived = findNode(plan.get(), LogicalNodeType::DERIVED);
+    ASSERT_NE(derived, nullptr);
+    ASSERT_EQ(derived->children[0]->type, LogicalNodeType::PROJECT);
+    EXPECT_EQ(derived->children[0]->children[0]->type, LogicalNodeType::FILTER)
+        << "DOUBLE arithmetic cannot raise, so the descent must still happen";
+}

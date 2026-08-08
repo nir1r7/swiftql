@@ -758,3 +758,89 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
                                         columnarLit(Value(int64_t(2025))));
     EXPECT_FALSE(ChunkPruner::shouldSkip(join_pred.get(), zone_maps, 0, prunerSchema()));
 }
+
+
+// ===== ChunkPruner and partial expressions (seam audit pass 4, P4-1) =====
+//
+// A zone-map skip is a decision about WHICH ROWS the filter is evaluated on, and
+// per-row evaluation is not total — so pruning is subject to the same rule the
+// optimizer obeys (parser/expr_totality.h). Two separate defects, one rule.
+
+// canSkipChunk compares a literal against zone-map metadata with Value's
+// operators, which THROW across the STRING boundary. That throw fires at SCAN
+// time, on metadata, before a single row exists — `WHERE team = 5` errored or
+// answered 0 rows depending only on which conjunct came first in the WHERE.
+TEST(ChunkPrunerCanSkip, DeclinesAcrossTheStringBoundary) {
+    ColumnChunk str_chunk{0, 4, Value(std::string("Alpha")), Value(std::string("Zeta"))};
+    // WITHOUT THE FIX every one of these throws "Type mismatch in Value comparison".
+    EXPECT_NO_THROW({
+        EXPECT_FALSE(ChunkPruner::canSkipChunk("=",  Value(int64_t(5)), str_chunk));
+        EXPECT_FALSE(ChunkPruner::canSkipChunk("<",  Value(int64_t(5)), str_chunk));
+        EXPECT_FALSE(ChunkPruner::canSkipChunk(">",  Value(int64_t(5)), str_chunk));
+        EXPECT_FALSE(ChunkPruner::canSkipChunk("<=", Value(int64_t(5)), str_chunk));
+        EXPECT_FALSE(ChunkPruner::canSkipChunk(">=", Value(int64_t(5)), str_chunk));
+    });
+    // and the reverse direction, a STRING literal against an INT zone map
+    ColumnChunk int_chunk{0, 4, Value(int64_t(2020)), Value(int64_t(2023))};
+    EXPECT_NO_THROW(
+        EXPECT_FALSE(ChunkPruner::canSkipChunk("=", Value(std::string("x")), int_chunk)));
+}
+
+// The SKIP itself, not the throw. `season = 2025` proves every chunk empty, so
+// pruning removes the rows the raising conjunct written BEFORE it was owed.
+// Measured from the CLI, `--no-optimize` in every mode, so no optimizer pass is
+// involved: row storage errored and columnar storage answered 0 rows.
+TEST(ChunkPrunerShouldSkip, APrunableConjunctBehindARaisingOneDoesNotPrune) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    // season * 9223372036854775807 > 0 — INT arithmetic, overflows per row
+    auto overflow = makeColumnarBinary(">",
+        makeColumnarBinary("*", columnarColRef("season"),
+                                columnarLit(Value(int64_t(9223372036854775807LL)))),
+        columnarLit(Value(int64_t(0))));
+    auto prunable = makeColumnarBinary("=", columnarColRef("season"),
+                                            columnarLit(Value(int64_t(2025))));
+    auto and_pred = makeColumnarBinary("AND", std::move(overflow), std::move(prunable));
+
+    // WITHOUT THE FIX this is true: collectSimplePredicates walked past the
+    // arithmetic conjunct and let `season = 2025` prove the skip.
+    EXPECT_FALSE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0, prunerSchema()))
+        << "a skip proved BEHIND a raising conjunct masks a raise the filter owed";
+}
+
+// THE CONTROL, and it is the half that keeps pruning working: written AHEAD of
+// the raising conjunct, the same predicate still prunes — the raising conjunct
+// would never have been evaluated on that chunk anyway, since nothing in it
+// passes the first conjunct.
+TEST(ChunkPrunerShouldSkip, APrunableConjunctAheadOfARaisingOneStillPrunes) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto prunable = makeColumnarBinary("=", columnarColRef("season"),
+                                            columnarLit(Value(int64_t(2025))));
+    auto overflow = makeColumnarBinary(">",
+        makeColumnarBinary("*", columnarColRef("season"),
+                                columnarLit(Value(int64_t(9223372036854775807LL)))),
+        columnarLit(Value(int64_t(0))));
+    auto and_pred = makeColumnarBinary("AND", std::move(prunable), std::move(overflow));
+
+    EXPECT_TRUE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0, prunerSchema()))
+        << "the screen freezes a suffix; it does not switch pruning off";
+}
+
+// The screen is type-aware here for the same reason it is in the optimizer:
+// DOUBLE arithmetic cannot overflow, so it must not cost a scan its zone maps.
+TEST(ChunkPrunerShouldSkip, DoubleArithmeticDoesNotStopPruning) {
+    std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
+    zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
+
+    auto total = makeColumnarBinary(">",
+        makeColumnarBinary("*", columnarColRef("speed"), columnarLit(Value(2.0))),
+        columnarLit(Value(0.0)));
+    auto prunable = makeColumnarBinary("=", columnarColRef("season"),
+                                            columnarLit(Value(int64_t(2025))));
+    auto and_pred = makeColumnarBinary("AND", std::move(total), std::move(prunable));
+
+    EXPECT_TRUE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0, prunerSchema()));
+}

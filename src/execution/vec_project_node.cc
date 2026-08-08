@@ -54,6 +54,11 @@ void VecProjectNode::prepare(){
         // this makes a coincidence deliberate rather than inventing a
         // requirement — and it costs nothing on the columns that are not armed,
         // which is all of them in almost every plan.
+        //
+        // OBSERVABLE only, deliberately: UNRENDERED relaxes a magnitude bound
+        // that a compiled executor never reaches at all, because the branch
+        // above has already sent every type MISMATCH down the per-value path and
+        // a matching type performs no narrowing.
         if (compiled_[c] && intNarrowing(c) == IntNarrowing::OBSERVABLE) {
             compiled_[c].reset();
         }

@@ -38,6 +38,22 @@ derived-table form has NO WORKING MODE AT ALL** — a capability regression, sin
 derived tables and the vectorized path now refuses this shape.
 
 ## HELD FOR WAVE C (collides on logical_plan.cc with the partiality agent)
+- **P4-M1**: the fully-inner spine BELOW a declined semi/anti join is still never enumerated —
+  **43104 vs 60637**, the exact loss `slotDeclineReason`'s own comment cites as its motivation.
+  **The fix is NOT one line**, and the auditor established why: the semi join stores a COPY of the
+  spine's schema, and `subquery_lowering.cc:106-109` records that the equality check which would
+  have caught that drift was **deliberately deleted**. Do not let a fixer treat this as trivial.
+- Join-chain pass 4's Part A is the strongest verification of the phase and should be trusted:
+  it wrote a STRUCTURAL PROBE linked against `libswiftql_lib.a` comparing the multiset of
+  `(relation_slot, name)` pairs between written-order and DP plans, scanning every node for
+  duplicates, on a 4-relation TPC-H spine with TWO `customer` relations and a DP order that moves
+  the leading relation. It DID find three schemas with a duplicated pair (all beneath a plain
+  LIMIT) and showed all three safe — the stable sort falls back to a schema order `build()` fixes
+  before any optimizer pass. Positional semi/anti resolution was checked with a composite key whose
+  two positions give DIFFERENT answers.
+  **It also recorded its own shortfall honestly: the randomized sweep finished 139 of a planned
+  240 shapes, and it reported 139.** All 12 flagged entries were `--no-optimize` timeouts,
+  hand-checked.
 - **S-12**: the bounded top-N is wired to `deterministicCut` ONLY, so a DECLARED `ORDER BY … LIMIT
   5` still sorts all 600865 rows. 8.3x + O(input) memory. **Fix is one argument.**
 - **S-10**: `LIMIT 0` is the MOST expensive cut (`row_cap=0` reads as unbounded).

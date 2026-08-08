@@ -4,6 +4,7 @@
 #include "subquery_lowering.h"
 #include "subquery_decorrelation.h"
 #include "parser/expr_utils.h"
+#include "parser/expr_totality.h"   // exprMayRaise — see applyLimit below
 #include <unordered_set>
 
 
@@ -1004,6 +1005,54 @@ std::unique_ptr<LogicalPlanNode> deterministicCut(std::unique_ptr<LogicalPlanNod
     return sort;
 }
 
+// Place the LIMIT so that the PLAN, not the engine, says how many rows the
+// projection beneath it is evaluated on.
+//
+// SEAM AUDIT PASS 4, E-13's SECOND MECHANISM. Volcano is pull-based: `LimitNode`
+// asks `ProjectNode` for n rows and the projection is evaluated n times. The
+// vectorized path evaluates a whole `DataChunk` in `VecProjectNode` and
+// truncates afterwards in `VecLimitNode`. Since per-row evaluation is not total,
+// that is not an implementation detail — it is two different answers:
+//
+//   SELECT SUBSTRING(name, age - 34, 2) FROM drivers LIMIT 3
+//     Volcano     Dr | Dr | Dr
+//     vectorized  Error: SUBSTRING: start position must be >= 1
+//
+//   and WITHOUT the LIMIT all four modes error, so adding a clause that can only
+//   REMOVE rows made two of the four start answering.
+//
+// Neither engine can be talked out of its own laziness — Volcano's pipelining is
+// the point of Volcano, and a chunk engine cannot evaluate exactly n rows when n
+// falls inside a chunk. So the LOGICAL PLAN settles it: σ-free, row-wise π
+// commutes with LIMIT (`LIMIT n (π(R)) ≡ π(LIMIT n (R))` — same rows, same
+// order, because π is 1:1 and order-preserving), and putting the LIMIT BELOW the
+// projection makes "n rows" a property both engines read off the plan.
+//
+// ONLY when the projection can raise, and that is deliberate: the rewrite is an
+// equivalence, but it is also a plan change, and a plan change on every LIMIT
+// query is not what this fix is for. Everything else keeps the plan it had.
+//
+// WHAT THIS DOES NOT COVER, stated so it is not mistaken for coverage: the swap
+// applies only where the LIMIT sits DIRECTLY above the projection. With
+// `deterministicCut`'s sort or a DISTINCT in between, the child is a pipeline
+// breaker or a blocking operator, the projection beneath it is genuinely
+// evaluated on every row, and both engines agree on that — E-17's "adding a JOIN
+// turns an answer into an error" is that case, and under this rule it is the
+// plan being honest rather than a defect.
+std::unique_ptr<LogicalPlanNode> applyLimit(std::unique_ptr<LogicalPlanNode> node, int limit) {
+    if (node->type == LogicalNodeType::PROJECT) {
+        auto* project = static_cast<LogicalProject*>(node.get());
+        const Schema& input = project->children[0]->output_schema;
+        for (const auto& e : project->exprs) {
+            if (!exprMayRaise(e.get(), input)) continue;
+            project->children[0] =
+                std::make_unique<LogicalLimit>(std::move(project->children[0]), limit);
+            return node;   // the projection is 1:1, so one LIMIT is enough
+        }
+    }
+    return std::make_unique<LogicalLimit>(std::move(node), limit);
+}
+
 } // namespace
 
 std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt, const Catalog& catalog) {
@@ -1229,7 +1278,7 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     // limit — over a determined input order; see deterministicCut above
     if (stmt.limit.has_value()) {
         node = deterministicCut(std::move(node), stmt.limit.value());
-        node = std::make_unique<LogicalLimit>(std::move(node), stmt.limit.value());
+        node = applyLimit(std::move(node), stmt.limit.value());
     }
 
     // Seam audit pass 3, B3-2 — THE JOIN-KEY TYPE RULE, once, on the finished

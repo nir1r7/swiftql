@@ -1836,3 +1836,56 @@ TEST(CorrelatedScalar, NonAggregateBodyIsRefusedRatherThanSilentlyAnswered) {
         "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)", cat),
         std::runtime_error);
 }
+
+
+// ===== A LIMIT over a partial projection (seam audit pass 4, E-13) =====
+//
+// Volcano is pull-based: LimitNode asks ProjectNode for n rows and the
+// projection is evaluated n times. The vectorized path evaluates a whole
+// DataChunk and truncates afterwards. Since per-row evaluation is not total that
+// is two different answers, and it was measured as such on the shipped catalog:
+// `SELECT SUBSTRING(name, age - 34, 2) FROM drivers LIMIT 3` answered `Dr|Dr|Dr`
+// on Volcano and errored on the vectorized path — while DROPPING the LIMIT made
+// all four modes error. The plan settles it: LIMIT n (pi(R)) == pi(LIMIT n (R))
+// for a row-wise projection, so the LIMIT goes BELOW.
+
+TEST(LogicalPlan, LimitIsPlacedBelowAProjectionThatCanRaise) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT SUBSTRING(name, age - 34, 2) FROM drivers LIMIT 3", cat);
+
+    // WITHOUT THE FIX the root is the LIMIT and the projection below it is
+    // evaluated on however many rows the engine happens to pull.
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT)
+        << "the LIMIT must sit below a projection whose select list can raise";
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::LIMIT);
+    EXPECT_EQ(plan->children[0]->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// THE CONTROL. The rewrite is an equivalence, but it is still a plan change, so
+// it fires only where it settles something: a total projection keeps the plan it
+// always had.
+TEST(LogicalPlan, LimitStaysAboveATotalProjection) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical("SELECT name, age FROM drivers LIMIT 3", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::LIMIT);
+    EXPECT_EQ(plan->children[0]->type, LogicalNodeType::PROJECT);
+}
+
+// The second control, and the one that bounds the claim: with a pipeline breaker
+// between the LIMIT and the projection there is nothing to settle — the
+// projection genuinely is evaluated on every row, in both engines. An ORDER BY
+// puts a SORT below the projection, and deterministicCut puts one ABOVE it; in
+// the latter case the LIMIT's child is the sort, not the projection.
+TEST(LogicalPlan, LimitStaysAboveTheDeterministicCutsSort) {
+    Catalog cat(CATALOG);
+    auto plan = buildLogical(
+        "SELECT SUBSTRING(l.team, l.lap_id - 34, 2) FROM laps l "
+        "JOIN drivers d ON l.driver_id = d.driver_id LIMIT 1", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::LIMIT);
+    EXPECT_EQ(plan->children[0]->type, LogicalNodeType::SORT)
+        << "the cut's sort is a pipeline breaker: the projection beneath it is "
+           "evaluated on every row and both engines agree on that";
+}
