@@ -5,8 +5,13 @@
 #include <algorithm>
 #include <chrono>
 
-VecScanNode::VecScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where)
-    : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), pruning_where_(pruning_where) {}
+VecScanNode::VecScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where, const Schema* hint_schema)
+    : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), pruning_where_(pruning_where) {
+    // Body, not the mem-init list: it defaults to `schema_`, and reading one
+    // member from another there depends on DECLARATION order, not on the order
+    // written in the list.
+    hint_schema_ = hint_schema ? *hint_schema : schema_;
+}
 
 void VecScanNode::open(){
     row_cursor_ = 0;
@@ -19,7 +24,7 @@ DataChunk* VecScanNode::nextChunk(){
     while (pruning_where_ && row_cursor_ < columnar_table_.num_rows
            && row_cursor_ % CHUNK_SIZE == 0) {
         int chunk_idx = row_cursor_ / CHUNK_SIZE;
-        if (!ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx, schema_))
+        if (!ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx, hint_schema_))
             break;
         row_cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - row_cursor_);
         ++skipped_chunks_;

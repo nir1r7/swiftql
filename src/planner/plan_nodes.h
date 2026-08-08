@@ -17,7 +17,15 @@ class SeqScanNode : public PlanNode {
         SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema);
 
         // columnar storage (pruning_where = nullptr disables chunk pruning)
-        SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where = nullptr);
+        //
+        // `hint_schema` is the schema `pruning_where` was WRITTEN against, which
+        // for an un-pushed WHERE over a join is the join's merged schema, not
+        // this scan's. ChunkPruner screens each conjunct for "can raise" in it,
+        // and screening in the scan's own schema was not conservative — a
+        // same-named column of a different type in the other relation typed the
+        // conjunct off the wrong column (chunk_pruner.h states the repro).
+        // nullptr = "the same as `schema`", the single-relation case.
+        SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where = nullptr, const Schema* hint_schema = nullptr);
 
         void open() override; // initialize cursor
         Row* next() override; // get next row
@@ -39,6 +47,7 @@ class SeqScanNode : public PlanNode {
         Row reconstructed_row_; // reuse on every columnar next()
 
         const Expr* pruning_where_ = nullptr; // non owning
+        Schema hint_schema_{{}};              // schema pruning_where_ was written against
         int skipped_chunks_ = 0;
         bool executed_ = false;  // gates chunks_skipped in explain(): the counter is only real after open()
 };

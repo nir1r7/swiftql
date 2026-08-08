@@ -35,26 +35,61 @@ namespace {
     //            them. Unsound; this walker stops before reaching C_k.
     //
     // The screen is exprMayRaise/conjunctMayRaise (parser/expr_totality.h), the
-    // one shared with the optimizer. It answers "may raise" for a conjunct this
-    // scan's schema cannot type — which is every conjunct naming another
-    // relation, so an un-pushed WHERE handed to the FROM-side scan of a join
-    // stops contributing hints at its first cross-relation conjunct.
+    // one shared with the optimizer.
     //
-    // THAT COST IS REAL AND MEASURED, not a theoretical concession. On
-    // `laps JOIN drivers WHERE dr.nationality = 'British' AND l.season = 2024`
-    // (shipped catalog, columnar/vectorized, median of 3): the OPTIMIZED leg is
-    // unchanged at `chunks_skipped=1/2`, because pushdown gives each scan a hint
-    // made only of its own conjuncts; the `--no-optimize` leg drops to
-    // `chunks_skipped=0/2` and 42.5 ms becomes 51.5 ms, +21%.
+    // !! `schema` IS THE SCHEMA THE HINT WAS WRITTEN AGAINST, NOT THE SCAN'S OWN.
+    // Week 37. Through the previous round it was the scan's own output schema,
+    // and the paragraph here claimed that made the screen conservative: "it
+    // answers may raise for a conjunct this scan's schema cannot type — which is
+    // every conjunct naming another relation". THAT SENTENCE WAS FALSE, and
+    // three independent seam audits reached the same counter-example (engine
+    // pass 5 E-20, storage pass 5 S-13, optimizer pass 5 P5-2). `staticTypeOf`'s
+    // ColumnRef arm resolves slot-first WITH A BARE-NAME FALLBACK — the rule it
+    // shares with evaluator.cc's resolveColumnIndex, where it is correct. Handed
+    // the WRONG schema it does not answer "I cannot type this"; it answers "I
+    // typed it", against the scanned relation's column of the same NAME. When
+    // the two relations declare that name with different TYPES the screen types
+    // the conjunct off a column it does not refer to, calls a raiser total, and
+    // lets a later conjunct prune away the rows the raise was owed:
     //
-    // It is the honest price of the hint arriving here WITHOUT the schema it was
-    // written against — guessing is what the wrong answer above was made of. The
-    // fix is not in this file: `pruningHintForPreservedSide`
-    // (predicate_pushdown.h) is the single place both planners route a hint
-    // through, and threading the filter's child schema alongside the hint would
-    // let this walker type every conjunct instead of only the scan-local ones.
-    // That is one line in each of the two builders and is left to a round that
-    // owns them.
+    //   big(k INT, x INT, j INT) JOIN small2(j INT, x STRING, s STRING)
+    //   SELECT COUNT(*) FROM big b JOIN small2 s2 ON b.j=s2.j
+    //   WHERE s2.x AND b.k > 999999
+    //     row storage       Error: std::get: wrong index for variant
+    //     columnar storage  0            (chunks_skipped=3/3)
+    //
+    // with the RAISER WRITTEN FIRST, which is exactly the `j < k` case the proof
+    // above calls unsound. A conservative screen may say "I do not know"; the one
+    // answer it must never give is a confident wrong one, and a schema the
+    // expression was not written against is what turns the first into the second.
+    //
+    // Giving this walker the hint's OWN schema removes the guess rather than
+    // patching around it: `s2.x` then resolves at its own slot to the STRING
+    // column, `conjunctMayRaise` answers TRUE, the walk stops, no chunk is
+    // skipped, and every mode raises. Both scan nodes carry that schema beside
+    // the hint (SeqScanNode, VecScanNode); the two builders that route a hint —
+    // Planner::plan and VectorizedPlanBuilder's FILTER case — already hold it,
+    // so `pruningHintForPreservedSide` (predicate_pushdown.h) needed no change:
+    // it decides WHETHER a hint may descend, not what it means.
+    //
+    // THE SAME CHANGE RECOVERS PRUNING THAT THE PREVIOUS ROUND LOST, which is
+    // why it is this fix and not the cheaper local guard (refuse to screen any
+    // conjunct holding a ref that does not resolve at its own slot). With the
+    // scan's schema, `dr.nationality = 'British'` written before `l.season = 2024`
+    // could not be typed, the walk stopped, and the scan lost every skip; with
+    // the join's schema it types as STRING vs STRING, cannot raise, and the walk
+    // continues to the conjunct that prunes. Measured on Release, median of 11,
+    // same query with the conjuncts swapped as the denominator: 2-chunk `laps`
+    // +21% (col-volcano, BOTH optimizer settings — Planner::plan hands the raw
+    // stmt.where to the FROM scan whether or not the optimizer ran, so this was
+    // never a `--no-optimize` effect), and 2.80x on TPC-H sf0.01's 8-chunk
+    // lineitem. One change closes a correctness divergence and a performance
+    // regression, because both were the same missing argument.
+    //
+    // Do NOT "fix" this by deleting the bare-name fallback in staticTypeOf: it
+    // is shared with evaluator.cc's resolution rule and is load-bearing wherever
+    // a post-aggregate or projected schema no longer carries the original slot.
+    // The defect was applying the screen in a schema the refs do not belong to.
     bool collectSimplePredicates(const Expr* expr, const Schema& schema,
                                  std::vector<std::tuple<std::string, std::string, Value>>& out){
         if (!expr) return true;
@@ -159,13 +194,17 @@ struct ChunkPruner {
         return false;
     }
 
-    // `schema` is the scanning node's own output schema — the one the hint's
-    // refs are looked up in. See collectSimplePredicates for why it is needed
-    // and what it costs when a hint names a column this scan does not have.
-    static bool shouldSkip(const Expr* where, const std::unordered_map<std::string, std::vector<ColumnChunk>>& zone_maps, int chunk_idx, const Schema& schema){
+    // `hint_schema` is the schema the HINT was written against — the child
+    // schema of the filter the hint came from, which for an un-pushed WHERE over
+    // a join is the JOIN's merged schema and not this scan's. It is used for the
+    // raise SCREEN only; the zone-map lookup below is by column name and the
+    // collection guard is by slot, so neither reads it. See
+    // collectSimplePredicates for why passing the scan's own schema here was a
+    // wrong answer rather than a conservative one.
+    static bool shouldSkip(const Expr* where, const std::unordered_map<std::string, std::vector<ColumnChunk>>& zone_maps, int chunk_idx, const Schema& hint_schema){
         if (!where) return false;
         std::vector<std::tuple<std::string, std::string, Value>> preds;
-        collectSimplePredicates(where, schema, preds);
+        collectSimplePredicates(where, hint_schema, preds);
 
 
         for (const auto& [col, op, val] : preds) {

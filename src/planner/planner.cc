@@ -284,9 +284,41 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     const Expr* prune_hint = pruningHintForPreservedSide(
         stmt.where.get(), outer ? JoinType::LEFT : JoinType::INNER, preserved_slots);
 
+    // The schema `prune_hint` was WRITTEN against, which is where the FilterNode
+    // 100 lines below type-checks and evaluates it: the merged join schema when
+    // there is a join, the scan schema otherwise. It is NOT the scan's schema,
+    // and passing that was not a conservative approximation but a wrong answer —
+    // ChunkPruner screens each conjunct for "can raise" and staticTypeOf's
+    // bare-name fallback resolved a JOIN-side ref against the FROM table's
+    // same-named column, calling a raiser total. Three seam audits found it
+    // independently (engine pass 5 E-20, storage S-13, optimizer P5-2), and the
+    // scope note that matters here is theirs: this path hands the RAW
+    // `stmt.where` to the FROM scan whether or not the optimizer ran, so both of
+    // Volcano's legs were affected, in correctness AND in the pruning the
+    // previous round's screen lost. See chunk_pruner.h.
+    //
+    // Built the same way the merged schema below is (FROM columns, then the JOIN
+    // relation's stamped slot 1) rather than reusing it, because the scan is
+    // constructed before the join is.
+    Schema hint_schema = scan_schema;
+    if (jc) {
+        const TableMetadata& hint_join_meta =
+            catalog.getTable(jc->relation.tableName("Planner::plan JOIN"));
+        // NAMED, not a temporary in the range-for: until C++23 a range-for binds
+        // its `__range` to `.columns()`'s reference and lets the Schema it points
+        // into die at the end of that initializer, which reads freed memory.
+        const Schema join_side = buildScanSchema(stmt, hint_join_meta.schema);
+        std::vector<ColumnDef> hint_cols = scan_schema.columns();
+        for (ColumnDef c : join_side.columns()) {
+            c.relation_slot = 1;
+            hint_cols.push_back(c);
+        }
+        hint_schema = Schema(hint_cols);
+    }
+
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(from_table) > 0) {
-        node = std::make_unique<SeqScanNode>(from_table, std::move(columnar_tables.at(from_table)), scan_schema, prune_hint);
+        node = std::make_unique<SeqScanNode>(from_table, std::move(columnar_tables.at(from_table)), scan_schema, prune_hint, &hint_schema);
     } else {
         node = std::make_unique<SeqScanNode>(
             from_table,

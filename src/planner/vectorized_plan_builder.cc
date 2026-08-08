@@ -39,8 +39,17 @@ struct Lowering {
     const Catalog& catalog;   // borrowed, read-only: build-side width stats
     const IntNarrowingMap& int_narrowing;
 
-    std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where);
-    std::unique_ptr<VecPlanNode> lowerNode(LogicalPlanNode* node, const Expr* pruning_where);
+    // `hint_schema` travels WITH `pruning_where` and is the schema that
+    // predicate was written against — the FILTER's child schema, which over a
+    // join is the join's merged schema and not the leaf scan's. ChunkPruner
+    // screens the hint's conjuncts for "can raise" in it; handing it the scan's
+    // own schema made staticTypeOf's bare-name fallback type a foreign ref off
+    // the scanned table's same-named column and call a raiser total (seam pass 5
+    // E-20 / S-13 / P5-2). nullptr wherever `pruning_where` is nullptr.
+    std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where,
+                                       const Schema* hint_schema = nullptr);
+    std::unique_ptr<VecPlanNode> lowerNode(LogicalPlanNode* node, const Expr* pruning_where,
+                                           const Schema* hint_schema);
 
     // The narrowing mask for one materializing node, sized to its output schema.
     // Empty when the plan said nothing about this node, which is the normal case.
@@ -735,13 +744,15 @@ double rowWidth(const LogicalPlanNode* child, const Catalog& catalog) {
 // only readers are main.cc's collectVecNodes, which builds the est= column.
 // The physical cost decisions in the JOIN case do NOT read it — they read the
 // LOGICAL children's estimates (join->children[i]->estimated_rows) directly.
-std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* pruning_where) {
-    std::unique_ptr<VecPlanNode> phys = lowerNode(node, pruning_where);
+std::unique_ptr<VecPlanNode> Lowering::lower(LogicalPlanNode* node, const Expr* pruning_where,
+                                             const Schema* hint_schema) {
+    std::unique_ptr<VecPlanNode> phys = lowerNode(node, pruning_where, hint_schema);
     phys->estimated_rows = node->estimated_rows;
     return phys;
 }
 
-std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Expr* pruning_where) {
+std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Expr* pruning_where,
+                                                 const Schema* hint_schema) {
     switch (node->type) {
         case LogicalNodeType::SCAN: {
             auto* scan = static_cast<LogicalScan*>(node);
@@ -751,7 +762,8 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 ? tables.at(scan->table_name)
                 : std::move(tables.at(scan->table_name));
             return std::make_unique<VecScanNode>(
-                scan->table_name, std::move(table), scan->output_schema, pruning_where);
+                scan->table_name, std::move(table), scan->output_schema, pruning_where,
+                hint_schema);
         }
 
         // Week 34 — a derived relation lowers to its BODY's operator tree and
@@ -913,7 +925,12 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             const Expr* from_hint = leftmost_is_slot0
                 ? pruningHintForPreservedSide(pruning_where, join->join_type, preserved)
                 : nullptr;
-            auto from_child = lower(join->children[0].get(), from_hint);
+            // The hint keeps the schema it was WRITTEN against as it descends —
+            // it is the same Expr, so the same refs and the same slots. Only the
+            // scan changes, and the scan's schema is exactly the one that made
+            // the screen answer wrongly (chunk_pruner.h).
+            auto from_child = lower(join->children[0].get(), from_hint,
+                                    from_hint ? hint_schema : nullptr);
             auto join_child = lower(join->children[1].get(), nullptr);
 
             // Week 27: arbitrary key counts, and children[0] may itself be a
@@ -1115,8 +1132,13 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             LogicalNodeType child_type = filter->children[0]->type;
             bool is_where = child_type == LogicalNodeType::SCAN
                          || child_type == LogicalNodeType::JOIN;
+            // THIS is where the hint's schema comes from: the predicate is
+            // evaluated against the filter's CHILD schema, so that is the schema
+            // its ColumnRefs were resolved in and the only one ChunkPruner may
+            // screen them in.
             auto child = lower(filter->children[0].get(),
-                               is_where ? filter->predicate.get() : nullptr);
+                               is_where ? filter->predicate.get() : nullptr,
+                               is_where ? &filter->children[0]->output_schema : nullptr);
             return std::make_unique<VecFilterNode>(std::move(child), std::move(filter->predicate));
         }
 
