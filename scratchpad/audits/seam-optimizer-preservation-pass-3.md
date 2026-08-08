@@ -312,3 +312,156 @@ than silently wrong — an error is not a wrong answer. It is HIGH rather than
 MEDIUM because direction 2 means the optimizer can turn a working query into a
 failing one, which is the strongest form of "not result-preserving" short of a
 wrong row.
+
+## Part A — the fix-round-2 questions
+
+### A.1 Is the new folding comment TRUE? Yes as to values. Its census of shape-consumers is WRONG — it says "there was exactly one", and there are four more.
+
+`src/planner/binder.cc:174-207`. The narrow claim it now makes —
+
+> for any expression it agrees to fold, the folded node evaluates to the same
+> Value as the original would have, on every row
+
+— is **true**, and earned rather than asserted. `foldNode` calls the same
+`evaluate()` the per-row path calls with an empty `Row`/`Schema`
+(`constant_folding.cc:89`, legitimate because a constant subtree reads neither),
+declines on any `std::runtime_error` so overflow and ill-typing surface from
+their usual site (`:92-97`), declines on a NULL result (`:98` — so folding never
+manufactures the `Literal::null_type` case), never folds `IS NULL` (`:121-125`),
+never folds an `AggregateExpr` (`:127-130`), and never descends into a
+`SubqueryExpr` body (`:165-169`). The `foldDateInterval` special case routes its
+one unguarded operation through `checkedNegate` (`:53`).
+
+It also correctly names the gap — *"any consumer downstream of here that tests
+the SHAPE of the tree rather than the value it computes"*. What it gets wrong is
+the count: *"There was exactly one — the Validator's column-ordinal rule."*
+
+**The exact shape delta folding can produce.** `isArithOp` is `+ - * /` only,
+plus `foldDateInterval` on `+`/`-`; a comparison operator is never folded, and
+`Literal` is the only node kind folding creates. So exactly two flips are
+reachable: (i) *"is this a `Literal`?"* false → true, and (ii) *"is this a
+`BinaryExpr` / `UnaryExpr` / `IntervalLiteral`?"* true → false. Folding can
+neither create nor destroy a `ColumnRef`.
+
+**Every remaining shape consumer downstream of `Binder::bind`, and its verdict.**
+
+| # | site | flip | verdict |
+|---|---|---|---|
+| 1 | `validator.cc:359,366` ordinal rule | (i) | **FIXED** — reads `written_ordinal`, not the tree |
+| 2 | `logical_plan.cc:106` `inferExprType` Literal case | (i)/(ii) | **safe, with an obligation.** Safe iff `evaluate`'s result type equals `inferExprType`'s promotion rule for the same tree. Both say INT⊗INT→INT, any DOUBLE→DOUBLE (`logical_plan.cc:163-170`). Confirmed: `SELECT 7 / 2 FROM laps LIMIT 1` prints `3`, i.e. the fold kept INT truncating division. Nobody states this obligation anywhere |
+| 3 | `logical_plan.cc:234-243` SUBSTRING constant start/length refusal | (i) | **outcome-changing, LOW.** Folding ACTIVATES it. `SELECT SUBSTRING(team, 1 - 1, 2) FROM laps WHERE speed > 99999` → plan-time `Error: SUBSTRING: start position must be >= 1`; the value-identical non-constant `SUBSTRING(team, lap_id - lap_id, 2)` with the same WHERE → **0 rows, no error**. Folding converts a conditional per-row failure into an unconditional plan-time one. Identical in both legs, and the site's own comment says it is deliberate |
+| 4 | `logical_plan.cc:250` `IntervalLiteral` → throw | (ii) | **safe, and it inverts the comment's framing.** Folding is the ONLY thing that removes an `IntervalLiteral`; without it every TPC-H `date ± interval` predicate is `Error: INTERVAL is only valid in constant date arithmetic`. So folding is load-bearing for CORRECTNESS, not "canonicalization". Anyone who moved `foldConstants` inside the `--no-optimize` gate on the strength of the word "canonicalization" would break every interval query on the `--no-optimize` leg |
+| 5 | `logical_plan.cc:642` `substituteInto` early-return on `ColumnRef \|\| Literal` | (i) | **safe.** A select item that folds to a `Literal` is never substituted by a GROUP BY expression key — and does not need to be, because a `Literal` is row-independent and evaluates to the same value above the aggregate. Confirmed on the shape the ordinal fix newly UNBLOCKED: `SELECT 1 + 1, COUNT(*) FROM laps GROUP BY 1 + 1` → `2 | 10000` |
+| 6 | `cardinality_estimator.cc:149-153` `col op lit` selectivity | (i) | **safe as a shape test** — folding strictly improves it. But see B3-2: what the estimate is USED for (conjunct order) is not plan-quality-only |
+| 7 | `chunk_pruner.h:60` `collectSimplePredicates` | (i) | **safe.** Folding lets `speed > 300 + 40` prune. Pruning is value-based (`canSkipChunk`) and runs in BOTH legs (`pruning=on` appears under `--no-optimize`), so fold+prune is ungated end to end |
+| 8 | `columnar_eval.cc:154` `col op lit` fast path | (i) | **safe here.** Folding routes more predicates to `scanColumn` instead of `evalFallback`; their agreement is the engine-divergence seam's subject, already audited |
+| 9 | `subquery_decorrelation.cc:306` `constantOnly` | (i)/(ii) | **safe, and closed under folding.** It accepts `Literal`, `BinaryExpr`, `UnaryExpr` recursively, so anything it accepted pre-fold folds to a `Literal` it still accepts. Monotone |
+| 10 | `expr_utils.h` `exprToString` | (ii) | **outcome-changing, LOW.** The OUTPUT COLUMN NAME comes from the folded tree: `SELECT 2020 + 4 FROM laps LIMIT 1` is headed `2024`; SQLite heads it `2020 + 4`. Both legs identical, and both harnesses compare `row.values()` rather than headers, so invisible by construction |
+| 11 | `expr_utils.h` `exprKey` | (i)/(ii) | **safe.** The GROUP BY key and the select item are folded by the SAME `foldConstants(stmt)` call over the same statement, so their keys stay equal |
+| 12 | `expr_utils.h` `cloneExpr` | — | total dispatcher, shape-preserving |
+| 13 | `evaluator.cc:84`, `expression_executor.cc:489` | — | value-based |
+| 14 | `join_condition.cc:13,58-60` join-key classification | (ii) | **safe by two independent facts.** It requires a `BinaryExpr` with a comparison op (never folded — `isArithOp` is arithmetic only) AND a `ColumnRef` on both sides (folding can neither create nor destroy one) |
+| 15 | `parser.cc:43-58` `ordinalAsWritten`, `:68-84` `constantValue` | — | run BEFORE folding; not downstream |
+
+**So: the comment's mechanism is right and its census is wrong.** Four more
+consumers test shape, three of them provably safe for a stated reason and two
+(#3 SUBSTRING, #10 column naming) actually changing an outcome — quietly, in
+both legs. Neither is a divergence and neither is worth a fix on its own;
+recorded because the comment now carries an obligation for future weeks
+(*"a new rule that tests for a Literal … must ask what the user WROTE"*) and
+that obligation is stated against a census that is already short by four.
+Ranked **LOW**.
+
+### A.2 `written_ordinal` — set on every path that needs it; it fails OPEN, and open is the safe direction
+
+**Where it is set.** Three sites, all in the parser:
+`parser.cc:226` and `:234` (ORDER BY — the first item and the comma loop, both
+covered), and `parser.cc:700` (GROUP BY). The GROUP BY site sets it only in the
+`else` branch, because the `if` branch is a plain `ColumnRef` and a `ColumnRef`
+is never an ordinal. Correct by cases.
+
+**Where a struct is synthesised instead of parsed.** Exactly one site in `src/`:
+`subquery_decorrelation.cc:544`
+
+```cpp
+GroupByColumn{cr->table_name, cr->column_name, cr->id, nullptr}
+```
+
+Four positional initializers; `written_ordinal` is declared **last** in both
+structs precisely so positional brace-inits stay valid (`ast.h:250-269`,
+comment says so), and it defaults to `""`. No other `src/` site constructs
+either struct. Test files build them positionally too
+(`test_vectorized.cc:479-480`, `test_execution.cc:391`), same default.
+
+**Which way it fails, and whether that is safe.** Empty = "the user wrote no
+ordinal" = **accept**. It fails OPEN with respect to the refusal, and open is
+correct: the rule exists to stop a USER silently sorting or grouping by a
+constant. A key the planner synthesised was chosen deliberately by the planner,
+so refusing it would be wrong — a fail-CLOSED default would refuse the very
+`GroupByColumn` `subquery_decorrelation.cc:544` builds for TPC-H decorrelation.
+`ast.h:240-241` states this: *"Only the parser sets this, so a hand-built
+OrderByItem is never an ordinal, which is correct: nobody wrote it."* Verified
+as written and verified as the right direction.
+
+**Can a PARSED item lose the field before the Validator sees it?** I checked
+every mutation site of `stmt.order_by` / `stmt.group_by`:
+`constant_folding.cc:186-198` rewrites `item.expr` and `g.expr` and never
+reconstructs the struct; `subquery_materialization.cc:408` walks
+`GroupByColumn::expr` in place; the binder's alias substitution replaces the
+`expr` only. Nothing rebuilds a parsed item, and struct copies carry the field.
+**No path loses it.**
+
+**Enforcement reaches nested blocks.** `Validator::validate` runs per statement
+and nested bodies go through it — confirmed by execution:
+`SELECT d.team FROM (SELECT team FROM laps ORDER BY 1) d LIMIT 3` →
+`Error: ORDER BY 1: …`, and
+`… WHERE driver_id IN (SELECT driver_id FROM drivers GROUP BY 1)` →
+`Error: GROUP BY 1: …`. No derived-body or subquery-body hole.
+
+**The boundary is where the comment says it is.** Confirmed by execution:
+`ORDER BY 1`, `ORDER BY (1)`, `ORDER BY - -1` all still refused, all quoting
+`ORDER BY 1`; `ORDER BY 1 + 1`, `SELECT 1 AS one … ORDER BY one` and
+`GROUP BY 1 + 1` now accepted. **CLEAN.**
+
+### A.3 Do the six ungated passes still behave identically in both legs? FIVE do. `materializeSubqueries` does NOT, and that is B3-1b.
+
+Five of the six run strictly BEFORE the gate, on an input the flag cannot have
+touched, so their output is identical by construction, not by argument:
+
+| pass | site | argument |
+|---|---|---|
+| `foldConstants` | `binder.cc:207`, inside `Binder::bind` | `Binder::bind` runs before `LogicalPlanBuilder::build`, which runs before the `if (!no_optimize)` block (`main.cc:560` then `:566`). Same input, same code |
+| `lowerInSubqueries` | `logical_plan.cc:1000` | inside `LogicalPlanBuilder::build`, same |
+| `lowerExistsSubqueries` | `logical_plan.cc:1005` | same |
+| `lowerCorrelatedScalars` | `logical_plan.cc:1022` | same |
+| derived normalization (`buildRelation`) | `logical_plan.cc:908` | same |
+
+I checked that none of the five reads anything the optimizer could have written:
+they take no `estimated_rows`, no `TableStats`, and no plan annotation. Fix
+round 2's edits to them (`reachesOutsideThisBody`, `hidden` synthetic columns,
+the alias cleared off the aggregate, `SELECT *` not expanding over a synthetic
+relation) are all pure statement rewrites at the same point, so they change
+what both legs do, identically.
+
+**The sixth does not, and it is by design.** `materializeSubqueries`
+(`main.cc:500-543`) EXECUTES the nested query, and the runner is handed the flag:
+
+```cpp
+return runVectorizedToRows(std::move(body), catalog, std::move(tables),
+                           args.no_optimize);   // main.cc:519
+```
+
+`runVectorizedToRows` then runs the same three gated passes on the body
+(`main.cc:133-138`). So the pass is ungated but its OUTPUT is gate-dependent
+whenever the body's result is plan-dependent. The comment at `main.cc:126-129`
+argues this is right — a runner that always optimized *"would give both legs the
+same subquery result and quietly stop testing the sub-plan"* — and it IS right:
+the flag being threaded is what makes B3-1b visible instead of silent. But the
+consequence is that pass-2's B-1 table has a sixth row that is not like the
+other five, and B3-1b is that row firing.
+
+**Correction to pass 2's B-1, therefore.** "Both legs of the differential run
+identical code" holds for five of the six ungated passes, not all six.
+`materializeSubqueries` runs identical code over a leg-dependent input and
+produces a leg-dependent constant. That does not weaken B-1's point (the oracle
+is blind to the five); it sharpens it.
