@@ -713,6 +713,26 @@ enters the declined node's `children[1]`. That is correct — the body is a sepa
 and it is the exact asymmetry P4-M1 says is missing one case, since the semi/anti decline
 leaves `children[0]` unvisited while the LEFT decline leaves `children[1]` visited.
 
+### B4-6 — the randomized joint sweep (240 shapes over two seeds)
+
+`$SCRATCH/gen4.py`, aimed at the surfaces fix round 3 widened rather than at the ground
+pass 3 already covered. Three legs (optimized / `--no-optimize` / SQLite), sort-normalised
+positional TSV; a shape both SwiftQL legs refuse, or that SQLite cannot parse, is skipped.
+
+**Result: no semantic divergence.** Every entry the runner flagged was a `--no-optimize`
+TIMEOUT at the harness's 90-second cap, not a difference — the unoptimized leg materialises
+the whole join product, and this is a Debug build. Each one was re-run by hand without the
+cap and agreed:
+
+    SELECT COUNT(*) FROM laps l0
+      JOIN (SELECT l.driver_id AS k, d.age AS v FROM laps l
+            JOIN drivers d ON … JOIN drivers d9 ON d.team = d9.team) j0 ON l0.driver_id = j0.k
+      JOIN drivers j1 ON … JOIN drivers j2 ON … WHERE l0.driver_id < 3
+      optimized 1407054  |  --no-optimize 1407054 (2m40s)  |  SQLite 1407054
+
+Counting a timeout as a skip rather than as agreement is deliberate: a leg that did not
+finish has not agreed with anything.
+
 ### B4-4 — join key types: the parts that are CORRECT
 
 Re-confirmed from pass 3 and extended: `keyFieldText`'s numeric affinity is right everywhere
