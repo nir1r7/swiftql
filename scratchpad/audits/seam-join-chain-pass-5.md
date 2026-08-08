@@ -212,3 +212,127 @@ Two sweeps go with it, per the standing rule:
   moves. **This is the fifth retracted/short enumeration in five passes, and it
   is in the file that was written this round to be the single statement of the
   rule.**
+
+---
+
+### A.3 — the wider change: SwiftQL now DEFINES evaluation order. What that means for JOIN shapes
+
+`parser/expr_totality.h` states the rule: a conjunct is evaluated on the rows for
+which every conjunct **written before it** evaluated TRUE; every other expression
+is evaluated on every row that reaches its node; nothing may change that set for
+an expression that can raise. `AND` is therefore not commutative for error
+behaviour, by design. Worked through for the join layer, shape by shape, each one
+measured on the shipped catalog with all four legs.
+
+| # | join shape | what the rule requires | verdict |
+|---|---|---|---|
+| 1 | **`ON` residual of an INNER join, partial** | the residual is folded into the WHERE conjunction AHEAD of the written WHERE (`logical_plan.cc:1144-1147`), so it is conjunct 0 and `firstMayRaise` freezes the whole list | **HOLDS** (E10, C1: both legs Error) |
+| 2 | **`ON` residual of a LEFT join, partial** | it is NOT a conjunct of any list the screen reads; it is evaluated per candidate pair inside the probe loop, and pushdown on the preserved side shrinks that set | **BROKEN — P5-B1** |
+| 3 | **semi/anti join probe predicate** | the probe expression must be total | **HOLDS, structurally**: `lowerInSubqueries` refuses a computed left operand outright (`IN subquery: the left operand must be a column reference`), so the probe expression is always a bound `ColumnRef` and `exprMayRaise` on a resolvable ColumnRef is FALSE. A semi/anti join also carries no `on_residual` (asserted at `cardinality_estimator.cc:475`), and `grep` confirms `on_residual` is assigned in exactly one place, `logical_plan.cc:1132`, under `jc.type == JoinType::LEFT`. That single assignment site is what bounds P5-B1 |
+| 4 | **a conjunct that straddles two relations** | `soleSlot` returns -1 so it cannot be pushed; it stays in `residual`, which is re-sorted into WRITTEN index order before `filterOnto` | **HOLDS** (E1–E4, E6: raising straddle written first and written second, 2- and 3-relation spines, all legs agree) |
+| 5 | **a predicate pushed to one side of a join** | only conjuncts before `firstMayRaise` may be pushed; a pushed conjunct sees one relation's rows instead of the join's survivors | **HOLDS** (E7–E9, and the 24 `distribute` shapes of A.2) |
+| 6 | **the DP reordering relations under a frozen conjunct** | a frozen conjunct sits in the residual FILTER above the join and is evaluated on the join's OUTPUT, which reordering preserves as a SET; whether an expression raises is a property of the set, not the sequence | **HOLDS** (E5, E6, E9; and `orderByWork` re-derives `firstMayRaise` against the schema of the child it is actually handed, `predicate_pushdown.cc:436-440`, so a conjunct whose index moved still freezes the right suffix) |
+| 7 | **`GROUP BY` key / `HAVING` / `ORDER BY` expression that can raise, over a join** | evaluated on every row reaching their node; pushdown does not change the aggregate's or sort's input set | **HOLDS** (E11–E13) |
+| 8 | **decorrelated `EXISTS` / correlated scalar whose BODY holds a partial expression** | the body is planned as its own block and its row set does not depend on the probe input | **HOLDS** (E17, E18) |
+
+Two of these deserve the argument spelled out, because they are the ones that
+look unsafe and are not:
+
+**Row 6 — reordering cannot change a raise.** `rebuild` preserves the merged
+schema's `(relation_slot, name)` pair SET (pass 4 A.1, re-verified in A.5 below),
+so a frozen conjunct above the join still resolves to the same columns with the
+same types; and the join's output as a SET is order-independent, so "some row
+raises" is invariant. The one way order could matter is a LIMIT beneath the
+filter, and there is none — `applyLimit` places a LIMIT at or below the
+projection, never below a WHERE filter.
+
+**Row 5 — the restamp does not change the verdict.** `distribute` calls
+`restampSlots(c, 0)` before attaching a bucket to `children[1]`, and `filterOnto`
+then re-runs `firstMayRaise` against that relation's own slot-0 schema. The
+conjunct's operand types are the same columns either way (the merged schema
+resolves them by slot, the leaf schema by slot 0 after the restamp), so the two
+screens agree by construction rather than by luck.
+
+### A.4 — P4-M1, re-confirmed at HEAD and RE-SIZED (still MEDIUM)
+
+Unchanged at `b14d086`. The same two `--explain` lines:
+
+    FROM laps l JOIN drivers d ON … JOIN drivers d2 ON d.team = d2.team
+      LogicalJoin [driver_id@1 = driver_id] order=drivers@1,drivers@2,laps@0
+                                            cost=43104 (written=60637) method=dp
+
+    … the same spine … WHERE l.driver_id IN (SELECT d3.driver_id FROM drivers d3)
+      LogicalSemiJoin [driver_id@0 = driver_id] join-ordering=skipped (semi/anti join)
+        LogicalJoin [team@1 = team]           <- fully inner, 3 relations, NOT enumerated
+          LogicalJoin [driver_id = driver_id]
+
+**Re-sized with the clock rather than only with the model.** `--explain-analyze`,
+`columnar/vectorized`, same query, written spine vs the same spine hand-written in
+the order the DP picks for the un-semi'd version:
+
+| | spine join time | total execution |
+|---|---|---|
+| `laps ⋈ drivers ⋈ drivers` (what the planner leaves) | 419.7 ms + 84.9 ms = **504.7 ms** | 1144.7 ms |
+| `drivers ⋈ drivers ⋈ laps` (what the DP would pick) | 319.2 ms + 0.5 ms = **319.7 ms** | 929.8 ms |
+
+**1.58x on the spine, 1.23x on the whole query**, answers identical (32193 both
+ways). The cost model's own 43104 / 60637 is 1.41x, so the measurement and the
+model agree on direction and roughly on size.
+
+**The fix is still not one line, and both halves of pass 4's reason survive at
+HEAD.** `subquery_lowering.cc:92-95` still does `Schema left_schema =
+spine->output_schema;` and hands the copy to the join as its output schema
+(`subquery_decorrelation.cc:813` likewise), and `subquery_lowering.cc:100-112`
+still records that the loop comparing the two was DELETED because "it compared a
+copy of one object with the object". Reordering the spine after that copy is
+taken is precisely what makes those two objects genuinely different — the stored
+schema would carry the WRITTEN column order while the child emits the DP's — and
+the check that survives downstream (`vectorized_plan_builder.cc:846-851`, and
+`VecHashJoinNode`'s constructor) compares only SIZE, which a permutation does not
+change. So the fix is: enumerate `children[0]`, then RE-DERIVE the semi/anti
+node's output schema from it, and restore the deleted equality as a real
+assertion on two now-different objects.
+
+Severity stays **MEDIUM**: declining is always legal, the loss is plan quality
+only, and it is measured rather than asserted. Recorded a second time because the
+comment that motivates the decline (`join_enumeration.cc:159-168`) still reads as
+though the loss were unavoidable.
+
+### A.5 — the structural probe re-run against the new plan shapes — **CLEAN**
+
+Fix round 4 changed `applyLimit` (`logical_plan.cc:1042-1054`) to place a `LIMIT`
+BELOW a projection that can raise, which moves the shapes pass 4's probe covered.
+`probe_pairs` was rebuilt against `b5`'s `libswiftql_lib.a` and re-run, with the
+new shapes added:
+
+| shape | pair-set | sequence |
+|---|---|---|
+| 3-rel f1 spine, `ORDER BY d.age LIMIT 5` | SAME | PERMUTED |
+| `SELECT *` over the 3-rel spine, `LIMIT 5` | SAME | PERMUTED |
+| duplicate output name, passthrough / computed / aggregate (3 shapes) | SAME | PERMUTED (+ the known `(0,a) x2` duplicates) |
+| **`SELECT l.speed * 1000000000000000 AS a … LIMIT 5`** (total DOUBLE projection: `applyLimit` does NOT descend) | SAME | PERMUTED |
+| **`SELECT l.lap_id * 1000000000000000 AS a … LIMIT 5`** (partial INT projection: `applyLimit` DOES descend) | SAME | PERMUTED |
+| derived relation as a join input, `ORDER BY … LIMIT 5` | SAME | PERMUTED |
+
+The three `DUPLICATE (slot,name)` reports are pass 4's A.1.3 cases and are still
+safe for the reason recorded there (stable sort over a schema order fixed inside
+`LogicalPlanBuilder::build`, before any optimizer pass runs).
+
+**And the behaviour under the new LIMIT placement agrees.** Seven shapes putting a
+RAISING projection under a `LIMIT` over a join, four legs, ordered compare:
+
+| # | shape | `vec` | `vecno` |
+|---|---|---|---|
+| L1 | raising `SUBSTRING` projection, `ORDER BY` with heavy ties, `LIMIT 3`, 3-rel spine | 3 rows | identical |
+| L2 | raising INT-overflow projection, same | 3 rows | identical |
+| L3 | raising projection, **plain** `LIMIT 3` (so `deterministicCut` inserts its sort ABOVE the project and `applyLimit` does not descend) | Error | Error |
+| L4 | raising projection, TOTAL `ORDER BY`, `LIMIT 3` | Error | Error |
+| L5 | raising projection over a DERIVED join input | 3 rows | identical |
+| L6 | raising projection over a SEMI join | 3 rows | identical |
+| L7 | raising projection over a LEFT join (all four legs) | 3 rows | identical on all four |
+
+L1 vs L4 is worth stating so it is not mistaken for a defect: both descend the
+LIMIT, and they differ only because the three rows the two orderings cut to are
+different rows — one trio raises and the other does not. That is the rule working
+as designed (the PLAN decides which rows the projection sees), and it is the same
+in both legs.
