@@ -167,3 +167,68 @@ reason.** Its comment justifies itself entirely by the COLUMNAR interleaving bug
 path. Anyone who later decides "this only affects columnar, relax it for row storage"
 would reintroduce a different bug in the leg they thought was safe. Recorded as L-1.
 
+
+### A.6 The cost — **S-9, MEDIUM: `narrowRows` is an O(N x width) plan-time pass on the row leg, and every harness this project owns is blind to it**
+
+The commit prices the change as "one pass over the table's rows at plan time, moving
+Values rather than copying them ... acceptable at this project's scale". That was
+asserted, not measured. Measured, on a **Release** build (`-O3 -DNDEBUG`, configured
+into the scratchpad so `build/` was untouched), TPC-H sf0.1, `lineitem` = 600 572 rows
+x 16 columns, `--storage row --execution volcano --explain-analyze --no-cache`:
+
+| query | Plan | Execution |
+|---|---|---|
+| `SELECT * FROM lineitem LIMIT 1` (narrowRows early-returns) | **43.5 µs** | 16.6 µs |
+| `SELECT l_quantity FROM lineitem LIMIT 1` (keeps 1 of 16) | **103 677 µs** | 15.6 µs |
+| `SELECT <15 named cols> FROM lineitem LIMIT 1` (keeps 15 of 16) | **110 540 µs** | 11.2 µs |
+| `SELECT COUNT(*) FROM lineitem WHERE l_quantity > 30` | **105 056 µs** | 184 910 µs |
+
+The same four on the Debug binary in `build/` (which is what every harness actually
+runs): 108.9 µs / 1 015 322 µs / 2 561 656 µs / 1 021 073 µs.
+
+Read it plainly:
+
+- Planning a row-storage query over `lineitem` went from **43 µs to 104 ms** — a factor
+  of **~2 400** in Release, ~9 300 in Debug. It is not a constant: it is O(rows x kept
+  width), so it grows with the data and it grows *with the number of columns you keep*
+  (15-of-16 costs more than 1-of-16 — this is pure overhead, not saved work).
+- On `SELECT ... LIMIT 1` the engine now narrows all 600 572 rows to serve **one**.
+  Planning is 6 600x execution. That is a Volcano pipeline paying a full
+  materialisation before the first `next()`.
+- On the full-scan aggregate, plan is **57% of execution** — the query is ~1.6x slower
+  end to end.
+- `--explain` pays it in full: `Planner::plan` runs before the `if (args.explain)`
+  branch (`main.cc:653-661`), so printing a plan for a row-storage query now rewrites
+  the entire table first.
+
+**Why nothing caught it, and this is the part that matters more than the number:**
+
+- `python_tools/benchmark.py:67-88` — `run_once` calls the binary with
+  `--explain-analyze` and greps **`Execution:` only**. Plan time is not parsed, not
+  summed, not reported. Its `MODES` list *does* include `("row", ["--storage","row"])`,
+  so row storage is benchmarked — with the one number that cannot see this.
+- `python_tools/run_tpch.py:69-74` runs `row-volcano` for **correctness**, against
+  recorded answers. No timing.
+- The gate's "TPC-H baseline unchanged" is a correctness baseline. It is true and it is
+  silent about this.
+
+So the harness suite can report the row leg getting *faster* — narrower rows are
+genuinely cheaper to copy through Sort/HashJoin — while total time per query got
+worse, because the work moved from the timer that is read into the timer that is not.
+That is a measurement-integrity problem, not just a slow pass.
+
+**It is fixable without giving back the correctness fix, and cheaply.** The narrowing
+does not have to happen at plan time or all at once. `SeqScanNode` already has the
+machinery on its OTHER path: the columnar branch reconstructs one row per `next()` into
+a reused `reconstructed_row_` member (`plan_nodes.cc:71-76`). The row branch can do the
+same — keep the wide `rows_`, store the `keep` index vector the lambda already computes,
+and in `next()` fill `reconstructed_row_` from `rows_[cursor_][keep[i]]`. Same narrowed
+output schema, same tie-break fix, O(1) extra memory, no plan-time pass, and it deletes
+the double-move hazard of A.5 as a side effect (an index used twice is now a copy, not
+a move). It also makes the two `SeqScanNode` paths symmetric, which is the shape the
+rest of this file keeps asking for.
+
+Severity **MEDIUM**: no wrong answer, and row storage is the correctness baseline rather
+than the performance path. It is not LOW because the regression is unbounded in the data
+size, it is paid by `--explain`, and the project's own instruments are structurally
+unable to see it — which is how it survived a green gate.
