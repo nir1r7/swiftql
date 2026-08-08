@@ -1512,9 +1512,15 @@ WEEK34_CORRELATED_SCALAR_VOLCANO_REJECTED = [
 # entries below pin both halves of the new boundary, so a future widening cannot
 # pass silently.
 WEEK34_CORRELATED_SCALAR_REFUSED = [
+    # ONE PRODUCER, ONE NEEDLE — see the note on the CASE-wrapper entry below.
+    # This query (a non-aggregate body) and that one (a non-constant wrapper)
+    # reach the SAME guard and emit BYTE-IDENTICAL text, so `"single aggregate"`
+    # and `"wrapped in constant arithmetic"` each matched BOTH messages. The
+    # correlation-family matrix reported it the first time these entries were
+    # cross-checked together; it had been latent since they were written.
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT l2.speed FROM laps l2 WHERE l2.team = l.team)",
-     "single aggregate"),
+     "decorrelated only when its select list is a single aggregate, optionally wrapped in constant arithmetic"),
     # SEAM AUDIT pass 2, B-6 — one word, and it is the difference between a pin
     # and a suffix. This used to read "LIMIT cannot be decorrelated", which is a
     # tail of BOTH "a body with LIMIT cannot be decorrelated" (the EXISTS guard,
@@ -1526,9 +1532,17 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team LIMIT 1)",
      "scalar body with LIMIT cannot be decorrelated"),
+    # LENGTHENED WHEN q21 LANDED, and the reason is a rot this file has now been
+    # bitten by twice. This query and the scalar entry in
+    # WEEK36_CORRELATED_RESIDUAL_REFUSED reach ONE guard and emit BYTE-IDENTICAL
+    # messages — verified by running both. Leaving this pin short while that one
+    # took the longer, more specific needle would have made each pin match the
+    # other's message, which `assert_refusal_pins_discriminate` reports as two
+    # producers behind one tick. One producer, one needle: both use the clause
+    # that names WHY, not just the shape of the complaint.
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.speed > l.speed)",
-     "only an equality between two columns can become a join key"),
+     "a correlated SCALAR subquery is lowered to a grouped derived table"),
 
     # WEEK 36 — TWO AGGREGATES under one wrapper. The lift is written for ONE
     # output column and ONE zero-row rule; two would need two of each, and the
@@ -1540,10 +1554,14 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
     # even though it is constant-valued here: it has no vectorized kernel by
     # design, it raises three-valued questions the arithmetic path does not, and
     # no TPC-H query needs one. The whitelist is Literal + arithmetic, full stop.
+    # Shares the needle above BY DESIGN. The two entries still earn their keep
+    # as a pair — they enter the guard by different routes — but the engine
+    # answers both with one sentence, so the oracle cannot tell them apart by
+    # message and must not pretend otherwise.
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT CASE WHEN AVG(l2.speed) > 1 THEN 1 ELSE 0 END FROM laps l2 "
      "WHERE l2.team = l.team)",
-     "wrapped in constant arithmetic"),
+     "decorrelated only when its select list is a single aggregate, optionally wrapped in constant arithmetic"),
     # WEEK 36 — a wrapper naming a BODY COLUMN outside the aggregate. Refused,
     # but NOT by the wrapper rule: the Validator's grouped-reference check runs
     # first and reports the ungrouped column, which is the better diagnostic and
@@ -1575,21 +1593,25 @@ WEEK34_CORRELATED_SCALAR_REFUSED = [
 # join emits the probe row if SOME matching build row passes, an anti join if
 # NONE does, and the two are not one boolean apart in the operator.
 WEEK36_CORRELATED_RESIDUAL_REFUSED = [
-    ("SELECT l.lap_id FROM laps l WHERE EXISTS "
-     "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
-     " AND l2.speed != l.speed)",
-     "would have to ride as an ON residual"),
-    ("SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
-     "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
-     " AND l2.speed > l.speed)",
-     "would have to ride as an ON residual"),
-    # ...and the SCALAR family reaches the same guard, which is worth pinning
-    # separately: splitCorrelation is shared, so a residual added for EXISTS
-    # would change this query's behaviour too, and it must not do so silently.
+    # THE EXISTS / NOT EXISTS PAIR THAT USED TO LIVE HERE IS GONE, AND THAT IS
+    # THE POINT. q21 implemented the ON residual, so both now ANSWER, and they
+    # moved into Q21_RESIDUAL_VEC_ONLY below rather than being deleted — the
+    # discipline this suite's header states: nothing leaves a rejection suite
+    # without arriving in a diffed one.
+    #
+    # THE SCALAR FAMILY STAYS REFUSED, for a reason that CHANGED rather than
+    # persisted. It used to refuse because no residual existed anywhere. It now
+    # refuses because a correlated SCALAR subquery is lowered to a GROUPED
+    # DERIVED TABLE joined with a standard LEFT join — and that derived table's
+    # rows are already aggregates over exactly the rows a residual would have
+    # selected, so there is no point in the plan at which a residual could be
+    # applied. The needle is updated to say that, because the old one
+    # ("would have to ride as an ON residual") now describes something the engine
+    # DOES, and would have gone on passing while meaning the opposite.
     ("SELECT COUNT(*) FROM laps l WHERE l.speed > "
      "(SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team "
      " AND l2.lap_id != l.lap_id)",
-     "would have to ride as an ON residual"),
+     "a correlated SCALAR subquery is lowered to a grouped derived table"),
 ]
 
 # SEAM AUDIT (subquery chain, pass 2) — B-1. `SELECT *` IN A BLOCK THAT HOLDS A
@@ -2708,6 +2730,142 @@ TYPEFIX_CUT_DEPTH2_VOLCANO_REJECTED = [
 #
 # So: this file does NOT cover the pruner type rule. If a future change needs it
 # here, the cost is a new catalog rather than a new table in the shipped one.
+
+# ─── q21: the shapes that MOVED here from the rejection suite ───────────────
+#
+# The EXISTS / NOT EXISTS pair that WEEK36_CORRELATED_RESIDUAL_REFUSED used to
+# pin now ANSWERS, so it arrives here — that suite's header wrote the rule
+# ("what a residual implementation would have to MOVE rather than delete") and
+# this is the arrival.
+#
+# VEC-ONLY: Volcano refuses every correlated subquery by capability. The twin is
+# WEEK33_DECORRELATED_VOLCANO_REJECTED's job, which already covers the family.
+#
+# !! WHY FOUR OF THESE ARE THE STRONGEST ENTRIES IN THE FILE. A residual carries
+# a correlated reference into a merged join schema where BOTH sides have a column
+# of the same name — `d.age` and `d2.age`, `d.driver_id` and `d2.driver_id`. If
+# that reference resolved by NAME instead of by relation slot it would compare a
+# column against ITSELF, and the predicate would collapse to a constant. The
+# by-name answers are recorded beside each entry, and they do not merely differ
+# from the correct ones — THEY FLIP:
+#
+#     entry                          correct   by-name
+#     EXISTS  team = , age >            13         0
+#     NOT EXISTS  team = , age >         7        20
+#     EXISTS  team = , driver_id !=     20         0
+#     NOT EXISTS  team = , driver_id != 0         20
+#
+# 0 and 20 are the two saturating answers over a 20-row table, so a by-name
+# regression cannot hide inside a plausible-looking count. Both halves of each
+# pair are kept for that reason: the semi and anti forms saturate in OPPOSITE
+# directions, so one of the two is always maximally wrong.
+#
+# Every count below was verified against SQLite in BOTH vectorized modes on the
+# shipped catalog.
+Q21_RESIDUAL_VEC_ONLY = [
+    # 1. the EXISTS half of the moved pair. COUNT(*) = 10000: every lap shares a
+    #    driver with some lap at a different speed.
+    "SELECT COUNT(*) AS n FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.speed != l.speed)",
+
+    # 2. the NOT EXISTS half — 21 rows, the per-driver maxima (one driver ties).
+    "SELECT l.lap_id AS id FROM laps l WHERE NOT EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.speed > l.speed) ORDER BY id",
+
+    # 3. 13 rows. BY NAME: 0 — `d2.age > d2.age` is false for every row.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team AND d2.age > d.age) "
+    "ORDER BY nm",
+
+    # 4. 7 rows. BY NAME: 20 — the anti join keeps everything.
+    "SELECT d.name AS nm FROM drivers d WHERE NOT EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team AND d2.age > d.age) "
+    "ORDER BY nm",
+
+    # 5. q21's own `!=` verbatim. 20 rows. BY NAME: 0.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team "
+    "AND d2.driver_id != d.driver_id) ORDER BY nm",
+
+    # 6. ...and the pair FLIPS: 0 rows correct, 20 by name.
+    "SELECT d.name AS nm FROM drivers d WHERE NOT EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team "
+    "AND d2.driver_id != d.driver_id) ORDER BY nm",
+
+    # 7. TWO residual conjuncts on one join — the residual is a conjunction, not
+    #    a single predicate slot. 13 rows.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team AND d2.age > d.age "
+    "AND d2.driver_id != d.driver_id) ORDER BY nm",
+
+    # 8. an OUTER-ONLY residual: `l.speed > 320` names no body column at all, so
+    #    the residual appends nothing to the build side and the lift has to cope
+    #    with an empty append.
+    "SELECT COUNT(*) AS n FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id AND l.speed > 320)",
+
+    # 9. a residual over two DIFFERENT columns of both sides, under NOT EXISTS.
+    "SELECT COUNT(*) AS n FROM laps l WHERE NOT EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.driver_id = l.driver_id "
+    "AND l2.season != l.season AND l2.speed > l.speed)",
+
+    # 10. THE MERGED-SCHEMA HAZARD, sharpest form: the body is itself a JOIN, so
+    #     the residual's correlated reference has to resolve against a schema
+    #     that already merges two relations before the semi-join merges a third.
+    #     13 rows.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM laps l JOIN drivers t ON l.driver_id = t.driver_id "
+    "WHERE t.team = d.team AND t.age > d.age) ORDER BY nm",
+
+    # 11. a nested correlation UNDER a residual: the inner EXISTS correlates to
+    #     the middle block, which is itself the build side of a residual join.
+    #     13 rows.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team AND d2.age > d.age "
+    "AND EXISTS (SELECT 1 FROM laps l WHERE l.driver_id = d2.driver_id "
+    "AND l.speed > 344)) ORDER BY nm",
+
+    # 12. q21's own SEMI + ANTI stack in one query — a residual on each, over the
+    #     same outer relation. 7 rows.
+    "SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+    "(SELECT 1 FROM drivers d2 WHERE d2.team = d.team "
+    "AND d2.driver_id != d.driver_id) AND NOT EXISTS "
+    "(SELECT 1 FROM drivers d3 WHERE d3.team = d.team AND d3.age > d.age) "
+    "ORDER BY nm",
+]
+
+# ─── q21: the residual boundary, both sides of it ───────────────────────────
+#
+# VEC-ONLY, NOT FOUR-MODE, and that is a correction rather than a preference.
+# Both Volcano modes refuse these by CAPABILITY ("correlated subqueries are
+# decorrelated to a semi-join and are not supported on the Volcano path") long
+# before the residual guard is reached, so a four-mode pin would assert the
+# specific message against a leg that never produces it. Verified by running all
+# four. The capability halves are pinned separately below.
+Q21_RESIDUAL_REFUSED_VEC_ONLY = [
+    # NO EQUALITY AT ALL. A residual rides ON a join key; with no key there is no
+    # join to hang it on, so this is the floor of the feature rather than a gap
+    # in it.
+    ("SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+     "(SELECT 1 FROM drivers d2 WHERE d2.age > d.age)",
+     "no equality links the subquery"),
+
+    # THE MASKED RAISER. `SUBSTRING(d2.name, d2.age - 29, 1)` can raise, and it
+    # is written BEFORE `d2.age > 0`. Lifting the raising conjunct onto the join
+    # as an ON residual while the body-local conjunct stays in the body would
+    # evaluate the residual on MORE rows than the written order gives it — the
+    # same defined-evaluation-order rule the partiality entries pin, reaching the
+    # residual machinery. Refused rather than silently reordered.
+    ("SELECT d.name AS nm FROM drivers d WHERE EXISTS "
+     "(SELECT 1 FROM drivers d2 WHERE d2.driver_id = d.driver_id "
+     "AND SUBSTRING(d2.name, d2.age - 29, 1) > d.name AND d2.age > 0)",
+     "lifted onto the semi/anti join as an ON residual"),
+]
+Q21_RESIDUAL_REFUSED_VOLCANO_REJECTED = [
+    (q, VOLCANO_CORRELATED) for q, _ in Q21_RESIDUAL_REFUSED_VEC_ONLY
+]
 
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
@@ -4473,6 +4631,23 @@ def main():
             f"cut: a REAL column two derived levels down — {label}", extra_args=extra)
         m_passed += mp; m_failed += mf; m_errors += me
 
+    # q21 — the residual shapes that MOVED out of the rejection suite, and the
+    # two boundaries that still refuse.
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, Q21_RESIDUAL_VEC_ONLY,
+            f"q21 semi/anti join with an ON residual — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+        rp, rf, re_ = run_rejection_suite(
+            Q21_RESIDUAL_REFUSED_VEC_ONLY,
+            f"q21 residual boundary — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            Q21_RESIDUAL_REFUSED_VOLCANO_REJECTED,
+            f"q21 residual boundary refused earlier — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
     findings = sweep_rejection_suites()
@@ -4497,6 +4672,17 @@ def main():
     findings += assert_refusal_pins_discriminate(
         "screening refusals",
         SCREENING_REFUSED_ALL_MODES + SCREENING_REFUSED_VEC_ONLY,
+        ["--execution", "vectorized", "--storage", "columnar"])
+    # THE CORRELATION FAMILY, as one matrix. q21's two new refusals share
+    # vocabulary with the residual family it grew out of — "ON residual" appears
+    # in three of these messages — so "the needles look different" is not
+    # evidence. The two scalar entries reach ONE guard and emit byte-identical
+    # text; they carry the SAME needle deliberately, which this matrix exempts as
+    # a shared producer rather than flagging.
+    findings += assert_refusal_pins_discriminate(
+        "correlation refusals",
+        Q21_RESIDUAL_REFUSED_VEC_ONLY + WEEK36_CORRELATED_RESIDUAL_REFUSED
+        + WEEK34_CORRELATED_SCALAR_REFUSED,
         ["--execution", "vectorized", "--storage", "columnar"])
     # The partiality refusals are four DIFFERENT producers (SUBSTRING, overflow,
     # type mismatch, SUBSTRING again) whose messages share no tail, so they get
