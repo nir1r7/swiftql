@@ -1,4 +1,27 @@
 # Phase 5 orchestrator state
+Current: **FIX ROUND 3 GATED GREEN on 9da0494. Launching SEAM PASS 4.**
+  build 0 warnings; unit **874/874** (97 suites); oracle **1602 passed / 0 failed / 0 errors**;
+  regression **335/0/0**; tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous;
+  1 unported), full 22-query run, baseline md5 7cee17dae5398e3f20ef92f05ba78d5b unchanged.
+  Tracked fingerprint 2701577474ea10e9fb4ed4eb5cf4b29d identical before AND after; HEAD unmoved.
+  **STALENESS DISPROVED IN BOTH DIRECTIONS** — the skill's build command was a no-op, so it touched
+  all 112 tracked .cc/.h (content md5 unchanged by the touch) and rebuilt: 58 Building CXX, 33.3s,
+  0 warnings — AND the rebuilt binaries are **BIT-IDENTICAL** to the ones already there, which
+  proves the pre-existing binaries were the product of these sources.
+  **Refusal-pin family check RAN, CLEAN, 16 pins** — and it GATES (feeds sys.exit(1)), not advisory.
+  7 join-key pins vs 7 actual messages, 9 INT-narrowing pins vs 9. Zero FINDING lines. Rejection
+  sweep clean over 28 suites / 235 entries.
+  **MY OWN ARITHMETIC WAS THE UNRELIABLE PART, not the run.** I briefed the verifier with
+  "~1556 plus roughly 70" oracle and "~330 plus 17" regression. Both were wrong: I added the agents'
+  CHECK counts (54/54, 17/17 across modes) to ENTRY totals — apples and oranges. The verifier
+  flagged both and PROVED the regression one with the harness's own breakdown
+  (63+119+136+4+9+1+1+2 = 335; the 17 tie-straddle sit INSIDE the 136 invariant subtotal, not
+  beside it). Do not hand a verifier an estimate dressed as a claim.
+  TOOL LIMIT NOTE: Bash caps at 10 minutes and killed the verifier's first gate-3 attempt at 1460
+  lines. Its fix, which every future gate should copy: launch the long gate detached, then
+  foreground-block on its PID with `tail --pid=$PID -f <outfile>` so the whole run sits inside one
+  blocking call read in the same turn.
+
 
 ## !! PENDING MERGE — `claude/typefix-wt` @ 070e01a (pushed to origin, durable)
 Type-through-division fix is DONE but **NOT on the working branch**. Merge it as soon as the
