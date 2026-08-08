@@ -1,4 +1,67 @@
 # Phase 5 orchestrator state
+
+## FIX ROUND 5 — screening agent: **DONE** (501ee80 + 3769d9d). Gates: unit **919**, oracle
+1722/0/0, regression 340/0/0, tpch PASS 20/22, BASELINE OK.
+- **P5-B1 (BLOCKER) CLOSED**: `distribute` now screens `join->on_residual` with `conjunctMayRaise`
+  (NOT `exprMayRaise` — `passes()` does `asInt()`, so it is truth-tested like a conjunct) and
+  declines the `children[0]` recursion. All EIGHT audit instances close on ONE guard. Controls
+  (total INT residual, DOUBLE residual) still push and still answer 4 in all six.
+  **It VERIFIED the control pin at test_predicate_pushdown.cc:871 rather than relying on my claim**
+  — that query has no residual, so it passes with and without the fix.
+- **B-3 (HIGH) CLOSED by refusal, and the refusal is FORCED**: the lifted equality's level-1
+  reference means nothing inside the body, so NO position there reproduces the row set it gave.
+  **Found and fixed a REAL REGRESSION mid-flight**: `cloneExpr` SHARES a `SubqueryExpr`'s
+  `shared_ptr`, so cloning a subquery-bearing conjunct tripped the `use_count() > 1` guard — 12
+  ordinary nested-EXISTS oracle queries errored and 4 refusal pins reported the wrong cause.
+- **P5-1 (MEDIUM) REPAIRED, not refused**: `guardLoweredConjunctPrefix` moves the conjuncts written
+  BEFORE the lowered one BELOW the semi/anti join — exactly where the written order says they are
+  evaluated. No answer lost; an ordinary IN query plans byte-identically. `IN(subq) AND raiser`
+  still answers 0, so **written position matters again**, which was the audit's second-order point.
+
+### !!! THE ANSWER TO "IS THERE A SINGLE ENFORCEMENT POINT?" — NO, and the shape matters more
+**The screen was already single and already right.** `exprMayRaise`/`conjunctMayRaise`/
+`firstMayRaise` needed NO change for any of the three findings.
+> *The rule is a property of `(expression, evaluation site, row set)`, but every enumeration in the
+> codebase is drawn on a different axis — consumers of the screen, or moves of a pass. Both axes
+> undercount, and five passes running the missing entry WAS the defect.*
+**P5-B1 sat in an expression NO MOVE TOUCHES**: pushing a conjunct into a preserved side changes the
+row set of a residual the pass never reads. An enumeration of MOVERS cannot find that, because the
+obligation is per **expression whose row set a move changes** — strictly larger than the conjuncts
+that travel. **"An expression need not MOVE to be moved."**
+Neither mechanical option exists: a differential check around each rewrite needs an enumeration of
+per-row expression SITES in a plan, which the codebase does not have — *that absence is precisely
+why `on_residual` was invisible: it is a FIELD ON A NODE, not a member of any list*. And the builder
+passes have no before-plan; their reference is the written statement, where the single statement
+already exists and B-3/P5-1 simply never called it.
+The three needed three different remedies because they move the row set in three directions:
+**shrink-below** (decline the push), **shrink-above** (move earlier conjuncts down), **grow**
+(refuse — nothing can be moved back). A single guard would have had to refuse in all three, costing
+answers P5-1 keeps.
+**"The enforcement point is the AXIS, not a function."** It rewrote both enumerations onto that axis
+rather than adding a fifth entry.
+
+### P4-M1 — it DISPROVED THE AUDIT'S OWN FIX SKETCH by construction
+The sketch (enumerate `children[0]`, re-derive the semi/anti node's schema) is INSUFFICIENT: that
+node is not always the top of its plan — `lowerCorrelatedScalars` attaches a `LogicalLeftJoin`
+ABOVE it whose merged schema is a POSITIONAL CONCATENATION. `Filter`/`Sort`/`Distinct`/`Limit` each
+copy their child's schema at construction too, so permuting the spine invalidates **every
+ancestor's** stored schema up to the first PROJECT/AGGREGATE/DERIVED. A correct fix is a plan-wide
+bottom-up re-derivation reusing `rebuild`'s merge, PLUS **inverting** `test_join_enumeration.cc:843-846`,
+which asserts only the declining node carries an `order_decision`. **Week-task shape, not fix-round
+shape.** Recorded in source beside the deleted-equality paragraph.
+
+### Left open by the screening agent (all stated in source, none silent)
+- **P5-M1**: no conjunct cascade inside a LEFT `ON` residual — `evaluate()` computes both operands of
+  an AND before the operator, so `ON k = k AND A AND B` evaluates B on rows where A is FALSE, while
+  the same text in a WHERE or on an INNER join does not. **All four legs agree — not a divergence**,
+  it is line 23 of `expr_totality.h` being false for a construct the parser accepts. A DECISION.
+- P5-1's bounded decline: `raiser AND EXISTS(...) AND IN(...)` still masked.
+- B-3's bounded decline: a body-local conjunct that itself holds a subquery is not screened.
+- `docs/week-29-plan.md:729` still says the unconditional recursion "is still correct at every…" —
+  deliberately LEFT, because week plans are historical records; `development.md` is swept.
+- 3 oracle entries owed (A/B/C rejection-suite), all verified against the current binary. **A is the
+  one that matters: NO TEST IN THE TREE PUTS A PARTIAL EXPRESSION IN AN `ON` CLAUSE**, which is why
+  five passes of harnesses stayed green over a blocker.
 Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST PASS ALLOWED.**
   unit **910**; oracle **1722/0/0** (= 1602 + 120 new, exact); regression **340/0/0** (= 335 + 5,
   and the harness NAMES the five: w37p_guard_first_substring, w37p_guard_first_overflow,
