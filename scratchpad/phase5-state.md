@@ -11,6 +11,37 @@ Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST 
   summary line), not merely free of failures.
 AFTER PASS 5: doc sweep -> q21 -> sf0.1 -> final gate.
 
+## PASS 5 — storage: **0 BLOCKER / 1 HIGH / 3 MEDIUM / 5 LOW.**
+**S-13 (HIGH) IS THE SAME BUG AS THE OPTIMIZER SEAM'S P5-2 — found INDEPENDENTLY, through a
+different door.** `conjunctMayRaise(expr, schema)` is handed the SCAN's schema; `staticTypeOf`'s
+bare-name fallback resolves a slot-1 ref against the scanned table anyway, so two joined relations
+sharing a column NAME with a different TYPE make the screen type the conjunct off the wrong column,
+call it total, and let the next conjunct prune every chunk:
+  SELECT COUNT(*) FROM big b JOIN small2 s2 ON b.j=s2.j WHERE s2.x AND b.k > 999999
+    row: `Error: std::get: wrong index for variant` | columnar: COUNT(*) = 0 (chunks_skipped=3/3)
+  Both engines, optimizer on AND off. The collector's `localSlot < 1` guard stops the conjunct being
+  COLLECTED; **nothing guards the SCREEN**. Pushdown froze the conjunct correctly — the filter never
+  moved — and the pruner cleared it anyway. Confined to INNER joins.
+  **TWO SEAMS, ONE FIX**: thread the hint's schema through `pruningHintForPreservedSide`.
+**S-14 (MEDIUM) — it corrected the fixer's scope TWICE.** The pruning loss is a **WRITTEN-ORDER**
+effect, NOT a `--no-optimize` one: `Planner::plan:284` hands raw `stmt.where` to the FROM scan
+regardless of the optimizer, so **Volcano's OPTIMIZED leg loses the skip too** (+21.4%). A Release
+build of 364a2d3 shows no order sensitivity at all — that is the control. Re-sized on an 8-chunk
+table: **2.80x Volcano, 1.84x vectorized --no-optimize**. The "42.5 -> 51.5 ms" absolutes DO NOT
+REPRODUCE; the ratio does. And the fix is **~20 lines**, not the "one line in each of two builders"
+the comment claims, because the schema must survive to SCAN time.
+S-9/S-10/S-11/S-12: **all four OPEN and unchanged in code**, each re-measured at HEAD.
+**It corrected pass 4's own S-9 framing**: 4 kept columns cost **+12% over 1, not 2x** — so the pass
+is O(rows) paid in full for a single column. And it SHOWED the instrument's error instead of arguing
+it: `Execution:` FALLS 19.1 -> 14.2 us on the query whose plan time rose 110 ms, so `benchmark.py`
+scores it a **25% speed-up**.
+HELD: value fidelity byte-exact (same md5 in all three cells), scan order identical, invariant 12
+intact under a construction built to collapse the answer if it leaked, 144-query raiser battery
+clean, **0 storage divergences in ~790 differential queries** outside the S-13 class.
+**Its closing line: "The audit ends here, but it should not close until S-13 is fixed — the only
+reason nothing catches it is that no catalog in the tree declares a same-named column with two
+types."**
+
 ## PASS 5 — optimizer preservation: **0 BLOCKER / 1 HIGH / 3 MEDIUM / 2 LOW.**
 **VERDICT LINE WORTH KEEPING:** *"Round 4 got the design right and the plumbing wrong. The
 definition, the precondition and the five-site partition all hold under attack; `exprMayRaise` is
