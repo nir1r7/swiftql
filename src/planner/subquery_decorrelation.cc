@@ -31,6 +31,69 @@ void requireDecorrelatableBody(const SelectStatement& body) {
     }
 }
 
+// SEAM AUDIT pass 2 — B-3. "Does this expression reach outside THE BODY?"
+//
+// collectSlots (dispatch site 8) is the maintained walker for the neighbouring
+// question, and this asks IT rather than growing a nineteenth private walker
+// (Week 30 refused to add one for the ORDER BY position rule). But it is not
+// the same question, and the difference is exactly one of its branches.
+// collectSlots has THREE producers of its "cannot name it here" sentinel -1:
+//
+//   1. a ColumnRef resolved to an ENCLOSING block   -> yes, reaches outside;
+//   2. an UNRESOLVED ColumnRef                      -> cannot be classified at
+//                                                      all, so refuse loudly —
+//                                                      the safe direction, and
+//                                                      the message below names
+//                                                      it (round 1, L-8);
+//   3. a nested CORRELATED SubqueryExpr             -> NOT AN ANSWER TO THIS
+//                                                      QUESTION.
+//
+// The enumeration in this comment used to say TWO, and (3) is the one it
+// missed. (3) is right for PUSHDOWN, which is what collectSlots is for: a
+// conjunct holding a correlated subquery owns no single relation slot, so
+// withholding it is conservative and safe. As a CORRELATION test it is simply
+// the wrong reading. `sq->correlated` means "some ref inside sq's own body
+// resolved to an enclosing scope" — and for a one-level reference the scope it
+// names is THIS BODY, the one being split. Body-local: exactly the
+// classification it must get, and the only route by which a nested correlated
+// subquery can reach the body's OWN lowering pass.
+//
+// What the misreading cost: a conjunct that merely CONTAINED a nested
+// correlated subquery was routed to the refusing branch, failed the
+// `BinaryExpr && op == "="` test, and was reported as
+//
+//     correlated subquery: only an equality between two columns can become a
+//     join key (a correlated inequality has no equi-join to lower to; ...)
+//
+// for queries with no inequality anywhere in them. Same wrong-cause class as
+// round 1's L-8, in this same function, which had already been corrected for it
+// once. The identical nesting under an UNCORRELATED IN ran and was right — the
+// only difference was whether the ENCLOSING subquery happened to be correlated.
+//
+// HOW THE THIRD PRODUCER IS SUPPRESSED, and why this is not a second walker:
+// forEachSubquery (dispatch site 19) is the maintained walk to every nested
+// SubqueryExpr; the flag is cleared across the single collectSlots call and put
+// back immediately, so what runs is site 8 itself answering a narrower
+// question. Every node cleared is recorded and restored — the flag is live data
+// (the body's own lowering passes route on it), not a scratch bit. collectSlots
+// cannot throw, so there is no path that skips the restore.
+//
+// !! THIS IS HALF OF A COUPLED PAIR. See the depth refusal below.
+bool reachesOutsideThisBody(std::unique_ptr<Expr>& e) {
+    if (!e) return false;
+    std::vector<SubqueryExpr*> suppressed;
+    forEachSubquery(e, [&](std::unique_ptr<Expr>& slot) {
+        auto* sq = static_cast<SubqueryExpr*>(slot.get());
+        if (!sq->correlated) return;
+        sq->correlated = false;
+        suppressed.push_back(sq);
+    });
+    std::unordered_set<int> slots;
+    collectSlots(e.get(), slots);
+    for (auto* sq : suppressed) sq->correlated = true;
+    return slots.find(-1) != slots.end();
+}
+
 // Splits the body's WHERE into join keys (the correlated equalities) and the
 // conjuncts that stay inside the body. Refuses any correlated conjunct that is
 // not a key, rather than leaving it in the body where its level-1 ref would be
@@ -40,18 +103,9 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
                       std::vector<std::unique_ptr<Expr>>& body_key_refs,
                       std::vector<std::unique_ptr<Expr>>& local) {
     for (auto& c : body_conjuncts) {
-        // Does this conjunct reach outside the body? collectSlots (dispatch
-        // site 8) is the maintained walker for exactly this question and maps a
-        // correlated ref to its "cannot name it here" sentinel, -1. A private
-        // walker here would be a nineteenth silent dispatch site, which is what
-        // Week 30 refused to add for the ORDER BY position rule.
-        //
-        // -1 also means UNRESOLVED, so a conjunct carrying an unbound ref lands
-        // in the refusing branch below. That is the safe direction: it is loud,
-        // not silently mis-classified as body-local.
-        std::unordered_set<int> slots;
-        collectSlots(c.get(), slots);
-        if (slots.find(-1) == slots.end()) { local.push_back(std::move(c)); continue; }
+        // Does this conjunct reach outside the body? See reachesOutsideThisBody
+        // above for why that is not the same as "collectSlots yields -1".
+        if (!reachesOutsideThisBody(c)) { local.push_back(std::move(c)); continue; }
 
         auto* bin = dynamic_cast<BinaryExpr*>(c.get());
         if (!bin || bin->op != "=")
@@ -98,6 +152,37 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
 
         const ColumnRef* body_side  = l_outer ? r : l;
         const ColumnRef* outer_side = l_outer ? l : r;
+        // !! THE OTHER HALF OF B-3's COUPLED PAIR, and it changed state with
+        // that fix. This guard was UNREACHABLE (seam audit pass 2, B-5.3): every
+        // route to a level-2 reference was closed by something earlier, and the
+        // nearest one was B-3's own misclassification — a nested correlated
+        // subquery was refused above before its body could ever be split.
+        //
+        // Fixing B-3 OPENS this route deliberately, and this guard is what makes
+        // it safe. The route is now:
+        //
+        //   EXISTS (SELECT 1 FROM laps l WHERE l.driver_id = d.driver_id
+        //             AND EXISTS (SELECT 1 FROM laps l2
+        //                         WHERE l2.driver_id = d.driver_id))
+        //
+        // The inner conjunct is classified body-local, the middle body is handed
+        // to LogicalPlanBuilder::build, and the body's OWN lowering pass splits
+        // the inner body — where `d.driver_id` still carries LEVEL 2. Levels are
+        // NOT decremented when the middle body is decorrelated (the rewrite
+        // moves a join, not a scope), so a stale level would otherwise reach
+        // leftKeyIndices and be read as a slot of the wrong range table. This
+        // test is the whole containment, and it now fires: the query above is
+        // refused by NAME, with the level as the stated cause.
+        //
+        // It is `!= 1` and not `> 1` on purpose: level 0 is local and cannot
+        // arrive here (the l_outer test above already parted the sides), so a
+        // level of anything but 1 is a case this rewrite does not model, and
+        // failing closed is the right direction for both.
+        //
+        // Pinned by message in the rejection suite, because the diffed oracle
+        // cannot hold a query that errors — a guard that fires but is asserted
+        // nowhere is how the previous three came to be dead without anyone
+        // noticing.
         if (outer_side->id.level() != 1)
             refuse("a reference to a query block more than one level out cannot "
                    "be decorrelated here");
@@ -151,27 +236,36 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
 // refusal is uniform today because splitting it means moving the extraction
 // ahead of the residual fold, which is the feature above.
 //
-// collectSlots is the same maintained walker splitCorrelation uses, and -1 is
-// the same sentinel; an UNRESOLVED ref also maps to -1 and is named in the
-// message rather than mis-diagnosed as correlation (round 1, L-8).
-void refuseSurvivingCorrelatedRefs(const SelectStatement& body) {
-    auto check = [](const Expr* e, const char* where) {
+// reachesOutsideThisBody is the SAME predicate splitCorrelation classifies with,
+// and it must be — this check runs on what splitCorrelation left behind, so a
+// question asked one way there and another way here is a refusal for a conjunct
+// the classifier just called legal. An UNRESOLVED ref maps to -1 there and here
+// alike, and is named in the message rather than mis-diagnosed as correlation
+// (round 1, L-8).
+//
+// !! IT MATTERS THAT THIS USES THE NARROWED PREDICATE AND NOT collectSlots
+// DIRECTLY (seam audit pass 2, B-3). The WHERE check below runs AFTER
+// splitCorrelation has put the body-local conjuncts back, and a nested
+// correlated subquery is now one of them. Left on plain collectSlots, this
+// function would refuse exactly the queries B-3's fix just admitted, one line
+// later and with a different wrong cause — the fix would have moved the refusal
+// rather than removed it. Both call sites, one predicate.
+void refuseSurvivingCorrelatedRefs(SelectStatement& body) {
+    auto check = [](std::unique_ptr<Expr>& e, const char* where) {
         if (!e) return;
-        std::unordered_set<int> slots;
-        collectSlots(e, slots);
-        if (slots.find(-1) != slots.end())
+        if (reachesOutsideThisBody(e))
             refuse(std::string("a reference this body cannot name locally survives "
                                "in its ") + where + " (a correlated reference is "
                    "lowered only from a top-level equality in the body's WHERE; "
                    "an unresolved one would report the same)");
     };
-    for (const auto& j : body.joins)       check(j.condition.get(), "JOIN ... ON clause");
-    for (const auto& e : body.select_list) check(e.get(), "SELECT list");
-    for (const auto& o : body.order_by)    check(o.expr.get(), "ORDER BY");
+    for (auto& j : body.joins)       check(j.condition, "JOIN ... ON clause");
+    for (auto& e : body.select_list) check(e, "SELECT list");
+    for (auto& o : body.order_by)    check(o.expr, "ORDER BY");
     // splitCorrelation guarantees this one is empty of correlated refs. Checked
     // anyway, because a guarantee that is never tested is the shape this round
     // has now found twice.
-    check(body.where.get(), "WHERE");
+    check(body.where, "WHERE");
 }
 
 // Week 36 — IS THIS SUBTREE A CONSTANT? The other half of
