@@ -60,6 +60,17 @@
 //     and no TPC-H query needs it (Q11's HAVING subquery is scalar);
 //   - a computed operand (`x + 1 IN (SELECT ...)`): JoinKey holds column NAMES,
 //     not expressions — this engine has no computed-key join.
+//
+// A FOURTH REFUSAL APPLIES TO THE KEY THIS PASS BUILDS AND IS NOT RAISED HERE:
+// a STRING operand against a numeric body column, or the reverse. It is raised
+// by Validator::validateJoinKeyTypes over the finished plan, where all four
+// JoinKey producers converge, and NOT at this site on purpose — Week 29 wrote
+// that rule into Validator::validate's `stmt.joins` loop, this pass shipped
+// after it and inherited nothing, and the key silently half-matched for four
+// weeks (seam audit pass 3, B3-2: 1 row where SQLite returns 3, and the
+// complement for NOT IN). Restating it here would be the fourth copy of one
+// rule, which is how it came to be missing three times. Listed because a reader
+// of this header must know the refusal exists; do not add it to this file.
 struct InLoweringResult {
     std::unique_ptr<LogicalPlanNode> plan;   // the spine, wrapped in one join per extraction
     int lowered = 0;                          // how many conjuncts were extracted

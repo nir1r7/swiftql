@@ -52,6 +52,18 @@
 // A shape failing any of these is REFUSED by name at the site, not silently
 // mis-rewritten. See docs/week-33-plan.md Task 5.
 //
+//   5. every key pairs two STRING columns or two numeric ones. THIS ONE IS NOT
+//      ENFORCED AT THIS SITE and must not be added here: it is
+//      Validator::validateJoinKeyTypes, over the finished plan, where all four
+//      JoinKey producers converge. Stated in this list anyway because it is a
+//      condition on the rewrite's validity like the other four, and because the
+//      four weeks it went unstated are the finding — Week 29 wrote the rule into
+//      Validator::validate's `stmt.joins` loop, splitCorrelation shipped after
+//      it, and `d.driver_id = l.team` planned into a semi-join whose text
+//      comparison half-matched (seam audit pass 3, B3-2). The
+//      correlated-scalar rewrite below inherits the same condition through
+//      splitCorrelation, and the same single enforcement.
+//
 // NOT EXISTS AND NULL. Unlike NOT IN, an anti-join IS exactly NOT EXISTS: EXISTS
 // is a pure existence test that is never UNKNOWN, so a NULL join key simply
 // fails to match and the outer row survives — which is what SQL says. Week 32's
