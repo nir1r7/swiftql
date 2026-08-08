@@ -154,3 +154,54 @@ MATERIALIZED (invariant 1: the join's two output blocks must stay contiguous),
 but the tie-break does not need the schema reordered, only a comparison ORDER —
 which is a permutation computed once in `rowLess`'s caller. That is a claim
 about feasibility, not a patch; I touched no source.
+
+### B3-1b — the amplification: `materializeSubqueries` turns the order divergence into a VALUE divergence, in a query with no `ORDER BY` and no `LIMIT` of its own
+
+The "every answer is legal SQL" defence dies here. `data/tpch/sf0.01/catalog.json`,
+col-vec:
+
+```sql
+SELECT n_name, n_nationkey FROM nation
+WHERE n_nationkey = (
+  SELECT n.n_nationkey
+  FROM supplier s
+  JOIN nation n ON s.s_nationkey = n.n_nationkey
+  JOIN region r ON n.n_regionkey = r.r_regionkey
+  WHERE s.s_suppkey > 0
+  ORDER BY n.n_regionkey DESC
+  LIMIT 1)
+```
+
+```
+optimized                      --no-optimize
+n_name  n_nationkey            n_name        n_nationkey
+EGYPT   4                      SAUDI ARABIA  20
+```
+
+One row either way; a **different** row. The outer block has no `ORDER BY`, no
+`LIMIT`, and nothing unspecified about it. `--explain` shows the mechanism
+directly — the scalar subquery is materialized to a constant before planning
+(`main.cc:500`, `materializeSubqueries`), and the constant differs:
+
+```
+optimized      LogicalFilter [(n_nationkey = 4)]
+--no-optimize  LogicalFilter [(n_nationkey = 20)]
+```
+
+The nested runner threads the flag (`main.cc:519`,
+`runVectorizedToRows(..., args.no_optimize)`) precisely so the sub-plan is
+tested too — so the body is optimized in one leg and not the other, its
+`LIMIT 1` cut lands on a different row for exactly the reason in B3-1, and the
+materialized `Literal` carries the difference into a query that has no
+order-dependence at all.
+
+Body in isolation, `... ORDER BY n.n_regionkey DESC LIMIT 1`: optimized returns
+`n_nationkey = 4`, `--no-optimize` returns `20`.
+
+`sort_comparator.h`'s header already names this amplification as the reason the
+tie-break was written — *"a scalar subquery of the same shape — materialized to
+a `Literal` — turned that into `COUNT(*)` = 977 versus 1536"*. It closed the
+cross-ENGINE instance and left the optimizer instance open.
+
+Same BLOCKER, same root cause; recorded separately because it is the shape that
+makes the severity unarguable.
