@@ -70,22 +70,29 @@
 // row must be the same in every mode. It is, for every shape this can decide,
 // because ORDER BY is planned directly above the aggregate/filter/join and below
 // the projection in both builders, and an aggregate's output schema
-// (`buildAggregateSchema`) is the same in all four modes. Where it is NOT the
-// same is row storage under Volcano, which hands `SeqScanNode` the FULL table
-// schema while every columnar mode hands it the narrowed `buildScanSchema`
-// (planner.cc). Columns present only in the wide leg are, by construction,
-// columns the query references nowhere — so two rows that the narrow leg leaves
-// tied project to identical output rows and the difference is immaterial.
+// (`buildAggregateSchema`) is the same in all four modes.
 //
-// That last argument is the weakest thing here, so it is pinned BEHAVIOURALLY
-// rather than trusted: the DISTINCT entry in `ENGINE_AGREEMENT_QUERIES`
-// (compare_against_sqlite.py) is the one entry whose sort input is a raw join
-// row rather than an aggregate's output, so it is the one that compares the two
-// legs over genuinely different column sets. It agrees today because the first
-// discriminating column is `driver_id` in both. If a future change makes the
-// wide leg's extra columns decide a cut, that entry goes red. `tests/
-// test_sort_tiebreak.cc` pins the comparator's own rules; it cannot see this
-// one, because it builds one schema.
+// !! THE ONE PLACE IT WAS NOT, AND WHY THAT IS NOW A FACT RATHER THAN AN
+// ARGUMENT. Row storage under Volcano used to hand `SeqScanNode` the FULL
+// catalog schema while every columnar mode handed it the narrowed
+// `buildScanSchema`, so the two legs tie-broke over different column sets. The
+// paragraph that stood here argued the difference was immaterial (the extra
+// columns are ones the query names nowhere, so rows the narrow leg leaves tied
+// project identically) and called that "the weakest thing here", pinning it
+// behaviourally with the DISTINCT entry in `ENGINE_AGREEMENT_QUERIES` — which
+// agreed only because the first discriminating column happened to be
+// `driver_id` in both legs.
+//
+// Seam audit pass 2 CLOSED the asymmetry instead of continuing to argue about
+// it: `Planner::plan` now narrows the ROWS as well as the schema (`narrowRows`,
+// planner.cc), because the row path returns `&rows_[cursor_]` verbatim and a
+// narrowed schema over a wide row would mis-index every column. Both legs hand
+// `SeqScanNode` the same schema, and this comparator sees one column set in
+// every mode. The DISTINCT entry stays — it is still the only entry whose sort
+// input is a raw join row, so it is still where a future re-divergence would
+// show up — but it is now a regression test rather than a standing hazard.
+// `tests/test_sort_tiebreak.cc` pins the comparator's own rules; it cannot see
+// this one, because it builds one schema.
 namespace sort_comparator {
 
 // compareForSort, widened so it can never throw. compareForSort refuses STRING

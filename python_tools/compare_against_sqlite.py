@@ -2321,12 +2321,19 @@ ENGINE_AGREEMENT_QUERIES = [
     # inherits every join-side and join-order decision above it.
     #
     # This is also the only entry whose sort input is a RAW JOIN ROW rather than
-    # an aggregate's output, and that makes it the one that can see a second
-    # asymmetry: row storage hands Volcano's scan the FULL table schema while
-    # every columnar mode hands it the narrowed one (planner.cc), so the two
-    # legs tie-break over different column sets. Here they agree because the
-    # first discriminating column is driver_id in both. It is kept precisely
-    # because it is the entry that would go red if that ever stopped being true.
+    # an aggregate's output, and that is why it was left here as a tripwire for a
+    # SECOND asymmetry: row storage handed Volcano's scan the FULL table schema
+    # while every columnar mode handed it the narrowed one, so the two legs
+    # tie-broke over different column sets and agreed only because the first
+    # discriminating column happened to be driver_id in both.
+    #
+    # THAT ASYMMETRY IS NOW CLOSED, not merely watched. Planner::plan narrows the
+    # ROWS as well as the schema (`narrowRows`), so both legs hand SeqScanNode
+    # the same buildScanSchema output and the tie-break sees one column set. The
+    # entry stays: it is still the only one whose sort input is a raw join row,
+    # so it remains the only place a future re-divergence of the two legs' scan
+    # schemas would show up here — it is now a regression test rather than a
+    # standing hazard.
     # PRE-FIX: {AlphaTauri, Alpine, McLaren} on three modes against
     # {RedBull, AlphaTauri, McLaren} on col-vec.
     {"query": f"SELECT DISTINCT d.team, l.season FROM drivers d JOIN laps l "
