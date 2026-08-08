@@ -544,3 +544,127 @@ variant. `WEEK34_DERIVED_TABLE_VEC_ONLY` has a derived table inside a subquery
 body, which is the other direction. So the W34xW35 joint — a correlated
 subquery inside a derived body — is diffed nowhere. It works today (probed
 above), and B-1's second symptom lives in exactly that gap.
+
+---
+
+## NULL semantics — end to end, and the vacuity behind the current coverage
+
+Producer separation re-verified at HEAD: `ANTI_NOT_IN` is written at exactly one
+site (`subquery_lowering.cc:100`) and `ANTI` at exactly one
+(`subquery_decorrelation.cc:639`); `vectorized_plan_builder.cc:498-504` forwards
+`join->semantics` rather than re-deriving it; and the probe loop parts the three
+rules at `vec_hash_join_node.cc:228` and `:265-270`. The unit tests are the
+opposite of vacuous — `nullableSemiJoin` routes every NULL case through
+`NullableSourceNode` with a comment naming the exact trap ("makeScan builds a
+ColumnarTable, which cannot express a SQL NULL ... a test written with makeScan
+asserts the NULL rule against data that holds no NULL and passes for the wrong
+reason").
+
+The join-chain auditor has already closed the CLI-level `ANTI` vs `ANTI_NOT_IN`
+question by manufacturing an all-NULL body key with a `LEFT JOIN` (20 vs 0,
+matching SQLite both ways). I did not re-derive that. What I added is a
+**second, independent NULL manufacturing route and the MIXED case**, because
+the all-NULL shape does not discriminate every wrong implementation:
+
+```
+-- an EXPRESSION-produced NULL: x/0 is NULL in this dialect, and this file
+-- already uses that trick for NULLs in WEEK34_DISTINCT_AGG_QUERIES
+SELECT COUNT(*) AS n FROM drivers d
+WHERE d.driver_id NOT IN (SELECT l.driver_id / (l.season - l.season) FROM laps l)
+   SwiftQL 0   SQLite 0     (a two-valued anti-join would answer 20)
+
+SELECT COUNT(*) AS n FROM drivers d
+WHERE d.driver_id IN (SELECT l.driver_id / (l.season - l.season) FROM laps l)
+   SwiftQL 0   SQLite 0
+
+-- MIXED: one NULL among real keys, which the all-NULL shape cannot distinguish
+-- from "the build side is empty"
+SELECT COUNT(*) AS n FROM drivers d
+WHERE d.driver_id NOT IN (SELECT l.driver_id / (l.driver_id - 5) FROM laps l)
+   SwiftQL 0   SQLite 0
+   counterfactual: with the one NULL filtered out of the body SQLite answers 16,
+   so this shape discriminates 0 from 16 rather than 0 from 20
+```
+
+Correct in every case. The `ANTI` (NOT EXISTS) half is NOT reachable by this
+route — `splitCorrelation` requires both sides of the correlated equality to be
+plain `ColumnRef`s (`decorr.cc:77-79`), so a computed NULL key cannot become a
+correlation key — which is why the LEFT-JOIN route the join-chain auditor used
+is the only one that reaches it.
+
+### B-8 — LOW / coverage. Not one of the oracle's 17 `NOT IN` entries has a
+NULL-bearing body.
+
+Enumerated over every suite in `compare_against_sqlite.py`: 17 entries contain
+`NOT IN`, and **zero** of them can produce a NULL in the body's output column.
+The CSV loader cannot express NULL (no empty field in either shipped CSV —
+checked), so every one of them asserts the three-valued rule against data that
+has no NULL in it. That is the exact vacuity class: they pass whether or not
+`build_had_unmatchable_key_` exists.
+
+The rule is called "the sharpest correctness item in the week" by its own unit
+test, and it is diffed against SQLite nowhere. Two of the three probes above are
+one-line suite entries that would close it, and the `x / 0` idiom is already in
+this same file. (The join-chain auditor's LEFT-JOIN route would close it too;
+either is fine, but the mixed case above discriminates more finely than the
+all-NULL one, so it is worth having both.)
+
+### Note on what `optimized == --no-optimize` proves here — nothing.
+
+Part A's A3 asks whether the positional order can differ between the optimized
+and `--no-optimize` legs. It cannot, and the reason is structural: the rename
+happens inside `LogicalPlanBuilder::build`, before any optimizer pass runs.
+
+Recording the other half, from the optimizer-preservation auditor: `--no-optimize`
+gates exactly three passes (pushdown, enumeration, estimation), and **all three
+subquery lowerings plus subquery materialization run in BOTH legs**. So the
+two-leg agreement the harness reports is not evidence about this seam in either
+direction — it re-runs identical code. Every reassuring number on the subquery
+chain comes from SQLite agreement alone. That is worth stating because B-1 is a
+wrong answer that both legs produce identically, and the two-leg check reported
+it as agreement.
+
+---
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 1 | B-1 |
+| **HIGH** | 0 | — |
+| **MEDIUM** | 2 | B-2, B-3 |
+| **LOW** | 5 | B-4, B-5, B-6, B-7, B-8 |
+
+- **B-1 (BLOCKER)** — `SELECT *` over a block holding a correlated scalar
+  subquery emits the synthetic `$scalarN` relation's columns (`$k0`, the
+  aggregate) in the result: 7 columns where SQLite returns 5. Inside a derived
+  body the same defect surfaces as an internal drift error. A Week-34 defect,
+  not introduced by `8a23b9d`; no oracle entry can see it because every
+  correlated-scalar entry names its select list.
+- **B-2 (MEDIUM)** — a column alias on an UNWRAPPED correlated scalar body
+  breaks the substitution (`column not found: 'AVG(l2.speed)'`) while the
+  wrapped form of the same query works, contradicting the "same plan" claim.
+- **B-3 (MEDIUM)** — a correlated subquery nested inside a correlated body is
+  refused, with a message about a correlated inequality the query does not
+  contain; the identical nesting under an uncorrelated `IN` runs correctly.
+- **B-4/B-5/B-6/B-7/B-8 (LOW)** — a deleted refusal still asserted in
+  `development.md` and `main.cc`; three guards in this seam that cannot fire
+  (one of them coupled to B-3); one rejection pin on a shared message tail; and
+  two coverage holes — no correlated subquery inside a derived body anywhere,
+  and no NULL-bearing `NOT IN` in 17 entries.
+
+**Part A verdict: the `8a23b9d` fix is real and complete.** The collision is
+impossible rather than unlikely (three independent reasons, all checked in
+code); the guard it left behind is dead on this call site and alive where it
+belongs, which is the right outcome and not a moved problem; the ordering it now
+depends on is established in one place and consumed in one place, and cannot
+differ across planner/executor, optimizer legs or engines. Its one cost is
+cosmetic: `$kN` now appears in `--explain`.
+
+**Pass 2 verdict: the seam is NOT clean.** One blocker — a wrong answer that
+luck has been hiding behind a suite that never writes `SELECT *` next to a
+correlated scalar — plus two legal shapes refused with the wrong reason. The
+lowering machinery itself is sound: routing, NULL rules, cardinality guarantees,
+`ColumnId` containment and the four productions' disjointness all hold under
+probing. What fails is at the edges the suites do not reach — star expansion,
+aliases, and nesting one level deeper than any entry goes.
