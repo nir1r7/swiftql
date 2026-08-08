@@ -731,8 +731,10 @@ std::string LogicalScan::explain() const {
 }
 
 std::string LogicalDerived::explain() const {
+    // The decline suffix is appended only when there IS one; see the field.
     return "LogicalDerived [" + alias + ", "
-         + std::to_string(output_schema.columns().size()) + " columns]";
+         + std::to_string(output_schema.columns().size()) + " columns]"
+         + (pushdown_decision.empty() ? "" : " " + pushdown_decision);
 }
 
 

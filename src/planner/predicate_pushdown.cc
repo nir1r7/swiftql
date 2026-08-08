@@ -167,57 +167,149 @@ int soleSlot(const Expr* conjunct) {
     return -1;
 }
 
-// Re-stamp every ColumnRef in a pushed conjunct to the given slot. Same
-// dispatch as collectSlots(). A conjunct pushed below the join lives in a
-// single-table subtree whose scan schema stamps all columns slot 0, so the
-// refs must match — this is also what lets ChunkPruner act on join-side
-// pruning hints (it ignores slot >= 1 refs; see chunk_pruner.h).
-void restampSlots(Expr* expr, int slot) {
+// Every ColumnRef of `expr` that belongs to THIS query block, in tree order.
+//
+// THE MUTABLE TWIN OF collectSlots, and it is ONE function on purpose: this file
+// had two copies of the same dispatch (collectSlots reading, restampSlots
+// writing) and the header already warns that they must stay in lockstep. Week 37
+// needed a THIRD writer — remapping a conjunct's refs onto a derived body's
+// schema — and a third open-coded copy is how a lockstep of two becomes a
+// lockstep of three that nobody checks. restampSlots and both remappers below
+// are now expressed in terms of this walker, so there is one place to add an
+// Expr subtype on the writing side.
+//
+// The two SCOPE decisions are the ones collectSlots already documents and are
+// repeated here because they are what makes "belongs to this block" true:
+//   * a SubqueryExpr's OPERAND is this block's and is visited; its BODY is
+//     another scope's range table and is NOT. Rewriting inside it would renumber
+//     a different block.
+//   * an AggregateExpr's argument is visited even though no conjunct containing
+//     one survives to pushdown today, because collectSlots descends there and
+//     the lockstep is only true if both do.
+template <typename F>
+void forEachLocalColumnRef(Expr* expr, F&& f) {
     if (!expr) return;
-    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { cr->id = ColumnId::local(slot); return; }
+    if (auto* cr = dynamic_cast<ColumnRef*>(expr)) { f(*cr); return; }
     if (auto* bin = dynamic_cast<BinaryExpr*>(expr)) {
-        restampSlots(bin->left.get(), slot);
-        restampSlots(bin->right.get(), slot);
+        forEachLocalColumnRef(bin->left.get(), f);
+        forEachLocalColumnRef(bin->right.get(), f);
         return;
     }
-    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { restampSlots(isn->operand.get(), slot); return; }
-    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) { restampSlots(un->operand.get(), slot); return; }
-    // Must stay in lockstep with collectSlots above: a conjunct classified as
-    // pushable there but not re-stamped here keeps slot 1 below the join, where
-    // ChunkPruner ignores it and the zone-map hint is lost.
-    if (auto* in = dynamic_cast<InExpr*>(expr)) { restampSlots(in->operand.get(), slot); return; }
-    if (auto* lk = dynamic_cast<LikeExpr*>(expr)) { restampSlots(lk->operand.get(), slot); return; }
+    if (auto* isn = dynamic_cast<IsNullExpr*>(expr)) { forEachLocalColumnRef(isn->operand.get(), f); return; }
+    if (auto* un = dynamic_cast<UnaryExpr*>(expr)) { forEachLocalColumnRef(un->operand.get(), f); return; }
+    if (auto* in = dynamic_cast<InExpr*>(expr)) { forEachLocalColumnRef(in->operand.get(), f); return; }
+    if (auto* lk = dynamic_cast<LikeExpr*>(expr)) { forEachLocalColumnRef(lk->operand.get(), f); return; }
     if (auto* c = dynamic_cast<CaseExpr*>(expr)) {
         for (auto& w : c->when_clauses) {
-            restampSlots(w.condition.get(), slot);
-            restampSlots(w.result.get(), slot);
+            forEachLocalColumnRef(w.condition.get(), f);
+            forEachLocalColumnRef(w.result.get(), f);
         }
-        restampSlots(c->else_expr.get(), slot);
+        forEachLocalColumnRef(c->else_expr.get(), f);
         return;
     }
     if (auto* sub = dynamic_cast<SubstringExpr*>(expr)) {
-        restampSlots(sub->operand.get(), slot);
-        restampSlots(sub->start.get(), slot);
-        restampSlots(sub->length.get(), slot);   // nullptr-safe
+        forEachLocalColumnRef(sub->operand.get(), f);
+        forEachLocalColumnRef(sub->start.get(), f);
+        forEachLocalColumnRef(sub->length.get(), f);   // nullptr-safe
         return;
     }
-    // Unreachable today — no conjunct containing an aggregate survives to
-    // pushdown (forbidden in WHERE by the Validator, refused inside ON by
-    // validateJoinCondition) — but collectSlots now descends here, and the
-    // lockstep above is only true if both do. A ref collected but not restamped
-    // keeps its own relation's slot below a join whose scan schema stamps 0.
-    if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) {
-        restampSlots(agg->argument.get(), slot);
-        return;
+    if (auto* agg = dynamic_cast<AggregateExpr*>(expr)) { forEachLocalColumnRef(agg->argument.get(), f); return; }
+    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr)) { forEachLocalColumnRef(sq->operand.get(), f); }
+}
+
+// Re-stamp every ColumnRef in a pushed conjunct to the given slot. A conjunct
+// pushed below the join lives in a single-table subtree whose scan schema stamps
+// all columns slot 0, so the refs must match — this is also what lets ChunkPruner
+// act on join-side pruning hints (it ignores slot >= 1 refs; see chunk_pruner.h).
+void restampSlots(Expr* expr, int slot) {
+    forEachLocalColumnRef(expr, [slot](ColumnRef& cr) { cr.id = ColumnId::local(slot); });
+}
+
+// The one resolution rule, identical to evaluator.cc's resolveColumnIndex:
+// slot-first, bare-name fallback. -1 when the schema does not hold the column.
+int resolveInSchema(const ColumnRef& cr, const Schema& schema) {
+    if (cr.id.isResolved() && cr.id.isLocal()) {
+        int idx = schema.indexOf(cr.column_name, cr.id.localSlot("predicate pushdown"));
+        if (idx >= 0) return idx;
     }
-    // Week 30, in lockstep with collectSlots: the IN operand is this block's
-    // and is restamped; the BODY is another scope and must not be touched —
-    // rewriting its slots would renumber a different range table. Provably
-    // never reached with a CORRELATED subquery: that contributes -1 above, so
-    // soleSlot is -1 and the conjunct is never pushed.
-    if (auto* sq = dynamic_cast<SubqueryExpr*>(expr)) {
-        restampSlots(sq->operand.get(), slot);
+    return schema.indexOf(cr.column_name);
+}
+
+// Rewrite a conjunct written against a DERIVED relation's schema so it reads the
+// BODY's schema instead, and report whether it could be.
+//
+// The mapping is POSITIONAL and that is the whole argument: derivedRelationSchema
+// builds the relation's schema from the body plan's output schema column by
+// column — it may RENAME (the `AS d (a, b)` alias list) and it stamps every slot
+// 0, and it does nothing else. So column i of one IS column i of the other, and
+// LogicalPlanBuilder::build's drift check already asserts the two agree in size
+// and per-column name/type. Resolving by NAME against the derived schema and then
+// taking the BODY's column at that index is therefore exact even when the body
+// joins and its own schema carries several slots and a repeated name — which is
+// the case a name-to-name mapping would get wrong.
+//
+// All-or-nothing: nothing is written until every ref has resolved, so a conjunct
+// this declines is left byte-identical for the caller to keep above the node.
+bool remapOntoDerivedBody(Expr* conjunct, const LogicalDerived& derived) {
+    const Schema& from = derived.output_schema;
+    const Schema& to = derived.children[0]->output_schema;
+    if (from.size() != to.size()) return false;   // drift: decline rather than guess
+
+    std::vector<ColumnRef*> refs;
+    forEachLocalColumnRef(conjunct, [&refs](ColumnRef& cr) { refs.push_back(&cr); });
+    std::vector<int> idx;
+    idx.reserve(refs.size());
+    for (const ColumnRef* cr : refs) {
+        int i = resolveInSchema(*cr, from);
+        if (i < 0) return false;
+        idx.push_back(i);
     }
+    for (size_t k = 0; k < refs.size(); ++k) {
+        const ColumnDef& c = to.column(idx[k]);
+        refs[k]->column_name = c.name;
+        refs[k]->id = ColumnId::local(c.relation_slot);
+        // The enclosing block's alias names nothing inside the body. Cleared
+        // rather than kept: resolution is (slot, name) with a bare-name fallback
+        // and never consults table_name (evaluator.cc's resolveColumnIndex), so
+        // keeping it would change only what --explain prints, and it would print
+        // a relation that does not exist at that depth.
+        refs[k]->table_name.clear();
+    }
+    return true;
+}
+
+// Rewrite a conjunct written against a PROJECT's output so it reads the
+// projection's INPUT instead, and report whether it could be.
+//
+// σ_p(π(R)) ≡ π(σ_p'(R)) for a row-wise π, with p' the conjunct rewritten onto
+// π's inputs — but only where every column p names is a PLAIN PASSTHROUGH.
+// A projected column that is COMPUTED (`speed * 2 AS fast`) cannot be rewritten
+// by substitution here without duplicating the expression, and a projected
+// AGGREGATE does not exist below the project at all. Both decline.
+//
+// All-or-nothing, like remapOntoDerivedBody, and for the same reason.
+bool remapThroughProject(Expr* conjunct, const LogicalProject& project) {
+    // A project whose select list and output schema are not 1:1 is a shape this
+    // rewrite has no positional mapping for.
+    if (static_cast<size_t>(project.output_schema.size()) != project.exprs.size()) return false;
+
+    std::vector<ColumnRef*> refs;
+    forEachLocalColumnRef(conjunct, [&refs](ColumnRef& cr) { refs.push_back(&cr); });
+    std::vector<const ColumnRef*> sources;
+    sources.reserve(refs.size());
+    for (const ColumnRef* cr : refs) {
+        int i = resolveInSchema(*cr, project.output_schema);
+        if (i < 0) return false;
+        const auto* src = dynamic_cast<const ColumnRef*>(project.exprs[i].get());
+        if (!src) return false;   // computed or aggregate output: not a passthrough
+        sources.push_back(src);
+    }
+    for (size_t k = 0; k < refs.size(); ++k) {
+        refs[k]->column_name = sources[k]->column_name;
+        refs[k]->table_name = sources[k]->table_name;
+        refs[k]->id = sources[k]->id;
+    }
+    return true;
 }
 
 // Build a one-table StatsContext for a scan-local filter's child, exactly as
@@ -520,6 +612,68 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
     return filterOnto(std::move(join), std::move(residual_exprs), catalog);
 }
 
+// Push a WHERE filter INTO a derived relation's body (seam audit pass 3, B3-3).
+//
+// filterOnto used to WRAP a conjunct routed to a derived relation above the
+// LogicalDerived and stop there, in every shape — including the one with no join
+// anywhere. Measured on the simplest exhibiting query before this existed:
+//
+//   SELECT d.team, d.speed FROM (SELECT team, speed, season FROM laps) d
+//   WHERE d.speed > 344 ORDER BY d.speed LIMIT 3
+//
+// 18465 us against 1969 us for the flat equivalent — 9.4x, and the cost is not
+// the filter but the body's projection MATERIALIZING 10000 rows that the filter
+// then discards to 174. The body's scan also printed no `chunks_skipped`, so the
+// zone-map hint was lost as well.
+//
+// WHY ENTERING IS SAFE, stated so it can be checked: the filter is attached
+// directly ABOVE the body's root, whose output rows ARE the derived relation's
+// rows (derivedRelationSchema renames and re-stamps; it does not add, drop or
+// reorder). So this step is σ applied at a point that produces the same
+// relation, for ANY body shape — aggregate, DISTINCT, LIMIT and all. It is the
+// NEXT step, below the body's projection, that has a precondition, and that one
+// lives in remapThroughProject where apply() reaches it.
+//
+// The B3-2 freeze applies unchanged and for the same reason: entering the body
+// moves a conjunct AHEAD of every conjunct that stays, so a raising conjunct
+// must not enter and nothing may enter from behind one.
+std::unique_ptr<LogicalPlanNode> pushIntoDerived(std::unique_ptr<LogicalFilter> filter,
+                                                 const Catalog& catalog) {
+    auto derived = std::unique_ptr<LogicalPlanNode>(filter->children[0].release());
+    auto* d = static_cast<LogicalDerived*>(derived.get());
+
+    std::vector<std::unique_ptr<Expr>> conjuncts;
+    splitConjuncts(std::move(filter->predicate), conjuncts);
+    const size_t frozen = firstMayRaise(conjuncts);
+
+    std::vector<std::unique_ptr<Expr>> entering, staying;
+    const char* decline = nullptr;
+    for (size_t i = 0; i < conjuncts.size(); ++i) {
+        if (i >= frozen) {
+            decline = "predicate can raise";
+            staying.push_back(std::move(conjuncts[i]));
+        } else if (remapOntoDerivedBody(conjuncts[i].get(), *d)) {
+            entering.push_back(std::move(conjuncts[i]));
+        } else {
+            decline = "column does not resolve against the body";
+            staying.push_back(std::move(conjuncts[i]));
+        }
+    }
+
+    // REPORTED, on the same argument `18af84f` added `join-ordering=skipped` on:
+    // a decision was available here and was refused, and a reader of --explain
+    // cannot otherwise tell "there was nothing to push" from "there was, and we
+    // did not". Only a REFUSAL is stamped — a body that took every conjunct says
+    // nothing, so every pre-existing --explain string is byte-identical.
+    if (decline) d->pushdown_decision = std::string("pushdown=skipped (") + decline + ")";
+
+    if (!entering.empty()) {
+        d->children[0] = std::make_unique<LogicalFilter>(std::move(d->children[0]),
+                                                         conjoinAll(std::move(entering)));
+    }
+    return filterOnto(std::move(derived), std::move(staying), catalog);
+}
+
 // Re-enter every subtree hanging off a join spine that is NOT part of the spine:
 // each relation leaf, and a semi/anti join's body. Twin of the function of the
 // same name in join_enumeration.cc, and for the same reason — see
@@ -567,6 +721,61 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
         orderByWork(parts, f->children[0].get(), catalog);
         f->predicate = conjoinAll(std::move(parts));
         return node;
+    }
+
+    // SEAM AUDIT PASS 3, B3-3. A conjunct routed to a derived relation used to
+    // stop above it in EVERY shape, silently. It now enters the body, and the
+    // FILTER-over-PROJECT rule below carries it the rest of the way — which is
+    // where the 9.4x lives, since the cost was the body's projection
+    // materializing rows the filter immediately discards.
+    if (node->type == LogicalNodeType::FILTER &&
+        node->children[0]->type == LogicalNodeType::DERIVED) {
+        auto* f = static_cast<LogicalFilter*>(node.release());
+        node = pushIntoDerived(std::unique_ptr<LogicalFilter>(f), catalog);
+        // fall through to the child loop: the FILTER just planted inside the body
+        // is reached there, as is anything left above.
+    }
+
+    // A filter over a row-wise projection descends when every column it names is
+    // a plain passthrough (remapThroughProject holds the argument and the
+    // refusal). REACHED ONLY FROM A DERIVED BODY today: LogicalPlanBuilder puts
+    // WHERE below the project and HAVING above the aggregate, so no top-level
+    // plan has this shape — which bounds this rule's blast radius to exactly the
+    // construct B3-3 is about.
+    else if (node->type == LogicalNodeType::FILTER &&
+             node->children[0]->type == LogicalNodeType::PROJECT) {
+        auto* f = static_cast<LogicalFilter*>(node.get());
+        std::vector<std::unique_ptr<Expr>> conjuncts;
+        splitConjuncts(std::move(f->predicate), conjuncts);
+        const size_t frozen = firstMayRaise(conjuncts);
+
+        auto* project = static_cast<LogicalProject*>(f->children[0].get());
+        std::vector<std::unique_ptr<Expr>> descending, staying;
+        for (size_t i = 0; i < conjuncts.size(); ++i) {
+            if (i < frozen && remapThroughProject(conjuncts[i].get(), *project))
+                descending.push_back(std::move(conjuncts[i]));
+            else
+                staying.push_back(std::move(conjuncts[i]));
+        }
+        if (!descending.empty()) {
+            project->children[0] = std::make_unique<LogicalFilter>(
+                std::move(project->children[0]), conjoinAll(std::move(descending)));
+        }
+        if (staying.empty()) {
+            node = std::unique_ptr<LogicalPlanNode>(f->children[0].release());
+        } else {
+            f->predicate = conjoinAll(std::move(staying));
+        }
+        // A conjunct refused HERE is not stamped, and the reason it does not need
+        // to be is that its refusal is READABLE FROM THE PLAN: the filter is
+        // drawn directly above the project whose select list --explain prints on
+        // the same line, so `LogicalFilter [(s2 > 688)]` over
+        // `LogicalProject [team, s2]` says which column is computed. The derived
+        // boundary was different — a filter above a LogicalDerived looks the same
+        // whether there was a decision or not — which is why the stamp is there
+        // and not here. Narrower than "every decline is named"; recorded as such.
+        //
+        // fall through to the child loop, which reaches the new filter.
     }
 
     for (auto& child : node->children) child = apply(std::move(child), catalog);

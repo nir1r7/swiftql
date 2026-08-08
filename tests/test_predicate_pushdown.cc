@@ -1217,3 +1217,145 @@ TEST(PredicatePushdown, DescendsIntoADerivedBodyUnderAJoiningOuterBlock) {
     EXPECT_EQ(body_join->children[1]->type, LogicalNodeType::FILTER)
         << "d.age > 38 should have reached the drivers scan";
 }
+
+// ===== Entering a derived body (seam audit pass 3, B3-3) =====
+//
+// filterOnto WRAPPED a conjunct routed to a derived relation ABOVE the
+// LogicalDerived and stopped there, in EVERY shape — including the one with no
+// join anywhere — and `--explain` said nothing about it. Measured on the
+// simplest exhibiting query (Release, repo `catalog.json`, `Execution:` from
+// --explain-analyze, median of 5): 988.6us before, 344.6us after, against 289us
+// for the flat equivalent the derived form is semantically identical to. The
+// cost was never the filter: it was the body's projection materializing 10000
+// rows the filter then discards to 152, and the body's scan losing its zone-map
+// hint.
+
+// The whole point: the conjunct must reach the body's SCAN, not stop at the
+// relation boundary and not stop at the body's projection.
+TEST(PredicatePushdown, ConjunctEntersADerivedBodyAndReachesItsScan) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT d.team, d.speed FROM (SELECT team, speed, season FROM laps) d "
+        "WHERE d.speed > 390", cat);
+
+    // WITHOUT THE FIX: PROJECT / FILTER / DERIVED / PROJECT / SCAN — the filter
+    // sits above the relation and the body materializes every row.
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::DERIVED)
+        << "no filter should be left above the derived relation";
+    const LogicalPlanNode* body = plan->children[0]->children[0].get();
+    ASSERT_EQ(body->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(body->children[0]->type, LogicalNodeType::FILTER)
+        << "the conjunct must also descend BELOW the body's projection — that is "
+           "where the materialization cost is";
+    EXPECT_EQ(body->children[0]->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// The relation's schema is derivedRelationSchema(body schema): it may RENAME
+// positionally and it re-stamps every slot to 0. So the mapping is by INDEX, and
+// a column-alias list is the case a name-to-name mapping would silently get
+// wrong.
+TEST(PredicatePushdown, DerivedColumnAliasesAreMappedPositionally) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT d.b FROM (SELECT team, speed FROM laps) d (a, b) WHERE d.b > 390", cat);
+
+    const LogicalPlanNode* filter = findNode(plan.get(), LogicalNodeType::FILTER);
+    ASSERT_NE(filter, nullptr);
+    EXPECT_EQ(filter->children[0]->type, LogicalNodeType::SCAN);
+    const auto* cmp = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(filter)->predicate.get());
+    ASSERT_NE(cmp, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(cmp->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "speed") << "d.b is the body's second column";
+}
+
+// σ_p(π(R)) ≡ π(σ_p'(R)) needs every column p names to be a PLAIN PASSTHROUGH.
+// A computed one cannot be rewritten by substitution here. It must stop above
+// the projection — and the conjunct must still have ENTERED the body, because
+// entering is safe for any body shape.
+TEST(PredicatePushdown, ComputedProjectionStopsTheDescentButNotTheEntry) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT d.s2 FROM (SELECT team, speed * 2 AS s2 FROM laps) d WHERE d.s2 > 780", cat);
+
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::DERIVED);
+    const LogicalPlanNode* inside = plan->children[0]->children[0].get();
+    ASSERT_EQ(inside->type, LogicalNodeType::FILTER) << "entry is safe for any body";
+    EXPECT_EQ(inside->children[0]->type, LogicalNodeType::PROJECT)
+        << "and the descent stops at the computed column";
+}
+
+// An AGGREGATE or a LIMIT in the body is not a special case in this pass: the
+// entry is above the body root either way, and the descent rule only fires on a
+// PROJECT of passthroughs. This pins that the filter lands ABOVE the LIMIT — the
+// one shape where descending would be a WRONG ANSWER rather than slow.
+TEST(PredicatePushdown, DerivedBodyLimitIsNeverDescendedPast) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto plan = buildPushed(
+        "SELECT d.team FROM (SELECT team, speed FROM laps LIMIT 10) d WHERE d.speed > 390", cat);
+
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::DERIVED);
+    const LogicalPlanNode* inside = plan->children[0]->children[0].get();
+    ASSERT_EQ(inside->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(inside->children[0]->type, LogicalNodeType::LIMIT)
+        << "filtering below the cut would change which 10 rows survive";
+}
+
+// A refusal at the RELATION boundary is the one --explain could not show: a
+// filter drawn above a LogicalDerived looks identical whether there was a
+// decision or not, and B3-3 is the third silent decline this phase found. Only a
+// refusal is stamped, so every body that takes its conjuncts keeps a
+// byte-identical explain string.
+TEST(PredicatePushdown, RefusedEntryToADerivedBodyIsReportedInExplain) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    auto refused = buildPushed(
+        "SELECT d.team FROM (SELECT team, speed, lap_id FROM laps) d "
+        "WHERE SUBSTRING(d.team, d.lap_id - d.lap_id, 2) = 'x'", cat);
+    const LogicalPlanNode* derived = findNode(refused.get(), LogicalNodeType::DERIVED);
+    ASSERT_NE(derived, nullptr);
+    EXPECT_EQ(static_cast<const LogicalDerived*>(derived)->explain(),
+              "LogicalDerived [d, 3 columns] pushdown=skipped (predicate can raise)");
+
+    // ...and the CONTROL that keeps the stamp from becoming decoration: a body
+    // that took its conjunct says nothing at all.
+    auto taken = buildPushed(
+        "SELECT d.team FROM (SELECT team, speed, lap_id FROM laps) d WHERE d.speed > 390", cat);
+    const LogicalPlanNode* ok = findNode(taken.get(), LogicalNodeType::DERIVED);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(static_cast<const LogicalDerived*>(ok)->explain(),
+              "LogicalDerived [d, 3 columns]");
+}
+
+// A body that JOINS: the conjunct descends through the projection and is then
+// routed by the ordinary FILTER-over-JOIN rule onto the relation that owns it.
+// This is also the case that would break if the mapping were by name — the
+// body's own schema carries two slots.
+TEST(PredicatePushdown, ConjunctRoutesToItsOwnRelationInsideAJoiningBody) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildPushed(
+        "SELECT d.n FROM (SELECT dr.name AS n, l.team AS t, l.speed AS sp "
+        "                 FROM laps l JOIN drivers dr ON l.driver_id = dr.driver_id) d "
+        "WHERE d.sp > 390", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[0]->type, LogicalNodeType::FILTER)
+        << "sp is laps.speed and belongs on the FROM-side scan";
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::SCAN);
+    const auto* cmp = dynamic_cast<const BinaryExpr*>(
+        static_cast<const LogicalFilter*>(join->children[0].get())->predicate.get());
+    ASSERT_NE(cmp, nullptr);
+    const auto* col = dynamic_cast<const ColumnRef*>(cmp->left.get());
+    ASSERT_NE(col, nullptr);
+    EXPECT_EQ(col->column_name, "speed");
+}

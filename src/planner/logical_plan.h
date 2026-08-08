@@ -99,6 +99,19 @@ struct LogicalScan : LogicalPlanNode {
 struct LogicalDerived : LogicalPlanNode {
     std::string alias;   // the enclosing block's ref name for this relation
 
+    // Week 37, seam audit pass 3 B3-3. Set by PredicatePushdown when a conjunct
+    // routed to this relation was REFUSED entry to the body, and never
+    // otherwise — same discipline as LogicalJoin::order_decision, so a body that
+    // took every conjunct (and every --no-optimize plan, and every hand-built
+    // test tree) keeps a byte-identical explain string.
+    //
+    // It exists because the refusal is the one thing --explain could not show.
+    // A filter drawn above a LogicalDerived looks identical whether there was
+    // nothing to push or whether there was and the pass declined, and B3-3 was
+    // the third silent decline this phase found. Set AFTER construction, like
+    // order_decision, so the three-argument constructor is unchanged.
+    std::string pushdown_decision;
+
     LogicalDerived(std::unique_ptr<LogicalPlanNode> body, std::string alias, Schema schema)
         : LogicalPlanNode(LogicalNodeType::DERIVED, std::move(schema)),
           alias(std::move(alias)) {
