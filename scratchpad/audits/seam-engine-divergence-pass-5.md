@@ -19,7 +19,7 @@ cv    columnar/volcano        cvn   columnar/volcano --no-optimize
 vec   columnar/vectorized     vecn  columnar/vectorized --no-optimize
 ```
 
-Status: IN PROGRESS — appended as each item is confirmed.
+Status: COMPLETE. Two findings are OPEN at the cap: E-19 (BLOCKER) and E-20 (HIGH).
 
 ---
 
