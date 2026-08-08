@@ -544,3 +544,35 @@ in `by_slot`, and the existing leftover loop lifts it above the whole tree.
 * The 36-shape comparison matrix (A.2), the 18-shape evaluation-order battery
   (A.3), the 16-shape NULL battery (B5-3) and the K1–K9 key-type battery (B5-4)
   produced no other disagreement.
+
+### B5-8 — the guard has to be PER-JOIN, and no existing pin can catch P5-B1
+
+**Per-join.** The LEFT join carrying the raising residual does not have to be the
+top of the spine:
+
+    SELECT COUNT(*) FROM laps l
+    LEFT JOIN drivers d ON l.driver_id = d.driver_id
+                       AND SUBSTRING(l.team, l.driver_id - 12, 2) = 'x'
+    JOIN drivers d2 ON l.team = d2.team
+    WHERE l.driver_id > 15
+      opt -> 7786      noop -> Error
+
+    LogicalJoin [team@0 = team] join-ordering=skipped (outer join)
+      LogicalLeftJoin [driver_id = driver_id] residual=(SUBSTRING(l.team, (l.driver_id - 12), 2) = x)
+        LogicalFilter [(l.driver_id > 15)]      <- descended PAST the LEFT join
+          LogicalScan [laps, 2 columns]
+
+`distribute` already recurses join by join and already re-applies its INNER/LEFT
+test at each one (`predicate_pushdown.cc:477-479` says so explicitly), so the new
+condition goes in the same place and inherits that property. Nothing else changes.
+
+**No existing pin can catch it, and the control pin stays green.**
+`tests/test_predicate_pushdown.cc:871`
+(`PreservedSidePredicateStillPushesThroughALeftJoin`) pins exactly the move
+P5-B1 shows is unsafe — but its query has **no ON residual at all**
+(`drivers d LEFT JOIN laps l ON d.driver_id = l.driver_id WHERE d.age > 30`), so
+a residual-aware guard leaves it passing. That is the shape of the missing pin:
+the same query plus a raising ON residual, asserting the filter now stays ABOVE
+the join. The three totality pins at `:1048`, `:1073` and `:1121` all put the
+partial expression in a WHERE conjunct; `:1486`/`:1509` put it in a projection.
+None puts it in an `ON` clause, and `grep` finds no test in the tree that does.
