@@ -17,6 +17,7 @@ add_executable(swiftql_tests
     test_cost_model.cc
     test_simd_loop_join.cc
     test_sort_tiebreak.cc
+    test_int_double_materialization.cc
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)
