@@ -134,7 +134,10 @@ void addTable(std::vector<std::string>& out, const std::string& name) {
 // under-refuses. What is left unknown is therefore worth keeping small, and the
 // two remaining cases are named rather than discovered: a correlated reference
 // (this walk has no enclosing scope) and a derived relation nested more than
-// MAX_TYPE_DEPTH levels deep.
+// MAX_TYPE_DEPTH levels deep. Week 37: the second of those is now TRUE. It used
+// to be a claim rather than a fact — exprMayBeInt dropped the catalog, so the
+// budget was spent but the second level had nothing to resolve against and
+// answered INTEGER regardless. See exprMayBeInt.
 // ===================================================================
 
 // The statement's own range table in slot order. A catalog relation contributes
@@ -156,7 +159,7 @@ using RangeTable = std::vector<RangeEntry>;
 constexpr int MAX_TYPE_DEPTH = 3;
 
 RangeTable rangeTableOf(const SelectStatement& stmt, const Catalog* catalog);
-bool exprMayBeInt(const Expr* e, const RangeTable& rt, int depth);
+bool exprMayBeInt(const Expr* e, const RangeTable& rt, const Catalog* catalog, int depth);
 
 RangeTable rangeTableOf(const SelectStatement& stmt, const Catalog* catalog) {
     RangeTable rt;
@@ -183,7 +186,7 @@ bool derivedColumnMayBeInt(const SelectStatement& body, const std::string& name,
     if (body.select_star || body.select_list.empty()) {
         ColumnRef probe;
         probe.column_name = name;
-        return exprMayBeInt(&probe, inner, depth - 1);
+        return exprMayBeInt(&probe, inner, catalog, depth - 1);
     }
     for (const auto& e : body.select_list) {
         std::string out = e->alias;
@@ -193,7 +196,7 @@ bool derivedColumnMayBeInt(const SelectStatement& body, const std::string& name,
                 out = aggregateOutputName(agg);
             else continue;   // exprToString names it; not worth re-deriving here
         }
-        if (out == name) return exprMayBeInt(e.get(), inner, depth - 1);
+        if (out == name) return exprMayBeInt(e.get(), inner, catalog, depth - 1);
     }
     return true;
 }
@@ -269,9 +272,27 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
         // COUNT is INT-typed; SUM and AVG accumulate into a double and emit a
         // DOUBLE whatever the input was; MIN/MAX hand back an element of the
         // input domain, so they inherit the argument's answer.
+        //
+        // !! EVERY ARM WALKS THE ARGUMENT, and the two that answer about their
+        // OWN type still walk it FOR THE SIDE EFFECT. `observed` is a side
+        // channel — the set of bodies an INT-partnered `/` divides — and it is
+        // independent of what this node's type is. Through the previous round
+        // SUM and AVG returned here without walking, and
+        // `HAVING SUM(l.round / (SELECT MAX(CASE ... 2 ELSE 0.5 END)))` was a
+        // SILENT WRONG ANSWER: 7 teams where both Volcano modes and SQLite give
+        // 4 (seam subquery pass 5, B-1). The discriminator that named the arm
+        // rather than the shape: MAX over the IDENTICAL body, from the same
+        // clause, refuses — because the MIN/MAX arm below recursed and these two
+        // did not. The plan-level walk this one is written to mirror
+        // (collectIntOrigins' AGGREGATE case, vectorized_plan_builder.cc) walks
+        // `spec.argument` for EVERY aggregate, outside its own order_stat test.
+        // Four other non-arithmetic arms of this same walk (IsNullExpr, InExpr,
+        // LikeExpr, SubstringExpr) already recurse for the side effect alone and
+        // discard the result; these are now the fifth and sixth.
+        const DivTaint arg = divWalk(agg->argument.get(), rt, observed, catalog, depth);
         if (agg->function_name == "COUNT") { out.may_be_int = true; return out; }
         if (agg->function_name == "SUM" || agg->function_name == "AVG") return out;
-        return divWalk(agg->argument.get(), rt, observed, catalog, depth);
+        return arg;   // MIN/MAX inherit the argument's answer, type and carried
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
         return divWalk(un->operand.get(), rt, observed, catalog, depth);
@@ -347,12 +368,20 @@ DivTaint divWalk(const Expr* e, const RangeTable& rt,
 // "Can this expression's Volcano Value be an INT?", with no interest in the
 // subqueries under it. One definition of the type question, used by the derived
 // arm of columnMayBeInt above and by divWalk itself.
-bool exprMayBeInt(const Expr* e, const RangeTable& rt, int depth) {
+bool exprMayBeInt(const Expr* e, const RangeTable& rt, const Catalog* catalog, int depth) {
     std::unordered_set<const SelectStatement*> ignored;
-    // The catalog reached this far through the RangeTable already; a body one
-    // level down is resolved against `rt`'s own entries, so nothing more is
-    // needed here than the depth budget.
-    return divWalk(e, rt, ignored, nullptr, depth).may_be_int;
+    // THE CATALOG IS NEEDED HERE, and the comment that used to say otherwise was
+    // the defect (seam subquery pass 5, B-4). It read: "the catalog reached this
+    // far through the RangeTable already; a body one level down is resolved
+    // against `rt`'s own entries". A body one level down is NOT resolved against
+    // `rt`: it needs its OWN range table, which derivedColumnMayBeInt builds with
+    // rangeTableOf(body, catalog) — and rangeTableOf returns an EMPTY table at
+    // its first line when catalog is null, on which columnMayBeInt answers
+    // "may be INT" for every name. So the SECOND derived level always answered
+    // INTEGER and MAX_TYPE_DEPTH = 3 was really 1: `t.s / (SELECT <mixed>)` over
+    // a REAL column answered at one derived level and was refused at two, with
+    // no working mode (Volcano refuses derived tables by capability).
+    return divWalk(e, rt, ignored, catalog, depth).may_be_int;
 }
 
 } // namespace
