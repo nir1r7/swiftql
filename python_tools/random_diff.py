@@ -66,6 +66,15 @@ THE TWO TRAPS WEEK 28'S NOTE NAMED, built in from the start:
   carries per-row-distinct columns, so the tie is MATERIAL and which tied row
   survives the cut is observable.
 
+  MEASURED, because a generator that emits a shape it cannot fail on is the same
+  vacuous coverage in a new place. Against a binary pinned BEFORE the tie-break
+  fix (`cb59ff8`, worktree build), the DEFAULT invocation -- seed 20250101,
+  --count 40 -- generates 7 tied shapes and reports 3 "OPTIMIZER CHANGED THE
+  RESULT", each of them "N rows vs N": the same row count, different rows.
+  Widened to 20 seeds, 13 of 64 tied shapes diverge (~20%). Against the fixed
+  binary the same runs are clean. Before this change the form was generated ZERO
+  times at any seed, and the file reported 40/40 preserved either way.
+
   THE ONE THING THAT IS STILL TRUE, and is why the form changes the COMPARISON
   and not just the SQL: SQLite has no such rule. Its answer among tied rows is
   its own plan's business. So the tied form runs LEG 1 ONLY (optimized ==
