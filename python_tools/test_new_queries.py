@@ -596,10 +596,10 @@ def _invariant_compare(query, rows):
                         has no specified emission order, and a reordered join
                         legitimately emits in a different one.
 
-    WHAT THIS STILL CANNOT SEE, stated rather than implied: a `LIMIT` with no
-    `ORDER BY` selects an unspecified subset, and both comparisons will call a
-    genuine plan-dependent subset change a difference — which is why that shape
-    lives in KNOWN_DIVERGENCES below and not here.
+    WHAT THIS STILL CANNOT SEE, stated rather than implied: a divergence that
+    the LIMIT happens not to expose. `b31_tie_order_only_no_set_change` is the
+    entry that pins the ordered half against exactly that; without the ordered
+    comparison it would pass under any comparator at all.
     """
     if re.search(r"\bORDER\s+BY\b", query, re.IGNORECASE):
         return normalize_ordered(rows)
@@ -1310,6 +1310,28 @@ TIE_STRADDLE_QUERIES = [
      " WHERE l.lap_id < 100 ORDER BY l.season LIMIT 1) "
      "GROUP BY team ORDER BY team"),
 
+    # ── shape 2: a plain `LIMIT` with NO `ORDER BY` at all ───────────────────
+    # There is no sort node in this plan, so the sort tie-break cannot reach it:
+    # the rows come out in the top join's probe order and the DP changes which
+    # relation probes. It was an OPEN defect when this block was first written
+    # and was closed separately (the LIMIT now cuts a determined order), which is
+    # why it sits beside the sort shapes rather than inside them — one symptom,
+    # two mechanisms, and a fix to either one alone leaves the other live.
+    #
+    # WHY THIS JOIN KEY AND NOT `l.driver_id = l2.driver_id`. Both shapes
+    # discriminate, and the obvious one is 25x MORE EXPENSIVE THAN THE WHOLE
+    # REST OF THIS BLOCK: `--no-optimize` does not push the WHERE, so a
+    # driver_id self-join hands the LIMIT the full 10000x10000/20 product, and
+    # once the LIMIT is given a determined order that product must be ordered
+    # rather than streamed — measured 47.3 s in the `--no-optimize` leg alone
+    # (0.27 s before that change). `l.lap_id = l2.driver_id` matches each of the
+    # 10000 probe rows to exactly ONE row, so the unfiltered join is 10000 rows
+    # and the same entry costs 1.8 s. Measured on both binaries, not reasoned.
+    ("b31_plain_limit_no_order_by",
+     "SELECT l.lap_id, l2.speed, d.name FROM laps l "
+     "JOIN laps l2 ON l.lap_id = l2.driver_id "
+     "JOIN drivers d ON l2.driver_id = d.driver_id LIMIT 5"),
+
     # ── CONTROLS. Without these the block proves only that SOME 3-relation
     # ── query diverges, which is not the claim. Each removes exactly one of the
     # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both
@@ -1348,80 +1370,14 @@ TIE_STRADDLE_QUERIES = [
 # tie-break trips over.
 
 
-# The shape the fix does NOT cover, recorded as an OPEN DEFECT rather than as a
-# pass or a silent omission.
-#
-# `LIMIT n` with NO `ORDER BY` over a reordered join returns a different SUBSET
-# in the two legs. There is no sort node in this plan, so the tie-break in
-# sort_comparator.h cannot fire and no comparator fix can reach it: the rows come
-# out in the top hash join's probe order, and the DP changes which relation
-# probes.
-#
-# TWO RECORDED PROJECT POSITIONS CONFLICT HERE, and this harness is not the place
-# to decide between them:
-#   * `sort_comparator.h` — "The project asserts optimized == --no-optimize, so
-#     that is a defect even though every one of those answers is legal SQL."
-#     Under that reading this is a live blocker.
-#   * `random_diff.py` TRAP 1 — "a LIMIT is only comparable under a TOTAL order",
-#     recorded after four such shapes were triaged as false failures.
-#     Under that reading it is out of scope by construction.
-#
-# So it is asserted as an EXPECTED DIVERGENCE: the check passes while the legs
-# differ and FAILS LOUDLY the moment they agree, which is the signal to promote
-# the entry into TIE_STRADDLE_QUERIES and delete this block. That keeps it live
-# and two-sided — it cannot pass vacuously, and it cannot rot into a green tick
-# for a defect someone fixed without noticing. What it is NOT is a claim that the
-# divergence is acceptable.
-KNOWN_DIVERGENCES = [
-    # laps is at slot 0 and written first; the DP leads with drivers, so the two
-    # legs probe with different relations and LIMIT 5 takes a different subset.
-    # Pre-fix: (2,2),(2,382),(2,488)... vs (2,2),(83,2),(158,2)... — the same
-    # answer set, a different five rows.
-    ("b31_open_plain_limit_no_order_by",
-     "SELECT l.lap_id, l2.lap_id, d.name FROM laps l "
-     "JOIN laps l2 ON l.driver_id = l2.driver_id "
-     "JOIN drivers d ON l.driver_id = d.driver_id "
-     "WHERE l.lap_id < 200 LIMIT 5"),
-
-    ("b31_open_plain_limit_written_leads_drivers",
-     "SELECT d.name, l.lap_id, l2.lap_id FROM drivers d "
-     "JOIN laps l ON d.driver_id = l.driver_id "
-     "JOIN laps l2 ON d.driver_id = l2.driver_id LIMIT 5"),
-]
-
-
-def run_known_divergences(queries):
-    """Assert that each OPEN defect above is STILL open — an xfail, not a pass.
-
-    Reports failure in both directions a coverage entry can go dead: an entry
-    that errors, and an entry whose two legs have started to agree (which means
-    the defect was fixed and the entry belongs in TIE_STRADDLE_QUERIES).
-    """
-    VEC = ["--execution", "vectorized", "--storage", "columnar"]
-    passed, failed, errors = 0, 0, 0
-    fail_list = []
-    print(f"\n--- OPEN: optimized != --no-optimize, expected to diverge today ---")
-    print("  These are NOT passing invariants. Each asserts a defect is still")
-    print("  present; agreement here means promote the entry and delete it here.")
-    for label, query in queries:
-        try:
-            opt = normalize_ordered(run_swiftql(query, VEC))
-            noopt = normalize_ordered(run_swiftql(query, VEC + ["--no-optimize"]))
-            if opt != noopt:
-                print(f"  XFAIL [{label}]  still diverges (expected)  {query[:52]}")
-                passed += 1
-            else:
-                print(f"  FAIL  [{label}]  LEGS NOW AGREE — promote this entry into")
-                print(f"        TIE_STRADDLE_QUERIES and remove it from KNOWN_DIVERGENCES")
-                failed += 1
-                fail_list.append((f"known-divergence:{label}", query,
-                                  "legs agree", "expected divergence (promote the entry)"))
-        except Exception as e:
-            print(f"  ERROR [{label}]  {query[:66]}\n    {e}")
-            errors += 1
-            fail_list.append((f"known-divergence:{label}", query, str(e), ""))
-    print(f"  {passed} still diverging, {failed} newly agreeing, {errors} errors")
-    return passed, failed, errors, fail_list
+# The `LIMIT` with no `ORDER BY` shape was carried here for one round as an
+# EXPECTED-DIVERGENCE entry, because no comparator fix could reach it and this
+# harness is not the place to decide an open question. It was closed while this
+# block was being written (the LIMIT is now given a determined order), the
+# expected-divergence check FAILED with "LEGS NOW AGREE — promote this entry",
+# which is what it was built to do, and the entry moved into
+# TIE_STRADDLE_QUERIES as `b31_plain_limit_no_order_by`. The mechanism is gone
+# with it rather than left standing empty.
 
 
 def main():
@@ -1450,13 +1406,11 @@ def main():
     # Week 29: an outer join in the tree means enumeration declined, so no
     # order= line may be printed — a decision that never happened
     r8 = run_outer_join_decline(WEEK29_NO_ORDER_DECISION)
-    # Week 37: the shape no comparator fix reaches, asserted as still-open
-    r9 = run_known_divergences(KNOWN_DIVERGENCES)
 
-    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0] + r8[0] + r9[0]
-    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1] + r8[1] + r9[1]
-    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2] + r8[2] + r9[2]
-    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3] + r8[3] + r9[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0] + r8[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1] + r8[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2] + r8[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3] + r8[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
@@ -1465,8 +1419,7 @@ def main():
           f"{len(TIE_STRADDLE_QUERIES)} tie-straddle) "
           f"+ {len(WEEK23_5_QUERIES)} algorithm steering + {len(WEEK28_QUERIES)} order steering "
           f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work + 1 estimate rendering "
-          f"+ {len(WEEK29_NO_ORDER_DECISION)} outer-join decline "
-          f"+ {len(KNOWN_DIVERGENCES)} known-open divergences)")
+          f"+ {len(WEEK29_NO_ORDER_DECISION)} outer-join decline)")
 
     if fail_list:
         print(f"\n{'='*70}")
