@@ -713,16 +713,21 @@ enters the declined node's `children[1]`. That is correct — the body is a sepa
 and it is the exact asymmetry P4-M1 says is missing one case, since the semi/anti decline
 leaves `children[0]` unvisited while the LEFT decline leaves `children[1]` visited.
 
-### B4-6 — the randomized joint sweep (240 shapes over two seeds)
+### B4-6 — the randomized joint sweep (139 of a planned 240 shapes; **incomplete, and said so**)
 
 `$SCRATCH/gen4.py`, aimed at the surfaces fix round 3 widened rather than at the ground
 pass 3 already covered. Three legs (optimized / `--no-optimize` / SQLite), sort-normalised
 positional TSV; a shape both SwiftQL legs refuse, or that SQLite cannot parse, is skipped.
 
-**Result: no semantic divergence.** Every entry the runner flagged was a `--no-optimize`
-TIMEOUT at the harness's 90-second cap, not a difference — the unoptimized leg materialises
-the whole join product, and this is a Debug build. Each one was re-run by hand without the
-cap and agreed:
+**It did not finish.** Seed 20260808 completed all 120 shapes; seed 777 reached shape 18 of
+120 before the pass ran out of wall clock, so the run is 139 shapes, not 240, and the
+runner's own tally line never printed. Recording the number I actually have rather than the
+number I planned.
+
+**Result over those 139: no semantic divergence.** All 12 entries the runner flagged were a
+`--no-optimize` TIMEOUT at the harness's 90-second cap, not a difference — the unoptimized
+leg materialises the whole join product, and this is a Debug build. Spot-checked by hand
+without the cap:
 
     SELECT COUNT(*) FROM laps l0
       JOIN (SELECT l.driver_id AS k, d.age AS v FROM laps l
