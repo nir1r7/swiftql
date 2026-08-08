@@ -8,6 +8,17 @@ Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 co
     Fix shape: mark the synthetic $scalarN columns `hidden` — hence the schema.h doc sweep, because
     `ColumnDef::hidden` had documented itself as "aggregate outputs referenced only in
     HAVING/ORDER BY", which the fix falsifies.
+    B-2 DONE (e916b0c). B-3 in progress; QUEUED for compare_against_sqlite.py after fixer C.
+    **B-3's honest risk, which it named itself:** the refusal it NARROWS (correlated non-equality
+    conjunct) has 3 rejection entries and is fine. But the guard its narrowing makes LOAD-BEARING —
+    the `level != 1` depth refusal — has **ZERO coverage anywhere**: no diffed entry, no rejection
+    entry, nothing. It was unreachable, so nothing ever noticed. Until its new entries land, the
+    honest statement is that B-3 trades a reachable-but-wrong-cause refusal for a newly-reachable
+    guard that only a manual probe has ever fired. **An uncovered refusal is worse than a stale
+    one — nothing will notice when it changes.** This must not close without that coverage.
+    Its B-3 shape avoids adding a 19th dispatch site: it asks `collectSlots` itself with the one
+    branch suppressed (clear nested `correlated` flags across a single call via forEachSubquery,
+    restore immediately, record every node cleared) rather than writing a private walker.
   Fixer B (constant folding + catalog + explain): **DONE**, all three items pushed. 823/823 C++.
     - Item 1 chose to make the ordinal rule test **WHAT THE USER WROTE**, not Literal-ness: the
       parser stamps `written_ordinal` on OrderByItem/GroupByColumn and the Validator tests that.
@@ -32,10 +43,35 @@ Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 co
       FIRST of two same-named TABLES. Same class one level up; no cross-storage divergence.
     - Its pre-lock results were re-run under the lock and held. One earlier subset run produced
       ~180 spurious "NO LONGER ERRORS" across suites it never touched — artifact, not finding.
-  Fixer C (deterministic tiebreak, E-1/E-1b): owns vec_sort_node, vec_limit_node, and the Volcano
-    sort/limit in plan_nodes. **USER DECISION: deterministic tiebreak**, NOT unifying build-side
-    selection (that would permanently constrain the optimizer). Where ORDER BY is not a total
-    order, the surviving row must be fixed regardless of plan/engine/storage.
+  Fixer C (deterministic tiebreak, E-1/E-1b): **ITEM 1 DONE** (7b84952, record-only — content was
+    swept into 733596e/119bf75 by wip commits). Item 2 in progress: it has the
+    compare_against_sqlite.py window until ~02:45.
+    **USER DECISION: deterministic tiebreak**, NOT unifying build-side selection (that would
+    permanently constrain the optimizer).
+    RULE CHOSEN: when every declared ORDER BY key ties, compare the whole row column-by-column in
+    schema order, ascending, on values alone. Both engines call one shared
+    `sort_comparator::rowLess`. E-1 and E-1b closed in ALL FOUR MODES.
+    **MY PREDICTION WAS HALF WRONG and it corrected me.** I said SwiftQL would now differ from
+    SQLite on tied queries. For GROUP BY ties it is BACKWARDS: the tie-break sorts tied groups by
+    the group key and SQLite's GROUP BY also emits in key order, so they now COINCIDE
+    (AlphaTauri/Alpine/Ferrari; COUNT(*)=977 — both SQLite's answers). NOT a guarantee: it fails
+    for DESC and where the tie-break column is not the group key. So the new entries still belong
+    in ENGINE_AGREEMENT_QUERIES — but that suite's comment justifies itself by "SQLite returns a
+    third answer", which is now FALSE for its own two entries. Stale-comment class; being fixed.
+    **ONE CURRENTLY-PASSING ANSWER MOVED — reported, not absorbed.** test_new_queries.py:145,
+    `ORDER BY speed LIMIT 5`: two rows tie at speed=280.01 and BOTH are inside the cut, so the row
+    SET is unchanged and only their relative order moves (5275,3882 -> 3882,5275). SQLite answers
+    5275 first (rowid order). NO GATE SEES IT — the query is not in compare_against_sqlite.py and
+    test_new_queries.py's normalize() sorts unconditionally. DECISION: make it total
+    (`ORDER BY speed, lap_id LIMIT 5`) — it was written to test LIMIT ordering, not to pin a tie
+    SQL leaves unspecified.
+    BLAST RADIUS, measured baseline-binary vs fixed in a PRIVATE git worktree (it never touched the
+    shared build/, which is a better answer than the lock): 200 distinct ORDER BY queries from both
+    harnesses x 4 modes -> EXACTLY 3 moved (the 2 ENGINE_AGREEMENT entries + the one above).
+    TPC-H 36 queries incl. mutants x 4 modes -> 0 moved. Regression 318/0/0. Unit 820/820.
+    DISCRIMINATION: 11 new C++ tests against a build with the tie-break loop removed -> 9 FAIL /
+    2 PASS, and it declined to count the 2 as evidence because they are marked GUARD (they assert
+    the tie-break must NOT fire). That self-discipline is the standard.
   AFTER ALL THREE: gate, then **seam pass 3** (pass 2 had blockers, so the audit did not stop).
 
 ## !! CONCURRENT FIXERS SHARE ONE build/swiftql — USE flock
