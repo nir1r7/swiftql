@@ -1,5 +1,45 @@
 # Phase 5 orchestrator state
 
+## PASS 4 — optimizer preservation: 0 BLOCKER / 2 HIGH / 1 MEDIUM / 3 LOW. B3-2 IS NOT CLOSED.
+**P4-1 (HIGH) — `mayRaise` is UNDER-approximate, and the sentence it rests on was NEVER TRUE.**
+The fix's precondition cites *"`inferExprType` decides every TYPE error at PLAN time — in both
+legs"* (predicate_pushdown.cc:378-384). False: `inferExprType`'s BinaryExpr branch
+(logical_plan.cc:159-171) computes `l` and `r` then **returns `TypeId::INT` WITHOUT COMPARING THEM**
+for `= != < > <= >=`. So `team = 5` (STRING column, INT literal) type-checks at plan time and
+raises PER ROW. `mayRaise` calls it total, so it is freely permuted and freely pushed.
+Four measured divergences on shipped catalog.json, BOTH directions:
+  `WHERE team = 5 AND speed > 999999`     -> opt 0 rows / noopt ERROR
+  `WHERE team > 'zzzzz' AND team = 5`     -> opt ERROR  / noopt 0 rows
+  `WHERE 5 = team AND speed = 333.3333`   -> opt 0 rows / noopt ERROR
+  `WHERE team LIKE 'zzz%' AND 5 = team`   -> opt ERROR  / noopt 0 rows
+**TWO independent raise sites, and the second is not in `evaluate()` at all**:
+`ChunkPruner::canSkipChunk` (chunk_pruner.h:79-83) does `val < mn` on ZONE-MAP metadata, and
+`shouldSkip` walks conjuncts IN ORDER returning on the first proven skip — so conjunct order
+decides whether it throws BEFORE A SINGLE ROW IS EVALUATED. Also reproduces through the NEW
+`pushIntoDerived` rule and under a LEFT join.
+**P4-2 (HIGH) — the same screen's OVER-approximation costs 87x, silently.** `mayRaise` screens
+arithmetic by OPERATOR and `firstMayRaise` freezes by POSITION. Identical conjunct SETS differing
+only in written ORDER: `WHERE l.speed*2 > 688 AND l.lap_id < 5 AND dr.age > 30` = **39.9 ms**,
+nothing pushed; the same three with the arithmetic written LAST = **0.45 ms**. `--explain` prints
+NO decline line. Established as a regression from the diff (5d5f188's `pushIntoJoin` had no
+`frozen` term). `l.speed` is DOUBLE and provably cannot overflow.
+**THE VERDICT SENTENCE WORTH KEEPING:** the precondition the fix wrote down is CORRECT; the
+classifier implementing it is **wrong in both directions at once** — too coarse on arithmetic, too
+fine on comparison — and the sentence it rests on was NEVER TRUE rather than having expired.
+MEDIUM P4-6: the retracted "folding cannot change results" has a **FOURTH copy** at
+  development.md:606 — now the ONLY unqualified statement of it left (constant_folding.h and
+  join_enumeration.h were swept). Two passes have now each found one more copy than the last.
+LOW x3: P4-3 the argument for not stamping a PROJECT-boundary refusal is FALSE — `--explain` prints
+  output NAMES, so `LogicalProject [t, s2]` is byte-identical for a computed and a passthrough
+  column; P4-4 the harness census says six ungated passes, there are EIGHT (`substituteGroupKeyRefs`,
+  `deterministicCut`); P4-5 folding's census, declared complete, was made short by one IN THE SAME
+  ROUND by `mayRaise`'s own Literal test.
+CLEAN: pass 3's two blockers genuinely closed (B3-1, B3-1b, both SUBSTRING shapes agree). B3-3
+  reproduces at 6.9x vs --no-optimize on debug; the 2.9x-vs-9.4x gap is Release-vs-debug and both
+  parties said so. The freeze PARTITION is sound at all four sites. `deterministicCut` runs in both
+  legs and both engines and cannot diverge. `(relation_slot, name)` is unique because
+  `derivedRelationSchema` refuses a repeated name. 20 further cross-shape queries agree.
+
 ## PASS 4 — subquery chain: **1 BLOCKER** (3f1794a). The seam that was CLEAN in pass 3.
 **The type-through-division refusal CANNOT CROSS THE MATERIALIZATION CUT**, and a scalar subquery
 turns it into a silent wrong answer:
