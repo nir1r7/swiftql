@@ -12,8 +12,9 @@
 #include "planner/logical_plan.h"
 #include "planner/plan_nodes.h"
 
+#include <algorithm>
 #include <memory>
-#include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
