@@ -138,4 +138,131 @@ being able to fire.
 
 ## Part A — does pass 2's clean verdict survive fix round 2?
 
+Verdict up front: **pass 2's clean verdict on the join chain survives three of the four
+changes intact. The fourth — the tie-break — did not create B3-1, but it is the change that
+turned a "both answers are legal" latitude into an invariant the engine now claims to hold
+and does not.**
+
+### A.1 — the scan-schema narrowing (`70570dc` + `074aeb7`): no join-side consumer depends on scan width — CLEAN
+
+The change is confined to `Planner::plan` (`src/planner/planner.cc:189-237` for `narrowRows`,
+`:288-291`, `:317-320`, `:325-329` for the three call sites), i.e. to the **Volcano** path,
+which by its own refusals holds at most one join, no derived table and no subquery. I walked
+every join-side consumer of a scan's schema on that path:
+
+| consumer | reads | width-dependent? |
+|---|---|---|
+| `HashJoinNode` key resolution | bare column NAME against each child schema (`planner.cc:342-350` builds `from_cols`/`join_cols`) | no — and `buildScanSchema` collects `stmt.joins[i].condition` (`logical_plan.cc:332`), so a key can never be narrowed away |
+| merged output schema | `node->outputSchema().columns()` ++ right's, stamped slot 1 (`:352-359`) | narrower on both sides now, symmetric with the columnar leg |
+| ON-residual type check + evaluation | `merged_schema` (`:382`) | no — an INNER join's residuals are folded into `stmt.where` (`:171-177`) **before** `buildScanSchema` runs at `:186`, and `cloneExpr` leaves `jc->condition` intact, so the residual's columns are collected twice over |
+| build/probe swap | `from_row_count` / `join_row_count` — row COUNTS, captured before the moves (`:240`, `:304-308`) | no |
+| pruning hint | `preserved_slots` derived from `scan_schema`'s slots, all 0 | no |
+| `SeqScanNode` row path | `&rows_[cursor_]` verbatim | **yes, and this is the reason the fix narrows rows and not just the schema** |
+
+Three edges checked rather than assumed:
+
+- **Row width can never disagree with the catalog schema.** `csv_loader.cc:44-50` refuses a
+  line whose field count differs, so `r[i]` in `narrowRows` is always in range. This is the
+  one place the change could have introduced an out-of-bounds read, and the loader closes it.
+- **`keep` is ascending and each index is moved exactly once.** `narrowSchema`
+  (`logical_plan.cc:72-79`) iterates `full` in order and pushes matches, so the narrowed
+  schema is a *subsequence* of the catalog schema, never a permutation. (Had it been driven
+  by the `unordered_set<string> required`'s iteration order it would have been
+  non-deterministic across runs — it is not.)
+- **Self-join.** `self_join_rows` is copied at `:249-253`, before the FROM scan's move at
+  `:290`, and both sides go through `narrowRows` against the same `meta.schema`; for a
+  self-join `right_scan_schema` and `scan_schema` are two calls to `buildScanSchema` with
+  identical arguments, so the two legs of the join are narrowed identically.
+- **Two tables sharing a column name.** `buildScanSchema` narrows by BARE name over one flat
+  schema, so `l.team` keeps `drivers.team` in the drivers scan too. Over-inclusion, which is
+  the safe direction; verified live (A9 below).
+
+Run: 12 join shapes across all four legs (`row/volcano`, `columnar/volcano`,
+`columnar/vectorized`, `columnar/vectorized --no-optimize`), positional TSV, sort-normalised —
+`SELECT *` + join, narrow join, self-join, `LEFT JOIN` with and without a residual, an INNER
+residual that gets lifted, tied `ORDER BY` + `LIMIT` over a raw join row, `GROUP BY`/`HAVING`
+over a join, two relations sharing a column name, an `ORDER BY` column absent from the select
+list, and an expression `GROUP BY` key. **12 of 12 agree on all four legs.**
+
+The narrowing does what the commit claims: the `row/volcano` leg now tie-breaks over the same
+column set as the columnar legs (shape A7 — a tied `ORDER BY l.season` with `LIMIT 5` over a
+raw join row — agrees across all four, which is exactly the case that was luck before). It is
+also the reason B3-1 needs **three** relations: at two the DP does not run, so the merged
+schema is the written one on every leg.
+
+### A.2 — the deterministic tie-break: see BLOCKER B3-1 above
+
+The fix is correct for what it addresses (arrival order, build side, chunk boundaries) and
+`sort_comparator.h`'s properties list is accurate about *values*. It is silent about the
+*sequence* those values are read in, and the join spine is the one place that sequence is
+plan-dependent. Full writeup at the top of this file.
+
+One consequence worth naming separately, because it is the standing-rule sweep failure that
+kept B3-1 invisible: **`python_tools/random_diff.py` — the one randomized
+`optimized == --no-optimize` differ in the tree — deliberately refuses to generate the shape.**
+Its "TRAP 1" docstring (`random_diff.py:29-38`):
+
+> an `ORDER BY` with TIES makes the comparison order-sensitive on rows whose order SQL does
+> not specify, and a reordered join breaks those ties differently — a FALSE FAILURE that
+> looks like an optimizer bug ... So the generator emits either no `ORDER BY`, or a TOTAL one
+> (a unique tiebreak column appended).
+
+That reasoning was correct before `7b84952`. Since `7b84952` a reordered join breaking a tie
+differently is no longer a false failure — it is precisely the failure the tie-break exists to
+prevent, and the tool that would have generated B3-1 in its first batch is the one still
+configured not to. Sweeping this is part of B3-1's fix, not a separate finding.
+
+### A.3 — `reachesOutsideThisBody` (`8ce4ebf`) upstream of join-key selection — CLEAN
+
+The change makes a conjunct whose only `-1` came from a nested **correlated** `SubqueryExpr`
+classify as body-**local** instead of correlated. The join-chain risk is the asymmetric one:
+a conjunct that *should* have become a join key being kept in the body, which would be a
+wrong ANSWER rather than a refusal. It cannot happen, for a structural reason:
+`SuppressNestedCorrelation` (`subquery_decorrelation.cc:87-102`) clears only
+`SubqueryExpr::correlated`, and an outer `ColumnRef` produces its `-1` through a completely
+different branch of `collectSlots` — so any conjunct carrying a real correlation still
+reaches `splitCorrelation`'s key path.
+
+The residual case is a conjunct whose *only* outer reference lives inside the nested body
+(`EXISTS (SELECT 1 FROM laps l WHERE EXISTS (SELECT 1 FROM laps l2 WHERE l2.driver_id = d.driver_id))`,
+no level-1 key at the middle level). That now yields zero keys, and the pass refuses by name
+rather than building a keyless join:
+
+    Error: correlated subquery: no equality links the subquery to the enclosing query,
+           so there is no join key to decorrelate on
+
+and the depth guard fires on the level-2 route, as the commit claims. Ran the three-way
+differential (optimized / `--no-optimize` / SQLite) on 8 shapes that put the changed
+classification directly upstream of a join: nested body-local `EXISTS`, nested correlated
+scalar, a nested `EXISTS` whose body itself joins, `NOT EXISTS` with a nested `EXISTS`,
+nesting under an uncorrelated `IN`, and semi / anti / correlated-scalar lowerings sitting on
+a **three-relation** outer spine (so the DP runs above them). **8 of 8 agree three ways.**
+
+### A.4 — `$scalarN` marked `hidden` (`de45779`) vs join planning — CLEAN
+
+`hidden` has exactly one meaning (`common/schema.h:22-38`): star synthesis skips the column,
+resolution never consults it. Three readers, all named in that comment
+(`logical_plan.cc:1113`, `planner.cc:431`, `logical_plan.cc:491`), none of them in join
+planning. The two places join planning touches column *width* are both correct:
+
+- `JoinEnumeration::rebuild` copies whole `ColumnDef`s **by value**
+  (`join_enumeration.cc:269`, and its comment says so explicitly), so `hidden` survives
+  reordering and a `$scalarN` column cannot become visible by being moved;
+- the vectorized builder's build-side cost reads real materialised widths, and a hidden
+  column *is* materialised, so counting it is right, not wrong.
+
+The `$scalarN` join is a LEFT join (`subquery_decorrelation.cc`), so `containsOuterJoin`
+declines the whole tree before `rebuild` could reach it anyway — two independent reasons.
+
+Run: 6 shapes putting a `hidden` column inside a join's merged schema — `SELECT *` over a
+2-relation and a **3**-relation join each carrying a correlated scalar, `SELECT *` over a join
+with `EXISTS` and with `IN`, **two** correlated scalars over one join (so two synthetic
+relations widen the same schema), and a correlated scalar over a join whose other input is a
+derived table. **6 of 6 agree three ways**, including the column COUNT of `SELECT *`
+(14 columns on the 2-relation shape, 19 on the 3-relation one — SQLite's numbers exactly).
+
+---
+
+## Part A′ — pass 2's three open MEDIUMs, re-ranked on the moved tree
+
 (continues below)
