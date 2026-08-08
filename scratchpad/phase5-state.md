@@ -32,10 +32,46 @@ under an AND, and ALL 5 have a CONSTANT start position. Green was always consist
 
 ## FIX ROUND 4 — second agent: the INT->DOUBLE refusals pull BOTH WAYS
 UNDER-fires: the arming walk cannot cross the materialization cut -> silent wrong answer (10000 vs
-SQLite 0). OVER-fires: `taintWalk` arms both operands of `/` regardless of type so `x / 2.0` is
+SQLite 0). **[ALL OF THIS IS NOW FIXED — see "FIX ROUND 4 — refusals agent: DONE" below.]**
+OVER-fires: `taintWalk` arms both operands of `/` regardless of type so `x / 2.0` is
 refused; the magnitude refusal enforces a RENDERING bound on values never rendered; and **the
 derived-table form has NO WORKING MODE AT ALL** — a capability regression, since Volcano refuses
 derived tables and the vectorized path now refuses this shape.
+
+## FIX ROUND 4 — refusals agent: **DONE** (gates green in its own worktree)
+**MECHANISM: THE ARMING REQUEST CROSSES INWARD, NOT THE TAINT OUTWARD.** The two facts live on
+opposite sides of `materializeSubqueries`: "can an INT reach this value" is only knowable AFTER the
+body runs (value-driven); "does a `/` with an INTEGER partner consume this value" is only knowable
+BEFORE, from the outer AST — which `materializeSubqueries` still holds intact. So the flag travels
+INWARD: it walks each statement's expression slots with a `divWalk` mirroring `taintWalk` one level
+up, marks each uncorrelated SCALAR body whose value reaches an INT-partnered `/`, and passes
+`int_type_observable` to the runner. The refusal stays at `appendColumnValue`, fired by the value
+that actually arrives.
+WHY THE ALTERNATIVES LOSE: carrying provenance OUTWARD on the materialized `Literal` fails because
+`foldConstants` bakes `7 / 2.0` into `3.5` before any plan exists, so the mark must survive folding
+AND `cloneExpr` AND pushdown — a field silently not copied is a wrong answer, i.e. the exact class
+under repair. Arming every subquery-runner body unconditionally (the audit's own preferred option)
+refuses `WHERE x > (SELECT MAX(CASE …))`, correct today.
+OVER-FIRING, both halves: `taintWalk` now returns `{origins, may_be_int}` and arms `/` only when
+BOTH operands can be INT in Volcano; it drops origins at an arithmetic node whose result can no
+longer be INTEGER, since both engines then produce the same double.
+**IT FOUND A PASSING ANSWER ROUND 3 HAD MOVED THAT THE AUDIT DID NOT**: `t.s / (SELECT <mixed>)`
+where `t.s` is a REAL column of a DERIVED relation — the AST-level operand typing had no schema
+there and answered INTEGER (conservative), arming the body and refusing a query that answers 10000.
+The type question now descends into the body's select list, and into its own range table for
+`SELECT *`, 3 levels. Remaining conservative cases NAMED: a CORRELATED reference (the walk has no
+enclosing scope) and a derived relation nested past 3 levels.
+GUARD PINS MOVED: **none.** Oracle 1602/1602 unchanged. The audit expected the "aggregate produced
+but not divided" guard to be at risk; conditioning on the outer `/` keeps it answerable.
+Its gates, in a scratch worktree at 689ea9a + its change ONLY: unit **892** (874 + 18 new), oracle
+1602/0/0, regression 335/0/0, tpch PASS 20/22. 9 of the new tests fail on base; every Guard passes
+both sides.
+**!! DO NOT GATE THE BRANCH YET — the partiality agent's partial work is in the shared tree and
+`test_storage.cc` DOES NOT COMPILE right now.** Wait for it to report.
+16 oracle entries owed, listed in its report — 5 rejection (pin `"that another expression divides"`),
+**only #3 is a non-vacuous Volcano diff** (7085; #1/#2/#4 are 0 in Volcano so diffing them asserts
+nothing), 8 four-mode guards, 3 vec-only derived guards. Prefer a NEW family `TYPEFIX_CUT_*` so the
+existing `assert len(TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED) == 6` stays about the single-plan family.
 
 ## HELD FOR WAVE C (collides on logical_plan.cc with the partiality agent)
 - **P4-M1**: the fully-inner spine BELOW a declined semi/anti join is still never enumerated —
@@ -552,6 +588,13 @@ FIX: `appendColumnValue`'s DOUBLE arm goes through `narrowToDoubleColumn` (vec_t
   the guard reduced to `return v.toNumeric();`. The other 4 pass both ways ON PURPOSE and are
   LABELLED so — 1 derives the constant, 3 pin what the fix must not move; neither kind is offered
   as evidence the fix works.
+**SUPERSEDED BY FIX ROUND 4 — the bound is now 1e15 for a column whose text CAN BE PRINTED, and
+2^53 otherwise.** `narrowToDoubleColumn` takes an `unrendered` flag; the origin sets of the plan
+root's output columns are exactly the origins whose text can be printed, so everything else is
+judged on the VALUE bound. `ColumnVector::int_observable` became
+`IntNarrowing{RENDERED, UNRENDERED, OBSERVABLE}`, RENDERED the safe default. The paragraph below is
+the ORIGINAL round-3 reasoning, kept because it explains WHY the rendering bound exists at all —
+read it as history, not as current behaviour.
 **THE BOUND IS 1e15, NOT 2^53** — two things must survive and it MEASURED both: the VALUE (fails
   above 2^53) and the RENDERING (`Value::toString()` uses `%.15g`, which flips to exponent form at
   1e15, so `1000000000000001` prints `1e+15` while the INT prints all sixteen digits). 1e15 < 2^53,
