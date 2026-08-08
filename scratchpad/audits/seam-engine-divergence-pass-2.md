@@ -687,3 +687,168 @@ One row-vs-columnar asymmetry inside Volcano, noted for completeness and **not**
 divergence: `Planner::plan` gives the columnar scan the NARROWED `scan_schema` and the row
 scan the FULL `meta.schema` (planner.cc:236-240). Column order above is by name, so results
 agree; it means the two Volcano modes do different amounts of work, not different work.
+
+---
+
+## Part A addendum — the two questions the orchestrator added
+
+### A6. Does `ENGINE_AGREEMENT_QUERIES` discriminate? **VERIFIED BY BUILD — yes, 2 of 2.**
+
+Not reasoned. I took `git archive HEAD`, reverted **only** the emit loop in
+`HashAggregateNode::open` (`for (const auto& key_str : group_order)` back to
+`for (auto& [key_str, group_accs] : accumulators)`), built that tree in a scratch directory,
+and ran both suite entries in all four modes against both binaries:
+
+```
+                 PRE-FIX (emit loop reverted)          HEAD ee9c9d7
+Q1 row-volcano   Williams  Ferrari    RedBull          AlphaTauri Alpine McLaren
+Q1 col-volcano   Williams  Ferrari    RedBull          AlphaTauri Alpine McLaren
+Q1 col-vec       AlphaTauri Alpine    McLaren          AlphaTauri Alpine McLaren
+Q1 col-vec-noopt AlphaTauri Alpine    McLaren          AlphaTauri Alpine McLaren
+Q2  (same four)  Williams/Ferrari/RedBull vs           all four: AlphaTauri Alpine McLaren
+                 AlphaTauri/Alpine/McLaren
+```
+
+Pre-fix, `run_engine_agreement_suite` compares `row-volcano` (baseline) against
+`col-vec` and finds `Williams != AlphaTauri` on the first row — **both entries fail**. The
+commit's claim ("Confirmed failing against the pre-fix binary, 2 of 2 entries, passing
+after") is exactly right, and the Volcano order it reports (`Williams, Ferrari, RedBull`)
+reproduces bit for bit. The suite is not a self-confirming artefact.
+
+### A7. Can SQLite adjudicate? **VERIFIED BY MEASUREMENT — no.**
+
+```
+SQLite Q1: AlphaTauri, Alpine, Ferrari
+SQLite Q2: AlphaTauri, Alpine, Ferrari
+```
+
+A **third** distinct set — different from pre-fix Volcano (`Williams/Ferrari/RedBull`),
+different from both pre- and post-fix vectorized (`AlphaTauri/Alpine/McLaren`). So HEAD
+still differs from SQLite on both entries, on a correct answer. Putting either query in
+`QUERIES` would go red today, in all four modes, for a reason that is not a defect. The
+implementer's reasoning is confirmed, and the reason is stronger than "inconvenient": the
+oracle is not merely silent, it actively disagrees.
+
+### A8. FINDING E-1b (BLOCKER, same root as E-1) — the divergence PROPAGATES THROUGH
+### SUBQUERY MATERIALIZATION into a scalar constant
+
+The orchestrator asked whether any of the six passes that run in **both** optimizer legs
+can affect output order, since `optimized == --no-optimize` is blind to them by
+construction. Swept all six:
+
+| Pass | Can it change output ORDER? |
+|---|---|
+| `foldConstants` | No — expression rewrite only. |
+| `lowerInSubqueries` (IN -> SEMI) | No — the SEMI/ANTI arm emits each surviving probe row once, in probe order (pass 1 T3); the side is forced, not costed. |
+| `lowerExistsSubqueries` (EXISTS -> SEMI/ANTI) | No — same operator, same arm. |
+| `lowerCorrelatedScalars` (-> `LogicalDerived` + LEFT join) | No — a LEFT join forces the preserved side to probe, and `JoinEnumeration` declines any tree containing an outer join (`containsOuterJoin`). |
+| derived normalization (`derivedRelationSchema` / `VecDerivedNode`) | No — naming and slot stamping; the operator forwards its child's chunk. |
+| `materializeSubqueries` | **Not of its own — but it TRANSPORTS one into a value.** |
+
+That last row is a real finding, and it is worse than E-1 rather than a footnote.
+`buildReplacement` (subquery_materialization.cc:225-243) turns a SCALAR body's
+`res.rows[0][0]` into a `Literal`. The body is run by the **same engine as the outer query**
+(main.cc:507-537). So if the body is itself an `ORDER BY <agg> LIMIT 1` with a tie at the
+cut, the two engines substitute **different constants**, and everything downstream is a
+different query. Run at HEAD:
+
+```sql
+SELECT COUNT(*) FROM laps
+WHERE team = (SELECT d.team FROM drivers d JOIN laps l ON d.driver_id = l.driver_id
+              WHERE l.season = 2022 AND ... (x6)
+              GROUP BY d.team ORDER BY MIN(l.season) LIMIT 1)
+```
+
+```
+row-volcano      COUNT(*)  977
+col-volcano      COUNT(*)  977
+col-vec          COUNT(*) 1536     <-- inner scalar resolved to 'RedBull', not 'AlphaTauri'
+col-vec-noopt    COUNT(*)  977
+SQLite           COUNT(*)  977
+```
+
+This is no longer "which of several equally-valid rows is displayed". It is a **single
+scalar answer that differs by 559** between two modes of the same engine, with three of the
+four modes and SQLite agreeing on one value. It is a direct violation of
+`optimized == --no-optimize`, the invariant `run_optimizer_invariant` gates on with 119
+entries. Strictly the inner query is underspecified, so 1536 is defensible in isolation —
+but by this project's own doctrine (the doctrine 87c08a2 established and this harness
+enforces), a mode-dependent answer is a defect.
+
+**Answering the orchestrator's question directly:** none of the six ungated passes
+*originates* an order change, so the `optimized == --no-optimize` oracle is not blind to an
+order defect *created* by them. But `materializeSubqueries` **converts an order-dependent
+choice into a value**, which means an order divergence born in a *gated* pass (cardinality
+estimation, driving the build side) escapes the "row order is unspecified anyway" defence
+entirely and becomes an arithmetic disagreement. That is the reason E-1 deserves BLOCKER
+rather than the MEDIUM its pass-1 ancestor received.
+
+---
+
+## Findings, ranked
+
+| # | Rank | Finding | Concrete failing shape? |
+|---|---|---|---|
+| **E-1** | **BLOCKER** | The two engines choose the hash join's **build side** by different rules — Volcano from raw table row counts (`planner.cc:289`), the vectorized path from post-pushdown cardinality estimates and real row widths (`vectorized_plan_builder.cc:527`). Build side decides probe order, probe order decides GROUP BY first-encounter order, and 87c08a2 made that order load-bearing. **Run and confirmed at HEAD.** | Yes — A1-repro, run: `{AlphaTauri, Alpine, McLaren}` vs `{RedBull, AlphaTauri, McLaren}` |
+| **E-1b** | **BLOCKER** | Same root, worse consequence: `materializeSubqueries` turns an `ORDER BY <agg> LIMIT 1` body's tied choice into a **scalar `Literal`**, so the divergence stops being a row-order question and becomes an arithmetic one. Also a direct `optimized != --no-optimize` violation. **Run and confirmed at HEAD.** | Yes — A8, run: `COUNT(*)` = 977 (Volcano, `--no-optimize`, SQLite) vs 1536 (optimized vec) |
+| **E-2** | HIGH | The vec-only families (multi-way, `IN`, correlated, derived — 34 of the TPC-H matrix's cells) are vouched for by SQLite alone; the only internal differential, `optimized == --no-optimize`, shares every physical operator with the leg it is compared against, so it cannot see an operator defect. And the tie-at-cut class is unaddable to any SQLite suite by construction. | Structural; no shipped TPC-H instance found — TPC-H's ORDER BYs are near-total |
+| **E-3** | MEDIUM | `development.md` -> *Relation slots and query levels* is wrong a **third** time: the "Unreachable … behind the refusal" section and two of its rows rest on a `Validator::validate` refusal Week 33 deleted. `validator.cc:142-146` names this document by hand as no longer holding; the document was not updated. One row is void by its own written terms. | N/A (documentation) |
+| **E-4** | MEDIUM | `ENGINE_AGREEMENT_QUERIES` is **tie-dependent and not self-checking**. Its comment says "Each query must have a tie SPANNING the LIMIT cut, or it proves nothing" and nothing asserts it; regenerate `data/laps.csv` with a wider season range and both entries become vacuous passes. The file already has the pattern (`check_rows_equal_non_finite`, `check_year_coercion_dependency` at compare_against_sqlite.py:2402). | Yes in principle — any regeneration that breaks the seven-way `MIN(season)` tie |
+| **E-5** | LOW | The fix's emit loop uses `accumulators[key_str]` (`operator[]`, plan_nodes.cc:331) rather than `.at()`. A `group_order` key absent from `accumulators` default-inserts an **empty** vector and the following `group_accs[i]` loop reads out of bounds — silent UB instead of a throw. Unreachable today (nothing erases). | No — unreachable, ranked accordingly |
+| **E-6** | LOW | Unmentioned costs of 87c08a2: a third full copy of every group key (`vector<std::string>` where `vector<const std::string*>` into the map's stable keys would do), and two hash lookups per group at materialization where the old loop had none. | No — performance only |
+| **E-7** | LOW | Nothing at either deciding site (`planner.cc:289`, `vectorized_plan_builder.cc:527`) records that the build-side rule is now observable in query *results*. The comment 87c08a2 added lives two layers above, in `HashAggregateNode`. Same for the scan-order dependency (B9). | No — a missing comment on a live dependency |
+
+### What came back CLEAN, stated plainly
+
+These were hunted and found sound; they are results, not gaps in the audit.
+
+- **NULL semantics** (B2) — three-valued AND/OR, NULL propagation, NULL-is-not-true in
+  filters and CASE, NULL in aggregates, NULL group keys, NULL join keys, NULL through the
+  `Row`<->`ColumnVector` round trip, NULL ordering in sort. No divergence.
+- **Type and precision** (B3) — checked integer arithmetic, INT/INT truncating division,
+  `x/0 -> NULL`, mixed INT/DOUBLE coercion, SUM/AVG accumulator width, string comparison,
+  `LIKE`/`SUBSTRING` (literally shared functions), `IN` set typing, dates. No divergence.
+  The architecture is why: the vectorized compiler returns `nullptr` and falls back to
+  `evaluate()` for every shape it cannot reproduce exactly.
+- **Empty and degenerate inputs** (B4) — scalar aggregate over empty input
+  (`COUNT -> 0`, `SUM -> NULL`) on both, zero-row GROUP BY, empty build side,
+  `LIMIT 0` (neither engine touches its child), final-chunk truncation with validity.
+  No divergence.
+- **Container-iteration sweep** (A4) — every `unordered_map`/`unordered_set`/`std::set` in
+  the tree checked for an iteration order that reaches an output. **No second instance of
+  pass 1's bug exists.** `PredicatePushdown` had already internalized the rule
+  (`std::map`, with the reason written down).
+- **Scan order** (B9) — both scans walk ascending and share `ChunkPruner::shouldSkip`;
+  pruning skips whole chunks and cannot reorder.
+- **The five ungated passes other than materialization** (A8) — none can change output
+  order.
+- **`run_engine_agreement_suite` runs in the gate and turns it red** (A5c) — invoked
+  unconditionally, counters flow to `sys.exit(1)`, and `verify` gate 3 is that script.
+
+---
+
+## SUMMARY
+
+```
+BLOCKER   2   E-1, E-1b   (one root cause: the two engines pick the join build side
+                           by different rules, and 87c08a2 made probe order
+                           load-bearing without pinning the rule that decides it)
+HIGH      1   E-2         (vec-only families rest on a single oracle, and the
+                           tie-at-cut class is unaddable to it)
+MEDIUM    2   E-3, E-4    (development.md wrong a third time; the new suite is
+                           tie-dependent and not self-checking)
+LOW       3   E-5, E-6, E-7
+```
+
+**Verdict.** Pass 1's fix is **real but incomplete**: it makes `HashAggregateNode` emit in
+first-encounter order, which is correct and which its new suite genuinely discriminates
+(verified against a rebuilt pre-fix binary, 2 of 2 failing). But it silently promoted
+"both engines encounter rows in the same order" to a correctness invariant, and that
+invariant is **false today** — the two engines pick the hash join's build side from
+different inputs, and the vectorized path's input is a cardinality *estimate*. One query,
+run at HEAD with the gate green, returns a different row set on Volcano than on the
+optimized vectorized path; a second returns `977` against `1536`. Pass 1's "0 result
+divergences" is a true measurement of a corpus that, before 87c08a2, contained **zero**
+queries able to express this class at all (measured: 32 with `ORDER BY … LIMIT`, 10 with a
+tie at the cut, **2** where the tied rows differ — and both are the two the fix added).
+The seam is not clean; the fix closed the instance and left the class.
