@@ -88,6 +88,35 @@ LOW x2: folding's new comment is true about VALUES but its shape-consumer census
 `written_ordinal` is COMPLETE and fails OPEN (the safe direction): three parser sites, one synthesis
   site at subquery_decorrelation.cc:544 that correctly leaves it empty; nothing rebuilds a parsed item.
 
+## PASS 3 — subquery chain: **CLEAN** (f6767b8). 0 BLOCKER / 0 HIGH / 0 MEDIUM / 4 LOW.
+All four of fix round 2's subquery fixes verified real and complete, and it checked the ways a
+claim could be true-but-useless rather than accepting it:
+- B-1's "`hidden` is read in exactly three places" is exhaustively true. It checked the two ways a
+  FOURTH consumer could exist without using the word: dropping the flag by rebuilding a `ColumnDef`
+  field-by-field (every merge site copies whole `ColumnDef`s BY VALUE — logical_plan.cc:967,
+  join_enumeration.cc:270, planner.cc:350, buildProjectSchema:351, buildAggregateSchema:451), and
+  propagating it where a reader must not skip (blocked by `derivedRelationSchema` forcing
+  hidden=false and by the two producers' names being UNLEXABLE). `Schema::indexOf` has no third
+  overload, so resolution is untouched. 12 star shapes match SQLite, incl. `DISTINCT *` — which is
+  safe ONLY because `LogicalDistinct` sits ABOVE `LogicalProject`.
+- B-3's suppression cannot leak, for a reason THE FIX DOES NOT STATE: `forEachSubquery` and
+  `collectSlots` enumerate IDENTICAL subtype sets and both stop at a body, so the cleared node set
+  is exactly the consulted set. A shared body cannot observe the flag because `correlated` lives on
+  `SubqueryExpr`, not the shared `SelectStatement`.
+- The depth guard's `!= 1` is right: level 0 cannot arrive (an unresolved id reports `isLocal()` and
+  is parted off above with its own message), making it a PURE depth test.
+- ~90 constructed queries in Part B: no wrong answer, no unsound refusal. NULL semantics correct in
+  all 16 shapes manufacturable by two independent routes, including the three that actually part
+  `ANTI` from `ANTI_NOT_IN`. The documented cardinality divergence has NOT widened.
+4 LOWs for the sweep: five rejection entries pinning needles that 4–24 messages satisfy (with
+  wrong-guard counterexamples for each, and one suite whose own stated purpose its pin cannot serve
+  while the rule is written out twelve lines above it); a comment on B-3's fix justifying its RAII
+  with **two facts that are both false** (the fix is still correct, for the different reason above);
+  a refusal class B-3's fix newly opened that is in no README table or suite.
+**CORRECTION to a queued item: the `NOT IN` NULL hole is NARROWER than pass 2 recorded** — three
+  LEFT-JOIN NULL entries are already in the tree. Only the mixed-body case is missing, and the
+  behaviour behind it is correct.
+
 ## !!! THE SYSTEMIC COVERAGE HOLE — fix this or the next green gate means as little as this one
 **`catalog.json` has TWO TABLES, and `MIN_ENUMERATED_RELATIONS = 3`. So NO QUERY IN THE ENTIRE
 ORACLE SUITE EVER REACHES JOIN ENUMERATION.** The DP — the thing three auditors just found a
