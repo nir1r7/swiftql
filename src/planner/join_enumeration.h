@@ -49,7 +49,7 @@
 //      what the user wrote by the model's own metric. `method=` names which of
 //      dp / greedy / written-floor / written-fallback produced the printed order.
 //   5. Outer joins are not reordered AT ALL. R ⟕ S ≠ S ⟕ R and associativity
-//      fails, so any tree containing one is declined whole (containsOuterJoin,
+//      fails, so any SPINE containing one is declined whole (containsOuterJoin,
 //      Week 29). --explain reports `join-ordering=skipped (outer join)` and no
 //      order= line: a decision was available and was refused (unlike the two
 //      declines below, where there is none to make), and one outer join costs the
@@ -57,16 +57,29 @@
 //      max(selectivity(ON residual) * matches, left_rows) — lives at the STAMPING
 //      site for the same reason the ≥1 floor does: neither term is multiplicative,
 //      so the search must never meet it.
+//      SPINE, not "tree", since Week 37 (seam audit pass 2, B-2). containsOuterJoin
+//      used to walk every child, so it answered about a DIFFERENT query block: a
+//      LEFT JOIN sealed inside a DERIVED body or inside a semi/anti join's
+//      subquery BODY declined the enclosing fully-inner spine, and reported
+//      `(outer join)` for trees whose real and stronger cause is
+//      `(semi/anti join)`. It uses countRelations' containment rule now — a
+//      derived relation is an opaque leaf, a semi/anti join's children[1] is not
+//      a relation of this block — because it is the same rule, and two spellings
+//      of it is how the two drifted.
 //
 // Above 32 relations the pass declines entirely (uint32_t subset masks) and
 // --explain shows no order= line, because there is no decision to show. No TPC-H
 // query comes close — Q9 and Q21 top out at 6 relations.
 //
-// It also declines, silently, any tree carrying a relation slot outside the
-// range table (hasSlotOutsideRangeTable, Week 30). What reaches it, as of Week
-// 34, is exactly two things: an unbound key (from_slot -1), and a SEMI/ANTI
-// join, whose join_slot is -1 because children[1] is a subquery BODY and not a
-// relation of this block.
+// It also declines any tree carrying a relation slot outside the range table
+// (slotDeclineReason — the function was called hasSlotOutsideRangeTable when this
+// paragraph was written, and returns a REASON rather than a bool since the phase
+// 5 seam audit). What reaches it, as of Week 34, is exactly two things: an
+// unbound key (from_slot -1), and a SEMI/ANTI join, whose join_slot is -1 because
+// children[1] is a subquery BODY and not a relation of this block. NOT SILENT
+// since pass 1 of that audit: the semi/anti cause is reported as
+// `join-ordering=skipped (semi/anti join)`, on the argument that a fully inner
+// three-relation spine below a semi join is a decision that WAS available.
 //
 // !! DERIVED TABLES DO NOT REACH IT, contrary to what Weeks 28, 29, 30 and 31
 // each predicted for "the week a nested scan genuinely joins the outer one".
@@ -79,13 +92,24 @@
 // now. No reported decline was added because no supported query pays a
 // plan-quality cost, which is the condition Week 30 set for earning one.
 //
-// What IS new, and is a different consumer: a derived relation has no
-// TableStats, so joinCardinality's non-multiplicative max(l, r) branch runs on a
-// query the CLI can type. Optimal substructure does not hold for a subset
-// containing one; the containment is the written-order bound in reorder(),
-// exactly as Week 28 specified, and this is the first time that bound is
-// load-bearing outside a C++ fixture. Week 28 recorded that method=written-floor
-// had never executed — it is reachable now.
+// !! THE PARAGRAPH THAT STOOD HERE WAS FALSE IN BOTH HALVES, and it is the exact
+// text `18af84f` deleted from join_enumeration.cc — swept in the .cc and left
+// standing in the HEADER, which is the copy a reader consults first. (Third
+// instance of that failure this phase: development.md:855 carries it too, and
+// constant_folding.h carried the retracted folding claim.) It said a derived
+// relation's missing TableStats make joinCardinality's non-multiplicative
+// max(l, r) branch run on a CLI-typable query, and that `method=written-floor`
+// was therefore reachable. The seam audit measured both and NEITHER happens:
+// `have_ndv` is set when EITHER side supplies an NDV and the non-derived side
+// always does, so the MULTIPLICATIVE branch runs; and the DP won outright on
+// both queries tested.
+//
+// What is true is narrower and worth keeping: a derived relation contributes no
+// NDV, so a subset containing one is priced from the other side's statistics
+// alone. max(l, r) still runs when NEITHER side has any — it is not
+// multiplicative, so such a subset has an order-dependent row count and optimal
+// substructure does not hold for it. The containment is unchanged and is the
+// written-order bound in reorder().
 //
 // This USED to throw, which made it the one place the optimized path could fail
 // on input `--no-optimize` accepts; declining keeps optimized == --no-optimize,
@@ -107,9 +131,19 @@ constexpr int MAX_DP_RELATIONS = 10;
 
 class JoinEnumeration {
     public:
-        // Reorders the single join tree inside `node`, if any, and returns the
-        // tree. Never called under --no-optimize (see main.cc): the written
-        // order is the benchmark baseline AND the differential oracle.
+        // Reorders EVERY join tree inside `node` and returns it. Never called
+        // under --no-optimize (see main.cc): the written order is the benchmark
+        // baseline AND the differential oracle.
+        //
+        // "Every", not "the single one", since Week 37 (seam audit pass 2, B-3).
+        // This used to stop at the topmost JOIN, on a comment that named its own
+        // expiry — "there is exactly one per statement until subqueries arrive in
+        // Week 30" — and was never swept when subqueries (W30), semi joins (W32)
+        // and derived tables (W34) each added another. A body's joins were
+        // enumerated only when the ENCLOSING block happened to have no join.
+        // The descent steps OVER each spine and into its LEAVES, because
+        // decompose only accepts a WRITTEN-ORDER tree and a reordered spine is
+        // not decomposable.
         static std::unique_ptr<LogicalPlanNode> apply(std::unique_ptr<LogicalPlanNode> node,
                                                       const Catalog& catalog);
 };

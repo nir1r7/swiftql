@@ -97,6 +97,19 @@ class CardinalityEstimator {
 
         // fraction of input rows a predicate keeps, in [0, 1]. Public so the
         // Week 21 pushdown pass can order scan-local conjuncts by expected work.
+        //
+        // !! WHAT THIS NUMBER IS ALLOWED TO DECIDE, stated because the seam audit
+        // (pass 3, B.1) found it was the one estimator entry point with NO stated
+        // precondition at all, and B3-2 is what that cost. `estimate` above feeds
+        // plan-SHAPE choices, where a wrong number is only a slow plan. THIS
+        // function decides conjunct ORDER, and the columnar cascade evaluates the
+        // right conjunct only over the left's survivors — so with per-row
+        // evaluation not being total, a wrong number here used to decide whether
+        // the query ERRORS. The rule is therefore not "this may be inaccurate":
+        // it is that a conjunct that CAN RAISE must never be ranked at all.
+        // PredicatePushdown enforces it (firstMayRaise), not this function, and
+        // any new caller of selectivity() that reorders evaluation owes the same
+        // screen.
         static double selectivity(const Expr* pred, const StatsContext& ctx);
 
         // Estimate ONE subtree in isolation: stamps estimated_rows bottom-up and

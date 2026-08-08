@@ -17,6 +17,24 @@
 // (σ_p(R⋈S) ≡ σ_p(R)⋈S) on BOTH sides. For a LEFT join it holds on the preserved
 // side only, so since Week 29 distribute() declines to push into children[1] of
 // a LEFT join and such conjuncts stay above the whole join tree.
+//
+// !! RESULT PRESERVATION IS NOT THE WHOLE OBLIGATION, and Week 37 is where that
+// stopped being an oversight. PER-ROW EVALUATION CAN THROW (substringOf, and
+// checkedArith overflow), so MOVING a conjunct — reordering it inside one filter
+// OR pushing it below a join OR pushing it into a derived body — decides whether
+// the query ERRORS. The row sets above are equal; the ERROR BEHAVIOUR is not,
+// and `optimized != --no-optimize` was reproducible in BOTH directions on the
+// shipped catalog. Every move this pass makes is now screened: see the totality
+// screen and `firstMayRaise` in the .cc, which state the precondition and what
+// property it restores. The screen is a no-op on a query with no raising
+// conjunct, which is every TPC-H query and every harness entry.
+//
+// Since Week 37 the pass also ENTERS a derived relation's body (seam audit pass 3,
+// B3-3) and DESCENDS past the first node it can rewrite (pass 2, B-2) — it used
+// to return from the FILTER-over-JOIN branch, so a body was optimized only when
+// the enclosing block happened to have no join. A conjunct REFUSED entry to a
+// body is reported on LogicalDerived::pushdown_decision; nothing is stamped when
+// there was no refusal.
 class PredicatePushdown {
     public:
         static std::unique_ptr<LogicalPlanNode> apply(std::unique_ptr<LogicalPlanNode> root, const Catalog& catalog);
