@@ -196,3 +196,89 @@ with `evaluator.cc`'s resolution rule and with two other consumers where it is
 load-bearing. The defect is applying the screen in a schema the ref does not belong to.
 
 ---
+## Part A.3 — the pruning loss: **confirmed, re-sized, and its scope corrected in two ways**
+
+The fixer recorded: *"the OPTIMIZED leg is unchanged at `chunks_skipped=1/2` … the
+`--no-optimize` leg drops to `chunks_skipped=0/2` and 42.5 ms becomes 51.5 ms, +21%."*
+The effect is real. The scope is wrong, and the ratio is the smallest one available.
+
+### It is not a `--no-optimize` phenomenon; it is a **written-order** phenomenon, and it hits Volcano's optimized leg too
+
+The controlled experiment is the same query with the two conjuncts swapped — identical
+plan otherwise, identical answer (398 rows), same binary, so nothing but the order of
+the WHERE differs. Shipped `catalog.json`, Release, `Execution:` from
+`--explain-analyze --no-cache`, **median of 11**:
+
+    cross-first   WHERE d.nationality = 'British' AND l.season = 2024
+    local-first   WHERE l.season = 2024 AND d.nationality = 'British'
+
+| binary | leg | cross-first | local-first | delta | `chunks_skipped` |
+|---|---|---|---|---|---|
+| **HEAD `b14d086`** | col-volcano **optimized** | 7.421 ms | 6.115 ms | **+21.4 %** | **0/2** vs 1/2 |
+| HEAD | col-volcano `--no-optimize` | 7.470 ms | 6.098 ms | **+22.5 %** | **0/2** vs 1/2 |
+| HEAD | col-vectorized `--no-optimize` | 2.317 ms | 1.786 ms | **+29.7 %** | **0/2** vs 1/2 |
+| HEAD | col-vectorized optimized | 0.197 ms | 0.183 ms | +7.7 % (noise) | 1/2 both |
+| **PRE `364a2d3`** | col-volcano optimized | 7.022 ms | 7.067 ms | −0.6 % | **1/2 both** |
+| PRE | col-volcano `--no-optimize` | 7.010 ms | 7.095 ms | −1.2 % | **1/2 both** |
+| PRE | col-vectorized `--no-optimize` | 1.796 ms | 1.751 ms | +2.6 % | **1/2 both** |
+| PRE | col-vectorized optimized | 0.174 ms | 0.186 ms | −6.5 % | 1/2 both |
+
+`364a2d3` is the parent of `33bb7ea`, the commit that added the schema parameter and the
+written-order stop. On that binary the conjunct order makes no difference at all and the
+chunk is always skipped, which is the control that proves the HEAD delta is caused by
+the pruner change and not by the query text. **Volcano's optimized leg lost pruning as
+well**, because `Planner::plan:284` hands the raw `stmt.where` to the FROM scan as the
+hint whether or not the optimizer ran — pushdown's re-stamped, scan-local hint is a
+*vectorized-builder* property, not an optimizer property. The fixer measured the one
+cell that kept it and generalized from it.
+
+### The ratio, on a denominator that is not a 2-chunk table
+
+`laps` is 10 000 rows in 2 chunks, so the lost skip is 18 % of one scan. TPC-H sf0.01
+(`lineitem` 60 144 rows, **8 chunks**, `l_orderkey` clustered; `l_orderkey > 14295`
+prunes 7 of 8), same swap, same binary, median of 7:
+
+| leg | cross-first | local-first | delta | `chunks_skipped` |
+|---|---|---|---|---|
+| col-volcano **optimized** | 65.56 ms | 23.44 ms | **+180 % (2.80×)** | **0/8** vs 7/8 |
+| col-volcano `--no-optimize` | 63.60 ms | 22.57 ms | **+182 % (2.82×)** | **0/8** vs 7/8 |
+| col-vectorized `--no-optimize` | 32.35 ms | 17.58 ms | **+84 % (1.84×)** | **0/8** vs 7/8 |
+| col-vectorized optimized | 13.40 ms | 12.22 ms | +9.7 % (noise) | 7/8 both |
+
+Same answer in every row (945 rows). **Method and denominator, stated because this is a
+performance claim:** the engine's own `Execution:` line on a Release build, median of
+11 (shipped catalog) or 7 (TPC-H) runs with `--no-cache`, quiet box; the denominator is
+the *same query's* execution time with the conjuncts written in the other order, so
+loading, parsing and planning are outside it entirely. The percentage is not comparable
+to S-9's, which is quoted against a whole process.
+
+The PRE binary could not be used for the TPC-H half — it fails to load `.tbl` files
+(`Error: Column count mismatch in CSV row`; the trailing-delimiter handling changed
+after `364a2d3`), so the before/after control exists only on the shipped catalog. The
+within-binary swap at HEAD stands on its own for the TPC-H numbers.
+
+### **FINDING S-14, MEDIUM** — restated
+
+A cross-relation conjunct written *before* a scan-local one costs the scan all of its
+zone-map pruning: **+21 % on a 2-chunk table and 2.8× on an 8-chunk one**, in
+**col-volcano both optimizer settings** and **col-vectorized `--no-optimize`**. It is a
+regression against `364a2d3`, it is invisible to `benchmark.py` only in the sense that
+nobody has pointed `benchmark.py` at it — the cost is in `Execution:`, so the instrument
+would see it.
+
+**The fix is the same one S-13 needs**, and that is the reason to do it rather than the
+6-line local guard: thread the filter's child schema alongside the hint through
+`pruningHintForPreservedSide` (`predicate_pushdown.h`), so `collectSimplePredicates`
+types every conjunct in the schema it was written against. Then `d.nationality = 'British'`
+types as STRING = STRING, answers "cannot raise", the walk continues, and
+`l.season = 2024` prunes — while `s.x` (S-13) types as DOUBLE, answers "may raise"
+correctly, and stops the walk. One change closes a HIGH correctness finding and a
+MEDIUM performance regression. Sizing: one extra argument on
+`pruningHintForPreservedSide` and on `ChunkPruner::shouldSkip`/`collectSimplePredicates`,
+one `Schema` member on `SeqScanNode` and `VecScanNode`, and the two call sites that
+already compute the child schema (`planner.cc:284`, `vectorized_plan_builder.cc:914`) —
+**~20 lines**, not the "one line in each of the two builders" the comment claims, because
+the schema has to survive to scan time and the two scan nodes currently store only their
+own.
+
+---
