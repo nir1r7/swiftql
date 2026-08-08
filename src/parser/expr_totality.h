@@ -23,26 +23,37 @@
 //     * AN OUTER JOIN'S `ON` RESIDUAL is evaluated on every CANDIDATE PAIR the
 //       join keys matched — not on rows of either input, and not on rows of the
 //       join's output, since a pair the residual rejects never becomes one.
-//       Both engines evaluate it EAGERLY over the whole residual conjunction, in
-//       the probe loop, against the assembled merged row (plan_nodes.cc's
-//       HashJoinNode::next and vec_hash_join_node.cc's probe both hold the same
-//       `passes` lambda);
-//     * every other expression is evaluated on every row that reaches its node.
+//       Both engines evaluate it EAGERLY, over the whole residual conjunction,
+//       in the probe loop against the assembled merged row (plan_nodes.cc's
+//       HashJoinNode::next and vec_hash_join_node.cc's probe hold the same
+//       `passes` lambda). !! THERE IS NO CONJUNCT CASCADE INSIDE A RESIDUAL:
+//       evaluate() computes both operands of an `AND` before it looks at the
+//       operator, so `ON k = k AND A AND B` evaluates B on the pairs where A is
+//       FALSE, while the identical text in a WHERE or on an INNER join does not.
+//       All four legs agree, so it is not a divergence — it is this file's own
+//       rule not holding for a construct the parser accepts. Recorded, not
+//       fixed, on LogicalJoin::on_residual;
+//     * every other expression is evaluated on every row that reaches its node
+//       — AND THE RULE BINDS THE REWRITE, NOT THE EXPRESSION: a pass may not
+//       change which rows reach a node holding an expression that can raise. An
+//       expression need not MOVE to be moved.
 //
-//   THE SECOND BULLET IS NEW TEXT AND IT IS A CORRECTION, not an addition. This
-//   file was written to be THE single statement of the rule and it had two
-//   sentences that were false of the same construct: it enumerated three
-//   consumers, and it said "every other expression is evaluated on every row
-//   that reaches its node" — which an `ON` residual is not, in either engine.
-//   Seam audit pass 5 (engine, A-1) found it by running the shape rather than
-//   reading it: `LEFT JOIN ... ON k AND age > 30 AND SUBSTRING(name, age-30, 3)
-//   = 'er_'` errors in all six modes, where the SAME two conjuncts written in a
-//   WHERE answer in all six. That is not an engine divergence — the two agree —
-//   but a reader who trusted this file would have concluded the residual was a
-//   filter conjunct and inherited the cascade. It does not. An INNER join has no
-//   such case: its residuals are folded into the WHERE conjunction, residuals
-//   first and the user's WHERE after, by BOTH planners (logical_plan.cc and
-//   planner.cc), so they ARE filter conjuncts and the first bullet governs them.
+//   THAT LAST CLAUSE IS WHERE FIVE PASSES OF THIS AUDIT KEPT LANDING. The
+//   sentence used to stop at "reaches its node", which quietly assumes no
+//   rewrite changes what reaches a node — and `distribute` does exactly that:
+//   pushing a conjunct into a LEFT join's preserved side removes rows, and with
+//   them evaluations of a residual the pass never reads. THE OBLIGATION IS PER
+//   EXPRESSION WHOSE ROW SET A REWRITE CHANGES, NOT PER REWRITE. That set is
+//   strictly larger than the expressions a rewrite touches, and five consecutive
+//   passes found the defect in exactly the entry a shorter enumeration was
+//   missing. If you are about to add an entry to an enumeration in this file,
+//   check the AXIS first: "consumers of the screen" and "moves a pass makes" are
+//   both the wrong one, and both undercount.
+//
+//   An INNER join has no residual case at all: its residuals are folded into the
+//   WHERE conjunction — residuals first, the user's WHERE after — by BOTH
+//   planners (logical_plan.cc and planner.cc), so they ARE filter conjuncts and
+//   the first bullet governs them.
 //
 //   Nothing may change that set for an expression that CAN RAISE: not a plan
 //   rewrite (predicate_pushdown.cc), not a storage-level chunk skip
@@ -72,18 +83,24 @@
 //   3. logical_plan.cc — a LIMIT above a projection that may raise is placed
 //      BELOW it, so the plan (not the engine's laziness) says how many rows the
 //      projection is evaluated on.
-//   4. an OUTER JOIN'S `ON` RESIDUAL — the consumer the enumeration used to
-//      omit, together with the sentence that would have told a reader it did not
-//      exist. Its row set is the key-matched candidate pairs, and BOTH engines
-//      evaluate the whole residual eagerly over them, so the two agree today by
-//      symmetry rather than by rule: nothing screens the residual and nothing
-//      states which rows it is owed. That makes it a dialect fact rather than a
-//      seam defect right now, and a rule this file states absolutely is not
-//      allowed to have a construct it does not describe.
+//   4. predicate_pushdown.cc AGAIN, at distribute — a LEFT join's ON residual.
+//      Not a conjunct of any list: it is a field on the join node, evaluated per
+//      CANDIDATE PAIR, and any rewrite that removes a preserved-side row removes
+//      evaluations of it. This is the entry the enumeration used to omit,
+//      together with the sentence that would have told a reader it could not
+//      exist — and it is the one that hid a blocker, because pushing a conjunct
+//      into the preserved side changes the row set of an expression the pass
+//      never touches. Consumers 1 and 4 are the SAME FILE and the same pass;
+//      counting consumers by file is how the fourth went missing.
 //
 // Same dispatch as collectSlots / forEachLocalColumnRef in
 // predicate_pushdown.cc. A MISSED Expr subtype here must answer TRUE, which the
-// final `return true` delivers. Keep the three in lockstep.
+// final `return true` delivers. Keep the three in lockstep — and note that the
+// claim holds at SUBTYPE granularity only: both walkers below end their
+// BinaryExpr arm on a fallthrough that assumes a comparison, and neither tests
+// `un->op` at all, so a new OPERATOR (`||`, or a `NOT` built as a UnaryExpr)
+// would be classified TOTAL from its first day rather than landing on the safe
+// `return true` (seam pass 5, P5-5).
 
 // The static type of an expression, as far as `schema` can decide it. Returns
 // false when it cannot be decided HERE — an unresolvable ColumnRef, an Expr
