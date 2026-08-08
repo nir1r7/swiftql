@@ -262,3 +262,92 @@ Two things fall out of this table that neither the commit nor the gate could hav
    The regression is not merely unmeasured; the instrument the project would reach for
    actively reports the opposite sign. That is the substance of S-9, and it is now
    measured rather than argued.
+
+---
+
+## Part B — what passes 1 and 2 missed
+
+### B.1 Chunking, on data built to break it — 182 more queries, 0 divergences
+
+Row storage never prunes and has no chunks; columnar does both. So any chunk wrongly
+skipped, any group lost at a boundary, any accumulator reset per chunk shows up as a
+row-vs-columnar difference. Two batches:
+
+**TPC-H sf0.01 (56 queries).** `lineitem` is 60 144 rows = 8 chunks, and pruning
+genuinely fires here (`chunks_skipped=7/8` on `l_orderkey < 100`, confirmed with
+`--explain-analyze`). Covered: every comparison operator against a zone map (`=`, `<`,
+`>`, `<=`, `>=`) including predicates that prune ALL chunks and predicates that prune
+NONE; conjunctions and disjunctions; INT / DOUBLE / STRING / date-shaped-STRING zone
+maps; aggregates accumulating over all 8 chunks (`SUM`, `AVG`, `MIN`, `MAX`,
+`COUNT(DISTINCT)`); groups whose members span every chunk and groups confined to the
+last one; `LIMIT` at 8191/8192/8193/16385; `LIMIT` combined with pruning that skips the
+FIRST chunks; single joins with the predicate on each side; LEFT JOINs; and
+`SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax))` for float accumulation order.
+**0 divergent.**
+
+**Synthetic boundary tables (126 queries).** Row counts 0, 1, 8192, 8193, 16384, 16385
+plus a 20 000-row table that is a SINGLE RLE run spanning three chunks — the shapes real
+data does not give you. Each with `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, `COUNT(DISTINCT)`
+over INT and STRING, `GROUP BY` on a low-cardinality RLE column and on a dictionary
+column, `ORDER BY ... LIMIT` both directions, predicates straddling row 8192,
+`SELECT *`, and joins/LEFT JOINs with the **empty** relation on each side.
+**0 divergent.**
+
+The empty relation was also checked for CORRECTNESS, not just agreement, since nothing
+in the shipped suites has one: `COUNT(*)`=0, `SUM/MIN/MAX/AVG`=NULL, `COUNT(DISTINCT)`=0,
+`GROUP BY` over it = 0 rows, and `t1 LEFT JOIN t0` = 1 row with `COUNT(b.k)`=0 — all
+byte-identical to SQLite's answers.
+
+### B.2 The pruning-hint-names-the-wrong-relation class — closed structurally
+
+The class that "has bitten once" is a conjunct whose column name exists in the scanned
+table but whose reference belongs to a DIFFERENT relation, matched against zone maps by
+name. `chunk_pruner.h::collectSimplePredicates` gates on
+`col->id.isLocal() && col->id.localSlot(...) < 1`, and `ColumnId::isLocal()` is
+`level_ == 0` (`column_id.h:49`). So:
+
+- a JOIN-side ref carries schema slot 1 and is dropped — the FROM scan cannot be pruned
+  by the other table's `team`/`driver_id`;
+- a CORRELATED ref carries level >= 1 and fails `isLocal()` before its slot is ever
+  read. The header's Week 33 paragraph says this is now REACHABLE (the Validator refusal
+  is gone) and that it DECLINES rather than throws. That is what the code does, and
+  `localSlot()` would throw loudly rather than silently mis-index if the order of the
+  two tests were ever swapped.
+
+Two shapes still worth naming, both benign and both deliberate: a literal on the LEFT
+(`WHERE 350 < l.speed`) is not collected at all, and a NULL literal (from a
+zero-row materialized scalar subquery) is declined explicitly. Both cost pruning, never
+correctness.
+
+### B.3 Loading and value fidelity — the divergence surface is thinner than it looks
+
+`CSVLoader::load` is the ONLY parse, and `CSVToColumnar::convert(rows, schema)` is built
+from its output, so a parsing difference between the two storage modes is not
+representable. What IS representable is a conversion/encoding difference, and the
+encodings were read for it:
+
+- **DOUBLE is never encoded** (`csv_to_columnar.cc:83`, `case TypeId::DOUBLE: break;`) —
+  stored as a raw `std::vector<double>`. So the RLE equality hazard that would collapse
+  `0.0` and `-0.0` into one run cannot reach a DOUBLE column. INT RLE compares
+  `int64_t` exactly; STRING dictionary compares `std::string` exactly.
+- **NaN / infinity are accepted by the loader** — `std::stod("nan")` and `stod("inf")`
+  consume the whole field, so `parseField` returns them without complaint. They are the
+  same `double` in both storages. Zone maps built over them degrade safely:
+  `v < mn` / `v > mx` are both false for NaN, so a NaN either becomes an unusable
+  min/max pair (and `canSkipChunk` then skips nothing) or is invisible to a min/max that
+  a real value set — and in both cases the predicate it would have been pruned by is
+  itself false for NaN. No wrong skip is reachable from this.
+- **Ragged rows are refused** with file+line+expected/got (`csv_loader.cc:43-51`), and
+  `parseField` requires FULL consumption for INT and DOUBLE, so a mistyped catalog
+  column is loud rather than silently truncating (`"1996-01-02"` as DOUBLE throws
+  instead of yielding 1996.0). Both properties are shared by both storage modes because
+  the loader is shared.
+- **`getValue` bounds**: the three raw-vector variants use `.at()`, but
+  `DictionaryEncoder::decode` (`dict[codes[row_idx]]`) and `RLEColumn::get` are
+  unchecked. Reachable only with `row_idx >= num_rows`, and `num_rows` is set from
+  `rows.size()` with every column populated in the same pass, so the widths cannot
+  disagree. Noted, not a finding.
+
+This is consistent with, and does not re-derive, the standing conclusion that NULL
+*representation* cannot be differentially tested because `ColumnArray` has no validity
+concept.
