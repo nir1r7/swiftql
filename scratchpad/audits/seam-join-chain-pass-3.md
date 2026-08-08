@@ -5,7 +5,7 @@ Scope: the joints between the join layers (single hash join -> multi-way DP -> s
 Repo `/home/user/swiftql`, branch `claude/phase5-week26-qomtkb`, HEAD `922ca15`.
 Predecessors: `seam-join-chain-pass-1.md`, `seam-join-chain-pass-2.md`.
 
-STATUS: in progress — written incrementally, never at the end.
+STATUS: COMPLETE.
 
 ---
 
@@ -418,4 +418,139 @@ the other.
 
 ## Part B — hunting what passes 1 and 2 missed
 
-(continues below)
+Two blockers came out of this part (B3-1 above, found from the tie-break's precondition;
+B3-2 above, found from the Week 29 guard's scope). Everything else I could construct is
+below, and it is clean.
+
+Method, stated so the negative result means something. Passes 1 and 2 ran hand-built shapes;
+this pass adds a **randomized SQLite-oracle sweep aimed specifically at the joints**, because
+the only randomized differ in the tree (`python_tools/random_diff.py`) neither generates
+derived relations nor semi/anti joins nor correlated subqueries — its generator emits inner
+and left joins over base tables only. Mine emits 2–4 relation spines mixing base tables,
+self-joins and derived relations, `LEFT` joins interleaved with inner ones, composite ON
+keys, `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS` / correlated-scalar predicates stacked on
+those spines, and optional `GROUP BY` / `LIMIT`. `ORDER BY` is always **total** (a unique
+tail key appended) so that this leg answers *correctness* and not *tie-break determinism* —
+B3-1 owns the latter, and left un-neutralised it would have swamped the run.
+
+Three legs per query: optimized / `--no-optimize` / SQLite, positional TSV, sort-normalised.
+
+**240 randomized shapes over two seeds (20260808, 777): 240 ok, 0 diff, 0 skipped.**
+
+Plus five hand batteries where randomness is the wrong tool because the interesting cases are
+sparse:
+
+#### C3-1 — NULL join keys through the whole chain (15 shapes, all agree three ways)
+
+The CSV loader cannot express NULL, so every NULL here is manufactured by a `LEFT JOIN`
+inside a derived body whose key column is null-extended for 10 of the 20 drivers. Tested with
+that NULL-bearing column as: an INNER join's build key and its probe key; a `LEFT` join's
+key; the body of `IN` and of `NOT IN`; the **probe** side of `IN`, `NOT IN` and `NOT EXISTS`;
+one component of a **composite** key under both INNER and LEFT; a correlated `EXISTS` /
+`NOT EXISTS` body key; a correlated scalar's key; a three-relation spine so the DP reorders
+around the NULL-bearing relation; and a join with the NULL-bearing derived relation on
+**both** sides. All 15 agree with SQLite in both optimizer modes, including the three-valued
+splits (`NOT IN` over a NULL-bearing body -> 0; `NOT EXISTS` over the same -> 10).
+
+This also re-runs, on a live plan, the shape queued as
+`VecDerivedNode::nextChunk` forwarding its child's chunk pointer: two derived relations on
+the two sides of one join (`(NB) x JOIN (NB) y ON x.k = y.k`) returns the right answer,
+because the two are separate `VecDerivedNode`s over separate subplans — a plan tree cannot
+route one node's output to two consumers. **Not worse than recorded**; if anything this is
+evidence the reachable-plan hunt should stop.
+
+#### C3-2 — the predicate/residual split at depth (12 shapes, all agree three ways)
+
+Aimed at "dropped, applied twice, or applied on the wrong side": a `LEFT` join's ON residual
+in the middle of a spine; the same with a WHERE conjunct on the null-supplying side (which
+must NOT be pushed below the join, and must turn the LEFT into an INNER at the WHERE, not at
+the ON); an INNER residual on a three-relation spine (lifted into WHERE, then pushed back
+down by `distribute`); a residual **spanning two relations** on three- and four-relation
+spines (so it must stay above the tree while the DP reorders underneath it); a residual
+referencing both sides of a `LEFT` join; a semi join over a three-relation spine that also
+carries residuals; an anti join over a LEFT-joined spine; a `LEFT` join sealed inside a semi
+join's body; a WHERE conjunct on the null-supplied side of a `LEFT` join at the end of a
+reordered spine; and two residuals plus a `GROUP BY`. No conjunct is dropped, duplicated or
+misplaced on any of them.
+
+#### C3-3 — semi/anti in a chain, and derived tables as join inputs (11 shapes + 3, all agree three ways)
+
+Two semi joins stacked; a semi and an anti stacked; semi + anti + correlated `EXISTS` on one
+three-relation spine; a semi join whose **body is itself a two- and a three-relation join**;
+composite keys across the derived boundary; derived relations on **both** sides with a
+composite key; an anti join whose body is a derived relation containing a `LEFT` join; and a
+four-relation spine carrying a derived input, a semi join, and a total `ORDER BY ... LIMIT`.
+
+#### C3-4 — join key types (the part of B3-2 that is CORRECT)
+
+`keyFieldText`'s numeric affinity is right and is right everywhere, not only where the
+Validator guards. `INT` key against an **integral DOUBLE** key matches, and matches SQLite,
+across a plain join (`ON l0.driver_id = x.ad` where `ad = AVG(driver_id)` -> 500 = SQLite),
+inside a **composite** key alongside an INT component, and through the `IN` lowering
+(`l0.driver_id IN (SELECT AVG(ld.driver_id) ... GROUP BY ld.driver_id)` -> 500 = SQLite).
+The `int_keys` SIMD gate (`vectorized_plan_builder.cc:555-558`) independently requires
+`TypeId::INT` on both resolved key columns, so nothing ill-typed can reach the flat int64
+buffer; B3-2's exposure is confined to the text-hash path.
+
+#### C3-5 — the exact boundary of B3-1, established by negative shapes
+
+Not every reordering diverges, and knowing which do is what a regression entry needs.
+On `catalog.json` the DP reorders a three-relation spine to `order=laps@0,drivers@2,laps@1`
+(`cost=41854 (written=59788)`) and the two legs still agree — because `laps@0` stays leftmost,
+so the leading (and here unique) tie-break column `lap_id` is unchanged. **B3-1 fires exactly
+when the DP changes which columns lead the merged schema**, i.e. when the leftmost relation
+moves, which is what `order=customer@1,...` does on the TPC-H shape and what
+`order=laps@0,...` does not do on the f1 ones. A regression entry for B3-1 therefore cannot be
+written against either f1 catalog with the shapes those catalogs support; it needs
+`data/tpch/sf0.01` (or a catalog where the cheapest leading relation is not the written one).
+
+#### C3-6 — B3-1 is not confined to the `LIMIT` cut
+
+Dropping the `LIMIT` from the TPC-H shape leaves the *ordering of the whole result* different
+between the two legs — the first five rows are the same five that differed under `LIMIT 5`.
+For a query that wrote an explicit `ORDER BY`, that is the ordering the tie-break exists to
+make reproducible, so the defect is one step wider than "which rows survive the cut".
+
+---
+
+## Summary
+
+| Severity | Count | IDs |
+|---|---|---|
+| BLOCKER | 2 | B3-1, B3-2 |
+| HIGH | 0 | — |
+| MEDIUM | 3 | B-2, B-3, B-5 (all carried from pass 2, all re-verified, severity agreed) |
+| LOW | 1 | B-1 (carried from pass 2, still open) |
+
+**Part A.** Three of fix round 2's four changes leave pass 2's clean verdict intact, and I
+checked each against the join chain rather than in isolation: the scan-schema narrowing
+touches no join-side consumer (12 shapes x 4 legs, and the loader's field-count refusal is
+what keeps `narrowRows` in bounds); `reachesOutsideThisBody` cannot hide a real correlation
+from join-key selection, because an outer `ColumnRef` produces its `-1` through a branch the
+suppression does not touch (8 shapes, three ways); and `hidden` is read in exactly three
+places, none of them in join planning, while `rebuild` copies whole `ColumnDef`s so a
+`$scalarN` column cannot become visible by being reordered (6 shapes, three ways, column
+counts matched to SQLite).
+
+The fourth — the deterministic tie-break — is where the pass stops being clean.
+
+**Part B.** 240 randomized oracle shapes plus 41 hand-built ones across NULL keys, the
+predicate/residual split, semi/anti chains, derived boundaries and key types found no third
+defect. The two that are here were both found the same way, and it is the way the prompt's
+standing rule predicts: **a guard or a precondition was written for the world as it stood, the
+join chain then grew a new producer, and the guard's text was not swept.**
+
+- **B3-1**: `sort_comparator.h` states its precondition as "the sort's INPUT row must be the
+  same in every mode". The join spine makes it the same *set* and a different *sequence*, and
+  the tie-break reads sequence as data. `optimized != --no-optimize` on `LIMIT` over a
+  reordered join, and 1115 vs 0 in the answer column once a scalar subquery carries it.
+- **B3-2**: Week 29's STRING-vs-numeric join-key refusal was written into
+  `Validator::validate`'s `stmt.joins` loop. Three more `JoinKey` producers shipped in Weeks
+  32–34 and none is covered, so `IN`, `NOT IN`, correlated `EXISTS`/`NOT EXISTS` and the
+  correlated-scalar rewrite all half-match, silently, against SQLite — in both directions,
+  since the `NOT` forms return the complement.
+
+**Verdict: the join chain's seam is NOT clean. Two blockers, both silent, both from the same
+failure mode — a correctness rule stated for one producer while the chain quietly grew three
+more — and the audit does not end here.**
+
