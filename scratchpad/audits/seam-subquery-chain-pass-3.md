@@ -509,3 +509,205 @@ remaining clone sites are ON residuals (subqueries refused in `ON`) and the
 Binder's select-list alias substitution (subqueries refused in `SELECT`), both
 closed by the Validator. So one of the three identical `use_count() > 1` guards
 fires and two cannot — pass 2's B-5 shape, two more instances.
+
+### B-2 — LOW. `SuppressNestedCorrelation`'s comment justifies its RAII with a
+hazard that does not exist, and states a fact about `forEachSubquery` that is
+false.
+
+`subquery_decorrelation.cc:76-83`:
+
+> `correlated` is live data — the body's own lowering passes route on it, and
+> **forEachSubquery descends into nested BODIES, which are held by a shared_ptr
+> and may be reachable from another expression** — so a throw that skipped the
+> restore would leave a shared tree silently mis-flagged.
+
+Both halves of the emphasised clause are wrong:
+
+1. **`forEachSubquery` does not descend into bodies.** Its `SubqueryExpr` case
+   visits `sq->operand`, calls `fn(expr)` and `return`s
+   (`subquery_materialization.cc:43-49`) — it never touches `sq->subquery`.
+   Pass 1's own routing analysis says so explicitly and relies on it ("a
+   surviving correlated IN's body is not re-entered by the scalar pass").
+2. **A shared body cannot carry a mis-flagged `correlated`.** The flag lives on
+   `SubqueryExpr` (`ast.h:196`), not on the shared `SelectStatement`
+   (`ast.h:191`), and `cloneExpr` builds a NEW `SubqueryExpr` with its own copy
+   of the flag while sharing the body. Two expressions naming one statement hold
+   two independent flags, so clearing one is unobservable through the other.
+
+The RAII destructor is still the right construction and the fix is still sound —
+the reach argument that *does* hold is the one in A3 above (site 19 and site 8
+enumerate the same container subtypes, so the suppression covers exactly the
+nodes `collectSlots` will consult, and nothing else runs inside the window).
+But the comment's stated reason is not that argument, and a reader who *uses*
+the claim — "forEachSubquery reaches nested bodies" — will draw a wrong
+conclusion somewhere else. That is the same class as pass 2's B-4
+(`development.md` asserting a deleted refusal) and round 1's L-8, in a comment
+written by the fix that closed B-3.
+
+Concretely checkable rather than argued: `grep -n "sq->subquery"
+src/planner/subquery_materialization.cc` returns nothing inside
+`forEachSubquery`.
+
+### B-3 — LOW. B-3's fix opened a new refusal class, and neither `README.md` nor
+`development.md` lists it.
+
+Two shapes now reach `no equality links the {scalar,} subquery to the enclosing
+query` that previously could not reach it — the correlation runs **only** through
+a nested subquery, so the node is `correlated` but `splitCorrelation`, correctly
+suppressing the nested flag, produces no key:
+
+```
+SELECT COUNT(*) FROM laps l WHERE l.speed > (SELECT AVG(l2.speed) FROM laps l2
+  WHERE EXISTS (SELECT 1 FROM laps l3 WHERE l3.driver_id = l.driver_id))
+  -> refused;  SQLite answers 4997
+
+SELECT COUNT(*) FROM drivers d WHERE EXISTS (SELECT 1 FROM laps l
+  WHERE EXISTS (SELECT 1 FROM laps l3 WHERE l3.driver_id = d.driver_id))
+  -> refused;  SQLite answers 20
+```
+
+`README.md:108` enumerates what decorrelation refuses — "a body with GROUP BY /
+HAVING / an aggregate / LIMIT / DISTINCT, a correlated inequality, a correlated
+equality with a computed side, **a reference more than one block out**, or an
+EXISTS that is not a whole top-level WHERE conjunct". A body with *no*
+correlated equality of its own is not in that list, and after B-3 it is a class a
+user can write without writing anything odd. The refusal message is accurate and
+the divergence is honest; what is missing is one clause in the table, beside the
+depth clause that came from the same fix. Neither shape is pinned in any suite.
+
+### B-4 — LOW / coverage. The `NOT IN` NULL hole is real but narrower than
+recorded, and nothing behind it is wrong.
+
+See the NULL section above. `WEEK32_SEMI_JOIN_VEC_ONLY` now holds three
+LEFT-JOIN-manufactured NULL entries (all-NULL body, NULL outer operand, and the
+`IN` polarity), so pass 2's "17 entries and not one has a NULL" no longer
+describes this tree. The one case still unrepresented is a **mixed** body — one
+NULL beside real keys — which is what separates "the flag is set when the build
+side is entirely unmatchable" from "the flag is set when any key is
+unmatchable". I ran it by both NULL routes and it is correct (0, where dropping
+the NULL would give 16 by the expression route and 15 by the join route, and
+where the counterfactual with the NULL filtered out does give 15). One
+one-line entry closes it.
+
+---
+
+## What else was probed and found correct
+
+Recorded so a fourth pass does not re-derive it. All against SQLite, `col-vec`,
+and where the query runs, `--no-optimize` agrees byte-for-byte in every case.
+(`--storage row --execution vectorized` is not a mode — the CLI refuses it —
+and both Volcano modes refuse this whole seam, so `col-vec` optimized vs
+`--no-optimize` is the entire mode matrix here. As pass 2 recorded, that
+agreement proves nothing about this seam: all three lowerings run in both legs.)
+
+- **Position.** A correlated scalar under an `OR` (6214 = SQLite, a partial row
+  set rather than pass 1's all-rows probe), inside a `CASE` in the `WHERE`
+  (4994), on the LEFT of its comparison (4994), and compared against a bare
+  LITERAL with no outer column in the predicate (20). A general `NOT (pred)` is
+  a parse error in this dialect — unrelated to this seam.
+- **Pass-1 F1's shape, now legal.** `l.driver_id = d.driver_id AND l.driver_id =
+  d.age` — two correlated equalities on the same body column — answers 20 =
+  SQLite instead of the old `column 'driver_id' is produced twice`. The `$kN`
+  rename closed it.
+- **Two independent correlation keys** (`driver_id AND season`, 623 = SQLite).
+- **Lowerings composed in one block.** Correlated `EXISTS` + correlated scalar
+  (20), uncorrelated `IN` + correlated scalar (20), correlated `NOT EXISTS` +
+  correlated scalar (9 — discriminating). The semi/anti joins add no range-table
+  slot, so the scalar lowering's `derived_slot = joins.size() + 1 + n` stays
+  disjoint from every user relation.
+- **The W34xW35 joint** in five shapes: a correlated scalar inside a derived
+  body (FROM and JOIN positions), a correlated EXISTS inside a derived body,
+  derived-inside-derived with a star at both levels, and a star body read
+  column-by-name from outside.
+- **Sideways references.** Both LATERAL halves refuse as `WEEK34_DERIVED_REFUSED`
+  pins them: at top level `unknown table qualifier: 'l'` (SQLite also errors),
+  and one block in `derived table 'x': a subquery in FROM cannot reference a
+  column of an enclosing query (LATERAL is not supported)` (SQLite answers
+  10000, a recorded divergence). `Binder::relationSchema` binds a derived body
+  against `parent`, never `&scope`, and refuses on the returned correlated flag
+  — so a derived body correlated to ANY enclosing block is refused, which is
+  what keeps a level-2 reference from entering through a derived table.
+- **The new SEAM2 coverage is not vacuous.** `SEAM2_STAR_OVER_LOWERED_SUBQUERY`
+  uses deliberately partial row sets and carries immunity locks for the three
+  lowerings that never had B-1's hole, and its Volcano counterpart picks its
+  needle per query by guard-ordering rule (`_seam2_volcano_pin`) — the standard
+  B-1 above says the three older suites do not meet.
+  `SEAM2_CORRELATION_DEPTH_REFUSED`'s pin (`"more than one level out"`) occurs
+  at exactly one refusal in `src/`; I re-confirmed that with the message
+  reconstruction used for B-1.
+
+## Already recorded, re-confirmed, nothing worse than stated
+
+`development.md`'s "Unreachable with a correlated ref today" heading;
+`main.cc:475`'s `has_correlated_subquery` (still written in `binder.cc` and read
+nowhere); B-5.1 (dead EXISTS-HAVING guard) and B-5.2 (dead scalar-arity guard),
+both re-executed and still dead; `$kN` in `--explain` (still present, still
+cosmetic — `LogicalLeftJoin [team = $k0]`); `week-36-plan.md`'s half-run
+verification claim. None is worse than recorded. The one addition is the two
+extra unreachable `use_count() > 1` guards noted in the boundary table, which is
+B-5's class rather than a new one.
+
+---
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 0 | — |
+| **HIGH** | 0 | — |
+| **MEDIUM** | 0 | — |
+| **LOW** | 4 | B-1, B-2, B-3, B-4 |
+
+- **Part A: all four of pass 2's fixes are real and complete.**
+  - **B-1** — `hidden` has exactly three readers and three writers, no fourth
+    consumer exists in either the read or the whole-`ColumnDef`-copy direction,
+    nothing in `Schema`'s resolution consults it, and the other three lowerings
+    take `children[0]`'s schema so they never had the hole. Twelve star shapes
+    now match SQLite, including `DISTINCT *`, star-over-star, two synthetic
+    relations, and a star over a JOIN beside a synthetic relation.
+  - **B-2** — `agg_expr->alias.clear()` is narrow enough: `Expr::alias` has five
+    readers, two run in the Binder (before any planning), and the only one that
+    runs after the clear is `buildProjectSchema`, the site of the defect. All
+    six alias/wrapper forms answer 4994 and the plans are byte-identical within
+    their group.
+  - **B-3** — the suppression cannot leak. Its reach is *exactly*
+    `collectSlots`' reach (identical subtype dispatch, both stopping at a body),
+    the window contains one pure call so no re-entrancy or nested lowering is
+    possible, and a shared body cannot observe the flag because the flag is on
+    the node, not the statement.
+  - **The depth guard** — `!= 1` is right: level 0 cannot arrive (the
+    local/outer parting above filters it, and an unresolved id reports local),
+    so it is a pure depth test that cannot fire for a non-depth reason. Six
+    level-2 shapes are refused by name; every one-level shape I could construct
+    — including a self-join whose two sides share column names, a derived outer
+    relation, slot 2 of a three-way join, and three levels of one-level nesting
+    — runs and matches SQLite.
+- **Part B: no wrong answer, no unsound refusal.** ~90 constructed queries
+  across star expansion, nesting and depth, NULL semantics in six operators,
+  cardinality, position, and the whole refusal boundary. Every one either
+  matches SQLite or refuses by name with the message that owns the cause.
+  - **B-1 (LOW)** — five rejection entries in three suites pin a needle several
+    messages satisfy; one suite's stated purpose (tell a real diagnostic from an
+    internal-defect message) is something its own pin cannot do, and the rule is
+    written out twelve lines above it. Concrete wrong-guard queries given for
+    each. Same class as pass 2's B-6; five more instances.
+  - **B-2 (LOW)** — the comment that justifies B-3's RAII asserts that
+    `forEachSubquery` descends into nested bodies (it does not) and that a shared
+    body could carry a mis-flagged `correlated` (it cannot). Construction right,
+    reason false.
+  - **B-3 (LOW)** — B-3's fix opened a new refusal class ("correlated only
+    through a nested subquery") that is in neither `README.md`'s refusal table
+    nor any suite.
+  - **B-4 (LOW / coverage)** — the `NOT IN`-with-a-NULL hole is narrower than
+    pass 2 recorded (three LEFT-JOIN NULL entries are in the tree now); the
+    remaining gap is the mixed body, and the behaviour behind it is correct in
+    every shape by both NULL routes.
+
+**Verdict: the seam is clean.** No blocker, no high, no medium. Pass 2's blocker
+is closed by a mechanism whose whole consumer set I enumerated rather than took
+on report, its two mediums are closed and their fixes hold under adversarial
+shapes, and the guard the fixes made load-bearing fires in six distinct states
+and refuses nothing it should admit. The four remaining items are one test-pin
+weakness, one false comment, one missing README clause and one missing oracle
+entry — none of them changes an answer, and none of them needs the engine
+touched.
