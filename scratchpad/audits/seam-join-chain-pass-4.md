@@ -498,3 +498,154 @@ Whichever is chosen, the carve-out paragraph (`predicate_pushdown.cc:377-404`) m
 swept: its list of what `inferExprType` decides is the load-bearing claim, it is enumerated
 rather than derived, and this is the second time in two rounds that an enumerated list in
 this file has been short.
+
+---
+
+### A.4 — predicate pushdown into derived bodies, and the `firstMayRaise` precondition — **the ENTRY rule holds; the DESCENT rule and the screen's carve-out are P4-B1 and P4-B2**
+
+#### A.4.1 the ENTRY rule (FILTER over DERIVED) — CLEAN, and its stated reason is the right one
+
+`pushIntoDerived` attaches the surviving conjuncts directly above the BODY's ROOT
+(`predicate_pushdown.cc:670-673`), and the claim that this is safe for any body shape is
+correct for a reason that can be checked: `derivedRelationSchema` renames and re-stamps and
+does nothing else (`logical_plan.cc:480-513`), so the body root's rows ARE the relation's
+rows, and σ at that point is σ at the relation. In particular the filter lands ABOVE the
+body's `LIMIT` / `DISTINCT` / `AGGREGATE`, never below, which is what a body-shape argument
+has to deliver. Measured:
+
+| body shape | optimized | --no-optimize |
+|---|---|---|
+| `ORDER BY … LIMIT 10`, outer `WHERE x.lap_id < 5` | 4 | 4 |
+| `SELECT DISTINCT`, outer `WHERE x.t = 'Ferrari'` | 1 | 1 |
+| `GROUP BY … HAVING`, outer `WHERE x.t = 'Ferrari'` | 1 | 1 |
+
+Ten further shapes across the derived boundary agree with SQLite on both legs: a body that
+is a `LEFT JOIN` with the filter on the null-supplied column and with `IS NULL` on it; the
+same body as a JOIN INPUT; a derived body inside a semi-join body and inside an anti-join
+body; `NOT IN` and `NOT EXISTS` over a NULL-bearing derived body (0 and 18 respectively —
+the three-valued split, right in both directions); a residual spanning two relations over a
+3-relation spine carrying a derived input; and a semi join over a spine that also carries
+one. `remapOntoDerivedBody`'s all-or-nothing rewrite leaves a declined conjunct
+byte-identical, so nothing is dropped or doubled: `entering` and `staying` partition the
+conjunct list and `filterOnto` re-attaches `staying` above the relation.
+
+The `pushdown=skipped (…)` stamp is a genuine improvement on the silent decline it replaces,
+and its two reason strings are the two the code can actually produce.
+
+#### A.4.2 the DESCENT rule (FILTER over PROJECT) — **BLOCKER P4-B1**, above
+
+Its precondition — "every named column is a plain passthrough" — is a SET-equivalence
+condition and the pass needs an ERROR-behaviour condition as well. `remapThroughProject`
+inspects only the project expressions the conjunct NAMES; the sibling expressions are the
+ones whose row count changes.
+
+#### A.4.3 the `firstMayRaise` precondition itself — sound as stated, and its stated scope is now short
+
+The core argument is correct and I could not break it: AND over TOTAL conjuncts is
+commutative under 3VL (a filter keeps only TRUE), so the survivor set entering position k
+depends on the SET of the conjuncts before it; and σ_p(R⋈S) ≡ σ_p(R)⋈S for an inner join,
+and σ_p(R)⟕S ≡ σ_p(R⟕S) on the preserved side, which is the only side `distribute` pushes
+to. The index bookkeeping is right where it is easy to get wrong:
+
+* `pushIntoJoin` re-sorts the leftover buckets back into WRITTEN index order before
+  `filterOnto` (`predicate_pushdown.cc:599-605`), so a leftover can never land after a
+  frozen conjunct — the case the comment names;
+* every downstream `orderByWork` re-derives `firstMayRaise` on the list it is actually
+  given, so a frozen conjunct that changed index (because an earlier one was pushed away)
+  still freezes the right suffix;
+* `mayRaise`'s dispatch defaults to `true` for an unrecognised `Expr` subtype, which is the
+  safe direction, and screens every CASE arm rather than the taken one.
+
+Three carve-out members were checked live rather than believed: `SUBSTRING` with literal
+start/length is refused at plan time in every out-of-range form I could write
+(`SUBSTRING(team, 0, 2)`, `(team, -1, 2)`, `(team, 1, 0-1)`), integer division by zero
+yields NULL, and an `InExpr`'s list is `std::vector<Value>` (`ast.h:108-112`) so it holds no
+expression that could raise — `mayRaise(in->operand)` really is the whole obligation there.
+
+The fourth member is where it breaks: the carve-out asserts `inferExprType` decides *every*
+type error at plan time and it does not decide a COMPARISON. See **P4-B2**.
+
+**The stated scope is also short in a second, non-behavioural way.** The precondition
+paragraph enumerates the moves it governs as "freely permuting a prefix of TOTAL conjuncts"
+and "pushing any of them below an inner join". `pushIntoDerived` (entry) and the
+FILTER-over-PROJECT descent are two more moves, added in the same round, and neither appears
+in the paragraph. Sweeping that is part of P4-B1's fix; recorded here so the two are not
+treated as separate chores.
+
+#### A.4.4 an honest caveat on P4-B1's proposed fix
+
+"Decline the descent when any project expression `mayRaise`" is sound but **not** free, and
+the difference from the conjunct case matters. `mayRaise` screens arithmetic by OPERATOR,
+so `l.speed * 2 AS v` — DOUBLE arithmetic, which cannot overflow — answers "may raise". The
+screen's own comment accepts that conservatism on the ground that "post-folding an
+arithmetic conjunct in a WHERE is rare"; a computed column in a derived body's SELECT LIST
+is not rare, and measured live it is exactly the shape B3-3's 9.4x was claimed on:
+
+    SELECT COUNT(*) FROM (SELECT l.driver_id AS k, l.speed * 2 AS v FROM laps l) x
+    WHERE x.v > 600 AND x.k < 5
+      LogicalDerived [x, 2 columns]
+        LogicalFilter [(v > 600)]          <- declines the descent (computed column)
+          LogicalProject [k, v]
+            LogicalFilter [(l.driver_id < 5)]   <- descended: this is what would be lost
+              LogicalScan [laps, 2 columns]
+
+So the fixer has a real choice to make rather than a mechanical edit: accept the loss on
+DOUBLE-arithmetic bodies, or make the projection screen type-aware (DOUBLE `+ - * /` cannot
+overflow, which the schema at that point does supply). Recorded rather than decided here —
+but the unsafe status quo is not one of the three options.
+
+---
+
+### A.5 — the standing sweep, run over the guards fix round 3 changed
+
+The rule: when a refusal, guard or invariant changes, every comment, precondition,
+assertion and header citing it must be swept. Checked, guard by guard.
+
+**SWEPT and correct.** `sort_comparator.h`'s precondition paragraph is rewritten around
+column identity (one imprecision, P4-L1). `join_enumeration.cc`'s `rebuild` comment now
+draws the materialized-order / comparison-order distinction and tells a future consumer
+which one it may rely on. `join_enumeration.h:75` no longer asserts the retracted
+`max(l, r)` paragraph and dates the `hasSlotOutsideRangeTable` name explicitly — pass 2's
+B-5 and the third copy the prompt names are both closed. `validator.h:15-40` states the
+four-producer containment accurately, including WHY the check cannot live at the producers
+(`semantics` is set after construction) and why the AST loop survives.
+`subquery_lowering.h:66` and `subquery_decorrelation.h:57` both point at the walk rather
+than claiming local coverage. `development.md:854` and the `PredicatePushdown` row carry
+the corrected text.
+
+**P4-L2 (LOW, carry-over — pass 2's B-1, still open after two fix rounds).** Three live
+source comments still name `hasSlotOutsideRangeTable`, a function that has not existed since
+`18af84f`, and one `development.md` row still asserts the behaviour that commit reversed:
+
+* `src/planner/join_enumeration.cc:585` — "DEAD since Week 30: hasSlotOutsideRangeTable
+  declines the whole tree" (the *fact* is right; the name is not);
+* `src/planner/cardinality_estimator.cc:464` — "JoinEnumeration also declines these trees —
+  hasSlotOutsideRangeTable fires on join_slot == -1";
+* `src/planner/cardinality_estimator.cc:513` — "(hasSlotOutsideRangeTable declines the tree
+  on join_slot -1)";
+* `development.md:808` — "**Level-agnostic, and now LIVE.** … **The decline is silent**, in
+  the same shape as the <3-relation one — there was no ordering decision to report".
+
+The last one is the one that matters: it is a live row of the consumer table whose stated
+purpose is to be the audit trail, it asserts the opposite of what the code does, and
+`development.md:854` — a row in the SAME file — states the correction. A reader who finds
+808 first is told the decline is silent and that no ordering decision was available; both
+halves are false, and the second is the premise P4-M1 turns on. `join_enumeration.h:75`
+shows the right way to do it (name the function, date the name), so the pattern to copy is
+already in the tree.
+
+**P4-L3 (LOW, and it is the surface a reader consults first).**
+`predicate_pushdown.h:20-36` WAS swept for this round and overshoots. It enumerates the
+moves as three —
+
+> MOVING a conjunct — reordering it inside one filter OR pushing it below a join OR pushing
+> it into a derived body — decides whether the query ERRORS … **Every move this pass makes
+> is now screened**
+
+— and then states the guarantee absolutely. There is a fourth move (descending below the
+body's PROJECT), it is not in the list, and it is not screened (P4-B1); and the screen the
+sentence points at rests on a carve-out that is false for comparisons (P4-B2). The header
+is not stale relative to the `.cc`; it is a stronger claim than the `.cc` delivers, which is
+the failure mode this project has logged repeatedly under "a dead assertion reads as a
+guarantee and stops anyone looking". It must be corrected with P4-B1 and P4-B2, not after
+them.
