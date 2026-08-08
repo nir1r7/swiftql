@@ -1409,3 +1409,55 @@ TEST(VecPlanBuilder, SemiJoinWithAnOnResidualIsRefusedByTheBuilder) {
     EXPECT_THROW(VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat),
                  std::runtime_error);
 }
+
+// !! Week 37, seam-join-chain pass 2 finding B-4. `Lowering::lower` is the
+// wrapper that stamps estimated_rows onto every physical node, and its comment
+// claims it "stamps once for all [nine] cases". Week 34's DERIVED case was
+// added calling `lowerNode` — the INNER function — for its body, so the root of
+// every derived body's physical subtree was the one node in the plan that never
+// got stamped and printed no est= under --explain. It is visible unremarked in
+// 17bfcea's own pasted evidence, in the commit that claimed estimates now track
+// actuals on EVERY node of exactly this construct.
+//
+// Written as the exhaustive form on purpose, mirroring
+// Cardinality.EveryNodeEstimatedOnFullQuery: pinning the one node that was
+// blank would pass again the next time a tenth case is added the same way. This
+// asserts the invariant the comment states, so a future case that skips the
+// wrapper fails here rather than in a reader's eye.
+//
+// Established it fails without the fix by reverting only
+// vectorized_plan_builder.cc and rebuilding — the single-derived query reports
+// one unstamped node, the nested one reports two.
+TEST(VecPlanBuilder, EveryPhysicalNodeUnderADerivedBodyCarriesItsEstimate) {
+    Catalog cat(CATALOG);
+
+    auto allStamped = [](const std::string& sql, const Catalog& c) {
+        auto plan = buildVecOptimized(sql, c);
+        std::vector<const VecPlanNode*> unstamped;
+        std::function<void(const VecPlanNode*)> walk = [&](const VecPlanNode* n) {
+            if (n->estimated_rows < 0.0) unstamped.push_back(n);
+            for (const VecPlanNode* ch : n->children()) walk(ch);
+        };
+        walk(plan.get());
+        std::string names;
+        for (const VecPlanNode* n : unstamped) names += "\n  " + n->explain();
+        return std::make_pair(unstamped.size(), names);
+    };
+
+    auto one = allStamped(
+        "SELECT d.t AS t FROM (SELECT team AS t FROM laps) AS d ORDER BY t LIMIT 5", cat);
+    EXPECT_EQ(one.first, 0u) << "unstamped physical nodes:" << one.second;
+
+    // nested: the defect is once per derived body, so two bodies means two
+    auto two = allStamped(
+        "SELECT y.t AS t FROM (SELECT x.t AS t FROM (SELECT team AS t FROM laps) AS x) "
+        "AS y ORDER BY t LIMIT 3", cat);
+    EXPECT_EQ(two.first, 0u) << "unstamped physical nodes:" << two.second;
+
+    // ...and a derived body under a JOIN, the shape 17bfcea's evidence used
+    auto joined = allStamped(
+        "SELECT dr.name AS n, d.s AS s FROM (SELECT driver_id, AVG(speed) AS s "
+        "FROM laps GROUP BY driver_id) AS d JOIN drivers dr "
+        "ON d.driver_id = dr.driver_id ORDER BY n LIMIT 5", cat);
+    EXPECT_EQ(joined.first, 0u) << "unstamped physical nodes:" << joined.second;
+}

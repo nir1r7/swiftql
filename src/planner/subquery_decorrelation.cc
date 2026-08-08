@@ -370,6 +370,48 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             // slot IS body.select_list[0] and the move empties it.
             std::unique_ptr<Expr>* agg_slot = constantWrapperAggregateSlot(wrapper);
             auto agg_expr = std::move(*agg_slot);
+            // SEAM AUDIT pass 2 — B-2. DROP THE SELECT ALIAS before the
+            // aggregate is pushed back into the body's rewritten select list.
+            //
+            // `agg_name` below is derived from the aggregate NODE; the column
+            // the derived relation actually publishes is named by
+            // buildProjectSchema, which lets a SELECT alias override the
+            // canonical name (`if (!expr->alias.empty()) cols.back().name =
+            // ...`). Two derivations of one name, and they disagreed exactly
+            // when the alias sat on the node that gets moved — i.e. when the
+            // body is UNWRAPPED, so the select-list item IS the aggregate:
+            //
+            //   (SELECT AVG(l2.speed) AS a FROM laps l2 WHERE l2.team = l.team)
+            //     relation published [$k0, "a"], the substituted outer ref
+            //     looked for "AVG(l2.speed)" -> Error: column not found:
+            //     'AVG(l2.speed)', naming a column the user never wrote, for
+            //     legal SQL that SQLite answers.
+            //
+            // The WRAPPED form was unaffected and that asymmetry is the tell:
+            // there the alias rides on the BinaryExpr, which is lifted OUT of
+            // the body, so the bare aggregate moved into the select list never
+            // carried one. It also broke a claim the README and this file's
+            // oracle both rest on — that the wrapped and constant-outside forms
+            // produce the SAME plan. With an alias they did not: one planned and
+            // one did not. Clearing it here restores that, and the two forms are
+            // now byte-identical under --explain WITH an alias as well as
+            // without.
+            //
+            // Dropping it loses nothing. A scalar subquery has no name in SQL —
+            // its body's output column is never addressable from outside — so
+            // the alias was already unobservable; it was only ever a second,
+            // divergent source for an internal name. This is the same cure the
+            // correlation keys got in 8a23b9d ($kN, generated at one point and
+            // consumed at one point), applied to the one remaining column of
+            // this relation that still resolved by a name derived twice.
+            //
+            // Cleared on the AGGREGATE only, deliberately. A wrapper's alias
+            // rides into the outer WHERE conjunct on the lifted expression,
+            // where it is inert: `alias` is read only by buildProjectSchema, for
+            // select-list items, and a subquery may only appear in WHERE or
+            // HAVING (the Validator's position rule). Clearing it too would be
+            // touching a thing that does nothing.
+            agg_expr->alias.clear();
             const auto* agg = static_cast<const AggregateExpr*>(agg_expr.get());
             const std::string agg_name = aggregateOutputName(agg);
             // !! COUNT IS THE EXCEPTION TO THE ZERO-ROW RULE, and getting this
