@@ -55,11 +55,23 @@ void VecProjectNode::prepare(){
         // requirement — and it costs nothing on the columns that are not armed,
         // which is all of them in almost every plan.
         //
-        // OBSERVABLE only, deliberately: UNRENDERED relaxes a magnitude bound
-        // that a compiled executor never reaches at all, because the branch
-        // above has already sent every type MISMATCH down the per-value path and
-        // a matching type performs no narrowing.
-        if (compiled_[c] && intNarrowing(c) == IntNarrowing::OBSERVABLE) {
+        // UNRENDERED is the one state that does NOT belong here, and the reason
+        // is that it relaxes a magnitude bound a compiled executor never reaches
+        // at all: the branch above has already sent every type MISMATCH down the
+        // per-value path, and a matching type performs no narrowing.
+        //
+        // The two VOLCANO_INT states DO belong here, and they are why this test
+        // is a list rather than one comparison. Their subject is a column whose
+        // declared type MATCHES what the executor produces — a DOUBLE holding
+        // the result of arithmetic that Volcano performs in INTEGER — so the
+        // mismatch branch above does not catch them and the executor would write
+        // its dense vector without ever appending a Value. `MAX(<mixed CASE>) *
+        // 987654321` is exactly that shape: compilable, type-correct, and a
+        // silent wrong answer (E-19). It costs the per-value path on the handful
+        // of columns the plan arms, and nothing on any other query.
+        if (compiled_[c] && (intNarrowing(c) == IntNarrowing::OBSERVABLE
+                             || intNarrowing(c) == IntNarrowing::VOLCANO_INT
+                             || intNarrowing(c) == IntNarrowing::VOLCANO_INT_UNRENDERED)) {
             compiled_[c].reset();
         }
         if (!compiled_[c]) needs_row_ = true;

@@ -6,7 +6,9 @@
 #include <stdexcept>
 #include <variant>
 #include <vector>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 
 
 // vectorized execution batch size
@@ -35,6 +37,16 @@ enum class IntNarrowing : uint8_t {
     // stored TYPE reaches a `/` whose other operand is also an INT. Refused
     // outright; see refuseObservableIntNarrowing.
     OBSERVABLE,
+    // The value arriving here is ALREADY A DOUBLE and Volcano computes it as an
+    // INT: the expression is `+ - *` (or `/`) over a column that was itself
+    // narrowed, so both operands are INTEGER in Volcano and REAL here. The two
+    // states above cannot see this — both are `if (v.type() != INT) return` by
+    // construction, and by this point the INT-ness is one node further down.
+    // Same two bounds, applied to the DOUBLE: VOLCANO_INT is the printed column
+    // (1e15, the %.15g cliff), VOLCANO_INT_UNRENDERED the one the plan proves is
+    // never printed (2^53, the value alone). See refuseDivergentVolcanoInt.
+    VOLCANO_INT,
+    VOLCANO_INT_UNRENDERED,
 };
 
 // one column of decoded, materialized data for batch
@@ -308,6 +320,74 @@ inline void refuseObservableIntNarrowing(const Value& v) {
         "(it does not run derived tables).");
 }
 
+// THE THIRD THING INT -> DOUBLE NARROWING DESTROYS, and it is the one the two
+// refusals above cannot see, because by the time it is observable the value is
+// no longer an INT.
+//
+// narrowToDoubleColumn asks its question of the value being STORED, and the
+// divergence it is guarding appears at the value being USED. `MAX` over a
+// mixed-type CASE keeps the argument's own Value, so Volcano holds the INT
+// 123456789 and this engine holds the double 123456789.0 — both below every
+// bound, both printing identically, no refusal on either side. Then one
+// ordinary multiplication:
+//
+//   SELECT MAX(CASE WHEN lap_id=1 THEN 123456789 ELSE 0.5 END) * 987654321
+//     Volcano, and SQLite   121932631112635269
+//     vectorized            1.21932631112635e+17     <- a SILENT WRONG ANSWER
+//
+// Seam audit pass 5, E-19, ranked BLOCKER: no error, no derived table, no
+// --no-optimize, no 15-digit literal, on the shipped catalog. The minimal form
+// is `+ 1`. The comment above (`Why '/' alone`) priced `+ - *` as safe on the
+// ground that "`x+1` is 8 either way" — a statement about the OPERAND, while the
+// %.15g cliff applies to the RESULT, and a single `*` moves a value from 1.2e8
+// to 1.2e17.
+//
+// So the test is asked HERE, of the result, and it is VALUE-driven exactly as
+// its two neighbours are — which is what keeps it from refusing the queries that
+// are right today. The plan marks a column VOLCANO_INT when it proves both
+// operands of the arithmetic are INTEGER in Volcano (taintWalk's `both`, with a
+// narrowed origin underneath); at that point Volcano's result is an exact
+// int64_t and ours is the double it rounds to, so:
+//
+//   |d| < the bound   the double IS that integer and prints as that integer, so
+//                     the two engines agree and nothing is refused. This is what
+//                     keeps `MAX(CASE WHEN c THEN 1 ELSE 0.5 END) + 1` = 2.
+//   |d| >= the bound  they disagree — in the TEXT from 1e15, in the VALUE from
+//                     2^53, and past INT64_MAX Volcano's checkedMul throws where
+//                     this engine answers. All three are refused, by one test.
+//
+// The one over-refusal is stated rather than hidden, and it is why the integral
+// test is here: when the CASE takes its REAL branch, Volcano's result is REAL
+// too and the engines agree at any magnitude. A non-integral double proves that
+// happened and is let through; a REAL branch that happens to hold an INTEGRAL
+// value at or above the bound is refused although it agrees. That needs a
+// per-row "was INT" bit to decide, which is a runtime type the column does not
+// carry — the same reason this rule exists at all.
+inline void refuseDivergentVolcanoInt(const Value& v, bool unrendered) {
+    // An INT Value here is narrowToDoubleColumn's subject, not this one's: it is
+    // applied to the same value straight after, with the same bound.
+    if (v.type() == TypeId::INT) return;
+    const double d = v.toNumeric();
+    const double bound = static_cast<double>(unrendered
+                                                 ? MAX_EXACT_INT_IN_DOUBLE_COLUMN
+                                                 : MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
+    if (d < bound && d > -bound) return;          // agrees; the fast path
+    // NaN and infinity fail both compares above and are not integral, so they
+    // fall out here — they are genuine DOUBLEs and this rule is only about the
+    // integers Volcano would have produced.
+    if (!std::isfinite(d) || d != std::floor(d)) return;
+    char rendered[64];
+    std::snprintf(rendered, sizeof(rendered), "%.15g", d);
+    throw std::runtime_error(
+        "vectorized execution cannot compute this expression the way the Volcano "
+        "engine does: its operands are INTEGER there and REAL here, because a "
+        "column below it mixes INTEGER and REAL results (typically a CASE) and a "
+        "chunk column holds one type. The two agree while the result stays below "
+        + std::string(unrendered ? "2^53 (9007199254740992)" : "1e15")
+        + "; this one reached " + rendered
+        + ". Re-run with --execution volcano, or give the branches the same type.");
+}
+
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
 // narrows into a DOUBLE column through TWO refusals — refuseObservableIntNarrowing
 // (the value's TYPE is observable to a `/` whose other operand is also INT, at
@@ -353,9 +433,17 @@ inline void appendColumnValue(ColumnVector& cv, const Value& v) {
             // the path every ordinary DOUBLE cell takes.
             if (cv.int_narrowing == IntNarrowing::OBSERVABLE) {
                 refuseObservableIntNarrowing(v);
+            } else if (cv.int_narrowing == IntNarrowing::VOLCANO_INT
+                    || cv.int_narrowing == IntNarrowing::VOLCANO_INT_UNRENDERED) {
+                // The value here is already a DOUBLE and Volcano's is an exact
+                // integer; neither call below can see that, so this one asks.
+                refuseDivergentVolcanoInt(
+                    v, cv.int_narrowing == IntNarrowing::VOLCANO_INT_UNRENDERED);
             }
             std::get<std::vector<double>>(cv.data).push_back(
-                narrowToDoubleColumn(v, cv.int_narrowing == IntNarrowing::UNRENDERED));
+                narrowToDoubleColumn(
+                    v, cv.int_narrowing == IntNarrowing::UNRENDERED
+                    || cv.int_narrowing == IntNarrowing::VOLCANO_INT_UNRENDERED));
             break;
         case TypeId::STRING:
             std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;

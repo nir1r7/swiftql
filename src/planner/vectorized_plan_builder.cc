@@ -189,6 +189,15 @@ bool mayYieldInt(const Expr* e, const Schema& schema) {
 struct Taint {
     std::vector<IntOrigin> origins;
     bool may_be_int = false;
+    // True when this expression CONTAINS an arithmetic node that Volcano
+    // computes in INTEGER and this engine computes in DOUBLE — `both` operands
+    // INT in Volcano, with a narrowed origin underneath at least one of them.
+    // The RESULT of such a node is an exact int64_t there and the double it
+    // rounds to here, so the column it lands in has to be judged on the DOUBLE
+    // (IntNarrowing::VOLCANO_INT). This is the half of E-19 the origin sets
+    // cannot express: origins say "an INT Value can arrive at this column", and
+    // by the time the arithmetic has run the INT is one node further down.
+    bool int_arith = false;
 };
 
 // Walk one expression over the child's origin sets. Returns the origins whose
@@ -224,7 +233,7 @@ Taint taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
         return out;
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
-        return taintWalk(un->operand.get(), schema, in, armed);
+        return taintWalk(un->operand.get(), schema, in, armed);   // carries int_arith
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
         Taint l = taintWalk(bin->left.get(), schema, in, armed);
@@ -248,11 +257,19 @@ Taint taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
                 mergeOrigins(out.origins, l.origins);
                 mergeOrigins(out.origins, r.origins);
             }
+            // E-19. `both` is exactly "Volcano computes this node in INTEGER";
+            // an origin on either side is exactly "and this engine computes it
+            // in DOUBLE". When `both` is false the result is REAL in BOTH
+            // engines and nothing below it can be told apart any more, which is
+            // the same reason the origins are dropped there.
+            out.int_arith = both && (l.int_arith || r.int_arith
+                                     || !l.origins.empty() || !r.origins.empty());
             out.may_be_int = both;
             return out;
         }
         // comparison / AND / OR: the result is a boolean INT in both engines, so
-        // the taint stops here even though the operands carried it.
+        // the taint stops here even though the operands carried it — and so does
+        // int_arith, for the same reason.
         out.may_be_int = true;
         return out;
     }
@@ -283,11 +300,13 @@ Taint taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
             Taint br = taintWalk(w.result.get(), schema, in, armed);
             mergeOrigins(out.origins, br.origins);
             out.may_be_int = out.may_be_int || br.may_be_int;
+            out.int_arith = out.int_arith || br.int_arith;
         }
         if (c->else_expr) {
             Taint br = taintWalk(c->else_expr.get(), schema, in, armed);
             mergeOrigins(out.origins, br.origins);
             out.may_be_int = out.may_be_int || br.may_be_int;
+            out.int_arith = out.int_arith || br.int_arith;
         }
         return out;
     }
@@ -305,6 +324,12 @@ Taint taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
 struct Arming {
     IntNarrowingMap mask;
     std::vector<IntOrigin> all;
+    // Columns whose VALUE Volcano computes as an exact integer while this engine
+    // computes it in DOUBLE arithmetic (Taint::int_arith). They are also entered
+    // in `all`, so the RENDERED/UNRENDERED split below decides their bound
+    // exactly as it does for every other origin; build() then upgrades whichever
+    // of the two they landed in to its VOLCANO_INT twin. E-19.
+    std::vector<IntOrigin> volcano_int;
 };
 
 void markColumn(IntNarrowingMap& mask, const IntOrigin& o, IntNarrowing state) {
@@ -408,9 +433,12 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
                 if (c >= static_cast<int>(out.size())) break;
                 std::vector<IntOrigin> in_set;
                 bool own = false;
+                bool key_volcano_int = false;
                 if (g.expr) {
-                    in_set = taintWalk(g.expr.get(), cs, child, armed).origins;
+                    const Taint t = taintWalk(g.expr.get(), cs, child, armed);
+                    in_set = t.origins;
                     own = mayYieldInt(g.expr.get(), cs);
+                    key_volcano_int = t.int_arith;
                 } else {
                     int idx = g.id.isResolved() ? cs.indexOf(g.column_name, g.id.localSlot(
                                                       "vectorized int-observable group key"))
@@ -421,19 +449,27 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
                 out[c] = in_set;
                 // fillChunk appends the group key Value into a column declared
                 // from output_schema, so an expression key that returns INT
-                // reaches the same narrowing the aggregates do.
-                if (own && node->output_schema.column(c).type == TypeId::DOUBLE) {
+                // reaches the same narrowing the aggregates do — and an
+                // expression key that is INT ARITHMETIC over a narrowed column
+                // reaches E-19's, which is judged on the DOUBLE instead.
+                const bool key_double =
+                    node->output_schema.column(c).type == TypeId::DOUBLE;
+                if (key_double && (own || key_volcano_int)) {
                     mergeOrigins(out[c], newOrigin(node, c));
                 }
+                if (key_double && key_volcano_int) st.volcano_int.push_back({node, c});
                 ++c;
             }
             for (const AggregateSpec& spec : a->aggregates) {
                 if (c >= static_cast<int>(out.size())) break;
                 std::vector<IntOrigin> in_set;
                 bool arg_int = false;
+                bool arg_volcano_int = false;
                 if (spec.argument && spec.column.empty()) {
-                    in_set = taintWalk(spec.argument, cs, child, armed).origins;
+                    const Taint t = taintWalk(spec.argument, cs, child, armed);
+                    in_set = t.origins;
                     arg_int = mayYieldInt(spec.argument, cs);
+                    arg_volcano_int = t.int_arith;
                 } else if (!spec.is_star) {
                     int idx = spec.id.isResolved() ? cs.indexOf(spec.column, spec.id.localSlot(
                                                          "vectorized int-observable aggregate arg"))
@@ -450,9 +486,17 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
                 const bool order_stat = spec.function == "MIN" || spec.function == "MAX";
                 if (order_stat) {
                     out[c] = in_set;
-                    if (arg_int && node->output_schema.column(c).type == TypeId::DOUBLE) {
+                    // MIN/MAX return an element of the input domain, so an
+                    // argument that is INT ARITHMETIC over a narrowed column
+                    // makes this output column Volcano-INT for the same reason
+                    // its rows are (E-19) — `MAX(t.x * 2)`, where Volcano's max
+                    // is an exact int64_t and this engine's is the double.
+                    const bool agg_double =
+                        node->output_schema.column(c).type == TypeId::DOUBLE;
+                    if (agg_double && (arg_int || arg_volcano_int)) {
                         mergeOrigins(out[c], newOrigin(node, c));
                     }
+                    if (agg_double && arg_volcano_int) st.volcano_int.push_back({node, c});
                 }
                 ++c;
             }
@@ -469,15 +513,26 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
             OriginSets out(node->output_schema.size());
             for (int c = 0; c < static_cast<int>(p->exprs.size()); ++c) {
                 if (c >= static_cast<int>(out.size())) break;
-                out[c] = taintWalk(p->exprs[c].get(), cs, child, armed).origins;
+                const Taint t = taintWalk(p->exprs[c].get(), cs, child, armed);
+                out[c] = t.origins;
+                const bool declared_double =
+                    node->output_schema.column(c).type == TypeId::DOUBLE;
                 // This column is itself an origin when the type it DECLARES and
                 // the type it can RETURN disagree — a mixed CASE is the general
                 // route. A bare ColumnRef of a DOUBLE column is not: the value
                 // comes out of a DOUBLE ColumnVector already.
-                if (node->output_schema.column(c).type == TypeId::DOUBLE
-                    && mayYieldInt(p->exprs[c].get(), cs)) {
-                    mergeOrigins(out[c], newOrigin(node, c));
-                }
+                //
+                // `t.int_arith` is the SECOND way this column can disagree with
+                // Volcano, and it is not the same question: there the INT Value
+                // arrives here, here the INT has already been consumed by an
+                // arithmetic node whose Volcano result is an exact integer.
+                // Both make the column an origin — so the magnitude split below
+                // judges it — and the second one is recorded so build() can turn
+                // whichever bound it got into the DOUBLE-side test (E-19).
+                const bool yields_int = declared_double && mayYieldInt(p->exprs[c].get(), cs);
+                const bool volcano_int = declared_double && t.int_arith;
+                if (yields_int || volcano_int) mergeOrigins(out[c], newOrigin(node, c));
+                if (volcano_int) st.volcano_int.push_back({node, c});
             }
             armAll(armed);
             return out;
@@ -1242,6 +1297,34 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
             continue;   // the type rule already refuses every INT here
         }
         markColumn(arming.mask, o, IntNarrowing::UNRENDERED);
+    }
+
+    // E-19, and it runs LAST on purpose: the two loops above have just decided
+    // which magnitude bound each origin is judged by, and a Volcano-INT column
+    // needs the SAME bound applied to the DOUBLE it holds rather than to an INT
+    // it never receives. So this upgrades the state in place instead of
+    // computing the printed/not-printed question a second time.
+    //
+    // OBSERVABLE is left alone: it refuses every INT at any magnitude, which is
+    // strictly more than this rule asks for, and the origin that earned it sits
+    // BELOW this column and refuses first.
+    //
+    // Reads through markColumn's own default rather than off the map: RENDERED
+    // is what a column the loops above said nothing about IS, and they say
+    // nothing about a printed one — so an absent entry is a RENDERED column and
+    // not a column to skip.
+    for (const IntOrigin& o : arming.volcano_int) {
+        IntNarrowing state = IntNarrowing::RENDERED;
+        auto it = arming.mask.find(o.first);
+        if (it != arming.mask.end() && o.second >= 0
+            && o.second < static_cast<int>(it->second.size())) {
+            state = it->second[o.second];
+        }
+        if (state == IntNarrowing::RENDERED) {
+            markColumn(arming.mask, o, IntNarrowing::VOLCANO_INT);
+        } else if (state == IntNarrowing::UNRENDERED) {
+            markColumn(arming.mask, o, IntNarrowing::VOLCANO_INT_UNRENDERED);
+        }
     }
 
     Lowering lowering{columnar_tables, {}, catalog, arming.mask};
