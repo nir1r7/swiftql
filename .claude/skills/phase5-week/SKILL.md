@@ -82,6 +82,29 @@ hung, not thinking. Relaunch it — do not keep waiting. Give the replacement an
 budget and tell it to write its findings file even if it has to stop early: a partial audit
 that exists beats a complete one that never lands.
 
+**But probe for minutes, not seconds.** Transcript growth only appears when a message
+*completes*, so an agent composing a long final report looks exactly like a corpse. One went
+quiet for nearly six minutes and was very much alive; a 40-second probe would have had you kill
+and duplicate working agents. Three minutes of total silence is the threshold, and two agents
+falling silent in the *same second* is a kill event, not two independent finishes.
+
+**Resume a dead agent with `SendMessage`, don't relaunch it.** That restores its transcript,
+context and partial progress; a fresh `Agent` call starts from nothing and redoes finished work.
+Tell it what killed it, tell it to re-check its own state **on disk** rather than trusting its
+recollection, and tell it explicitly not to restart from the top.
+
+**"The container was restarted" is not always true — run `uptime` before believing it.** The
+harness reports a restart when it kills background shells, which also stops the agents owning
+them. If uptime is continuous, nothing rebooted: the worktree, build outputs and every
+uncommitted edit are still on disk, and **`git reset --hard` at that moment destroys live work**.
+It nearly took two files of an in-flight fix. Order after any restart notice: `uptime`, then
+`git status`, then **snapshot anything loose as `wip:`**, and only then consider a reset — and
+only once `git merge-base --is-ancestor HEAD origin/<branch>` confirms it can lose nothing.
+
+**Tell agents never to use background `until`/`sleep` waiter loops.** They are the first thing
+killed, they die silently, and an agent blocked on one cannot tell "still waiting" from "my
+waiter is gone". Foreground the command and let it block, or poll once per tool call.
+
 **Never read the agent's transcript file to do this.** It is full JSONL and reading it
 overflows exactly the context this skill exists to protect. The check is cheap probes only:
 
