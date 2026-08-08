@@ -407,6 +407,12 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         node = std::make_unique<HavingNode>(std::move(node), std::move(stmt.having));
     }
 
+    // Is the row order reaching a LIMIT a function of the query alone? See the
+    // deterministic-cut block at the bottom of this function. Captured HERE
+    // because the ORDER BY test below moves `stmt.order_by` out, and a
+    // moved-from vector is not a question worth asking.
+    bool order_is_plan_stable = (jc == nullptr) || !stmt.order_by.empty();
+
     // sort (ORDER BY) — must evaluate against pre-projection schema
     if (!stmt.order_by.empty()) {
         for (const auto& item : stmt.order_by) {
@@ -452,6 +458,25 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
     // limit
     if (stmt.limit.has_value()) {
+        // A CUT over a plan-dependent order is a plan-dependent ANSWER. The
+        // logical builder answers this with `orderIsPlanStable` over its tree
+        // (logical_plan.cc, and the reasoning is there); this path is a straight
+        // line whose only unstable node is the join, so the same question is a
+        // local fact. Everything else Volcano can build — the scan, the filter,
+        // the aggregate's first-encounter group order, HAVING, the projection,
+        // DISTINCT — is order-preserving over its input, and multi-way joins,
+        // derived tables and subqueries are all refused above.
+        //
+        // `stmt.order_by` non-empty already put a SortNode below the projection,
+        // and the shared comparator makes THAT order plan-independent, so the
+        // extra sort is for the no-ORDER-BY case only. The two engines must
+        // agree here or the fix is the same divergence with a new cause: a hash
+        // join's output is probe-major, and Volcano picks its build side from
+        // raw row counts while the vectorized builder picks it from post-pushdown
+        // estimates.
+        if (!order_is_plan_stable) {
+            node = std::make_unique<SortNode>(std::move(node), std::vector<OrderByItem>{});
+        }
         node = std::make_unique<LimitNode>(std::move(node), stmt.limit.value());
     }
 

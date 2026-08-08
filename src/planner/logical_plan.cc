@@ -816,6 +816,10 @@ std::string LogicalProject::explain() const {
 
 // LogicalSort
 std::string LogicalSort::explain() const {
+    // No declared keys = the deterministic cut a LIMIT over a plan-dependent
+    // order gets (deterministicCut, above): the comparator falls through to the
+    // canonical whole-row tie-break. Say so, rather than printing "[]".
+    if (order_by.empty()) return "LogicalSort [canonical row order]";
     std::string s = "LogicalSort [";
     for (size_t i = 0; i < order_by.size(); ++i) {
         if (i) s += ", ";
@@ -905,6 +909,80 @@ std::unique_ptr<LogicalPlanNode> buildRelation(TableRef& ref,
 
     return std::make_unique<LogicalDerived>(std::move(body_plan), ref.alias(),
                                             std::move(normalized));
+}
+
+// Is this subtree's OUTPUT ROW ORDER a function of the query alone, or of the
+// plan the optimizer happened to choose?
+//
+// Seam audit pass 3, engine E-8 / optimizer B3-1. A `LIMIT` is a CUT: it turns
+// its input's row ORDER into the answer's row SET, so a plan-dependent order
+// below a `LIMIT` is a plan-dependent ANSWER — and it is not merely "unspecified
+// SQL", because `materializeSubqueries` threads the optimize flag into the
+// nested runner, so the same cut inside a scalar subquery substitutes a
+// DIFFERENT CONSTANT into a query that has no order-dependence at all.
+//
+// Measured at HEAD before this: a plain `customer JOIN orders WHERE
+// o_orderstatus='F' AND o_orderpriority='1-URGENT' LIMIT 3` returned DISJOINT
+// row sets optimized vs `--no-optimize` (two ordinary conjuncts move orders'
+// estimate below customer's raw count, the build side flips, the probe order
+// reverses), and carried into a scalar subquery as `COUNT(*)` 11 vs 10.
+//
+// The two answers, per node kind:
+//
+//   SCAN      stable. Storage order, and the row and columnar legs reconstruct
+//             the same sequence.
+//   SORT      stable. That is what the comparator is for — total on
+//             distinguishable rows, and rows it leaves tied are equal in every
+//             column of its schema, so they project identically.
+//   JOIN      NOT stable, and this is the whole finding. A hash join emits
+//             probe-major; which side probes is a cost decision (and the two
+//             engines make it by different rules), and `JoinEnumeration` also
+//             permutes the spine. Semi/anti joins are `LogicalJoin` too and are
+//             treated the same rather than argued about.
+//   AGGREGATE / DISTINCT
+//             stable IFF the child is. Both engines emit groups and distinct
+//             representatives in FIRST-ENCOUNTER order (plan_nodes.cc's
+//             `group_order`, vec_hash_aggregate_node.cc's `group_order_`), which
+//             is a function of the input order and of nothing else.
+//   FILTER / PROJECT / LIMIT / DERIVED
+//             stable iff the child is — each is order-preserving row by row.
+bool orderIsPlanStable(const LogicalPlanNode* node) {
+    switch (node->type) {
+    case LogicalNodeType::SCAN:
+    case LogicalNodeType::SORT:
+        return true;
+    case LogicalNodeType::JOIN:
+        return false;
+    case LogicalNodeType::DERIVED:
+    case LogicalNodeType::FILTER:
+    case LogicalNodeType::AGGREGATE:
+    case LogicalNodeType::PROJECT:
+    case LogicalNodeType::DISTINCT:
+    case LogicalNodeType::LIMIT:
+        return orderIsPlanStable(node->children[0].get());
+    }
+    return false;
+}
+
+// Give a cut a determined input order, and only where it does not already have
+// one. A `LogicalSort` with NO declared keys is exactly that: `rowLess` falls
+// straight through to the canonical whole-row tie-break
+// (execution/sort_comparator.h), which is a function of the row's values and of
+// each column's `(relation_slot, name)` identity — nothing the optimizer can
+// permute. It is inserted directly beneath the `LIMIT`, i.e. ABOVE the
+// projection, so it orders the OUTPUT row: fewer columns to compare, and the
+// projected schema's own order is a function of the SELECT list.
+//
+// WHAT THIS DELIBERATELY CHANGES. `LIMIT n` with no `ORDER BY` over a join now
+// returns the n canonically-smallest output rows rather than the first n the
+// plan happened to produce. SQL specifies neither; the project asserts
+// `optimized == --no-optimize` and cross-engine agreement, and only one of the
+// two can be had. SQLite's own arbitrary choice is a third answer again, which
+// is why compare_against_sqlite.py's `run_engine_agreement_suite` already says
+// "SQLite cannot adjudicate a tie at a LIMIT cut".
+std::unique_ptr<LogicalPlanNode> deterministicCut(std::unique_ptr<LogicalPlanNode> node) {
+    if (orderIsPlanStable(node.get())) return node;
+    return std::make_unique<LogicalSort>(std::move(node), std::vector<OrderByItem>{});
 }
 
 } // namespace
@@ -1129,8 +1207,9 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         node = std::make_unique<LogicalDistinct>(std::move(node));
     }
 
-    // limit
+    // limit — over a determined input order; see deterministicCut above
     if (stmt.limit.has_value()) {
+        node = deterministicCut(std::move(node));
         node = std::make_unique<LogicalLimit>(std::move(node), stmt.limit.value());
     }
 

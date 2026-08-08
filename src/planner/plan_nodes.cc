@@ -552,6 +552,7 @@ const Schema& SortNode::outputSchema() const {
 }
 
 std::string SortNode::explain() const {
+    if (order_by_.empty()) return "Sort [canonical row order]";
     std::string s = "Sort [";
     for (size_t i = 0; i < order_by_.size(); ++i) {
         if (i) s += ", ";

@@ -99,6 +99,7 @@ const Schema& VecSortNode::outputSchema() const {
 }
 
 std::string VecSortNode::explain() const {
+    if (order_by_.empty()) return "VecSort [canonical row order] (materialize)";
     std::string s = "VecSort [";
     for (size_t i = 0; i < order_by_.size(); ++i) {
         if (i) s += ", ";
