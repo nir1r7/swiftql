@@ -1170,6 +1170,260 @@ def run_explain_estimate_format():
 
 
 
+# ─── Week 37 / seam pass 3 B3-1: the tie that straddles the LIMIT cut ───────
+#
+# WHY THIS BLOCK EXISTS. Three independent auditors found a blocker in the join
+# order DP — `JoinEnumeration::rebuild` builds the merged join schema in the
+# CHOSEN order, the sort tie-break in `src/execution/sort_comparator.h` compares
+# the row POSITIONALLY in schema order, so the two legs impose two different
+# total orders on rows the declared keys leave tied — and every gate stayed green
+# through it. This block is why it can be seen.
+#
+# WHAT THE CLAIM "no oracle query reaches join enumeration" GOT WRONG, checked
+# rather than inherited. `catalog.json` has two tables, and `reorder` declines
+# below MIN_ENUMERATED_RELATIONS = 3 (join_enumeration.h:99). But a SELF-JOIN is
+# three RELATIONS over two TABLES, and WEEK27/WEEK28_QUERIES are full of them:
+# `--explain` on w28_nonzero_leftmost_projection prints
+# `order=drivers@1,drivers@2,laps@0 cost=1692 (written=2045) method=dp`. The DP
+# has been running against the oracle catalog since Week 28. A THIRD TABLE WAS
+# NOT WHAT WAS MISSING and none is added — see the note at the end of this block.
+#
+# What was missing is the DEFECT SHAPE, which needs four things at once, all of
+# which the existing 3-relation entries have three of:
+#
+#   (1) >= 3 relations, so the DP runs at all;
+#   (2) the DP actually PICKS a different order (`order=` != written) — proved
+#       per entry by run_join_order_steering's sibling assertion, and visible in
+#       `--explain`;
+#   (3) the sort sits DIRECTLY above that join — no GROUP BY in between, because
+#       `buildAggregateSchema`'s column order is a function of the query, not of
+#       the plan, and immunises everything above it;
+#   (4) the ORDER BY is NOT a total order on the surviving columns, and the tie
+#       is MATERIAL — the tied rows differ in some other projected column.
+#
+# (4) is the part a fixture has to earn, so: WHY THIS DATA PRODUCES MATERIAL
+# TIES. `data/laps.csv` is 10000 rows over 20 drivers; `season` takes 4 distinct
+# values and `round` about 24, so any prefix of laps has thousands of rows per
+# season and hundreds per round, and those rows carry DIFFERENT lap_id, speed and
+# sector values. `drivers.csv` is 20 rows over 8 teams, so `team` and
+# `nationality` repeat 2-3x with different name/age beside them. Every ORDER BY
+# key below is one of those columns, and every projection carries at least one
+# column that differs across the tie — so which tied row survives the cut is
+# OBSERVABLE, which is the whole point. A tie whose rows are identical in every
+# projected column is an "immaterial tie" and cannot fail this check no matter
+# how broken the comparator is.
+#
+# THESE ARE INVARIANT-ONLY, NOT SQLITE-ORACLE ENTRIES, and that is a real
+# limitation rather than a convenience. `ORDER BY <non-unique> LIMIT n` has no
+# single correct answer in SQL — SQLite picks a tied row by its own plan, SwiftQL
+# picks one by the tie-break rule it declares. Diffing them would fail for a
+# reason that is not a bug. What IS assertable, and is what the project asserts
+# (sort_comparator.h: "The project asserts optimized == --no-optimize, so that is
+# a defect even though every one of those answers is legal SQL"), is that
+# SwiftQL's own answer must not depend on which passes ran. So these go to
+# run_optimizer_invariant and nowhere else.
+#
+# Vectorized-only for the standing Week 27 reason: Volcano refuses multi-way
+# joins outright, in both legs.
+TIE_STRADDLE_QUERIES = [
+    # ── shape 1: ORDER BY a non-unique key, LIMIT cuts inside the tie ────────
+    # The canonical B3-1 repro on the oracle catalog. `l.season` ties across
+    # every row of the lap_id<100 prefix that shares a season; LIMIT 5 cuts
+    # inside the 2022 group; the tied rows carry different lap_id and different
+    # driver names. Measured pre-fix: 4 of 5 rows differ between the legs.
+    ("b31_tie_int_key_limit_cut",
+     "SELECT l.lap_id, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 ORDER BY l.season LIMIT 5"),
+
+    # the same with a STRING key, so the tie-break's string path
+    # (compareForTieBreak's number-before-string rule) is on the hook too, not
+    # just its integer path
+    ("b31_tie_string_key_limit_cut",
+     "SELECT l.lap_id, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 ORDER BY l.team LIMIT 5"),
+
+    # DESC. The tie-break is documented as ALWAYS ASCENDING regardless of the
+    # declared direction, so this pins that the direction of the declared key
+    # does not smuggle plan-dependence back in.
+    ("b31_tie_desc_limit_cut",
+     "SELECT l.lap_id, d.name, d2.age FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 ORDER BY l.round DESC LIMIT 5"),
+
+    # a key on the MIDDLE relation rather than the leading one: the DP moves
+    # drivers@1 to the bottom of the spine, so this is the column whose position
+    # in the merged schema moves furthest
+    ("b31_tie_middle_relation_key",
+     "SELECT l.lap_id, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 ORDER BY d.nationality LIMIT 5"),
+
+    # ── shape 1b: the ORDER-ONLY divergence, with the same rows on both sides ─
+    # Two declared keys, still not total. The LIMIT does NOT straddle here: both
+    # legs return the SAME SEVEN ROWS in a DIFFERENT ORDER. The pre-existing
+    # sorted comparison passes this entry no matter what the comparator does;
+    # only normalize_ordered() can see it. It is here to keep that half of the
+    # harness honest — if someone re-sorts the invariant comparison, this entry
+    # is the one that goes quiet.
+    ("b31_tie_order_only_no_set_change",
+     "SELECT l.lap_id, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 80 ORDER BY l.season, d.team LIMIT 7"),
+
+    # ── shape 3: the cut inside a SCALAR SUBQUERY — a wrong VALUE, not a
+    # ── wrong order ─────────────────────────────────────────────────────────
+    # This is the shape that makes the severity unarguable, and the reason it
+    # works is A.3's sixth pass: materializeSubqueries EXECUTES the body and
+    # threads --no-optimize into the nested runner, so the body's LIMIT 1 cut
+    # lands on a different tied row per leg and the Literal it folds to differs.
+    # The OUTER query has no ORDER BY and no LIMIT and nothing unspecified about
+    # it — a plain COUNT(*) that comes back with two different numbers.
+    ("b31_subquery_cut_becomes_a_constant",
+     "SELECT COUNT(*) FROM laps WHERE lap_id > "
+     "(SELECT l.lap_id FROM laps l "
+     " JOIN drivers d ON l.driver_id = d.driver_id "
+     " JOIN drivers d2 ON d.team = d2.team "
+     " WHERE l.lap_id < 100 ORDER BY l.season LIMIT 1)"),
+
+    # the same, reaching the third relation's column through the cut, and with
+    # an aggregate pair outside so a single wrong constant moves two numbers
+    ("b31_subquery_cut_third_relation_column",
+     "SELECT COUNT(*), MAX(speed) FROM laps WHERE driver_id = "
+     "(SELECT d2.driver_id FROM laps l "
+     " JOIN drivers d ON l.driver_id = d.driver_id "
+     " JOIN drivers d2 ON d.team = d2.team "
+     " WHERE l.lap_id < 100 ORDER BY l.round DESC LIMIT 1)"),
+
+    # ...and grouped, so the wrong constant redistributes rows across groups
+    ("b31_subquery_cut_under_group_by",
+     "SELECT team, COUNT(*) FROM laps WHERE speed > "
+     "(SELECT l.speed FROM laps l "
+     " JOIN drivers d ON l.driver_id = d.driver_id "
+     " JOIN drivers d2 ON d.team = d2.team "
+     " WHERE l.lap_id < 100 ORDER BY l.season LIMIT 1) "
+     "GROUP BY team ORDER BY team"),
+
+    # ── CONTROLS. Without these the block proves only that SOME 3-relation
+    # ── query diverges, which is not the claim. Each removes exactly one of the
+    # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both
+    # ── before and after any fix. Measured SAME pre-fix.
+    #
+    # (4) removed: the declared key list is made total, so the tie-break is never
+    # reached. Same query, same data, same reordered plan.
+    ("b31_control_total_order_is_immune",
+     "SELECT l.lap_id, d.name, d2.name FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 ORDER BY l.season, l.lap_id, d.name, d2.name LIMIT 5"),
+
+    # (3) removed: a GROUP BY between the join and the sort. buildAggregateSchema
+    # emits a plan-independent column order, so everything above it is immune —
+    # which is also the reason 20 of the 22 TPC-H queries cannot exhibit B3-1.
+    ("b31_control_aggregate_between_is_immune",
+     "SELECT d2.team, COUNT(*) FROM laps l "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "JOIN drivers d2 ON d.team = d2.team "
+     "WHERE l.lap_id < 100 GROUP BY d2.team ORDER BY COUNT(*) LIMIT 3"),
+]
+
+# WHY NO THIRD TABLE. The brief for this work assumed the oracle catalog's two
+# tables put join enumeration out of reach and asked for a third. Checked, and
+# it does not: three RELATIONS is what MIN_ENUMERATED_RELATIONS counts, a
+# self-join supplies them over two tables, the DP has been reordering oracle
+# queries since Week 28 (`method=dp` on w28_*), and every one of the three defect
+# shapes above reproduces on `catalog.json` unchanged. A third table would have
+# added a catalog-wide change — new row counts feeding CardinalityEstimator, new
+# join-order decisions on existing w28 entries, a new file for every harness that
+# loads the catalog into SQLite — to buy coverage the fixture already had. It
+# would also have been WEAKER in one respect: a self-join is the harder case for
+# this defect, because the merged schema then carries several columns of the SAME
+# NAME at different relation slots, which is exactly the confusion a positional
+# tie-break trips over.
+
+
+# The shape the fix does NOT cover, recorded as an OPEN DEFECT rather than as a
+# pass or a silent omission.
+#
+# `LIMIT n` with NO `ORDER BY` over a reordered join returns a different SUBSET
+# in the two legs. There is no sort node in this plan, so the tie-break in
+# sort_comparator.h cannot fire and no comparator fix can reach it: the rows come
+# out in the top hash join's probe order, and the DP changes which relation
+# probes.
+#
+# TWO RECORDED PROJECT POSITIONS CONFLICT HERE, and this harness is not the place
+# to decide between them:
+#   * `sort_comparator.h` — "The project asserts optimized == --no-optimize, so
+#     that is a defect even though every one of those answers is legal SQL."
+#     Under that reading this is a live blocker.
+#   * `random_diff.py` TRAP 1 — "a LIMIT is only comparable under a TOTAL order",
+#     recorded after four such shapes were triaged as false failures.
+#     Under that reading it is out of scope by construction.
+#
+# So it is asserted as an EXPECTED DIVERGENCE: the check passes while the legs
+# differ and FAILS LOUDLY the moment they agree, which is the signal to promote
+# the entry into TIE_STRADDLE_QUERIES and delete this block. That keeps it live
+# and two-sided — it cannot pass vacuously, and it cannot rot into a green tick
+# for a defect someone fixed without noticing. What it is NOT is a claim that the
+# divergence is acceptable.
+KNOWN_DIVERGENCES = [
+    # laps is at slot 0 and written first; the DP leads with drivers, so the two
+    # legs probe with different relations and LIMIT 5 takes a different subset.
+    # Pre-fix: (2,2),(2,382),(2,488)... vs (2,2),(83,2),(158,2)... — the same
+    # answer set, a different five rows.
+    ("b31_open_plain_limit_no_order_by",
+     "SELECT l.lap_id, l2.lap_id, d.name FROM laps l "
+     "JOIN laps l2 ON l.driver_id = l2.driver_id "
+     "JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE l.lap_id < 200 LIMIT 5"),
+
+    ("b31_open_plain_limit_written_leads_drivers",
+     "SELECT d.name, l.lap_id, l2.lap_id FROM drivers d "
+     "JOIN laps l ON d.driver_id = l.driver_id "
+     "JOIN laps l2 ON d.driver_id = l2.driver_id LIMIT 5"),
+]
+
+
+def run_known_divergences(queries):
+    """Assert that each OPEN defect above is STILL open — an xfail, not a pass.
+
+    Reports failure in both directions a coverage entry can go dead: an entry
+    that errors, and an entry whose two legs have started to agree (which means
+    the defect was fixed and the entry belongs in TIE_STRADDLE_QUERIES).
+    """
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    passed, failed, errors = 0, 0, 0
+    fail_list = []
+    print(f"\n--- OPEN: optimized != --no-optimize, expected to diverge today ---")
+    print("  These are NOT passing invariants. Each asserts a defect is still")
+    print("  present; agreement here means promote the entry and delete it here.")
+    for label, query in queries:
+        try:
+            opt = normalize_ordered(run_swiftql(query, VEC))
+            noopt = normalize_ordered(run_swiftql(query, VEC + ["--no-optimize"]))
+            if opt != noopt:
+                print(f"  XFAIL [{label}]  still diverges (expected)  {query[:52]}")
+                passed += 1
+            else:
+                print(f"  FAIL  [{label}]  LEGS NOW AGREE — promote this entry into")
+                print(f"        TIE_STRADDLE_QUERIES and remove it from KNOWN_DIVERGENCES")
+                failed += 1
+                fail_list.append((f"known-divergence:{label}", query,
+                                  "legs agree", "expected divergence (promote the entry)"))
+        except Exception as e:
+            print(f"  ERROR [{label}]  {query[:66]}\n    {e}")
+            errors += 1
+            fail_list.append((f"known-divergence:{label}", query, str(e), ""))
+    print(f"  {passed} still diverging, {failed} newly agreeing, {errors} errors")
+    return passed, failed, errors, fail_list
+
+
 def main():
     conn = load_sqlite()
     VEC = ["--execution", "vectorized", "--storage", "columnar"]
@@ -1180,8 +1434,10 @@ def main():
     r1 = run_suite(conn, QUERIES + AUDIT_FIXES_QUERIES + WEEK24_QUERIES, "Default (row storage, Volcano)")
     # whole surface + Week 21 shapes on the vectorized path (where the optimizer runs)
     r2 = run_suite(conn, all_queries, "Vectorized (columnar, optimizer ON)", extra_args=VEC)
-    # Week 21 result-preserving invariant
-    r3 = run_optimizer_invariant(all_queries)
+    # Week 21 result-preserving invariant. TIE_STRADDLE_QUERIES joins HERE and
+    # not in r2: `ORDER BY <non-unique> LIMIT n` has no single correct answer, so
+    # SQLite is not an oracle for it — see the block's header.
+    r3 = run_optimizer_invariant(all_queries + TIE_STRADDLE_QUERIES)
     # Week 23.5 plan-shape steering
     r4 = run_join_steering(WEEK23_5_QUERIES)
     # Week 28 join-order steering: the chosen order, from --explain
@@ -1194,18 +1450,23 @@ def main():
     # Week 29: an outer join in the tree means enumeration declined, so no
     # order= line may be printed — a decision that never happened
     r8 = run_outer_join_decline(WEEK29_NO_ORDER_DECISION)
+    # Week 37: the shape no comparator fix reaches, asserted as still-open
+    r9 = run_known_divergences(KNOWN_DIVERGENCES)
 
-    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0] + r8[0]
-    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1] + r8[1]
-    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2] + r8[2]
-    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3] + r8[3]
+    passed = r1[0] + r2[0] + r3[0] + r4[0] + r5[0] + r6[0] + r7[0] + r8[0] + r9[0]
+    failed = r1[1] + r2[1] + r3[1] + r4[1] + r5[1] + r6[1] + r7[1] + r8[1] + r9[1]
+    errors = r1[2] + r2[2] + r3[2] + r4[2] + r5[2] + r6[2] + r7[2] + r8[2] + r9[2]
+    fail_list = r1[3] + r2[3] + r3[3] + r4[3] + r5[3] + r6[3] + r7[3] + r8[3] + r9[3]
 
     print(f"\n{'='*70}")
     print(f"{passed} passed, {failed} failed, {errors} errors "
-          f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized + {len(all_queries)} invariant "
+          f"({len(QUERIES) + len(AUDIT_FIXES_QUERIES) + len(WEEK24_QUERIES)} default + {len(all_queries)} vectorized "
+          f"+ {len(all_queries) + len(TIE_STRADDLE_QUERIES)} invariant (of which "
+          f"{len(TIE_STRADDLE_QUERIES)} tie-straddle) "
           f"+ {len(WEEK23_5_QUERIES)} algorithm steering + {len(WEEK28_QUERIES)} order steering "
           f"+ {len(WEEK28_ORDER_EQUIVALENT_PAIRS)} order work + 1 estimate rendering "
-          f"+ {len(WEEK29_NO_ORDER_DECISION)} outer-join decline)")
+          f"+ {len(WEEK29_NO_ORDER_DECISION)} outer-join decline "
+          f"+ {len(KNOWN_DIVERGENCES)} known-open divergences)")
 
     if fail_list:
         print(f"\n{'='*70}")
