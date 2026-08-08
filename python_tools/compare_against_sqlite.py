@@ -1937,52 +1937,57 @@ B32_JOIN_KEY_TYPE_VOLCANO_REJECTED = [
 ]
 
 
-def assert_b32_pins_discriminate():
-    """Prove each B3-2 pin matches ITS OWN message and NO OTHER entry's.
+def assert_refusal_pins_discriminate(label, suite, extra_args=None):
+    """Prove each pin in `suite` matches ITS OWN message and NO OTHER entry's.
 
     run_rejection_suite only asks "does the actual message contain the expected
     substring". That is satisfied by a pin so short it also matches a sibling —
     which is exactly how `"EXISTS subquery"` passes against `"IN / EXISTS
     subquery"` and against `"NOT EXISTS subquery"`, three different producers
-    behind one green tick. The suite above has four distinct producer messages
-    and would not notice three of them being replaced by a fourth.
+    behind one green tick.
 
-    So this collects every entry's ACTUAL message once and cross-checks the full
-    pin matrix: pin[i] must match message[i] and must NOT match message[j != i]
-    unless the two entries genuinely share a producer (rows 0, 2 and 5, 6 do —
-    IN and EXISTS are one producer, and the two IN-literal shapes are another
-    instance of it). Shared pins are compared as equal-expectation pairs rather
-    than exempted by index.
+    THIS HAS NOW HAPPENED TWICE, WHICH IS WHY IT IS A SHARED FUNCTION RATHER
+    THAN A B3-2 SPECIAL CASE. The second time nobody wrote a bad pin at all:
+    `"cannot materialize the integer"` was exact and unambiguous when the E-10
+    entries landed, and a later, unrelated commit shipped a SECOND refusal that
+    opens with the same sentence. A pin can therefore rot without anyone
+    touching it, so the property has to be re-established by execution on every
+    run rather than argued once in review.
+
+    Collects every entry's ACTUAL message, then cross-checks the full pin
+    matrix: pin[i] must match message[i] and must NOT match message[j != i]
+    unless the two entries genuinely share a producer, in which case their pins
+    are equal and the pair is compared as such rather than exempted by index.
     """
-    VEC = ["--execution", "vectorized", "--storage", "columnar"]
     actual = []
     findings = []
-    for query, expected in B32_JOIN_KEY_TYPE_REJECTED:
+    for query, _expected in suite:
         try:
-            run_swiftql(query, VEC)
-            findings.append(f"expected a rejection, got rows: {query[:60]}")
+            run_swiftql(query, extra_args)
+            findings.append(f"{label}: expected a rejection, got rows: {query[:60]}")
             actual.append(None)
         except RuntimeError as e:
             actual.append(str(e))
         except Exception as e:                                # pragma: no cover
-            findings.append(f"unexpected error kind {e!r}: {query[:60]}")
+            findings.append(f"{label}: unexpected error kind {e!r}: {query[:60]}")
             actual.append(None)
 
-    for i, (qi, pin_i) in enumerate(B32_JOIN_KEY_TYPE_REJECTED):
+    for i, (_qi, pin_i) in enumerate(suite):
         if actual[i] is None:
             continue
         if pin_i not in actual[i]:
-            findings.append(f"pin {i} does not match its own message: {pin_i!r}")
-        for j, (_qj, pin_j) in enumerate(B32_JOIN_KEY_TYPE_REJECTED):
+            findings.append(
+                f"{label}: pin {i} does not match its own message: {pin_i!r}")
+        for j, (_qj, pin_j) in enumerate(suite):
             if i == j or actual[j] is None or pin_i == pin_j:
                 continue
             if pin_i in actual[j]:
                 findings.append(
-                    f"pin {i} ({pin_i!r}) ALSO matches entry {j}'s message — "
-                    f"it cannot tell the two producers apart")
+                    f"{label}: pin {i} ({pin_i!r}) ALSO matches entry {j}'s "
+                    f"message — it cannot tell the two producers apart")
 
-    print(f"\n--- B3-2 join-key pin discrimination ---")
-    print(f"{len(B32_JOIN_KEY_TYPE_REJECTED)} pins cross-checked against "
+    print(f"\n--- {label}: refusal-pin discrimination ---")
+    print(f"{len(suite)} pins cross-checked against "
           f"{sum(a is not None for a in actual)} actual messages")
     for f in findings:
         print(f"  FINDING  {f}")
@@ -2072,11 +2077,21 @@ E10_VOLCANO_ONLY = [
 ]
 
 # Built from the list above BY IDENTITY so the two halves cannot drift: an edit
-# to a query there is an edit here. The pin is the stable clause of the message;
-# the integer that follows it differs per entry (entry 3 names ...92, not ...93,
-# because that is the value the column reaches first).
+# to a query there is an edit here.
+#
+# !! THE PIN WAS `"cannot materialize the integer"` AND THAT BECAME WRONG WHILE
+# IT SAT HERE. The type-through-division refusal
+# (`refuseObservableIntNarrowing`, vec_types.h) opens with the SAME sentence —
+# "vectorized execution cannot materialize the integer N into a DOUBLE result
+# column" — and only then diverges: `without changing it` (this one, a MAGNITUDE
+# rule) versus `that another expression divides` (that one, a TYPE rule). The old
+# pin matched both, so a query refused for the WRONG REASON satisfied this suite.
+# Nothing failed; the entry simply stopped discriminating the moment a sibling
+# refusal shipped. Pin the clause that separates them, never the shared opening —
+# and `assert_refusal_pins_discriminate` below now re-proves that by execution
+# for this whole family, so the next sibling cannot repeat it silently.
 E10_VECTORIZED_REFUSED = [
-    (query, "cannot materialize the integer") for query in E10_VOLCANO_ONLY
+    (query, "without changing it") for query in E10_VOLCANO_ONLY
 ]
 
 # ALL FOUR MODES, diffed against SQLite. Without these the block above shows only
@@ -2116,6 +2131,147 @@ E10_BOUNDARY_GUARDS = [
     # would turn this into an error.
     "SELECT CASE WHEN round > 10 THEN 9007199254740993 ELSE 0.5 END AS c "
     "FROM laps ORDER BY c LIMIT 2",
+]
+
+# ─── The type-through-division refusal: the STORED TYPE changes the answer ──
+#
+# E-10 above is a MAGNITUDE rule — an INT too big for a double. This is a TYPE
+# rule and fires at any magnitude, including 7. A chunk column holds one type, so
+# a CASE mixing INTEGER and REAL branches is stored as REAL; `INTEGER / INTEGER`
+# truncates and `INTEGER / REAL` does not, so `7 / 2` is 3 where the value kept
+# its INT type and 3.5 where the column flattened it to REAL. SQLite truncates
+# (verified: entry 4 below returns `AlphaTauri 3`, not 3.5), so the flattened
+# answer is simply wrong.
+#
+# PIN `"that another expression divides"`. Do NOT pin `"cannot materialize the
+# integer"` — see the note on E10_VECTORIZED_REFUSED; the two refusals share that
+# opening sentence verbatim and only the tail says which rule fired.
+#
+# THE MODE SPLIT IS NOT UNIFORM ACROSS THESE ENTRIES, so they are four lists
+# rather than one. Verified by running all eleven in all four modes:
+#   * entries over a DERIVED table refuse on Volcano for an unrelated reason
+#     (`derived tables … are not supported on the Volcano path`), so their
+#     Volcano leg is a capability refusal, not an answer;
+#   * the aggregate entries run everywhere, so Volcano ANSWERS them;
+#   * the guards must answer wherever their shape is supported at all.
+TYPEFIX_DIV_PIN = "that another expression divides"
+
+# (b) Volcano ANSWERS, vectorized REFUSES — the E-10 pairing.
+# THE NON-VACUOUS VALUE WITNESS, and the only entry of this family that carries a
+# real diff. Volcano and SQLite both return AlphaTauri 3 / McLaren 0.25 /
+# RedBull 0.25 — the `3` is the whole point, because a REAL column would make it
+# 3.5 and the entry would still "return rows".
+TYPEFIX_DIV_VOLCANO_ONLY = [
+    "SELECT team, MAX(CASE WHEN lap_id=2 THEN 7 ELSE 0.5 END) / 2 AS m "
+    "FROM laps WHERE lap_id < 4 GROUP BY team ORDER BY team",
+]
+
+# Refused in both vectorized modes. The first entry is the value witness above,
+# taken BY IDENTITY; the rest are refusal-only because their answer is empty or
+# their Volcano leg is a capability refusal.
+TYPEFIX_DIV_VECTORIZED_REFUSED = [
+    (q, TYPEFIX_DIV_PIN) for q in TYPEFIX_DIV_VOLCANO_ONLY
+] + [
+    # divided in the PROJECT list, one derived level
+    ("SELECT x / 2 FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x "
+     "FROM laps WHERE lap_id < 4) t", TYPEFIX_DIV_PIN),
+
+    # divided in a FILTER — a different consumer (VecFilterNode), so a rule
+    # wired only into projection would let this through
+    ("SELECT x FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x "
+     "FROM laps WHERE lap_id < 4) t WHERE x / 2 > 3", TYPEFIX_DIV_PIN),
+
+    # the taint travels through `*` and TWO derived levels before meeting `/`
+    ("SELECT y / 4 FROM (SELECT x * 2 AS y FROM "
+     "(SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x "
+     "FROM laps WHERE lap_id < 4) t) u", TYPEFIX_DIV_PIN),
+
+    # THE ROW-COUNT WITNESS, and REFUSAL-ONLY ON PURPOSE. Truncated, `7/2 > 3` is
+    # false and SQLite returns no rows; flattened to REAL, `3.5 > 3` is true and
+    # a row appears. But its Volcano leg is EMPTY (0 rows, verified), so diffing
+    # it against SQLite would agree whether or not the rule works — vacuous. The
+    # diff is carried by the value witness above; this entry only has to refuse.
+    ("SELECT team FROM laps WHERE lap_id < 4 GROUP BY team "
+     "HAVING MAX(CASE WHEN lap_id=2 THEN 7 ELSE 0.5 END) / 2 > 3 ORDER BY team",
+     TYPEFIX_DIV_PIN),
+]
+
+# (c) Boundary guards, ALL FOUR MODES answer and match SQLite. These are what
+# show the rule is narrow: it fires on the stored TYPE being observable to a
+# division, and nowhere else.
+TYPEFIX_DIV_GUARDS_ALL_MODES = [
+    # the mixed CASE with NO division above it — nothing observes the type
+    "SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END AS x "
+    "FROM laps WHERE lap_id < 4 ORDER BY x",
+
+    # THE NAMED ANSWER A BLANKET REFUSAL WOULD HAVE COST. Same shape, `THEN 1`:
+    # still INT beside REAL, still stored as REAL, and still perfectly answerable.
+    "SELECT CASE WHEN lap_id = 2 THEN 1 ELSE 0.5 END AS x "
+    "FROM laps WHERE lap_id < 4 ORDER BY x",
+
+    # the aggregate PRODUCED but not DIVIDED — the value witness minus its `/ 2`
+    "SELECT team, MAX(CASE WHEN lap_id=2 THEN 7 ELSE 0.5 END) AS m "
+    "FROM laps WHERE lap_id < 4 GROUP BY team ORDER BY team",
+]
+
+# (d) Boundary guards over DERIVED tables: both vectorized modes answer and match
+# SQLite; Volcano refuses them for the derived-table capability, pinned below.
+#
+# Each carries an ORDER BY. Without one, SQLite and SwiftQL emit these in
+# different row orders on data/laps.csv and the entry would fail on ordering
+# rather than on the rule — run_query_suite compares in order when ORDER BY is
+# present and as a set otherwise, so the ORDER BY makes the comparison the
+# stronger one instead of merely dodging the problem.
+TYPEFIX_DIV_GUARDS_VEC_ONLY = [
+    # THE ARMED SHAPE WHERE NO INT EVER ARRIVES. The plan cannot tell that
+    # `lap_id = 99` never fires, so the division-taint is armed and every value
+    # reaching the column is REAL. This entry FAILS THE MOMENT ANYONE CONVERTS
+    # THE RULE TO A PLAN-TIME-ONLY REFUSAL — the refusal has to be driven by the
+    # value that actually arrives, not by the shape that might produce one.
+    "SELECT x / 2 AS d FROM (SELECT CASE WHEN lap_id = 99 THEN 7 ELSE 0.5 END "
+    "AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+
+    # `THEN 7.0` — same magnitude, REAL branch, so no type is lost and the
+    # division is honest: 3.5, not 3
+    "SELECT x / 2 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7.0 ELSE 0.5 END "
+    "AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+
+    # `+` INSTEAD OF `/`. INT+INT and INT+REAL agree, so the stored type is not
+    # observable and the query must answer. THIS ENTRY FAILS IF THE RULE IS EVER
+    # WIDENED PAST `/` — which is the cheapest way to "fix" a future report and
+    # the most expensive to notice.
+    "SELECT x + 1 AS d FROM (SELECT CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END "
+    "AS x FROM laps WHERE lap_id < 4) t ORDER BY d",
+]
+
+# The derived-table entries' Volcano half: every query above whose FROM is a
+# derived table is refused by Volcano for the CAPABILITY, not for the type rule,
+# and pinning that keeps the boundary under test instead of assumed.
+#
+# Selected by the structural fact that decides it — `FROM (SELECT` — rather than
+# by a hand-kept index list, so an entry added above is classified by its own
+# text. The count is asserted so a selector that silently matches nothing (or
+# everything) cannot pass as an empty suite.
+TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED = [
+    (q, VOLCANO_DERIVED)
+    for q in (TYPEFIX_DIV_GUARDS_VEC_ONLY
+              + [q for q, _ in TYPEFIX_DIV_VECTORIZED_REFUSED])
+    if "FROM (SELECT" in q
+]
+assert len(TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED) == 6, (
+    "expected 3 vec-only guards + 3 derived refusal entries, got "
+    f"{len(TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED)}")
+
+# The masking-direction query, in ALL FOUR MODES. It belongs here and NOT in
+# run_optimizer_invariant: post-fix it ERRORS in both legs, which is the correct
+# answer (`SUBSTRING(team, lap_id - lap_id, 2)` asks for start position 0), and
+# an invariant runner records an exception from either leg as an ERROR rather
+# than as agreement. Verified: all four modes raise the same message, and SQLite
+# answers 0 — a recorded divergence, not a claim about SQL.
+TYPEFIX_SUBSTRING_START_REFUSED = [
+    ("SELECT COUNT(*) FROM laps WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' "
+     "AND speed = 333.3333",
+     "SUBSTRING: start position must be >= 1"),
 ]
 
 WEEK34_DISTINCT_AGG_QUERIES = [
@@ -3687,10 +3843,73 @@ def main():
         m_failed += mf
         m_errors += me
 
+    # The type-through-division refusal. Same swapped-sides split as E-10, but
+    # not uniform across the entries, so four wirings — see the block's header.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_DIV_VOLCANO_ONLY,
+            f"type-through-division value witness — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_DIV_VECTORIZED_REFUSED,
+            f"type-through-division refused — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    for label, extra in [("row storage, Volcano", None),
+                         ("columnar storage, Volcano", ["--storage", "columnar"]),
+                         *vec_modes]:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_DIV_GUARDS_ALL_MODES,
+            f"type-through-division guards — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in vec_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_DIV_GUARDS_VEC_ONLY,
+            f"type-through-division guards over derived — {label}", extra_args=extra)
+        m_passed += mp
+        m_failed += mf
+        m_errors += me
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_DIV_DERIVED_VOLCANO_REJECTED,
+            f"type-through-division derived shapes refused earlier — {label}",
+            extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    # ...and the masking-direction query, refused in ALL FOUR modes. Here rather
+    # than in run_optimizer_invariant: both legs erroring IS the correct answer,
+    # and an invariant runner reads an exception as an ERROR.
+    for label, extra in [("row storage, Volcano", None),
+                         ("columnar storage, Volcano", ["--storage", "columnar"]),
+                         *vec_modes]:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_SUBSTRING_START_REFUSED,
+            f"SUBSTRING start position refused — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
     findings = sweep_rejection_suites()
-    findings += assert_b32_pins_discriminate()
+    findings += assert_refusal_pins_discriminate(
+        "B3-2 join key", B32_JOIN_KEY_TYPE_REJECTED,
+        ["--execution", "vectorized", "--storage", "columnar"])
+    # The INT-narrowing FAMILY, cross-checked as ONE suite rather than two: the
+    # magnitude refusal and the type-through-division refusal share an opening
+    # sentence, so the only way to prove each pin still names its own rule is to
+    # put them in the same matrix.
+    findings += assert_refusal_pins_discriminate(
+        "INT-narrowing family",
+        E10_VECTORIZED_REFUSED + TYPEFIX_DIV_VECTORIZED_REFUSED,
+        ["--execution", "vectorized", "--storage", "columnar"])
     mode_census()
 
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
@@ -3700,7 +3919,7 @@ def main():
     if findings:
         # A sweep whose findings are printed but do not fail the run is a sweep
         # nobody reads.
-        print(f"Rejection-suite sweep + B3-2 pin discrimination: "
+        print(f"Rejection-suite sweep + refusal-pin discrimination: "
               f"{len(findings)} finding(s)")
     if total_failed > 0 or total_errors > 0 or findings:
         sys.exit(1)

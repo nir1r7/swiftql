@@ -1363,6 +1363,62 @@ TIE_STRADDLE_QUERIES = [
      "JOIN drivers d ON l.driver_id = d.driver_id "
      "WHERE l.lap_id < 15 LIMIT 5"),
 
+    # ── Wave-B optimizer fixes: conjunct ordering, and pushdown into a derived
+    # ── body ────────────────────────────────────────────────────────────────
+    # Invariant-only by nature. Each asserts that a pass which REORDERS or MOVES
+    # work did not change the answer, and the failure mode is a divergence
+    # between the legs rather than a disagreement with SQLite.
+    #
+    # `run_optimizer_invariant` records an exception from either leg as an ERROR,
+    # so the sibling shape whose correct post-fix answer is "both legs error"
+    # (`SUBSTRING(team, lap_id - lap_id, 2)` with no eliminating conjunct) is NOT
+    # here — it is a rejection entry in compare_against_sqlite.py, where an error
+    # is the assertion rather than a failure.
+    #
+    # THE TOTAL-SUBSTRING CONTROL. `SUBSTRING(team, 1, 3)` is well-defined on
+    # every row, so this query must keep ANSWERING `Ferrari`. A blanket refusal
+    # of SUBSTRING-in-WHERE — the cheapest way to make the throwing shapes go
+    # away — would still pass an invariant that only compared two legs, so the
+    # entry is here to make sure the fix narrowed the rule instead of the
+    # surface. Verified non-empty: 1 row, both legs.
+    ("w37_substring_total_still_answers",
+     "SELECT DISTINCT team FROM laps WHERE SUBSTRING(team, 1, 3) = 'Fer' "
+     "AND speed > 344.5"),
+
+    # pushdown INTO a derived body: the conjuncts must reach the inner scan and
+    # the answer must not move. 7 groups, both legs.
+    ("w37_pushdown_into_derived_body",
+     "SELECT d.team, COUNT(*) FROM (SELECT team, speed, season FROM laps) d "
+     "WHERE d.speed > 344.5 AND d.season = 2023 GROUP BY d.team"),
+
+    # ...and into a derived body that itself contains a JOIN, where the pushed
+    # conjunct has to be routed to the right side of the inner join. 82, both legs.
+    ("w37_pushdown_into_derived_join_body",
+     "SELECT COUNT(*) FROM (SELECT l.team AS t, l.speed AS sp FROM laps l "
+     "JOIN drivers dr ON l.driver_id = dr.driver_id) d WHERE d.sp > 344.5"),
+
+    # THE MASKING PAIR, and they are NOT vacuous despite returning zero rows.
+    # `SUBSTRING(l.team, l.lap_id - l.lap_id, 2)` asks for start position 0 and
+    # THROWS wherever it is evaluated — verified, it is a hard error in all four
+    # modes when nothing eliminates the row first. Here `d.nationality = 'Zzz'`
+    # matches nothing, so the correct behaviour is zero rows and NO error, in
+    # both legs. The assertion is therefore "neither leg threw", which
+    # run_optimizer_invariant enforces by recording an exception as an ERROR —
+    # so a conjunct reordering that hoists the SUBSTRING ahead of the eliminating
+    # predicate fails this entry loudly. Empty output is the answer, not an
+    # absence of one.
+    ("w37_masking_conjunct_inner_join",
+     "SELECT l.team FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE d.nationality = 'Zzz' "
+     "AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'"),
+
+    # the same over LEFT JOIN, where the null-extended rows are the ones a
+    # careless pushdown would evaluate the throwing conjunct against
+    ("w37_masking_conjunct_left_join",
+     "SELECT l.team FROM laps l LEFT JOIN drivers d ON l.driver_id = d.driver_id "
+     "WHERE d.nationality = 'Zzz' "
+     "AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'"),
+
     # ── CONTROLS. Without these the block proves only that SOME 3-relation
     # ── query diverges, which is not the claim. Each removes exactly one of the
     # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both
