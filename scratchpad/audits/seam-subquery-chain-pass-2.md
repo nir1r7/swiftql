@@ -236,3 +236,311 @@ Week 36's header says the same. With an alias present they do not — one plans
 and one does not.
 
 STATUS: to be executed once the gate releases `build/`.
+
+### B-3 — MEDIUM (pending execution). A correlated subquery nested inside a
+correlated body is refused, by a guard that names the wrong cause.
+
+`splitCorrelation` decides "does this conjunct reach outside the body?" with
+`collectSlots(c, slots); if (slots.find(-1) == slots.end()) -> local`
+(`subquery_decorrelation.cc:52-54`). Its comment enumerates the producers of
+`-1` as **two**: a correlated `ColumnRef`, and an unresolved one.
+
+`collectSlots` has a **third** producer, in a branch the comment does not
+mention (`predicate_pushdown.cc:127-131`):
+
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        collectSlots(sq->operand.get(), out);
+        if (sq->correlated) out.insert(-1);
+        return;
+    }
+
+`-1` there is `collectSlots`' *conservative* "cannot name it here", which is
+right for pushdown (withhold it) and wrong as a correlation test: the inner
+node's `correlated` flag means "reaches outside the INNER body", and for a
+one-level reference that target is **the body splitCorrelation is splitting** —
+i.e. body-local, exactly the classification it must get.
+
+So a conjunct that merely *contains* a nested correlated subquery is routed to
+the refusing branch, fails the `BinaryExpr && op == "="` test, and reports:
+
+    correlated subquery: only an equality between two columns can become a join
+    key (a correlated inequality has no equi-join to lower to; ...)
+
+for a query with no inequality in it at all. Same wrong-cause-diagnostic class
+as round 1's L-8, which this same function was already corrected for once
+(`:83-97`).
+
+Failing shapes (all legal SQL, all answered by SQLite):
+
+    -- nested correlated EXISTS inside a correlated EXISTS body
+    SELECT COUNT(*) FROM drivers d WHERE EXISTS (
+      SELECT 1 FROM laps l WHERE l.driver_id = d.driver_id
+        AND EXISTS (SELECT 1 FROM laps l2 WHERE l2.lap_id = l.lap_id))
+
+    -- correlated scalar inside a correlated EXISTS body
+    SELECT COUNT(*) FROM drivers d WHERE EXISTS (
+      SELECT 1 FROM laps l WHERE l.driver_id = d.driver_id
+        AND l.speed > (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))
+
+Both would work if the conjunct were classified local: it is then left in
+`body.where`, the body is handed to `LogicalPlanBuilder::build`, and the body's
+OWN lowering pass takes the inner node with its reference at level 1 — which is
+exactly the route the same shape takes today under an UNCORRELATED `IN`
+(`WEEK34_CORRELATED_SCALAR_VEC_ONLY` has three such entries and they pass).
+The difference between "works" and "refused with the wrong reason" is only
+whether the enclosing subquery happens to be correlated.
+
+It is a refusal and not a wrong answer, so MEDIUM. **Coverage:** no suite holds
+a correlated subquery nested inside a correlated body, in either the diffed or
+the rejection direction — checked `WEEK33_DECORRELATED_VEC_ONLY`,
+`WEEK33_CORRELATED_BINDS`, `WEEK34_CORRELATED_SCALAR_*`,
+`WEEK35_SUBQUERY_IN_DERIVED_BODY_*`. The only nesting the suites hold is
+uncorrelated-outer / correlated-inner.
+
+STATUS: to be executed once the gate releases `build/`.
+
+### B-4 — LOW. `development.md`'s "Relation slots and query levels" states a
+refusal that was deleted in Week 33, and `main.cc` repeats it.
+
+The section "**Unreachable with a correlated ref today (behind the refusal)**"
+opens with two facts, of which the first is:
+
+> 1. `Validator::validate` refuses any statement with
+>    `has_correlated_subquery` ... A `ColumnRef` with `query_level > 0` exists
+>    **only** inside a correlated subquery, so none reaches a plan.
+
+That refusal is gone. `has_correlated_subquery` is **written and never read**
+— grep over `src/` gives exactly three hits, all in `binder.cc` setting it and
+`ast.h` declaring it. So the heading of that whole table ("Unreachable with a
+correlated ref today") and its framing are false: every row under it is
+reachable, and each row's real containment is a guard of its own.
+
+The individual rows are still correct — I re-derived them:
+`ChunkPruner`/`collectSimplePredicates` declines `query_level > 0`,
+`buildAggregateSchema` throws, `restampSlots` is protected by `soleSlot`'s
+`-1` rejection, and `AggregateSpec::relation_slot` is contained by
+`refuseSurvivingCorrelatedRefs` (which walks the body's SELECT list) plus
+`requireDecorrelatableBody`'s aggregate refusal. So this is a documentation
+defect, not a live one. But it is the third time this section has been wrong,
+and the brief's framing is exactly right: a reader who *uses* fact 1 concludes
+that nothing further is needed.
+
+`predicate_pushdown.cc:118-126` already flags this in-place ("is the refusal
+Week 33 DELETED, so it justifies nothing now") — the source was corrected and
+the map was not.
+
+Same stale claim at `src/cli/main.cc:475-479`:
+
+> materializeSubqueries TRUSTS three Validator rules — exactly one output
+> column for SCALAR/IN, position restricted to WHERE/HAVING, and **no
+> correlated subquery**
+
+The pass has not trusted that since Week 33 — it routes off `sq->correlated`
+itself (`subquery_materialization.cc:351`), and the comment there says so
+explicitly. Harmless today; it is a third copy of a precondition that has
+already caused three silent wrong answers when believed.
+
+---
+
+## Execution results (gate released `build/`; single short queries, no harness run)
+
+All probes: `--catalog catalog.json --storage columnar --execution vectorized`.
+SQLite side computed through the oracle's own `load_sqlite()`, so the data is
+identical to the harness's.
+
+**B-1 confirmed — WRONG ANSWER.**
+
+```
+SELECT * FROM drivers d WHERE d.age >
+  (SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)
+
+SwiftQL:  driver_id  name  nationality  team  age  $k0   COUNT(*)
+          1  Driver_1  Spanish  RedBull  35   NULL  NULL
+          ...  (7 columns)
+SQLite:   ['driver_id','name','nationality','team','age']   (5 columns, 20 rows)
+```
+
+Same with a non-COUNT aggregate, where the synthetic columns carry real values
+rather than NULLs:
+
+```
+SELECT * FROM laps l WHERE l.speed > 1.02 *
+  (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team) LIMIT 3
+
+SwiftQL: ... season round  $k0         AVG(l2.speed)
+         ... 2022   17     AlphaTauri  313.25153531218
+SQLite:  9 columns, no $k0, no AVG column
+```
+
+And the derived-body symptom, exactly as predicted:
+
+```
+SELECT COUNT(*) AS n FROM (SELECT * FROM drivers d WHERE d.age >
+  (SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.speed > 999)) AS x
+
+SwiftQL: Error: internal: derived table 'x' was bound against a 5-column schema
+         but planned to 7 columns (blockOutputSchema and
+         LogicalPlanBuilder::build disagree)
+SQLite:  20
+```
+
+**B-2 confirmed.**
+
+```
+(SELECT AVG(l2.speed) AS a  FROM laps l2 WHERE l2.team = l.team)   -> Error: column not found: 'AVG(l2.speed)'   (SQLite 4994)
+(SELECT 1.02 * AVG(l2.speed) AS a FROM ...)                        -> 4037  = SQLite
+(SELECT AVG(l2.speed) FROM ...)                                    -> 4994  = SQLite
+```
+
+The alias breaks the unwrapped form and not the wrapped one — the asymmetry the
+README and the suite both claim does not exist.
+
+**B-3 confirmed.** All three shapes refuse with the correlated-inequality
+message; SQLite answers 20 for each.
+
+```
+EXISTS (... l.driver_id = d.driver_id AND EXISTS (SELECT 1 FROM laps l2 WHERE l2.lap_id = l.lap_id))
+EXISTS (... l.driver_id = d.driver_id AND l.speed > (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team))
+EXISTS (... l.driver_id = d.driver_id AND EXISTS (SELECT 1 FROM laps l2 WHERE l2.driver_id = d.driver_id))
+  -> Error: correlated subquery: only an equality between two columns can become
+     a join key (a correlated inequality has no equi-join to lower to; ...)
+```
+
+The same nesting under an UNCORRELATED `IN` runs and is right, which is the
+proof that the shape is supportable and only the classification is wrong:
+
+```
+SELECT COUNT(*) FROM drivers d WHERE d.driver_id IN
+  (SELECT l.driver_id FROM laps l WHERE EXISTS (SELECT 1 FROM laps l3 WHERE l3.lap_id = l.lap_id))
+  -> 20 = SQLite
+```
+
+**A4 confirmed — `$kN` leaks into `--explain`, in all three plan sections:**
+
+```
+LogicalLeftJoin [driver_id = $k0 AND age = $k1]
+  LogicalScan [drivers, 5 columns]
+  LogicalDerived [$scalar0, 3 columns]
+VecLeftHashJoin [driver_id = $k0 AND age = $k1] (materialize) build=derived ...
+```
+
+**A1 confirmed empirically.** Two correlated scalars whose aggregates share an
+output name resolve correctly, optimized and `--no-optimize`:
+
+```
+SELECT COUNT(*) AS n FROM laps l
+WHERE l.speed > (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.team = l.team)
+  AND l.speed < 1.5 * (SELECT AVG(l2.speed) FROM laps l2 WHERE l2.driver_id = l.driver_id)
+  -> 4994 optimized, 4994 --no-optimize, 4994 SQLite
+```
+
+**Coverage-hole shapes are otherwise correct.** A correlated scalar and a
+correlated EXISTS inside a derived body, with named select lists, both match
+SQLite (4 rows / `{8,18}`). So the W34xW35 joint is sound; what it lacks is a
+suite entry, and B-1 sits in the gap.
+
+---
+
+## Refusal boundary — enumerated from the code and each one executed
+
+Everything `lowerInSubqueries` / `lowerExistsSubqueries` / `lowerCorrelatedScalars`
+still refuses, with what actually fires:
+
+| refusal (source) | fires? | pinned in a suite? |
+|---|---|---|
+| EXISTS body GROUP BY (`decorr.cc:22`) | yes | test_logical_plan.cc |
+| EXISTS body HAVING (`:23`) | **NO — DEAD** (see B-5) | no |
+| EXISTS body LIMIT (`:24`) | yes | no |
+| EXISTS body DISTINCT (`:25`) | yes | no |
+| EXISTS body aggregate (`:29`) | yes | test_logical_plan.cc |
+| correlated non-equality conjunct (`:70`) | yes (**and over-fires — B-3**) | oracle x3 |
+| non-ColumnRef side of a correlated equality (`:78`) | yes | no |
+| both sides outer (`:91`) | yes | no |
+| unresolved ref in a body conjunct (`:95`) | not constructed | no |
+| correlated ref more than one level out (`:101`) | **NO — UNREACHABLE** (B-5) | no |
+| correlated ref surviving in JOIN ON / SELECT / ORDER BY / WHERE (`:163`) | yes (SELECT, ORDER BY probed) | oracle (ON, SELECT) |
+| two aggregates under one wrapper (`:249`) | yes | oracle |
+| non-aggregate body / non-constant wrapper (`:268`) | yes | oracle x2 |
+| scalar body LIMIT (`:295`) | yes | oracle |
+| scalar body DISTINCT (`:296`) | yes | no |
+| scalar body HAVING (`:297`) | yes (checked BEFORE group_by, unlike the EXISTS guard) | no |
+| scalar body own GROUP BY (`:298`) | yes | no |
+| scalar body select-list arity (`:301`) | **NO — DEAD**, Validator's arity rule wins (B-5) | no |
+| shared body (`use_count > 1`, `:329`/`:570`) | yes (`BETWEEN` clones) | test_subquery.cc |
+| no correlated equality at all (`:347`/`:584`) | yes | test_logical_plan.cc |
+| `renamed.size() != keys.size()+1` (`:447`) | not constructible today | no |
+| correlated IN / NOT IN (`:693`) | yes | oracle x3 |
+| correlated subquery not a top-level conjunct (`:698`) | yes | oracle |
+| IN computed operand (`lowering.cc:70`) | yes | no |
+| IN not a top-level conjunct (`:142`) | yes | oracle |
+
+Rejection-suite quality: the pinned substrings ARE specific (`"may hold ONE
+aggregate"`, `"would have to ride as an ON residual"`, `"single aggregate"`),
+not a shared tail — the Week-34 lesson held. One exception, below.
+
+### B-5 — LOW. Three guards in this seam cannot fire.
+
+1. **`requireDecorrelatableBody`'s HAVING refusal (`decorr.cc:23`) is dead.**
+   The GROUP BY check is on the line above, so HAVING is only reached with an
+   EMPTY `group_by` — which `Validator` has already refused with
+   `HAVING requires GROUP BY`. Verified both ways:
+   `EXISTS (... HAVING COUNT(*) > 0)` -> `HAVING requires GROUP BY`;
+   `EXISTS (... GROUP BY l.team HAVING COUNT(*) > 0)` ->
+   `a body with GROUP BY cannot be decorrelated`.
+   Note the SCALAR guard orders the two the other way round (`:297` before
+   `:298`), so ITS HAVING refusal is live — verified:
+   `(SELECT AVG(...) ... GROUP BY l2.season HAVING AVG(...) > 0)` ->
+   `a scalar body with HAVING cannot be decorrelated`. The two guards
+   deliberately do not share code, and this is the visible consequence: one
+   pair of clause checks is ordered so both fire and the other is not.
+
+2. **`requireDecorrelatableScalarBody`'s arity refusal (`decorr.cc:301`) is
+   dead.** `Validator::validate` runs first (`logical_plan.cc:899`) and refuses
+   `select_star || select_list.size() != 1` for every non-EXISTS subquery
+   (`validator.cc:560-566`). Verified: a two-column scalar body reports
+   `scalar subquery must return exactly one column`, never
+   `a correlated scalar subquery must select exactly one expression`.
+
+3. **The correlation-depth refusal (`decorr.cc:101-103`) is unreachable, and
+   B-3 is why.** To reach it, `splitCorrelation` must run on a body holding a
+   level-2 reference. Every route is closed first:
+   - nested inside a correlated body -> B-3 refuses at `:70`;
+   - nested inside an uncorrelated `IN` body -> a level-2 ref makes the IN body
+     correlated, so the IN node is correlated and `refuseUnloweredCorrelated`
+     refuses (verified: `IN (SELECT l.driver_id FROM laps l WHERE EXISTS
+     (SELECT 1 FROM laps l3 WHERE l3.driver_id = d.driver_id))` ->
+     `a correlated IN / NOT IN is not lowered`);
+   - inside a derived body -> `markCorrelated` marks the derived body's scope,
+     so `Binder::relationSchema` refuses it as LATERAL (`binder.cc:196-200`);
+   - inside a materialized uncorrelated body -> a level-2 ref makes that body
+     correlated, so it is not materialized.
+
+   **This is coupled to B-3 and must not be fixed independently.** Classifying
+   a nested correlated subquery as body-local (the obvious B-3 fix) is what
+   makes the depth guard reachable again — the inner body's level-2 refs are
+   NOT decremented when the middle body is decorrelated, so the guard is the
+   backstop that stops a stale level from reaching a plan. Same coupled-pair
+   shape as F1/F2: relax one and the other becomes load-bearing.
+
+### B-6 — LOW. One rejection pin does not discriminate which guard fired.
+
+`WEEK34_CORRELATED_SCALAR_REFUSED`'s second entry pins the substring
+`"LIMIT cannot be decorrelated"`, which is a suffix of **both**
+`"a body with LIMIT cannot be decorrelated"` (EXISTS) and
+`"a scalar body with LIMIT cannot be decorrelated"` (scalar). The entry is a
+scalar query so it hits the right one today, but the assertion would pass if
+the scalar guard were deleted and the EXISTS guard somehow reached. One
+character (`"scalar body with LIMIT"`) fixes it. This is a single instance of
+the shape the Week-34 sweep was built for, not a recurrence of the 40-entry
+one.
+
+### B-7 — LOW / coverage. No suite holds a CORRELATED subquery inside a derived
+body.
+
+`WEEK35_SUBQUERY_IN_DERIVED_BODY_VEC_ONLY`'s five entries are all
+uncorrelated: a scalar in the body's WHERE, a scalar in its HAVING, an
+uncorrelated EXISTS, the JOIN-position variant and the two-derived-relations
+variant. `WEEK34_DERIVED_TABLE_VEC_ONLY` has a derived table inside a subquery
+body, which is the other direction. So the W34xW35 joint — a correlated
+subquery inside a derived body — is diffed nowhere. It works today (probed
+above), and B-1's second symptom lives in exactly that gap.
