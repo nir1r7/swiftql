@@ -130,11 +130,42 @@ bool reachesOutsideThisBody(std::unique_ptr<Expr>& e) {
 // clones, for `refuseUnguardedRaiser` to screen once the body's schema exists.
 // Clones rather than pointers: `local` is conjoined into `body.where` and then
 // MOVED into the plan, where a nested lowering may consume individual conjuncts.
+//
+// WEEK 36 — `residuals` IS THE SIXTH PARAMETER AND IT IS A POINTER, not a
+// reference, because the two callers differ in whether a residual EXISTS as a
+// destination:
+//
+//   lowerExistsSubqueries  passes a vector. A correlated conjunct that is not an
+//                          equality becomes an ON RESIDUAL on the semi/anti
+//                          join, evaluated inside the probe against a
+//                          probe(+)build pair. TPC-H q21 is exactly this shape:
+//                          `l2.l_suppkey != l1.l_suppkey` beside the good key
+//                          `l2.l_orderkey = l1.l_orderkey`.
+//   lowerCorrelatedScalars passes nullptr and KEEPS the old refusal. Its join is
+//                          a STANDARD LEFT join over a GROUPED derived table:
+//                          the correlation keys ARE the GROUP BY, so a residual
+//                          would have to be applied to a row that is already an
+//                          aggregate over the very rows it would have selected.
+//                          A different rewrite, not a flag on this one.
+//
+// !! THE REFUSAL NARROWS; IT DOES NOT DISAPPEAR. A body correlated ONLY by
+// inequalities produces no key at all, and the `keys.empty()` check at each call
+// site still refuses it by name — there is no hash key to build, and the
+// fallback is a cross product this engine has no operator for. What changed is
+// only that an inequality BESIDE a surviving key is no longer read as "no
+// equi-join to lower to".
+//
+// !! A ROUTED RESIDUAL BREAKS THE CASCADE EXACTLY AS A LIFTED KEY DOES, and sets
+// the same flag. The residual stops being a conjunct of the body: it is enforced
+// by the PROBE, above the body, so every body-local conjunct written AFTER it is
+// evaluated on the body's whole relation. Missing that would leave `unguarded`
+// under-filled for precisely the queries this parameter admits.
 void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
                       std::vector<JoinKey>& keys,
                       std::vector<std::unique_ptr<Expr>>& body_key_refs,
                       std::vector<std::unique_ptr<Expr>>& local,
-                      std::vector<std::unique_ptr<Expr>>& unguarded) {
+                      std::vector<std::unique_ptr<Expr>>& unguarded,
+                      std::vector<std::unique_ptr<Expr>>* residuals = nullptr) {
     bool lifted_a_key = false;
     for (auto& c : body_conjuncts) {
         // Does this conjunct reach outside the body? See reachesOutsideThisBody
@@ -165,23 +196,44 @@ void splitCorrelation(std::vector<std::unique_ptr<Expr>>& body_conjuncts,
         }
 
         auto* bin = dynamic_cast<BinaryExpr*>(c.get());
-        if (!bin || bin->op != "=")
-            // Week 36 — the message now names WHAT IT WOULD TAKE, because "no
-            // equi-join to lower to" reads as a dead end and it is not one. TPC-H
-            // Q21 is exactly this shape: `l2.l_orderkey = l1.l_orderkey AND
-            // l2.l_suppkey != l1.l_suppkey` -- a perfectly good key WITH an
-            // inequality beside it. The inequality would have to ride as an ON
-            // RESIDUAL on the semi/anti join, evaluated inside the probe against a
-            // probe(+)build pair. That is a real operator change and not a flag:
-            // the semi/anti build side keeps KEYS ONLY (build_keys_, a set), the
-            // residual would need the build ROWS, and it would have to be
-            // evaluated against a private probe(+)build schema -- output_schema_
-            // IS the probe schema and must stay that way (Week 32's containment).
-            // See docs/week-36-plan.md Task 3 for the full requirement.
-            refuse("only an equality between two columns can become a join key "
-                   "(a correlated inequality has no equi-join to lower to; it "
-                   "would have to ride as an ON residual on the semi/anti join, "
-                   "which this engine's set-probe build side cannot evaluate)");
+        if (!bin || bin->op != "=") {
+            // Week 36 — THIS IS WHERE THE REFUSAL BECAME A ROUTE. It used to
+            // read "a correlated inequality has no equi-join to lower to", which
+            // named a dead end that was never one: TPC-H q21 writes
+            // `l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey != l1.l_suppkey` —
+            // a perfectly good key WITH an inequality beside it. The inequality
+            // now rides as an ON RESIDUAL on the semi/anti join, evaluated inside
+            // the probe against a probe(+)build pair (the caller appends its
+            // body-side columns to the body projection and restamps its refs).
+            //
+            // A residual holding a SubqueryExpr is still refused, and not for
+            // tidiness: evaluate() throws unconditionally on one, so a nested
+            // body inside a per-pair predicate is an error at run time rather
+            // than a plan-time decision. It cannot arrive from an UNCORRELATED
+            // subquery (materializeSubqueries folded those to Literals before
+            // planning) and a CORRELATED one is classified body-local by
+            // reachesOutsideThisBody, so this guards a route that is closed
+            // twice over — which is exactly the kind that opens quietly.
+            if (!residuals)
+                refuse("only an equality between two columns can become a join "
+                       "key (a correlated inequality can ride as an ON residual "
+                       "on a semi/anti join, but a correlated SCALAR subquery is "
+                       "lowered to a grouped derived table, whose rows are "
+                       "already aggregated over the rows a residual would have "
+                       "selected)");
+            bool holds_subquery = false;
+            forEachSubqueryConst(c.get(), [&](const SubqueryExpr&) { holds_subquery = true; });
+            if (holds_subquery)
+                refuse("a correlated conjunct holding a subquery cannot become an "
+                       "ON residual (it is evaluated per candidate pair, and "
+                       "evaluate() has no case for a subquery node)");
+            residuals->push_back(std::move(c));
+            // See the header note: a routed residual takes a guard away from
+            // every body-local conjunct written after it, exactly as a lifted
+            // key does.
+            lifted_a_key = true;
+            continue;
+        }
 
         auto* l = dynamic_cast<ColumnRef*>(bin->left.get());
         auto* r = dynamic_cast<ColumnRef*>(bin->right.get());
@@ -308,6 +360,14 @@ const Schema* bodySpineSchema(const LogicalPlanNode* n) {
 // in the correlated-inequality refusal a few lines up and in docs/week-36-plan.md
 // Task 3. Refusing by name beats answering where the definition says raise.
 //
+// !! WEEK 36 CHANGED WHAT FILLS `unguarded`, NOT WHAT THIS DOES WITH IT. An ON
+// residual is now a second way a conjunct leaves the body's cascade, and
+// splitCorrelation sets the same flag for it, so a body-local raiser written
+// after `l2.l_suppkey != l1.l_suppkey` is screened here exactly as one written
+// after a lifted key is. The paragraph above still describes the OTHER half —
+// the residue that a residual now carries and that this refusal no longer has to
+// decline for lack of an operator.
+//
 // conjunctMayRaise via firstMayRaise, not exprMayRaise: a body conjunct is
 // truth-tested by the filter that holds it, so a non-INT static type raises on
 // its own.
@@ -320,6 +380,119 @@ void refuseUnguardedRaiser(const std::vector<std::unique_ptr<Expr>>& unguarded,
         refuse("a conjunct that can raise is written after the correlated "
                "equality this rewrite lifts into a join key, so decorrelating "
                "would evaluate it on rows the written order excluded");
+}
+
+// WEEK 36 — BIND A ROUTED RESIDUAL TO THE SCHEMA IT WILL BE EVALUATED IN, and
+// the single most dangerous function in this change.
+//
+// q21's residual is `l3.l_suppkey != l1.l_suppkey`: ONE COLUMN NAME, TWO
+// RELATIONS, one on each side of the join. Left to resolve by name in the
+// concatenated probe(+)build schema, BOTH sides find the probe's `l_suppkey`
+// (indexOf takes the first match and the probe half is first), the residual
+// becomes `x != x`, and the query answers with no error and an identical
+// --explain. That is round 1's H-1 shape verbatim, and it is why every ref is
+// restamped here rather than left to the fallback.
+//
+// The two sides are separated by SLOT — see kResidualBuildSlot (logical_plan.h):
+//
+//   BODY SIDE (level 0)   its column is APPENDED to the body's projection, after
+//                         the keys, under the generated name `$rN` — where N is
+//                         its POSITION in that projection, which is what makes
+//                         the names unique without a second counter and makes
+//                         --explain say which build column the residual reads.
+//                         APPENDED, never inserted: the right-hand key indices
+//                         are POSITIONAL 0..k-1 (rightKeyIndices), so anything
+//                         placed before them re-points every key at the wrong
+//                         column. (q21's residual therefore prints `$r1`: one
+//                         key at 0, the residual's `l_suppkey` at 1.)
+//   OUTER SIDE (level 1)  `id.outward()`, which is the SAME arithmetic
+//                         splitCorrelation applies to JoinKey::from_slot: one
+//                         step out makes a level-1 reference level 0 in the
+//                         enclosing block, whose schema is the probe half.
+//
+// `$` is not lexable in an identifier, so no body column and no probe column can
+// ever be named `$rN` — the name is a second, independent barrier behind the
+// slot, and it is what makes a mis-binding VISIBLE: --explain renders the
+// residual `(l1.l_suppkey != $r0)`, so the two same-named columns read
+// differently on the surface used to debug them.
+//
+// forEachLocalColumnRef (predicate_pushdown.h) is the maintained writing walk —
+// collectSlots's mutable twin — and asking it is what keeps this from becoming a
+// twentieth private dispatch site. It deliberately does NOT descend into a
+// SubqueryExpr's BODY (another scope's range table), which is right here too;
+// splitCorrelation has already refused a residual that holds one.
+//
+// An UNRESOLVED ref reports isLocal() == true, so it would be silently taken for
+// a body column and projected under a name the body cannot produce. It is
+// refused with the SAME message splitCorrelation gives it, because it is the
+// same fault seen one branch later (round 1, L-8).
+// `body_projection` is the body's select list, ALREADY holding the key refs;
+// this appends to it, so `size()` is the position the appended column will take.
+void bindResidualRefs(std::vector<std::unique_ptr<Expr>>& residuals,
+                      std::vector<std::unique_ptr<Expr>>& body_projection) {
+    for (auto& r : residuals) {
+        forEachLocalColumnRef(r.get(), [&](ColumnRef& cr) {
+            if (!cr.id.isResolved())
+                refuse("a column reference in this body could not be resolved to "
+                       "any relation, so the conjunct cannot be classified as "
+                       "local or correlated");
+            if (cr.id.isLocal()) {
+                const std::string name =
+                    "$r" + std::to_string(body_projection.size());
+                auto projected = cloneExpr(&cr);
+                projected->alias = name;   // buildProjectSchema publishes it
+                body_projection.push_back(std::move(projected));
+                cr.table_name.clear();
+                cr.column_name = name;
+                cr.id = ColumnId::local(kResidualBuildSlot);
+                return;
+            }
+            // The same containment splitCorrelation applies to a key, for the
+            // same reason: levels are NOT decremented when a middle body is
+            // decorrelated, so a level-2 reference would be read as a slot of
+            // the wrong range table.
+            if (cr.id.level() != 1)
+                refuse("a reference to a query block more than one level out "
+                       "cannot be decorrelated here");
+            cr.id = cr.id.outward();
+        });
+    }
+}
+
+// WEEK 36 — the residual's own half of the cascade rule, and the MIRROR of
+// refuseUnguardedRaiser rather than a copy of it.
+//
+// That function screens the conjuncts that LOST a guard. This one screens the
+// conjunct that GAINED one. A residual is lifted out of the body's AND cascade
+// and evaluated in the probe, so every body-local conjunct written AFTER it now
+// runs BEFORE it — in the body's own filter, on the build side — and the
+// residual is evaluated on FEWER rows than the written order gives it. For an
+// expression that can raise, that MASKS a raise: the query answers where the
+// written cascade says it must error. Same rule, opposite sign; expr_totality.h
+// binds the rewrite, not the direction.
+//
+// CONSERVATIVE ON PURPOSE: `unguarded` holds the body-local conjuncts written
+// after ANYTHING this rewrite lifted, which is a superset of "written after a
+// residual". Refusing on the superset can decline a query whose raising residual
+// is in fact written last, and that costs nothing measurable — residuals are new
+// this week, so nothing that ran before can be declined by this — while the
+// precise version would need splitCorrelation to hand back a per-residual index
+// nothing else wants.
+//
+// The schema is the FULL residual schema, not the body's: a residual names both
+// sides by construction, and screening it against the body's spine schema alone
+// would answer "unresolvable, so may raise" for every one of them.
+void refuseMaskedResidualRaiser(const std::vector<std::unique_ptr<Expr>>& residuals,
+                                const std::vector<std::unique_ptr<Expr>>& unguarded,
+                                const Schema& residual_schema) {
+    if (residuals.empty() || unguarded.empty()) return;
+    for (const auto& r : residuals) {
+        if (conjunctMayRaise(r.get(), residual_schema))
+            refuse("a correlated conjunct that can raise is lifted onto the "
+                   "semi/anti join as an ON residual while a body-local conjunct "
+                   "written after it stays in the body, so the residual would be "
+                   "evaluated on fewer rows than the written order gives it");
+    }
 }
 
 // Condition 2, enforced over the WHOLE body rather than only its WHERE.
@@ -873,7 +1046,16 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         std::vector<std::unique_ptr<Expr>> body_key_refs;
         std::vector<std::unique_ptr<Expr>> local;
         std::vector<std::unique_ptr<Expr>> unguarded;
-        splitCorrelation(body_conjuncts, keys, body_key_refs, local, unguarded);
+        // WEEK 36 — the sixth argument is what makes q21 plannable. A correlated
+        // conjunct that is not an equality is ROUTED here instead of refused; it
+        // becomes this join's ON residual below.
+        std::vector<std::unique_ptr<Expr>> correlated_residuals;
+        splitCorrelation(body_conjuncts, keys, body_key_refs, local, unguarded,
+                         &correlated_residuals);
+        // UNCHANGED, and it is the half of the old refusal that must survive: a
+        // body correlated ONLY by inequalities has no hash key, and the fallback
+        // would be a cross product this engine has no operator for. The routing
+        // above narrowed the refusal to exactly this case.
         if (keys.empty())
             refuse("no equality links the subquery to the enclosing query, so "
                    "there is no join key to decorrelate on");
@@ -911,14 +1093,32 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         // aggregate, LIMIT -- are every one of them refused by
         // requireDecorrelatableBody, which is what makes this rewrite sound
         // rather than merely convenient.
+        //
+        // WEEK 36 — THE RESIDUAL'S BODY COLUMNS ARE APPENDED TO THIS LIST, AFTER
+        // THE KEYS, and the word "after" is load-bearing. Everything above rests
+        // on the right-hand key indices being POSITIONAL 0..k-1
+        // (rightKeyIndices), so a column placed anywhere but the tail re-points
+        // every key at its neighbour — wrong rows, no error. bindResidualRefs
+        // gives each one the generated name `$rN` and rewrites the residual's
+        // ref to match; see its comment for why a name is not enough on its own.
         body.select_star = false;
         body.select_list = std::move(body_key_refs);
+        bindResidualRefs(correlated_residuals, body.select_list);
         auto body_plan = LogicalPlanBuilder::build(std::move(body), catalog);
 
         // SEAM AUDIT PASS 5, subquery B-3. Screened HERE and not inside
         // splitCorrelation because this is the first point at which the body's
         // own schema exists, and the screen needs operand TYPES.
         refuseUnguardedRaiser(unguarded, *body_plan);
+
+        // WEEK 36 — the mirror screen, and it needs BOTH schemas, so it is the
+        // first thing after the body plan and before the join exists. Same
+        // derivation the operator and the two static screens will use, from the
+        // one function, so none of them can be answering about a different
+        // expression than the one that runs.
+        const Schema residual_schema =
+            joinResidualSchema(spine->output_schema, body_plan->output_schema);
+        refuseMaskedResidualRaiser(correlated_residuals, unguarded, residual_schema);
 
         // SEAM AUDIT PASS 5, P5-1 — the same screen lowerInSubqueries takes, for
         // the same reason: this join goes BELOW the WHERE filter and removes
@@ -941,6 +1141,16 @@ ExistsLoweringResult lowerExistsSubqueries(std::unique_ptr<LogicalPlanNode> spin
         // to tell them apart, so one NULL in the body's key column emptied the
         // whole result and a NULL correlated key dropped a row SQL keeps.
         join->semantics = sq->negated ? JoinSemantics::ANTI : JoinSemantics::SEMI;
+        // WEEK 36 — and it is ANTI, never ANTI_NOT_IN, for a SECOND reason now:
+        // ANTI_NOT_IN may carry no residual at all (VecHashJoinNode's
+        // constructor says so), because its NULL short-circuit is a claim about
+        // the key column that a residual makes untrue.
+        //
+        // CONJOINED, not assigned: `spine` is a chain, and two EXISTS conjuncts
+        // over one body would each own a residual. conjoinAll of an empty vector
+        // is nullptr, which is exactly the pre-Week-36 value for every semi/anti
+        // join and keeps every existing plan string byte-identical.
+        join->on_residual = conjoinAll(std::move(correlated_residuals));
 
         // THE CONTAINMENT: this join's output schema is its LEFT child's, never a
         // merged one -- the invariant that keeps the body's slot numbering out of

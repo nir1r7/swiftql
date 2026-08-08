@@ -30,11 +30,45 @@
 //   1. the subquery appears as a WHOLE TOP-LEVEL WHERE CONJUNCT. `EXISTS(...) OR
 //      x > 5` has no disjunctive semi-join to lower to (Week 32's rule for IN,
 //      inherited verbatim);
-//   2. every correlated conjunct in the body's WHERE is an EQUALITY between two
-//      plain ColumnRefs, one level 0 (the body) and one level 1 (the immediately
-//      enclosing block). JoinKey holds column NAMES, so an inequality or a
-//      computed side has no key to become — and there is no cross-product
-//      operator to run the residual on;
+//   2. every correlated conjunct in the body's WHERE is EITHER an EQUALITY
+//      between two plain ColumnRefs — one level 0 (the body) and one level 1
+//      (the immediately enclosing block) — which becomes a JOIN KEY, OR any
+//      other correlated conjunct, which becomes this join's ON RESIDUAL.
+//
+//      WEEK 36 NARROWED THIS FROM "every correlated conjunct is an equality",
+//      and the narrowing is what makes TPC-H q21 plannable. Both of its bodies
+//      write `l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey != l1.l_suppkey`:
+//      a perfectly good key with a correlated INEQUALITY beside it. The
+//      inequality cannot be folded into the WHERE the way an INNER join's
+//      residual is, because `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)` — the identity
+//      join_condition.h rests on — FAILS for a semi join: the semi join has
+//      already collapsed the matching build rows to a yes/no answer, so by the
+//      time `q` could apply, the row that would satisfy it is gone. It is
+//      evaluated INSIDE the probe instead, against a probe⊕build pair, which is
+//      what an outer join's residual already does.
+//
+//      THREE THINGS THE ROUTE OWES, each enforced by name rather than assumed:
+//        * the body's projection gains the residual's body-side columns AFTER
+//          the keys (bindResidualRefs), so the right-hand key indices stay
+//          positional 0..k-1;
+//        * every ref is RESTAMPED BY SLOT — the body side onto
+//          kResidualBuildSlot under the generated name `$rN`, the outer side one
+//          level outward. q21's residual names `l_suppkey` on BOTH sides, from
+//          two aliases of the same table, and by-name resolution reads the probe
+//          column twice and answers `x != x`: wrong rows, no error, an identical
+//          --explain, which is round 1's H-1 shape verbatim;
+//        * output_schema DOES NOT MOVE. It is still children[0]'s. The residual
+//          resolves in joinResidualSchema(), which is private to the residual
+//          and reaches no consumer above the join.
+//
+//      A correlated EQUALITY whose sides are not both plain ColumnRefs is still
+//      refused rather than routed: JoinKey holds column NAMES, and turning a
+//      computed side into a residual is a widening no query needs yet.
+//
+//      lowerCorrelatedScalars does NOT take this route (it passes nullptr) and
+//      keeps the whole refusal. Its join is a STANDARD LEFT join over a GROUPED
+//      derived table, whose rows are already aggregates over the very rows a
+//      residual would have selected;
 //   3. the body has NO GROUP BY / HAVING / aggregate / LIMIT / DISTINCT. THIS
 //      CONDITION IS THIS FUNCTION'S, NOT THE FILE'S — Week 34's
 //      lowerCorrelatedScalars below REQUIRES an aggregate and ADDS a GROUP BY,
@@ -48,7 +82,11 @@
 //      results of a small dataset;
 //   4. at least one key was produced. A body correlated by nothing is
 //      uncorrelated and is materialized before planning; a body correlated ONLY
-//      by non-equalities has no join to build.
+//      by non-equalities has no join to build. THIS IS THE HALF OF THE OLD
+//      CONDITION-2 REFUSAL THAT SURVIVES WEEK 36 UNCHANGED, and the reason the
+//      route above is not a general one: a residual needs a hash key to be a
+//      residual OF, and the fallback for a keyless correlation is a cross
+//      product this engine has no operator for.
 //   6. NO BODY-LOCAL CONJUNCT THAT CAN RAISE IS WRITTEN AFTER A KEY (seam audit
 //      pass 5, subquery B-3). Lifting a correlated equality into a join key
 //      takes it out of the body's AND cascade: it is enforced by the PROBE,

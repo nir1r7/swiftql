@@ -7,7 +7,7 @@
 #include <numeric>
 #include <stdexcept>
 
-VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual, JoinSemantics semantics) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)), semantics_(semantics) {
+VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, std::vector<int> probe_key_indices, std::vector<int> build_key_indices, Schema output_schema, bool swapped, bool left_outer, std::unique_ptr<Expr> on_residual, JoinSemantics semantics, Schema residual_schema) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(std::move(probe_key_indices)), build_key_idx_(std::move(build_key_indices)), output_schema_(std::move(output_schema)), swapped_(swapped), left_outer_(left_outer), on_residual_(std::move(on_residual)), semantics_(semantics), residual_schema_(std::move(residual_schema)) {
     // Loud rather than latent: with swapped_ the build block is the LEFT half of
     // the output row, so emitNullExtended's trailing-NULL assembly would null the
     // PRESERVED side's own columns and return rows that look like data.
@@ -30,14 +30,49 @@ VecHashJoinNode::VecHashJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::
             throw std::runtime_error(
                 "internal: a semi/anti join cannot also be a left outer join");
         }
-        if (on_residual_) {
+        // Week 36 — WAS an unconditional "a semi/anti join takes no ON residual".
+        // SEMI and ANTI may now carry one (TPC-H q21). ANTI_NOT_IN may not, and
+        // the reason is specific rather than caution: its
+        // build_had_unmatchable_key_ short-circuit answers "S contains a NULL, so
+        // `x NOT IN S` is never TRUE" — a claim about the KEY column that a
+        // residual makes untrue, because a build row with a NULL key can no
+        // longer stand for "some row matched". NOT IN never produces a residual,
+        // so this is a containment and not a limitation.
+        if (on_residual_ && semantics_ == JoinSemantics::ANTI_NOT_IN) {
             throw std::runtime_error(
-                "internal: a semi/anti join takes no ON residual");
+                "internal: a NOT IN anti-join takes no ON residual");
         }
+        // THE OUTPUT SCHEMA ASSERTION STAYS, unchanged and load-bearing. The
+        // residual is evaluated against residual_schema_, which is PRIVATE: no
+        // body column enters output_schema_, so nothing above the join can name
+        // one. This is the line that says the residual did not widen the
+        // containment on its way in.
         if (output_schema_.size() != probe_child_->outputSchema().size()) {
             throw std::runtime_error(
                 "internal: a semi/anti join's output schema must be the probe schema");
         }
+        // The pairing, checked both ways so neither a residual without its
+        // schema nor a schema without its residual can sit here looking
+        // harmless. The width is exact because it is what the assembled row will
+        // be: the probe row followed by the whole build row.
+        if (on_residual_) {
+            if (residual_schema_.size()
+                != probe_child_->outputSchema().size() + build_child_->outputSchema().size()) {
+                throw std::runtime_error(
+                    "internal: a semi/anti join's residual schema must be its probe "
+                    "schema followed by its build schema");
+            }
+        } else if (residual_schema_.size() != 0) {
+            throw std::runtime_error(
+                "internal: a semi/anti join was given a residual schema without a residual");
+        }
+    }
+    // A LEFT join's residual resolves in output_schema_, which IS its merged
+    // schema, so it must not be handed a second one — two schemas for one
+    // expression is the drift joinResidualSchema exists to prevent.
+    if (semantics_ == JoinSemantics::STANDARD && residual_schema_.size() != 0) {
+        throw std::runtime_error(
+            "internal: a standard join's ON residual resolves in its output schema");
     }
 }
 
@@ -126,7 +161,16 @@ void VecHashJoinNode::open() {
 
             // Week 32: a SEMI/ANTI join never emits a build-side row, so only the
             // key is kept.
-            if (semantics_ != JoinSemantics::STANDARD) {
+            //
+            // Week 36 — UNLESS IT CARRIES A RESIDUAL. "Never emits" is still
+            // true; "never READS" is what stops being true. A residual is a
+            // predicate over build columns, and a set of serialized keys cannot
+            // answer one, so such a node falls through to the STANDARD path
+            // below and fills hash_table_ with the rows. A ROUTING CHANGE, not a
+            // new data structure: the machinery below is the one the ordinary
+            // equi-join has always used, and exactly one of the two containers
+            // is ever populated.
+            if (semantics_ != JoinSemantics::STANDARD && !on_residual_) {
                 build_keys_.insert(key_buf_);
                 continue;
             }
@@ -170,6 +214,45 @@ void VecHashJoinNode::fillOutChunk(int start, int count) {
 // NULL, so fillOutChunk turns these into REAL nulls rather than the placeholder
 // underneath them — the Week 24 validity mask doing the whole job. This operator
 // needs no materialization change at all.
+// Week 36 — THE SEMI/ANTI MATCH TEST, for a probe key that serialized into
+// key_buf_. One question — "does SOME build row under this key satisfy the
+// residual?" — asked of whichever container open() filled.
+//
+// WITHOUT a residual it is `build_keys_.count()`, byte for byte the pre-Week-36
+// test, and hash_table_ is empty.
+//
+// WITH one it scans the bucket and BREAKS ON THE FIRST PASS. The break is not an
+// optimization: a semi join emits each probe row AT MOST ONCE — R ⋉ S is π_R(R ⋈
+// S) with duplicates COLLAPSED, not an inner join with a projection on top — and
+// a loop that kept going would be indistinguishable here but is the shape that
+// grows into the duplicate bug the operator exists to prevent.
+//
+// SEMI AND ANTI ASK THE SAME QUESTION AND DIFFER ONLY IN THE VERDICT, which is
+// why this returns "matched" rather than "emit". A residual that evaluates to
+// NULL is UNKNOWN, and `passes()`'s `!v.isNull() && v.asInt() != 0` counts it as
+// NOT passing on BOTH sides — correct for both, and not a sign flip away from
+// wrong: EXISTS is two-valued, so a candidate that is UNKNOWN simply is not a
+// witness, and NOT EXISTS keeps the probe row exactly as it would with no
+// candidate at all. (The Week 33 round-2 failure was the opposite mistake:
+// applying NOT IN's three-valued collapse to an anti-join.)
+//
+// The assembled row is probe ⊕ build, matching residual_schema_'s construction
+// in joinResidualSchema. residual_row_ is reused across candidates, so the loop
+// allocates nothing per pair.
+bool VecHashJoinNode::buildSideMatches(const Row& probe_row) {
+    if (!on_residual_) return build_keys_.count(key_buf_) > 0;
+
+    auto it = hash_table_.find(key_buf_);
+    if (it == hash_table_.end()) return false;
+    for (const Row& build_row : it->second) {
+        residual_row_.assign(probe_row.begin(), probe_row.end());
+        residual_row_.insert(residual_row_.end(), build_row.begin(), build_row.end());
+        Value v = evaluate(on_residual_.get(), residual_row_, residual_schema_);
+        if (!v.isNull() && v.asInt() != 0) return true;
+    }
+    return false;
+}
+
 void VecHashJoinNode::emitNullExtended(const DataChunk& probe_chunk, int r) {
     Row out_row;
     out_row.reserve(output_schema_.size());
@@ -236,6 +319,11 @@ DataChunk* VecHashJoinNode::nextChunk() {
         // build row is read. Emitting once is the whole point — an inner join
         // with a projection on top would emit the probe row per match.
         if (semantics_ != JoinSemantics::STANDARD) {
+            // Week 36 — assembled ONCE per probe row when a residual needs it,
+            // outside the candidate scan. Without a residual nothing reads it
+            // before the emit path builds its own, so it stays empty and the
+            // no-residual node does exactly the work it did before.
+            Row probe_row;
             for (int r : *indices_ptr) {
                 stats.rows_in++;
                 // A NULL probe key emits nothing, for SEMI and ANTI alike:
@@ -263,6 +351,11 @@ DataChunk* VecHashJoinNode::nextChunk() {
                     //                   `x NOT IN ()` is TRUE for any x, which
                     //                   is why the empty case is tested on
                     //                   build_keys_ rather than folded in.
+                    //
+                    // Week 36: `build_keys_` is still the RIGHT container to ask
+                    // here, and not by luck — the constructor refuses a residual
+                    // on ANTI_NOT_IN, which is the only semantics this line
+                    // reads, so open() cannot have filled hash_table_ instead.
                     const bool emit =
                         semantics_ == JoinSemantics::ANTI
                         || (semantics_ == JoinSemantics::ANTI_NOT_IN
@@ -275,7 +368,12 @@ DataChunk* VecHashJoinNode::nextChunk() {
                     }
                     continue;
                 }
-                const bool hit = build_keys_.count(key_buf_) > 0;
+                if (on_residual_) {
+                    probe_row.clear();
+                    probe_row.reserve(probe_chunk->columns.size());
+                    for (const auto& cv : probe_chunk->columns) probe_row.push_back(valueAt(cv, r));
+                }
+                const bool hit = buildSideMatches(probe_row);
                 if (hit != (semantics_ == JoinSemantics::SEMI)) continue;
                 Row out_row;
                 out_row.reserve(output_schema_.size());

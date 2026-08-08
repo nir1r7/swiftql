@@ -1143,3 +1143,172 @@ TEST(Decorrelation, ARaiserWrittenBeforeTheLiftedEqualityAndATotalOneAfterItStil
         "SELECT l.lap_id FROM laps l WHERE EXISTS (SELECT 1 FROM drivers d "
         "WHERE d.driver_id = l.driver_id AND d.name < d.nationality)", cat));
 }
+
+// ===== Week 36: a correlated inequality becomes an ON residual (TPC-H q21) =====
+//
+// splitCorrelation used to refuse ANY correlated conjunct that was not an
+// equality, which is what blocked q21 — whose bodies pair a perfectly good key
+// with `l2.l_suppkey != l1.l_suppkey`. The refusal NARROWED to "no equality
+// survived"; the inequality is now routed onto the semi/anti join as an ON
+// residual. These tests pin the four pieces of that route separately, because
+// three of the four fail SILENTLY (wrong rows, no error, identical --explain)
+// and only the first fails loudly.
+
+namespace {
+const LogicalJoin* findSemiAnti(const LogicalPlanNode* n) {
+    if (n->type == LogicalNodeType::JOIN) {
+        const auto* j = static_cast<const LogicalJoin*>(n);
+        if (j->semantics != JoinSemantics::STANDARD) return j;
+    }
+    for (const auto& c : n->children)
+        if (const auto* j = findSemiAnti(c.get())) return j;
+    return nullptr;
+}
+// The self-correlated shape, with ONE COLUMN NAME on both sides of the residual
+// — q21's own hazard, transplanted onto the test catalog.
+const char* kSelfResidual =
+    "SELECT l.lap_id FROM laps l WHERE EXISTS "
+    "(SELECT 1 FROM laps l2 WHERE l2.team = l.team AND l2.speed > l.speed)";
+} // namespace
+
+// Piece 1 — the routing. Before the change this threw
+// "only an equality between two columns can become a join key".
+TEST(ExistsDecorrelation, ACorrelatedInequalityBesideAKeyIsRoutedToAnOnResidual) {
+    Catalog cat(CATALOG);
+    std::unique_ptr<LogicalPlanNode> plan;
+    ASSERT_NO_THROW(plan = planLowered(kSelfResidual, cat));
+    const LogicalJoin* semi = findSemiAnti(plan.get());
+    ASSERT_NE(semi, nullptr) << plan->explain();
+    EXPECT_EQ(semi->semantics, JoinSemantics::SEMI);
+    ASSERT_NE(semi->on_residual, nullptr)
+        << "the inequality must ride on the join, not vanish";
+    // ONE key survives and the key is the equality, not the inequality.
+    ASSERT_EQ(semi->keys.size(), 1u);
+    EXPECT_EQ(semi->keys[0].from_col, "team");
+    EXPECT_EQ(semi->keys[0].join_col, "team");
+}
+
+// Piece 4 — the body projection. [keys..., residual columns...], APPENDED. If a
+// residual column were inserted anywhere before the keys, rightKeyIndices'
+// positional 0..k-1 would point every key at its neighbour: wrong rows, no
+// error.
+TEST(ExistsDecorrelation, TheResidualsBodyColumnsAreAppendedAfterTheKeys) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(kSelfResidual, cat);
+    const LogicalJoin* semi = findSemiAnti(plan.get());
+    ASSERT_NE(semi, nullptr);
+    const Schema& body = semi->children[1]->output_schema;
+    ASSERT_EQ(body.size(), 2) << "one key, one residual column";
+    EXPECT_EQ(body.column(0).name, "team") << "the KEY must stay at index 0";
+    EXPECT_EQ(body.column(1).name, "$r1")
+        << "the residual's body column, renamed to a name `$` makes unlexable so "
+           "no user column can ever shadow it";
+}
+
+// !! THE BY-SLOT TEST, at the level where the binding is decided. q21's residual
+// names `l_suppkey` on BOTH sides; this one names `speed` on both. If the two
+// refs carried the same identity, indexOf would resolve both to the first match
+// — the PROBE half — and the residual would be `speed > speed`, constantly
+// FALSE. That is a wrong answer with no error and an identical --explain (round
+// 1's H-1 shape), so it has to be asserted structurally as well as by row count.
+TEST(ExistsDecorrelation, TheResidualsTwoSidesAreDistinguishedBySlotNotByName) {
+    Catalog cat(CATALOG);
+    auto plan = planLowered(kSelfResidual, cat);
+    const LogicalJoin* semi = findSemiAnti(plan.get());
+    ASSERT_NE(semi, nullptr);
+    const auto* bin = dynamic_cast<const BinaryExpr*>(semi->on_residual.get());
+    ASSERT_NE(bin, nullptr) << exprToString(semi->on_residual.get());
+    const auto* body_side  = dynamic_cast<const ColumnRef*>(bin->left.get());
+    const auto* outer_side = dynamic_cast<const ColumnRef*>(bin->right.get());
+    ASSERT_NE(body_side, nullptr);
+    ASSERT_NE(outer_side, nullptr);
+
+    // The body side names the APPENDED projection column at the build slot.
+    EXPECT_EQ(body_side->column_name, "$r1");
+    EXPECT_TRUE(body_side->id.isLocal());
+    EXPECT_EQ(body_side->id.localSlot("test"), kResidualBuildSlot);
+
+    // The outer side kept its own name and was moved ONE LEVEL OUT, so it is a
+    // local slot of the ENCLOSING block — the same arithmetic JoinKey::from_slot
+    // gets.
+    EXPECT_EQ(outer_side->column_name, "speed");
+    EXPECT_TRUE(outer_side->id.isLocal());
+    EXPECT_NE(outer_side->id.localSlot("test"), kResidualBuildSlot);
+
+    // And that is the whole property: two refs to a column called `speed` that
+    // resolve to DIFFERENT columns.
+    EXPECT_NE(body_side->id, outer_side->id);
+    const Schema resid = joinResidualSchema(*semi);
+    const int body_idx  = resid.indexOf(body_side->column_name,
+                                        body_side->id.localSlot("test"));
+    const int outer_idx = resid.indexOf(outer_side->column_name,
+                                        outer_side->id.localSlot("test"));
+    ASSERT_GE(body_idx, 0);
+    ASSERT_GE(outer_idx, 0);
+    EXPECT_NE(body_idx, outer_idx)
+        << "both sides resolved to the same column; the residual is `x > x`";
+    EXPECT_LT(outer_idx, semi->children[0]->output_schema.size())
+        << "the outer side must land in the PROBE half";
+    EXPECT_GE(body_idx, semi->children[0]->output_schema.size())
+        << "the body side must land in the BUILD half";
+}
+
+// THE HALF OF THE OLD REFUSAL THAT SURVIVES. A body correlated ONLY by an
+// inequality has no hash key at all, and the fallback would be a cross product
+// this engine has no operator for. It must still refuse — and by the `no
+// equality links...` message, not by the old `only an equality...` one, because
+// the cause genuinely changed.
+TEST(ExistsDecorrelation, ABodyCorrelatedOnlyByAnInequalityIsStillRefused) {
+    Catalog cat(CATALOG);
+    for (const char* sql : {"SELECT l.lap_id FROM laps l WHERE EXISTS "
+                            "(SELECT 1 FROM laps l2 WHERE l2.speed > l.speed)",
+                            "SELECT l.lap_id FROM laps l WHERE NOT EXISTS "
+                            "(SELECT 1 FROM laps l2 WHERE l2.speed > l.speed)"}) {
+        try {
+            auto plan = planLowered(sql, cat);
+            ADD_FAILURE() << "a keyless correlation was planned: " << sql;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("no equality links the subquery"),
+                      std::string::npos) << e.what();
+        }
+    }
+}
+
+// The SCALAR path passes nullptr and keeps the WHOLE refusal: its join is a
+// STANDARD LEFT join over a GROUPED derived table, whose rows are already
+// aggregates over the very rows a residual would have selected. Pinned by
+// message so a future widening of splitCorrelation cannot quietly reach it.
+TEST(ScalarDecorrelation, ACorrelatedInequalityIsStillRefusedForAScalarBody) {
+    Catalog cat(CATALOG);
+    try {
+        auto plan = planLowered("SELECT l.lap_id FROM laps l WHERE l.speed > "
+                                "(SELECT AVG(l2.speed) FROM laps l2 "
+                                " WHERE l2.season > l.season)", cat);
+        ADD_FAILURE() << "a correlated inequality reached the scalar rewrite";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find(
+                      "only an equality between two columns can become a join key"),
+                  std::string::npos) << e.what();
+    }
+}
+
+// The masking half of the cascade rule. A residual is lifted out of the body's
+// AND cascade and evaluated in the probe, so a body-local conjunct written AFTER
+// it now runs FIRST — on the build side — and the residual sees fewer rows than
+// the written order gives it. For an expression that can raise, that MASKS a
+// raise, which is the mirror of refuseUnguardedRaiser and is refused by name.
+TEST(ExistsDecorrelation, ARaisingResidualAheadOfABodyLocalConjunctIsRefused) {
+    Catalog cat(CATALOG);
+    try {
+        auto plan = planLowered(
+            "SELECT d.name FROM drivers d WHERE EXISTS "
+            "(SELECT 1 FROM drivers d2 WHERE d2.driver_id = d.driver_id "
+            "   AND SUBSTRING(d2.name, d2.age - 29, 1) > d.name "
+            "   AND d2.age > 0)", cat);
+        ADD_FAILURE() << "a raising residual was lifted past a body-local conjunct";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("lifted onto the semi/anti join as an "
+                                             "ON residual"),
+                  std::string::npos) << e.what();
+    }
+}

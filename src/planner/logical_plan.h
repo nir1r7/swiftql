@@ -180,13 +180,36 @@ struct LogicalJoin : LogicalPlanNode {
     // every hand-built test tree that calls it — is unchanged.
     JoinType join_type = JoinType::INNER;
 
-    // Non-key ON conjuncts, conjoined. NON-NULL ONLY FOR AN OUTER JOIN: an inner
+    // Non-key ON conjuncts, conjoined. NEVER SET ON AN INNER JOIN: an inner
     // join's residuals are folded into the WHERE conjunction instead (Week 27),
     // because ON and WHERE are interchangeable there and the fold buys pushdown.
     // For an outer join they are part of the MATCH TEST — a left row whose every
-    // candidate fails this predicate is null-extended, not deleted. Resolves
-    // against THIS node's merged output_schema, and is MOVED into the physical
-    // operator at lowering (like LogicalFilter::predicate).
+    // candidate fails this predicate is null-extended, not deleted. MOVED into
+    // the physical operator at lowering (like LogicalFilter::predicate).
+    //
+    // WEEK 36 — TWO PRODUCERS NOW, NOT ONE, and they resolve in DIFFERENT
+    // SCHEMAS. logical_plan.cc sets this on a JoinType::LEFT node, where it
+    // resolves against this node's merged output_schema. subquery_decorrelation.cc
+    // sets it on a SEMI/ANTI node (TPC-H q21's `l2.l_suppkey != l1.l_suppkey`),
+    // where output_schema IS the probe schema and the residual also names the
+    // body's projected columns — so it resolves against joinResidualSchema()
+    // below, which is probe (+) build. Every reader must ask that function rather
+    // than reach for output_schema; the sentence "resolves against THIS node's
+    // merged output_schema" stood here and is now true of only one producer.
+    //
+    // Why a semi join's residual cannot be folded into the WHERE the way an
+    // inner join's is: `R ⋈_(p∧q) S ≡ σ_q(R ⋈_p S)` is the identity the fold
+    // rests on, and it FAILS for a semi join — the semi join has already
+    // collapsed the matching build rows to a yes/no answer, so by the time `q`
+    // could apply, the row that would satisfy it is gone. It must be evaluated
+    // INSIDE the probe, against a probe(+)build pair.
+    //
+    // ANTI_NOT_IN NEVER carries one, and that is a containment rather than an
+    // omission: its build_had_unmatchable_key_ short-circuit answers "S contains
+    // a NULL, so `x NOT IN S` is never TRUE" — a claim about the KEY column that
+    // a residual makes untrue, because a build row with a NULL key can no longer
+    // stand for "some row matched". `NOT IN` produces no residual, so the
+    // constraint costs nothing; VecHashJoinNode's constructor enforces it.
     //
     // !! IT IS EVALUATED PER CANDIDATE PAIR, NOT PER OUTPUT ROW, and that makes
     // it the one per-row expression in the join layer that is not a conjunct of
@@ -200,6 +223,17 @@ struct LogicalJoin : LogicalPlanNode {
     // become ordinary WHERE conjuncts (below) and the screen sees them in the
     // list. Anything else added that shrinks a LEFT join's preserved input owes
     // the same screen.
+    //
+    // WEEK 36: "a LEFT join's preserved input" is now "a LEFT join's preserved
+    // input OR A SEMI/ANTI JOIN'S PROBE INPUT". The argument transfers verbatim
+    // — distribute pushes into children[0] of a semi/anti join exactly as it does
+    // for a LEFT one, and every probe row it removes removes that row's residual
+    // evaluations — so the screen itself is UNCHANGED except for the schema it is
+    // handed (joinResidualSchema, not output_schema). Handing it output_schema
+    // for a semi/anti node would be worse than useless: the body-side refs are
+    // named `$rN`, which resolves nowhere in the probe schema, so the screen
+    // would answer "may raise" for every q21-shaped query and quietly cost
+    // pushdown on all of them.
     //
     // A SEPARATE, STILL-OPEN PROPERTY (pass 5, P5-M1): there is no conjunct
     // CASCADE inside this expression. It is one Expr handed to evaluate(), which
@@ -254,6 +288,52 @@ struct LogicalJoin : LogicalPlanNode {
     }
     std::string explain() const override;
 };
+
+// Week 36 — THE RELATION SLOT EVERY BUILD-SIDE COLUMN CARRIES INSIDE A SEMI/ANTI
+// JOIN'S RESIDUAL SCHEMA, and the whole reason q21's residual resolves to the
+// right column.
+//
+// q21's residual is `l3.l_suppkey != l1.l_suppkey`: the SAME COLUMN NAME, from
+// two aliases of the same table, one on each side of the join. In a concatenated
+// probe(+)build schema `indexOf(name)` takes the FIRST match — which is always
+// the probe half, because the probe half is first — so a body-side ref left to
+// resolve by name reads the PROBE's column and the residual becomes `x != x`.
+// Wrong rows, no error, an identical --explain: the H-1 failure shape verbatim.
+//
+// So the two halves are separated by SLOT, not by name. The probe half keeps the
+// outer block's own slots (the residual's level-1 refs are stamped
+// `id.outward()`, exactly as splitCorrelation stamps JoinKey::from_slot). The
+// build half is re-stamped to THIS value, and the residual's body-side refs are
+// stamped to match — so `indexOf(name, slot)` is exact on both sides and neither
+// can reach the other.
+//
+// Out of band on purpose: a relation slot is a range-table position, so every
+// real one is small and non-negative and no probe column can collide with this.
+// It is never stored in any node's `output_schema` — joinResidualSchema builds a
+// PRIVATE schema for the residual, and nothing else reads it.
+//
+// Belt AND braces: decorrelation also RENAMES the appended body columns to
+// `$rN`, and `$` is not lexable in an identifier, so even the bare-name fallback
+// in resolveColumnIndex / staticTypeOf cannot cross the seam. The slot is the
+// guarantee; the name is what makes a wrong one visible in --explain.
+constexpr int kResidualBuildSlot = 1 << 20;
+
+// The schema `LogicalJoin::on_residual` resolves in, which is NOT always the
+// node's output schema.
+//
+//   STANDARD (incl. LEFT)  the merged output schema, exactly as Week 29 had it.
+//   SEMI / ANTI            probe (+) build — because output_schema IS the probe
+//                          schema (the Week 32 containment, which does NOT move)
+//                          and the residual also names the body's projected
+//                          columns.
+//
+// ONE function, three consumers that must agree: VecHashJoinNode (which
+// evaluates the residual), PredicatePushdown::distribute (which screens it with
+// conjunctMayRaise before it will shrink the probe side) and collectIntOrigins's
+// taint walk. A second derivation of this schema is the drift that would make a
+// screen answer about a different expression than the one that runs.
+Schema joinResidualSchema(const Schema& probe, const Schema& build);
+Schema joinResidualSchema(const LogicalJoin& join);
 
 // evaluate a predicate (bool expr) and discard non matching rows
 // serves both WHERE and HAVING; position encodes which (below aggregate = WHERE)
