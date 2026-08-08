@@ -90,3 +90,72 @@ exhibited it. But `sort_comparator.h`'s own header states the general defect cor
 then closes only the stable_sort instance. The cut is `LimitNode`/`VecLimitNode`, and nothing
 requires a `SortNode` to sit under it. `LIMIT` without `ORDER BY` is a first-class SQL shape.
 
+#### E-8 is much wider than pass 2's repro: no `GROUP BY` and no contrivance are needed either
+
+The aggregate is not load-bearing. Neither is the repeated-conjunct trick. Three more shapes, all
+run at HEAD:
+
+**(i) `DISTINCT` + `LIMIT`, no `ORDER BY`** (f1 data, same 6x predicate):
+
+```sql
+SELECT DISTINCT d.team FROM drivers d JOIN laps l ON d.driver_id = l.driver_id WHERE ... LIMIT 3
+```
+```
+row-volcano / col-volcano / vec-noopt : AlphaTauri, Alpine,     McLaren
+vec optimized                          : RedBull,    AlphaTauri, McLaren
+```
+
+**(ii) A bare projection over a join + `LIMIT`. No aggregate, no DISTINCT, no ORDER BY** — the
+minimal expression of the defect:
+
+```sql
+SELECT d.team, l.lap_id FROM drivers d JOIN laps l ON d.driver_id = l.driver_id WHERE ... LIMIT 3
+```
+```
+row-volcano / col-volcano / vec-noopt : (AlphaTauri,2) (AlphaTauri,8) (Alpine,9)
+vec optimized                          : (RedBull,95)   (RedBull,181)  (RedBull,208)
+```
+Disjoint row sets.
+
+**(iii) NO CONTRIVANCE AT ALL — an ordinary TPC-H query, two plain equality predicates**
+(`--catalog data/tpch/sf0.01/catalog.json`):
+
+```sql
+SELECT c.c_name, o.o_orderkey
+FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey
+WHERE o.o_orderstatus = 'F' AND o.o_orderpriority = '1-URGENT'
+LIMIT 3
+```
+```
+row-volcano       Customer#000000404 2 | Customer#000000752 36 | Customer#000000607 45
+columnar-volcano  Customer#000000404 2 | Customer#000000752 36 | Customer#000000607 45
+col-vectorized    Customer#000000004 13388 | Customer#000000005 1090 | Customer#000000005 11941
+col-vec-noopt     Customer#000000404 2 | Customer#000000752 36 | Customer#000000607 45
+```
+Disjoint row sets, on a query no one would call pathological. `--explain` names the mechanism
+exactly:
+```
+optimized     VecHashJoin [c_custkey = o_custkey] build=orders    <- probe = customer
+                VecScan [customer]                    est=1500
+                VecFilter [...] / VecScan [orders]    est=1000    (15000 / 3 / 5)
+--no-optimize VecHashJoin [o_custkey = c_custkey]                 <- probe = orders
+```
+Two ordinary conjuncts on `orders` drop its estimate (`15000 * 1/3 * 1/5 = 1000`) below
+`customer` (1500), the build side flips, the probe order reverses, and the `LIMIT 3` cut lands on
+a different three rows. Volcano's raw-count rule (`1500 < 15000`) never flips.
+
+**And it transports into a value on the same query**, so it is arithmetic and not row order:
+
+```sql
+SELECT COUNT(*) FROM orders WHERE o_custkey =
+  (SELECT c.c_custkey FROM customer c JOIN orders o ON c.c_custkey = o.o_custkey
+   WHERE o.o_orderstatus = 'F' AND o.o_orderpriority = '1-URGENT' LIMIT 1)
+```
+```
+row-volcano 11 | columnar-volcano 11 | col-vectorized 10 | col-vec-noopt 11
+```
+
+So E-8 is not a corner of pass 2's contrived predicate. `<any join> ... LIMIT n` where pushdown
+moves one side's estimate across the other's raw count is the general shape, and TPC-H-scale
+tables (1500 vs 15000, two ordinary equality filters) reach it without help.
+
