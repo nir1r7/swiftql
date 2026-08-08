@@ -534,3 +534,190 @@ storage formats — so the refusals hand this seam *more* jurisdiction, not less
   nothing states or tests that coupling.
 
 ---
+### B.9 Randomized differencing — 550 queries × 6 invocations, **0 storage divergences**
+
+A generator biased at the classes above (multi-conjunct WHEREs mixing scan-local and
+cross-relation predicates, literals drawn from the chunk boundaries 8191/8192/8193 and
+15000/16383/19999, `LIMIT` on 60 % of shapes from
+{0,1,2,3,5,1023,1024,1025,8191,8192,8193,10000,20000}, `ORDER BY` on 35 %, `GROUP BY`
+and `COUNT/MIN/MAX` arms, joins on ~50 %). Every query run in all six invocations and
+compared byte-exactly (stdout+stderr, encoding banner filtered):
+
+| seed | catalog | queries | storage divergences (A vs B) | engine-only (B vs C) |
+|---|---|---|---|---|
+| 20260808 | shipped | 120 | **0** | 0 |
+| 4242 | synthetic 3-chunk | 130 | **0** | 0 |
+| 99991 | synthetic 3-chunk | 150 | **0** | 0 |
+| 771 | shipped | 150 | **0** | 1 |
+
+The single engine-only difference is pass 4's B.3 shape again and is **not** a finding:
+
+    SELECT l.round FROM laps l JOIN drivers d ON l.driver_id = d.driver_id
+      WHERE l.driver_id >= 1 AND l.lap_id < 7 AND d.driver_id >= -1
+      B  17 3 20 4 19 14      C  17 20 19 14 3 4
+
+`sort`ed, the two are byte-identical — verified, not asserted. `JoinEnumeration` flips
+the probe side, the query has no `LIMIT` and no `ORDER BY`, and `orderIsPlanStable`
+states JOIN is not order-stable. A and B agree exactly, which is what this seam owns.
+
+---
+
+## Findings
+
+Ranked. Every one has a concrete failing shape, run across the three real cells with the
+outputs recorded side by side above.
+
+### S-13 — **HIGH** (new) — a cross-relation conjunct whose column name also exists in the scanned table with a different type bypasses the pruner's raise-screen; the skip then masks the raise
+
+`ChunkPruner::collectSimplePredicates` screens with `conjunctMayRaise(expr, schema)`
+where `schema` is the scan's own; `staticTypeOf`'s bare-name fallback
+(`expr_totality.h`, `if (idx < 0) idx = schema.indexOf(col->column_name);`) resolves a
+slot-1 ref against the scanned table anyway, types it off the wrong column, and lets the
+walk continue to a conjunct that prunes every chunk. The collector's
+`isLocal() && localSlot(...) < 1` guard stops the conjunct being *collected*; nothing
+guards the *screen*, and the screen is what licenses everything behind it. `big(k INT,
+x INT, j INT)` 20 000 rows / 3 chunks, `small(j, x DOUBLE, s)`, `small2(j, x STRING, s)`:
+
+| query | A | A-noopt | B | B-noopt | C | C-noopt |
+|---|---|---|---|---|---|---|
+| `SELECT b.k FROM big b JOIN small s ON b.j=s.j WHERE s.x AND b.k > 999999` | `Error: std::get: wrong index for variant` | same | **0 rows** | **0 rows** | **0 rows** | **0 rows** |
+| `SELECT b.k FROM big b JOIN small2 s ON b.j=s.j WHERE s.x > 5 AND b.k > 999999` | `Error: Type mismatch in Value comparison` | same | **0 rows** | **0 rows** | **0 rows** | **0 rows** |
+| `SELECT COUNT(*) FROM big b JOIN small2 s2 ON b.j=s2.j WHERE s2.x AND b.k > 999999` | `Error: std::get…` | same | **`0`** | **`0`** | **`0`** | **`0`** |
+
+`chunks_skipped=3/3` in the plan, with the filter still sitting unmoved above the join —
+pushdown froze the same conjunct that the pruner cleared. Reproduces over three
+different all-chunk pruners and both engines, with the optimizer on and off. Confined to
+INNER joins (B.3). Not reachable on the shipped catalog or TPC-H, whose shared column
+names happen to be same-typed — so **no gate can currently see it**. Fix: give the
+pruner the schema the hint was written against (~20 lines, see S-14), or the 6-line
+local guard that requires every ref in a conjunct to resolve at its own slot before the
+conjunct is screened.
+
+### S-14 — **MEDIUM** (new; the fix round's own cost item, re-scoped) — a cross-relation conjunct written before a scan-local one costs the scan all of its zone-map pruning, on Volcano in **both** optimizer settings
+
+Confirmed, and the fixer's scope corrected twice: it is a written-order effect, not a
+`--no-optimize` one, and `Planner::plan:284` hands raw `stmt.where` to the FROM scan
+regardless of the optimizer, so **Volcano's optimized leg loses the skip too**. Same
+query, conjuncts swapped, same binary, same 398-row answer, median of 11 (shipped) / 7
+(TPC-H) `Execution:` on Release:
+
+| leg | cross-first | local-first | delta | `chunks_skipped` |
+|---|---|---|---|---|
+| shipped, col-volcano optimized | 7.421 ms | 6.115 ms | **+21.4 %** | 0/2 vs 1/2 |
+| shipped, col-vectorized `--no-optimize` | 2.317 ms | 1.786 ms | **+29.7 %** | 0/2 vs 1/2 |
+| sf0.01 (8 chunks), col-volcano optimized | 65.56 ms | 23.44 ms | **2.80×** | 0/8 vs 7/8 |
+| sf0.01, col-vectorized `--no-optimize` | 32.35 ms | 17.58 ms | **1.84×** | 0/8 vs 7/8 |
+
+Control: a Release build of `364a2d3` (the parent of the commit that added the
+written-order walk) skips the chunk in **every** combination and shows no order
+sensitivity at all. Denominator: the same query's own `Execution:`, so loading, parsing
+and planning are excluded. The fixer's "42.5 → 51.5 ms" does not reproduce on this box
+in any cell; the ratio does. Fix: thread the filter's child schema through
+`pruningHintForPreservedSide` to `ChunkPruner` — **~20 lines**, not the one-liner the
+comment claims, because the schema must survive to scan time and neither scan node
+stores it — and it closes S-13 at the same time.
+
+### S-9 — **MEDIUM** (carried) — `narrowRows` is a plan-time rewrite of the whole table on the row leg, and `benchmark.py` reports it with the wrong sign
+
+Code unchanged. Re-measured, TPC-H sf0.1, Release, `--storage row --execution volcano`:
+`SELECT * FROM lineitem LIMIT 1` Plan **44.1 µs** / Exec 19.1 µs;
+`SELECT l_quantity FROM lineitem LIMIT 1` Plan **110 926.8 µs** / Exec **14.2 µs**.
+**2 515× on the plan timer; +4.5 % of a 2 699 ms process.** New this pass: the width
+term is weak (4 kept columns cost +12 % of 1 kept column's plan time, not 2×), so the
+cost is O(rows) paid in full for a single kept column. And the instrument's error is now
+shown rather than argued: `Execution:` *falls* from 19.1 µs to 14.2 µs on the query that
+got 110 ms slower, so `benchmark.py` scores it a 25 % speed-up. Fix unchanged: a
+`keep_` index vector consumed in `SeqScanNode::next()`, mirroring the columnar branch,
+~25 lines.
+
+### S-12 — **MEDIUM** (carried) — the bounded top-N is wired to the deterministic cut only
+
+`row_cap` still assigned in exactly two places, both the cut. `SELECT l_orderkey FROM
+lineitem ORDER BY l_orderkey LIMIT 5` (sf0.1): row-volcano `Sort` **930 686 µs**
+vs 877 599 µs without the `LIMIT`; col-vectorized prints `VecSort rows_in=600865
+**rows_out=600865**` under a `LIMIT 5`. Size of the miss unchanged (pass 4's controlled
+8.3×). Fix: one argument at `planner.cc:421` and one assignment where the logical
+`LIMIT` is built over a declared `LogicalSort`.
+
+### S-10 — **LOW** (carried) — `LIMIT 0` is the most expensive cut in the engine
+
+sf0.01 join: sort `rows_out=0` **20 133 µs** (A) / **23 778 µs** (B) vs `rows_out=1`
+2 792 / 2 781 µs — **7.2× / 8.5×**. Shipped catalog `drivers ⨝ laps … LIMIT 0`:
+A 11.626 ms / B 11.993 ms / **C 0.008 ms**, ~1 450×, same answer in all three.
+One line: `if (limit <= 0) return node;` in `deterministicCut` plus the matching `> 0`
+at `planner.cc:477`.
+
+### S-11 — **LOW** (carried) — the cut's sort sits above the projection, so a redundant `ORDER BY` decides whether a query runs
+
+Plan shapes re-confirmed (`Project rows_in=5000` under the cut vs `rows_in=1` under a
+declared `ORDER BY`). `SELECT v FROM big2 b JOIN k5000 a ON b.id=a.id LIMIT 1` is
+REFUSED in C and C-noopt and answers `0` in A and B; adding `ORDER BY b.id` makes all
+six answer `0`.
+
+### L-1, L-2, L-3 — **LOW** (carried) — all three re-verified live at HEAD
+
+L-1's duplicate-column refusal fires (`column 'lap_id' is declared twice`) and is still
+the only thing keeping `narrowRows` from double-moving a `Value`. L-2's duplicate table
+name still silently keeps the first (`COUNT(*) = 10000` in all three cells). L-3's early
+return is still correct only by an unstated property of `narrowSchema`.
+
+### Not findings, recorded so they are not re-derived
+
+- **Order-only vectorized-optimizer differences on unordered joins.** 1 of 550
+  randomized queries; `sort`ed output byte-identical, verified. `JoinEnumeration` flips
+  the probe side; A = B always. Accepted behaviour of `orderIsPlanStable`'s JOIN rule.
+- **The written-order stop keeps the pruning it should.** A total disjunction
+  (`(lap_id > 1 OR lap_id > 2)`) does not stop the walk; a disjunction containing a
+  raiser does. The screen is precise, not uniformly conservative.
+- **Invariant 12 holds.** The `localSlot < 1` guard survives a construction built to
+  collapse the answer to 0 if it leaked (B.4).
+- **Outer joins are immune to S-13** (B.3), and correlated refs cannot reach the pruner
+  at all (B.5) — both by refusals that a future round could remove.
+- **The round-4 refusals still widen this seam's jurisdiction** rather than escaping it
+  (B.7); `--storage row --execution vectorized` is still refused, so there are still
+  three cells.
+
+---
+
+## Summary
+
+| severity | count |
+|---|---|
+| BLOCKER | **0** |
+| **HIGH** | **1** — S-13 (new) |
+| MEDIUM | 3 — S-14 (new), S-9 (carried), S-12 (carried) |
+| LOW | 5 — S-10, S-11, L-1, L-2, L-3 (all carried) |
+
+**Final status of the four carried items — all four OPEN and unchanged in code:**
+
+- **S-9 OPEN.** `narrowRows` is still a plan-time lambda in `Planner::plan:217`;
+  `SeqScanNode` still has no `keep_`; `benchmark.py:81` still parses `Execution:` only.
+  Re-measured at HEAD: 2 515× on the plan timer, +4.5 % of the process, and the
+  benchmark still scores the regressed query 25 % *faster*. Pass 3's headline (1540×)
+  and pass 4's own correction (+2.7 % end-to-end) both stand for their denominators;
+  pass 4's "keeping 4 columns costs twice what keeping 1 costs" does not — the plan
+  timer says +12 %.
+- **S-10 OPEN.** 7.2×/8.5× on the sort at `LIMIT 0`, ~1 450× between the engines on the
+  shipped catalog. One line.
+- **S-11 OPEN.** Sort still above the projection; the redundant-`ORDER BY` answerability
+  flip still reproduces exactly.
+- **S-12 OPEN.** `row_cap` still assigned only by the cut; a declared `ORDER BY … LIMIT
+  5` over 600 865 rows still sorts all of them, and `VecSort` still says so in its own
+  `rows_out`.
+
+Evidence base for this pass: **~790 queries × 6 invocations** — 550 randomized over four
+seeds and two catalogs, 144 in the raiser × pruner battery, 64 in the join battery, and
+~30 targeted — plus a before/after against a Release build of `364a2d3`. **All six
+divergences found are one finding, S-13.**
+
+**Verdict: the storage seam is NOT clean. Four passes called it clean and pass 5 does
+not — the raise-masking class the fix round closed is still open through a second door
+(S-13, HIGH: `WHERE s.x AND b.k > 999999` errors in row storage and prints `COUNT(*) = 0`
+in columnar), and the fix that closed the first door cost Volcano its zone-map pruning
+on both legs, not just `--no-optimize` (S-14, MEDIUM: +21 % on a 2-chunk table, 2.80× on
+an 8-chunk one). One ~20-line change — thread the hint's own schema to the pruner —
+closes both. Everything else this seam owns held: value fidelity byte-exact, scan order
+identical, invariant 12 intact, 0 storage divergences in ~790 differential queries
+outside the S-13 class. The audit ends here with one HIGH open; it should not close
+until S-13 is fixed, because the only reason no gate sees it is that no catalog in the
+tree declares a same-named column with two types.**
