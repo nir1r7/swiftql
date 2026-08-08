@@ -347,3 +347,202 @@ table on each side and with a join-topped derived body — all agree with SQLite
   leftover loop lifts it above the tree. Ran the `COUNT` zero-row shape
   (`WHERE d.age > (SELECT count(*) ... WHERE l.speed > 999)`, 20 rows) and the `AVG` shape
   in a three-relation spine; both match SQLite.
+
+#### C-6 — derived-table naming and resolution across the boundary
+
+- `derivedRelationSchema` refuses two output columns of one name — verified live:
+  `SELECT * FROM (SELECT d.driver_id, l.driver_id FROM drivers d JOIN laps l ON …) x`
+  gives *"derived table 'x': column 'driver_id' is produced twice; give one of them an
+  alias"*. `development.md`'s Week 34 row is accurate here.
+- A derived column sharing a name with an outer relation's column stays resolvable:
+  `indexOf(name, slot)` is an exact pair match and the derived relation is normalized to
+  slot 0 in its own schema, then stamped with the outer slot by the merged schema. Ran
+  `SELECT x.team, d.team FROM (SELECT … AS team FROM laps) x JOIN drivers d …` — correct.
+- `rightKeyIndices`' bare-name lookup on a STANDARD join's build side is still safe with
+  derived relations: `children[1]` of a STANDARD join is always a single relation (a leaf
+  after `decompose`/`rebuild`, a `buildRelation` result before), a derived relation's own
+  schema is slot-0 and duplicate-free by the refusal above, and `$scalarN`'s group keys
+  were renamed `$k0…$k{n-1}` in `8a23b9d` (`$` is not lexable, so no body column can
+  shadow one).
+- An outer reference INTO a derived body is refused by name, not silently mis-resolved:
+  *"derived table 'y': a subquery in FROM cannot reference a column of an enclosing query
+  (LATERAL is not supported)"* — verified at top level and inside an `EXISTS` body.
+- Nested derived tables (`FROM (SELECT … FROM (SELECT …) y) z JOIN …`) and a derived
+  relation as the LEFTMOST relation of a reordered spine both agree with SQLite. In the
+  latter case the DP moved the derived relation OFF slot 0 (`order=drivers@1,laps@2,@0`),
+  `leftmost_is_slot0` correctly withheld the top-level pruning hint, and each relation's
+  own pushed filter still reached its own scan (`pruning=on`, `chunks_skipped=1/2`).
+
+---
+
+### B-4 (LOW, EXPLAIN surface; a case added without the wrapper the comment promises) — the DERIVED lowering calls `lowerNode` instead of `lower`, so the ROOT of every derived body's physical subtree is the one node in the plan with no `est=`
+
+`src/planner/vectorized_plan_builder.cc:274-281`:
+
+    // Week 23: every physical node inherits its logical counterpart's estimate so
+    // EXPLAIN ANALYZE can print est= next to rows_out. The wrapper stamps once for
+    // all eight cases (the JOIN case has two returns); -1 stays -1 under --no-optimize.
+    std::unique_ptr<VecPlanNode> Lowering::lower(...) {
+        std::unique_ptr<VecPlanNode> phys = lowerNode(node, pruning_where);
+        phys->estimated_rows = node->estimated_rows;
+        return phys;
+    }
+
+`lowerNode` has **nine** cases, not eight — Week 34 added DERIVED — and DERIVED is the
+only case in the file that recurses via `lowerNode` rather than `lower`
+(`:304`, the sole in-case caller; every other case calls `lower`). So the body's root
+physical node never gets stamped and prints blank.
+
+Visible in `17bfcea`'s own pasted evidence, unremarked:
+
+    VecHashJoin [c_custkey = k] ... build=derived cost=3516 (alt=4024)   est=1000
+      VecScan [customer, 2 columns]                                      est=1500
+      VecDerived [d, 2 columns]                                          est=1000
+        VecProject [k, s] (materialize)                                  <-- no est=
+          VecHashAggregate [group_by=o.o_custkey, agg=COUNT(*)]          est=1000
+
+Reproduced on `catalog.json` under `--explain-analyze`: `VecProject [driver_id, speed]`
+inside the derived body shows `rows_in=10000 rows_out=10000` and no `est=`, while its own
+child scan shows `est=10000`. So `17bfcea`'s claim that "`--explain-analyze` now shows
+estimates tracking actuals on **every node** of that plan" is one node short, and it is a
+node inside the very construct the commit was fixing.
+
+**Impact is confined to EXPLAIN.** `VecPlanNode::estimated_rows` has exactly one writer
+(`:279`) and one reader (`collectVecNodes`, `src/cli/main.cc:302`); no operator and no
+cost decision consults it — the physical cost decisions read the LOGICAL estimates
+(`join->children[i]->estimated_rows`) directly. Hence LOW, not higher. But it is exactly
+the class the standing rule names: a case was added, the comment that states the
+invariant ("the wrapper stamps once for all eight cases") was not swept, and the new case
+is the one that broke it.
+
+Fix is one token: `lowerNode(` -> `lower(` at `:304`, plus "eight" -> "nine" at `:275`.
+
+---
+
+### B-5 (MEDIUM, stale invariant in a header, in the wake of a fix that corrected only the `.cc`) — `join_enumeration.h` still carries verbatim the paragraph `18af84f` identified as "false in both halves" and replaced in `join_enumeration.cc`
+
+`18af84f`'s commit message, item 3:
+
+> join_enumeration.cc: the Week 34 paragraph claiming joinCardinality's max(l, r) branch
+> runs for a derived relation, and that method=written-floor was therefore CLI-reachable,
+> is false in both halves … Replaced with what is true.
+
+It was replaced in `join_enumeration.cc:483-500`. The **header was not swept**, and
+`src/planner/join_enumeration.h:84-91` still says, word for word, the thing that commit
+deleted:
+
+    // What IS new, and is a different consumer: a derived relation has no
+    // TableStats, so joinCardinality's non-multiplicative max(l, r) branch runs on a
+    // query the CLI can type. Optimal substructure does not hold for a subset
+    // containing one; … Week 28 recorded that method=written-floor
+    // had never executed — it is reachable now.
+
+Both halves are still false, for the reason `18af84f` gives: `have_ndv` is set when
+**either** side supplies an NDV (`cardinality_estimator.cc:259-264`), and on the shapes
+the CLI can type the non-derived side always does, so the multiplicative branch runs.
+I re-probed for `method=written-floor` on the shape most likely to produce it — a
+three-relation spine where **every** relation is derived, so neither side of any subset
+has an NDV and `max(l, r)` genuinely runs:
+
+    SELECT count(*) FROM (SELECT l.driver_id AS k FROM laps l) a
+      JOIN (SELECT d2.driver_id AS k2 FROM drivers d2) b ON a.k = b.k2
+      JOIN (SELECT d3.driver_id AS k3 FROM drivers d3) c ON b.k2 = c.k3
+
+    order=@1,@2,@0 cost=16108 (written=30080) method=dp
+
+`method=written-floor` still does not fire. The header asserts a reachability nobody has
+observed, and asserts it as the justification for a containment.
+
+Two more stale claims in the same header block, from the same commit:
+
+- `join_enumeration.h:66` — "It also declines, **silently**, any tree carrying a relation
+  slot outside the range table (`hasSlotOutsideRangeTable`, Week 30)". The decline is no
+  longer silent (B-1a shows it printing) and the function no longer exists under that name.
+- `join_enumeration.h:53-56` — invariant 5's parenthetical "(unlike the two declines below,
+  where there is none to make)" is now false for one of those two.
+
+Ranked MEDIUM rather than LOW because this is the *header* — the surface a reader
+consults for the pass's contract — and because it is the second time in one audit cycle
+that this exact paragraph has had to be corrected. The standing rule this codebase
+records ("three silent wrong answers shipped from that shape in Week 33, **two of them
+living in header comments**") names this precise failure. No wrong answer today: the
+`.cc` is right and the containment (the written-order bound) is real regardless of which
+branch runs.
+
+#### C-7 — the decisive `ANTI` vs `ANTI_NOT_IN` pair, run with a real NULL in the body's key column
+
+The one thing this seam could get wrong as a silent wrong answer is `NOT EXISTS`
+re-inheriting `NOT IN`'s three-valued rule (or the reverse). It has happened once here
+already (`vec_hash_join_node.cc:223-234` records it). The CSV loader cannot express a
+NULL, so the NULL has to be manufactured by a `LEFT JOIN` inside the body — which is
+itself a Week 29 x Week 32/33 seam shape:
+
+    -- body's key column is NULL for EVERY row
+    …NOT EXISTS (SELECT 1 FROM drivers dr LEFT JOIN laps l
+                 ON dr.driver_id = l.driver_id AND l.speed > 9999
+                 WHERE l.driver_id = d.driver_id)          -> 20 rows  (SQLite: 20)
+
+    …d.driver_id NOT IN (SELECT l.driver_id FROM drivers dr LEFT JOIN laps l
+                         ON dr.driver_id = l.driver_id AND l.speed > 9999)
+                                                            ->  0 rows  (SQLite:  0)
+
+**The two answers differ, in the right direction, on the same NULL-bearing body.** The
+positive forms (`EXISTS` -> 0, `IN` -> 0) agree too. The distinction is live, not just
+asserted in a comment.
+
+#### C-8 — latent shapes with no live input (recorded, not counted as findings)
+
+- `JoinEnumeration::rebuild` (`:262-264`) constructs fresh `LogicalJoin`s copying neither
+  `join_type`, `on_residual` nor `semantics`, and `vectorized_plan_builder.cc:626-629`'s
+  `swapped=true` branch drops `on_residual`. Both rest on the same single guard
+  (`containsOuterJoin` / the forced side), which pass 1 flagged as a coupled pair. Still
+  coupled, still unreachable — `on_residual` has exactly one writer
+  (`logical_plan.cc:965-970`, inside `if (jc.type == JoinType::LEFT)`), and a LEFT tree
+  never reaches either site.
+- A self-edge (`from_slot == join_slot`) would be silently dropped by `rebuild`; it is
+  unreachable because `classifyJoinCondition` routes a same-relation equality to the
+  residual list (C-1).
+
+---
+
+## Summary
+
+| Severity | Count | IDs |
+|---|---|---|
+| BLOCKER | 0 | — |
+| HIGH | 0 | — |
+| MEDIUM | 3 | B-2, B-3, B-5 |
+| LOW | 2 | B-1, B-4 |
+
+**Part A: `17bfcea` is real, complete and correctly derived.** The DERIVED estimate is
+taken from the subplan (not a constant), the switch now covers all nine `LogicalNodeType`
+members with no silent default left anywhere in the file or in the other three
+`LogicalNodeType` dispatchers, nothing downstream keyed on the old zero (every consumer
+tests `>= 0`, not `!= 0`), and re-running pass 1's cited shape shows the same join order
+with honest numbers (`cost=6543 (written=7409)` where it had claimed
+`cost=1525 (written=4216)`) plus both physical decisions restored. The one correction to
+pass 1: the fabricated 0 manufactured the *margin*, not the *order* — the DP picks the
+same, and better, order with correct costing.
+
+**Part B: no wrong answer found.** 28 constructed seam shapes across
+`catalog.json` and `data/tpch/sf0.01` — multi-way reordering with derived inputs, derived
+relations as the leftmost and as the last relation, composite keys across the derived
+boundary, nested derived tables, semi/anti stacked on multi-way spines, correlated scalars
+(`AVG` and the `COUNT` zero-row rule) over three-relation spines, and NULL join keys
+manufactured by a `LEFT JOIN` inside a derived body — all agree three ways (optimized,
+`--no-optimize`, SQLite). The `ANTI` / `ANTI_NOT_IN` split is live and correct on a real
+all-NULL body key. NULL keys are dropped before encoding on both sides of all three join
+operators. The `'\x01'` composite-key class is closed by the length prefix and the
+prefix flag cannot differ across a join's two sides.
+
+The five findings are all **plan-quality or documentation** defects, three of them the
+same shape: a guard or an invariant changed and its citations were not swept
+(B-1 four source comments + a `development.md` row, B-4 an "eight cases" count that is now
+nine, B-5 a header paragraph a fix corrected only in the `.cc`). The two behavioural ones
+(B-2, B-3) both cost join ordering on supported queries — B-3 measurably, 62729 against
+38417 by the engine's own model — and both are invisible on `--explain`.
+
+**Verdict: the join chain's seam is correct; pass 2 returns no blockers. What it returns
+instead is that the pass's own header and `development.md`'s slot table now describe a
+join enumerator that no longer exists in three places, and that two legality guards
+decline more than legality requires.**
