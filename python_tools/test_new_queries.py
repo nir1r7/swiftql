@@ -1459,6 +1459,44 @@ TIE_STRADDLE_QUERIES = [
      "SELECT COUNT(*) AS n FROM (SELECT name, age, SUBSTRING(name, age - 34, 2) "
      "AS s FROM drivers WHERE age > 34) d"),
 
+    # ── Round 5: screening positions nothing previously reached ─────────────
+    # The refusing halves of this set error in BOTH legs, which is the correct
+    # answer and therefore belongs in compare_against_sqlite.py's rejection
+    # suite — it runs there in col-vec AND col-vec --no-optimize, so the
+    # `optimized == --no-optimize` property is asserted for the error case too.
+    # What lives here is the ANSWERING half: the same positions with a total
+    # expression, where a leg-dependent conjunct order would turn an answer into
+    # an exception and this runner would record it as an ERROR.
+    #
+    # THE ON-CLAUSE POSITION IS THE ONE THAT MATTERED — no test in the tree put a
+    # partial expression in a join condition, which is why the blocker outlived
+    # five audit passes. A join condition is evaluated per candidate PAIR, so an
+    # outer `WHERE` does not bound what it computes.
+    ("w38_on_clause_total_expression",
+     "SELECT COUNT(*) AS n FROM laps l LEFT JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.speed * 2 > 0 WHERE l.lap_id < 5"),
+
+    # the subquery-conjunct position, written in the order that eliminates every
+    # row before the arithmetic is reached. Its unswapped twin RAISES on the same
+    # data, so this zero is a measurement of written order, not an empty answer.
+    ("w38_subquery_conjunct_swapped_answers",
+     "SELECT COUNT(*) AS n FROM laps l WHERE l.driver_id IN "
+     "(SELECT d.driver_id FROM drivers d WHERE d.age > 999) "
+     "AND l.lap_id * 9223372036854775807 > 0"),
+
+    # arithmetic on a narrowed INT at magnitudes where INT and REAL agree exactly
+    ("w38_arith_guard_add",
+     "SELECT MAX(CASE WHEN lap_id=1 THEN 1 ELSE 0.5 END) + 1 AS m FROM laps"),
+    ("w38_arith_guard_mul",
+     "SELECT MAX(CASE WHEN lap_id=1 THEN 7 ELSE 0.5 END) * 2 AS m FROM laps"),
+
+    # a REAL column reached through TWO derived levels: the type walk has to
+    # descend that far to leave the body unarmed, and both legs must agree on it
+    ("w38_depth2_real_column",
+     "SELECT COUNT(*) AS n FROM laps WHERE (SELECT MAX(u.s) FROM "
+     "(SELECT t.s AS s FROM (SELECT l.speed AS s FROM laps l WHERE l.lap_id < 4) t) u) "
+     "/ 2 > 100"),
+
     # ── CONTROLS. Without these the block proves only that SOME 3-relation
     # ── query diverges, which is not the claim. Each removes exactly one of the
     # ── four preconditions from b31_tie_int_key_limit_cut and must be SAME both

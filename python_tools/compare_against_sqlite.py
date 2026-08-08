@@ -2551,6 +2551,164 @@ PARTIALITY_DERIVED_GUARDS_VOLCANO_REJECTED = [
               + [q for q, _ in PARTIALITY_DERIVED_SWAPPED_VEC_REFUSED])
 ]
 
+# ─── Round 5: SCREENING — a partial conjunct in positions nothing reached ────
+#
+# SQLITE CANNOT ADJUDICATE ANY OF THESE, so none is a diffed entry. It promotes
+# to float on integer overflow where SwiftQL raises, and it accepts `SUBSTRING`
+# starts SwiftQL refuses by dialect. The property under test is SwiftQL's own
+# error behaviour and its agreement with itself across `--no-optimize`.
+#
+# !! ENTRY A IS THE ONE THAT MATTERED. NO TEST IN THE TREE PUT A PARTIAL
+# EXPRESSION IN AN `ON` CLAUSE. Five passes of green harnesses sat over that
+# blocker because every partial-expression shape anyone had written lived in a
+# `WHERE`, a select list, or a derived body — never in a join condition, which is
+# evaluated per candidate PAIR rather than per row and so reaches values no row
+# filter ever produces.
+SCREENING_REFUSED_ALL_MODES = [
+    # THE ON-CLAUSE SHAPE. `lap_id * 1000000000000000` overflows for lap_id >= 10
+    # and the ON clause is evaluated against every probe/build pair, so the
+    # `WHERE l.lap_id < 5` outside it does not bound what the join computes.
+    ("SELECT COUNT(*) AS n FROM laps l LEFT JOIN drivers d "
+     "ON l.driver_id = d.driver_id AND l.lap_id * 1000000000000000 > 0 "
+     "WHERE l.lap_id < 5",
+     "integer overflow in '*'"),
+]
+
+# Refused on the vectorized path for the SCREENING reason; refused on Volcano
+# earlier and for a CAPABILITY reason, pinned separately below.
+SCREENING_REFUSED_VEC_ONLY = [
+    # a partial conjunct written BEFORE an IN-subquery conjunct
+    ("SELECT COUNT(*) AS n FROM laps l WHERE l.lap_id * 9223372036854775807 > 0 "
+     "AND l.driver_id IN (SELECT d.driver_id FROM drivers d WHERE d.age > 999)",
+     "integer overflow in '*'"),
+
+    # a partial conjunct inside an EXISTS body, written AFTER the correlated
+    # equality that the decorrelation turns into a join key. The equality stops
+    # being a row filter once it is a join key, so a conjunct after it is no
+    # longer guarded by it — which is what the refusal says.
+    ("SELECT COUNT(*) AS n FROM laps l WHERE l.driver_id = 1 AND EXISTS "
+     "(SELECT 1 FROM drivers d WHERE d.driver_id = l.driver_id "
+     "AND SUBSTRING(d.name, d.age - 29, 1) = 'D')",
+     "written after the correlated equality"),
+]
+
+# THE COMPANIONS THAT PIN THE FIX COSTING NOTHING. Without these the screening
+# entries prove only that something refuses, and the cheapest way to pass them
+# would be to refuse every arithmetic conjunct in an ON clause or beside a
+# subquery.
+SCREENING_GUARDS_ALL_MODES = [
+    # the same ON-clause position with a TOTAL expression: `speed * 2` cannot
+    # overflow, so the join must still run. 4 rows.
+    "SELECT COUNT(*) AS n FROM laps l LEFT JOIN drivers d "
+    "ON l.driver_id = d.driver_id AND l.speed * 2 > 0 WHERE l.lap_id < 5",
+]
+SCREENING_GUARDS_VEC_ONLY = [
+    # B's conjuncts SWAPPED: the IN-subquery conjunct is written first and
+    # eliminates every row, so the overflow is never reached. 0 rows — and the
+    # zero is load-bearing, because the unswapped twin above RAISES on the same
+    # data. This is the entry that shows the rule is about written order rather
+    # than about the presence of a subquery.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.driver_id IN "
+    "(SELECT d.driver_id FROM drivers d WHERE d.age > 999) "
+    "AND l.lap_id * 9223372036854775807 > 0",
+]
+
+# The Volcano halves: both IN shapes and the EXISTS shape are refused by
+# capability before any screening happens, so the boundary stays pinned.
+SCREENING_VOLCANO_CAPABILITY_REJECTED = [
+    (SCREENING_REFUSED_VEC_ONLY[0][0], VOLCANO_IN),
+    (SCREENING_REFUSED_VEC_ONLY[1][0], VOLCANO_CORRELATED),
+    (SCREENING_GUARDS_VEC_ONLY[0], VOLCANO_IN),
+]
+
+# ─── Round 5: ARITHMETIC ON A NARROWED INT — a third rule, a third needle ────
+#
+# E-10 is about MAGNITUDE ("without changing it"), the division rule is about the
+# stored TYPE ("that another expression divides"), and this one is about an
+# ARITHMETIC RESULT the two engines compute differently once the operand has been
+# flattened to REAL. Needle: `"the way the Volcano engine does"` — verified to
+# collide with no existing pin, and cross-checked by the family matrix below
+# rather than by that assertion alone.
+TYPEFIX_ARITH_PIN = "the way the Volcano engine does"
+
+TYPEFIX_ARITH_VOLCANO_ONLY = [
+    # 123456789 * 987654321 = 121932631112635269, which is exact in INT64 and
+    # NOT exact as a double. Volcano and SQLite both answer the exact integer.
+    "SELECT MAX(CASE WHEN lap_id=1 THEN 123456789 ELSE 0.5 END) * 987654321 AS m "
+    "FROM laps",
+    # the ADDITION form, one below the rendering bound: 999999999999999 + 1 is
+    # 1000000000000000 exactly in INT64
+    "SELECT MAX(CASE WHEN lap_id=1 THEN 999999999999999 ELSE 0.5 END) + 1 AS m "
+    "FROM laps",
+]
+TYPEFIX_ARITH_VECTORIZED_REFUSED = [
+    (q, TYPEFIX_ARITH_PIN) for q in TYPEFIX_ARITH_VOLCANO_ONLY
+]
+
+# ALL FOUR MODES. The same two operators at magnitudes where INT and REAL
+# arithmetic agree exactly, so the answer is reachable and must not be refused.
+TYPEFIX_ARITH_GUARDS_ALL_MODES = [
+    "SELECT MAX(CASE WHEN lap_id=1 THEN 1 ELSE 0.5 END) + 1 AS m FROM laps",
+    "SELECT MAX(CASE WHEN lap_id=1 THEN 7 ELSE 0.5 END) * 2 AS m FROM laps",
+]
+
+# ─── Round 5: the cut rule reached through HAVING, and at derived depth 2 ────
+
+# The subquery sits in HAVING ONLY — putting it in the select list as well is
+# refused outright ("subqueries are supported in WHERE and HAVING only"), which
+# is a different boundary and not what this entry is for. `> 8000` rather than
+# some rounder threshold because that is where the truncating division puts the
+# cut: Volcano and SQLite both return FOUR groups.
+TYPEFIX_CUT_HAVING_VOLCANO_ONLY = [
+    "SELECT l.team, COUNT(*) AS n FROM laps l GROUP BY l.team "
+    "HAVING SUM(l.round / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) "
+    "FROM laps l2)) > 8000 ORDER BY l.team",
+]
+
+TYPEFIX_CUT_HAVING_VECTORIZED_REFUSED = [
+    (q, TYPEFIX_DIV_PIN) for q in TYPEFIX_CUT_HAVING_VOLCANO_ONLY
+] + [
+    # THE `MAX` TWIN, AND IT IS THE DISCRIMINATOR RATHER THAN A DUPLICATE.
+    # Its Volcano answer is ZERO ROWS, so diffing it asserts nothing — but it
+    # must still REFUSE on the vectorized path, and that is what separates
+    # "correctly refused" from "the arm stopped firing". Without it, an arm that
+    # only recognised SUM would leave this shape silently answering.
+    ("SELECT l.team, COUNT(*) AS n FROM laps l GROUP BY l.team "
+     "HAVING MAX(l.round / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) "
+     "FROM laps l2)) > 1000 ORDER BY l.team",
+     TYPEFIX_DIV_PIN),
+]
+
+# Depth 2: a REAL column reached through TWO derived levels. The type question
+# has to descend that far to know the operand is REAL and leave the body unarmed;
+# a walk that gave up at depth 1 would answer INTEGER conservatively and refuse a
+# query that answers 10000.
+TYPEFIX_CUT_DEPTH2_VEC_ONLY = [
+    "SELECT COUNT(*) AS n FROM laps WHERE (SELECT MAX(u.s) FROM "
+    "(SELECT t.s AS s FROM (SELECT l.speed AS s FROM laps l WHERE l.lap_id < 4) t) u) "
+    "/ 2 > 100",
+]
+TYPEFIX_CUT_DEPTH2_VOLCANO_REJECTED = [
+    (q, VOLCANO_DERIVED) for q in TYPEFIX_CUT_DEPTH2_VEC_ONLY
+]
+
+# ─── A GAP THAT IS RECORDED RATHER THAN CLOSED: the chunk-pruner type rule ───
+#
+# Round 5 also fixed a pruner defect that needs a STRING column compared against
+# an INT column of another table. The shipped `catalog.json` has no such pair, so
+# carrying the discrimination here would have meant adding an `alt` table to it.
+#
+# DELIBERATELY NOT DONE, and this comment is the record. A catalog change moves
+# every existing entry's cardinalities and therefore the estimator's inputs and
+# the join orders those inputs decide — the same reason a third table was
+# declined earlier this phase, and the reason the tie-straddle work was done on
+# self-joins instead. The coverage EXISTS: `tests/data/test_alt.csv` plus two
+# end-to-end C++ tests that were verified failing without the fix. It lives in
+# `ctest`, not in this oracle.
+#
+# So: this file does NOT cover the pruner type rule. If a future change needs it
+# here, the cost is a new catalog rather than a new table in the shipped one.
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -4249,6 +4407,72 @@ def main():
             extra_args=extra)
         r_passed += rp; r_failed += rf; r_errors += re_
 
+    # Round 5 — screening a partial conjunct in positions nothing reached.
+    all_four = [("row storage, Volcano", None),
+                ("columnar storage, Volcano", ["--storage", "columnar"]),
+                *vec_modes]
+    for label, extra in all_four:
+        rp, rf, re_ = run_rejection_suite(
+            SCREENING_REFUSED_ALL_MODES,
+            f"screening: partial conjunct in an ON clause — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+        mp, mf, me = run_query_suite(
+            conn, SCREENING_GUARDS_ALL_MODES,
+            f"screening: total conjunct in an ON clause still runs — {label}",
+            extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            SCREENING_REFUSED_VEC_ONLY,
+            f"screening: beside a subquery conjunct — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+        mp, mf, me = run_query_suite(
+            conn, SCREENING_GUARDS_VEC_ONLY,
+            f"screening: the swapped order still answers — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            SCREENING_VOLCANO_CAPABILITY_REJECTED,
+            f"screening: subquery shapes refused earlier — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+
+    # Round 5 — arithmetic on a narrowed INT.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_ARITH_VOLCANO_ONLY,
+            f"arithmetic on a narrowed INT — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_ARITH_VECTORIZED_REFUSED,
+            f"arithmetic on a narrowed INT refused — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in all_four:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_ARITH_GUARDS_ALL_MODES,
+            f"arithmetic where INT and REAL agree — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+
+    # Round 5 — the cut rule through HAVING, and at derived depth 2.
+    for label, extra in volcano_modes:
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_CUT_HAVING_VOLCANO_ONLY,
+            f"cut: reached through HAVING — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_CUT_DEPTH2_VOLCANO_REJECTED,
+            f"cut: depth-2 derived refused earlier — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            TYPEFIX_CUT_HAVING_VECTORIZED_REFUSED,
+            f"cut: HAVING shapes refused — {label}", extra_args=extra)
+        r_passed += rp; r_failed += rf; r_errors += re_
+        mp, mf, me = run_query_suite(
+            conn, TYPEFIX_CUT_DEPTH2_VEC_ONLY,
+            f"cut: a REAL column two derived levels down — {label}", extra_args=extra)
+        m_passed += mp; m_failed += mf; m_errors += me
+
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
     findings = sweep_rejection_suites()
@@ -4263,7 +4487,16 @@ def main():
         "INT-narrowing family",
         E10_VECTORIZED_REFUSED + E10_UNRENDERED_VECTORIZED_REFUSED
         + TYPEFIX_DIV_VECTORIZED_REFUSED + TYPEFIX_CUT_VECTORIZED_REFUSED
-        + TYPEFIX_CUT_DERIVED_STILL_REFUSED,
+        + TYPEFIX_CUT_DERIVED_STILL_REFUSED
+        + TYPEFIX_CUT_HAVING_VECTORIZED_REFUSED
+        + TYPEFIX_ARITH_VECTORIZED_REFUSED,
+        ["--execution", "vectorized", "--storage", "columnar"])
+    # The screening refusals: an overflow and a correlated-equality message, which
+    # share nothing with each other or with the narrowing family — asserted by
+    # execution rather than by inspection, same as every other pin here.
+    findings += assert_refusal_pins_discriminate(
+        "screening refusals",
+        SCREENING_REFUSED_ALL_MODES + SCREENING_REFUSED_VEC_ONLY,
         ["--execution", "vectorized", "--storage", "columnar"])
     # The partiality refusals are four DIFFERENT producers (SUBSTRING, overflow,
     # type mismatch, SUBSTRING again) whose messages share no tail, so they get
