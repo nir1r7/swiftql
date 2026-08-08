@@ -208,7 +208,7 @@ inline double narrowToDoubleColumn(const Value& v) {
 // materialized column read by another expression, or is it the query's output?
 // appendColumnValue sees one Value and cannot know. vectorized_plan_builder.cc
 // can, and it arms `cv.int_observable` on exactly the columns whose INT-ness
-// can reach an operand of a `/` somewhere above them (armIntObservableColumns).
+// can reach an operand of a `/` somewhere above them (collectIntOrigins).
 //
 // Both halves are needed and both are narrow:
 //   - plan shape alone would refuse `SELECT x/2 FROM (SELECT CASE WHEN c THEN
