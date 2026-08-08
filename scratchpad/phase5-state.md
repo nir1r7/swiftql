@@ -58,6 +58,46 @@ WHY THE GATE IS GREEN ANYWAY — measured, not assumed: of 211 distinct harness 
   no estimate and the two build-side rules provably coincide. TPC-H: 21/22 agree opt-vs-noopt.
   **The corpus contains no instance of the class — exactly as it did not before pass 2 either.**
 
+## PASS 3 — optimizer preservation: 1 BLOCKER, 1 HIGH, 1 MEDIUM, 2 LOW. THIRD CONVERGENCE.
+**Same comparator defect, found INDEPENDENTLY BY A THIRD AUDITOR.** Three isolating controls that
+  pin it exactly: write the FROM list in the DP's order -> SAME; make ORDER BY total -> SAME; put a
+  GROUP BY between join and sort -> SAME. `JoinEnumeration::rebuild`'s OWN COMMENT admits it: "a
+  slot-sorted canonical order is not available". Repro on shipped sf0.01, col-vec:
+    SELECT n.n_name, s.s_suppkey FROM supplier s JOIN nation n ... JOIN region r ...
+    ORDER BY n.n_regionkey LIMIT 5
+    optimized: 5x ALGERIA | --no-optimize: ALGERIA/MOZAMBIQUE/MOROCCO/MOROCCO/ALGERIA (4 of 5 differ)
+  **B3-1b kills the "it's all legal SQL" defence**: `materializeSubqueries` threads the flag into the
+  nested runner, so the same LIMIT 1 cut inside a scalar materializes a DIFFERENT CONSTANT. A query
+  with NO ORDER BY and NO LIMIT of its own returns `EGYPT 4` optimized vs `SAUDI ARABIA 20` unopt.
+  Also CORRECTS pass 2's B-1: **five** of the six ungated passes are identical in both legs by
+  construction, not all six. The sixth is `materializeSubqueries` — which is B3-1b.
+**B3-2 (HIGH) — `orderByWork` reorders conjuncts on an estimate, and per-row evaluation is NOT
+  total.** The optimizer both MASKS and INTRODUCES errors, both directions confirmed on catalog.json:
+    WHERE SUBSTRING(team, lap_id - lap_id, 2) = 'x' AND speed = 333.3333
+      -> optimized 0 rows, --no-optimize ERRORS
+    WHERE team LIKE 'zzz%' AND SUBSTRING(...) = 'x'
+      -> optimized ERRORS, --no-optimize 0 rows
+  The precondition that would make reordering safe is written NOWHERE.
+**B3-3 (MEDIUM) — a THIRD silent decline**: predicate pushdown never enters a `LogicalDerived` body
+  in ANY shape, even with no join present. Measured **9.4x** (18465us vs 1969us) plus lost zone-map
+  pruning, with nothing in `--explain`.
+LOW x2: folding's new comment is true about VALUES but its shape-consumer census says "there was
+  exactly one" and there are FOUR MORE (two change an outcome today) — 15 consumers enumerated with
+  a verdict each; and `foldConstants` is load-bearing for CORRECTNESS, not canonicalization — it is
+  the only thing that removes an `IntervalLiteral`.
+`written_ordinal` is COMPLETE and fails OPEN (the safe direction): three parser sites, one synthesis
+  site at subquery_decorrelation.cc:544 that correctly leaves it empty; nothing rebuilds a parsed item.
+
+## !!! THE SYSTEMIC COVERAGE HOLE — fix this or the next green gate means as little as this one
+**`catalog.json` has TWO TABLES, and `MIN_ENUMERATED_RELATIONS = 3`. So NO QUERY IN THE ENTIRE
+ORACLE SUITE EVER REACHES JOIN ENUMERATION.** The DP — the thing three auditors just found a
+blocker in — is exercised by ZERO of the 1496 oracle queries and ZERO of the 119 invariant checks.
+That is why every gate has been green. TPC-H is the only place the shape exists at all, and only q2
+has it (5-relation join, ORDER BY, no GROUP BY); it is byte-identical both ways only because its key
+list happens to end in `p_partkey`.
+**ROUND 3 MUST ADD A THIRD TABLE TO THE ORACLE CATALOG** and real multi-relation join coverage.
+Without it the fix cannot be shown to work and the next regression is invisible again.
+
 ## !! MY RECOMMENDATION WAS WRONG — CORRECTED FIX DESIGN FOR ROUND 3
 I offered the user "deterministic tiebreak" vs "unify build-side selection" and RECOMMENDED the
 tiebreak, framing the problem as "where ORDER BY is not a total order". **That framing was too
