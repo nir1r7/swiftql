@@ -67,8 +67,25 @@ void VecSortNode::consumeAndSort() {
             indices_ptr = &all_indices;
         }
 
+        // The heap is FULL and there are no declared keys, so a candidate can be
+        // rejected by reading columns straight out of the chunk -- almost every
+        // one loses on the first compared column, and building a Row for it is
+        // pure waste. Same comparison, one implementation: compareCanonical is
+        // what rowLess's tie-break loop is written in terms of.
+        const bool lazy = row_cap_ > 0 && order_by_.empty();
+
         rows_seen_ += static_cast<int>(indices_ptr->size());
         for (int r : *indices_ptr) {
+            const bool heap_full = row_cap_ > 0
+                && static_cast<int>(flat_buffer_.size()) >= row_cap_;
+            if (lazy && heap_full) {
+                const Row& worst = flat_buffer_.front();
+                const int n = std::min(static_cast<int>(chunk->columns.size()),
+                                       static_cast<int>(worst.size()));
+                auto read = [&](int i) { return valueAt(chunk->columns[i], r); };
+                if (sort_comparator::compareCanonical(tie_order, n, read, worst) >= 0) continue;
+            }
+
             candidate.clear();   // keeps capacity: no per-row reallocation
             candidate.reserve(chunk->columns.size());
             for (const auto& cv : chunk->columns) {
@@ -76,10 +93,10 @@ void VecSortNode::consumeAndSort() {
             }
             if (row_cap_ <= 0) {
                 flat_buffer_.push_back(candidate);
-            } else if (static_cast<int>(flat_buffer_.size()) < row_cap_) {
+            } else if (!heap_full) {
                 flat_buffer_.push_back(candidate);
                 std::push_heap(flat_buffer_.begin(), flat_buffer_.end(), less);
-            } else if (less(candidate, flat_buffer_.front())) {
+            } else if (lazy || less(candidate, flat_buffer_.front())) {
                 std::pop_heap(flat_buffer_.begin(), flat_buffer_.end(), less);
                 flat_buffer_.back() = candidate;
                 std::push_heap(flat_buffer_.begin(), flat_buffer_.end(), less);

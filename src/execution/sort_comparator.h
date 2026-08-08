@@ -163,6 +163,27 @@ inline std::vector<int> tieBreakOrder(const Schema& schema) {
     return order;
 }
 
+// The tie-break itself, with the LEFT row read LAZILY through `left(i)`, where
+// `i` is a SCHEMA index. Returns <0, 0 or >0.
+//
+// Lazy because a bounded top-N (VecSortNode's row_cap) compares every input row
+// against one heap entry and keeps almost none of them: reading only the columns
+// the comparison actually reaches, and materializing a Row only for a row that
+// wins, is the difference between paying for the input and paying for the
+// answer. `rowLess` below is written in terms of it so there is exactly ONE
+// implementation of the canonical comparison — a second one that drifted would
+// be this file's original defect with a new cause.
+template <typename ReadLeft>
+inline int compareCanonical(const std::vector<int>& tie_order, int n,
+                            ReadLeft&& left, const Row& b) {
+    for (int i : tie_order) {
+        if (i >= n) continue;
+        int c = compareForTieBreak(left(i), b[i]);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
 // The strict weak ordering handed to std::stable_sort by both engines.
 //
 // compareForSort, not Value::operator< — the SQL operators return false for every
@@ -189,12 +210,7 @@ inline bool rowLess(const std::vector<OrderByItem>& order_by,
     // schema indices by construction; the bound is on the ROWS, defensively, for
     // the same reason the schema-order loop carried one.
     const int n = static_cast<int>(std::min(a.size(), b.size()));
-    for (int i : tie_order) {
-        if (i >= n) continue;
-        int c = compareForTieBreak(a[i], b[i]);
-        if (c != 0) return c < 0;
-    }
-    return false;
+    return compareCanonical(tie_order, n, [&a](int i) -> const Value& { return a[i]; }, b) < 0;
 }
 
 // One-shot form, for a single comparison (and for the unit tests, which compare
