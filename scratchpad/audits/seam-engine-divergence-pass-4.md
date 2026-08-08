@@ -154,3 +154,183 @@ the failing engine, so "Volcano adjudicates" is not available as a fallback; it 
 in the state where one mode returns rows and another returns an error, which is the cross-mode
 comparison the regression harness exists to make; and (b) is a self-inconsistency inside one
 engine that no engine-vs-engine framing even covers.
+
+---
+
+## Part A (cont.)
+
+### A-2 — the tie-break's soundness argument, tested rather than accepted. **It holds, with one
+### sentence of the header that is false but not reachable.**
+
+The argument is that `(relation_slot, name)` is a stable, unique name for a column on both legs.
+Checked at every producer of a `relation_slot`, by grep over the tree (`relation_slot` is assigned
+in exactly six places):
+
+| site | what it stamps | plan-dependent? |
+|---|---|---|
+| `join_enumeration.cc:257` | leftmost leaf's block -> `order[0]` | slot is the **written-order** index, not the spine position |
+| `join_enumeration.cc:316` | relation `r`'s block -> `r` | same |
+| `logical_plan.cc:1066` | written-order fold -> `join_slot` = `i+1` | not reordered |
+| `logical_plan.cc:495` | `derivedRelationSchema` -> 0 (a leaf's own schema) | re-stamped by the fold above |
+| `logical_plan.cc:542` | `blockOutputSchema` -> `i+1` | mirrors the fold; schema-only |
+| `subquery_decorrelation.cc:621` | `$scalarN` -> `range_table_size + out.lowered` | unique per lowering, and `hidden` |
+| `planner.cc:351` | Volcano's single join -> 1 | Volcano never reorders |
+
+So the SET of `(slot, name)` pairs is the same on both legs, and `decompose`/`rebuild` is the only
+thing that permutes the sequence. **Uniqueness** was the part worth attacking, and the two routes
+to a duplicate are both closed by an explicit refusal, not by luck:
+`derivedRelationSchema` (logical_plan.cc:503-511) throws `column '<x>' is produced twice` on a
+derived relation with two same-named outputs, and the catalog refuses duplicate column names.
+
+**The one false sentence.** The header justifies the duplicate case with *"a PROJECTED schema's
+order is a function of the SELECT list rather than of the plan."* That is false for `SELECT *`,
+whose star expansion (logical_plan.cc:1204-1216, planner.cc:433-445) copies the CHILD schema's
+columns in the child's own order — which for a join is the merged, DP-permuted order. It does not
+bite, because the star copies whole `ColumnDef`s and so carries `relation_slot` through, and a
+duplicate `(slot, name)` pair needs two same-named columns *within one relation*, which the two
+refusals above forbid. Recorded below as **E-16 (LOW)**: the sentence is offered as the reason the
+fallback is safe, and it is not the reason.
+
+Behaviourally: `SELECT *` over 2-way and 3-way joins under a `LIMIT`, and over a self-join, are
+included in the 108-query sweep and the 13-query battery above — all identical in every mode.
+
+### A-3 — the per-node `orderIsPlanStable` table, audited. **The table is right; the one thing it
+### cannot see is that it is about ROW ORDER, and one aggregate is order-dependent in its VALUE.**
+
+- SCAN / SORT / JOIN / FILTER / PROJECT / LIMIT / DERIVED — confirmed by reading each operator on
+  both paths. The switch is exhaustive over `LogicalNodeType` (9 kinds, 9 cases, no default fall-out
+  that is reachable).
+- AGGREGATE and DISTINCT: **"both engines emit groups and distinct representatives in
+  first-encounter order" is TRUE at HEAD**, re-checked rather than inherited —
+  `HashAggregateNode::open` iterates `group_order` (plan_nodes.cc:328, `// first-encounter order,
+  not hash order`) against `VecHashAggregateNode::materializeResults`' `group_order_`
+  (vec_hash_aggregate_node.cc:248); `DistinctNode`/`VecDistinctNode` both emit first-seen.
+- Volcano's local answer (`planner.cc:412`, `order_is_plan_stable = (jc == nullptr) ||
+  !stmt.order_by.empty()`) agrees with the logical builder's on **every shape Volcano can build**:
+  no join => the tree is SCAN/FILTER/AGG/PROJECT/DISTINCT, all stable; a join with no ORDER BY =>
+  JOIN reaches the cut, both insert; a join with ORDER BY => a SORT sits below the projection in
+  both, both stop there. Derived tables, multi-way joins and surviving subqueries are refused above,
+  so no shape distinguishes the two rules.
+
+**What the table cannot express.** `orderIsPlanStable` reasons about row ORDER. `MIN`/`MAX` are the
+one construct whose VALUE is a function of input order — both engines keep the *first* argument
+`Value` that compares equal (`if (acc.min_val.isNull() || val < acc.min_val)`, plan_nodes.cc:311 and
+vec_hash_aggregate_node.cc:222), so a tie between two values that COMPARE equal but RENDER
+differently would be decided by the join's probe order, which no sort above can repair. I looked for
+a reachable instance and did not find one: the only way to get two compare-equal, render-different
+values into one column is INT vs DOUBLE (`MIN(CASE WHEN … THEN 1 ELSE 1.0 END)`), and `%.15g`
+renders `1.0` as `1`, so they render the SAME; the next candidate is INT `2^53+1` against DOUBLE
+`2^53`, which the new magnitude refusal now rejects on the vectorized path before it can be
+compared. Recorded as a CLEAN result with its reason, not as a finding.
+
+### A-4 FINDING **E-14 (MEDIUM)** — both new INT->DOUBLE refusals fire on queries that are CORRECT
+### today, and one of the two over-fires for a reason the code's own comment does not cover.
+
+The brief asks the question directly. Both answers are yes, and they are not the same kind of yes.
+
+**(i) The TYPE refusal (`refuseObservableIntNarrowing`) arms on BOTH operands of `/`
+unconditionally, including when the other operand is REAL — where truncation is impossible.**
+`taintWalk` (vectorized_plan_builder.cc:184-189) does `if (op == "/") { mergeOrigins(armed, l);
+mergeOrigins(armed, r); }` with no test on the operands' types. Run at HEAD:
+
+```sql
+SELECT MAX(CASE WHEN lap_id = 1 THEN 7 ELSE 0.5 END) / 2.0 AS y FROM laps
+```
+```
+row-volcano / columnar-volcano   3.5
+col-vectorized / vec --no-opt    Error: vectorized execution cannot materialize the integer 7
+                                 into a DOUBLE result column that another expression divides …
+```
+`7 / 2.0` is 3.5 and `7.0 / 2.0` is 3.5 — the stored type CANNOT change this answer, because the
+division is never INTEGER/INTEGER. The refusal's own justification ("INTEGER/INTEGER truncates while
+INTEGER/REAL does not") does not apply, and this is NOT the residue the comment admits (which is
+"when that division happens to be exact"): here no exactness is involved at all. With `/ 2` instead
+of `/ 2.0` Volcano answers 3 and the vectorized path would have answered 3.5, so the refusal is
+right there — one character apart.
+
+**Where it costs the most: a shape NO engine can now answer.** The same over-arming inside a derived
+table leaves the query unanswerable, and the error message says so itself in parentheses:
+```sql
+SELECT t.x / 2.0 AS y FROM (SELECT CASE WHEN lap_id = 1 THEN 7 ELSE 0.5 END AS x
+                            FROM laps WHERE lap_id < 3) t
+```
+```
+row-volcano / columnar-volcano   Error: derived tables … are not supported on the Volcano path
+col-vectorized / vec --no-opt    Error: … or re-run with --execution volcano where that path
+                                 supports the query (it does not run derived tables).
+```
+Before fix round 3 this query returned `3.5, 0.25` on the vectorized path, which is correct.
+
+**(ii) The MAGNITUDE refusal (`narrowToDoubleColumn`) fires on the TEXT bound even when the value is
+never rendered.** The bound is deliberately the smaller of the value bound (2^53) and the rendering
+bound (1e15), and between them the double is EXACT — only `%.15g` differs. So any query that
+consumes the column arithmetically or as a predicate rather than printing it is refused for a
+difference that cannot occur:
+```sql
+SELECT MAX(CASE WHEN lap_id = 1 THEN 2000000000000000 ELSE 0.5 END) > 1 AS big FROM laps
+```
+```
+row-volcano / columnar-volcano   1
+col-vectorized / vec --no-opt    Error: … cannot materialize the integer 2000000000000000 into a
+                                 DOUBLE result column without changing it …
+```
+`2e15 < 2^53`, so the double IS the integer; the comparison is `1` either way. Volcano answers, the
+vectorized path refuses.
+
+Ranked MEDIUM, not higher: both are LOUD, both hand the user a message, and for the single-block
+forms the message's advice (`--execution volcano`) actually works. Ranked MEDIUM, not LOW: they are
+NEW capability regressions introduced by the fix under audit, on shapes that were correct in all
+four modes before it, and the derived-table form has no working mode at all. The corpus cannot see
+them — the gate is green — because no corpus query mixes an INT and a REAL branch under a `/` or a
+15-digit literal.
+
+### A-5 FINDING **E-15 (MEDIUM)** — the deterministic cut's cost lands on the INJECTED `LIMIT 1`
+### that `materializeSubqueries` puts on an uncorrelated `EXISTS` body, where the surviving row's
+### identity is provably never read.
+
+This is the case the brief asks to be reported if found: a place the measured 7.6x was not measured.
+`runOnce` (subquery_materialization.cc:198) sets `body.limit = 1` for an `EXISTS` body, and that
+`stmt.limit` reaches `LogicalPlanBuilder::build`'s `deterministicCut` like any user-written one. If
+the body contains a join, a `LogicalSort [canonical row order]` with `row_cap = 1` is inserted — so
+the body now READS ITS ENTIRE INPUT and heap-compares every row, to choose which single row proves a
+fact that `buildReplacement` reads as `!res.rows.empty()` (subquery_materialization.cc:219). Any row
+proves it. Pass 3's own site table says so (`#3 CLOSED — only !res.rows.empty() is read`).
+
+Measured on the tree's `build/swiftql` (a **Debug** build, so the absolute seconds are not the
+Release figures — the ratios are the point), `laps` 10,000 rows, `laps ⋈ laps ON driver_id` = 5M rows:
+
+```
+EXISTS (SELECT a.lap_id FROM laps a JOIN laps b ON a.driver_id = b.driver_id)   17.25 s
+SELECT COUNT(*) FROM laps a JOIN laps b ON a.driver_id = b.driver_id             7.73 s
+EXISTS (SELECT lap_id FROM laps)                                                 0.21 s
+SELECT a.lap_id FROM laps a JOIN laps b ON … LIMIT 1                            17.56 s
+```
+
+The EXISTS pays **the same 17.5 s as the top-level `LIMIT 1`** — the full accepted cost — and is
+**2.2x slower than materializing and counting the entire join it is only asking about**. The third
+line is the control: the same `EXISTS` over a plan-stable SCAN takes no cut and costs 0.21 s.
+
+The same applies to the injected `LIMIT 2` on a SCALAR body (site #4): the cap exists so that two
+rows THROW, and a determined choice between them changes nothing about whether `res.rows.size() > 1`.
+
+Ranked MEDIUM: it is a cost, not a wrong answer — but it is not the accepted cost, because the user
+wrote no `LIMIT`, the cut cannot change the answer at either site, and a two-line test in
+`deterministicCut`'s caller (skip when the limit was injected) removes it. Nothing measures it: the
+TPC-H harness's `EXISTS` bodies (Q4, Q21, Q22) are correlated or single-relation, so none of them
+takes this path.
+
+### A-6 — the other cut sites (#5, #7, #8, #9, #10) re-confirmed order-invariant. **CLEAN.**
+
+- **#5** (`res.rows[0][0]`) is guarded by #4's throw, unchanged.
+- **#7 DISTINCT**: the dedup key is every output column on both engines
+  (`appendGroupKeyField` over the whole row, plan_nodes.cc:460 / vec_distinct_node.cc:41), so tied
+  rows are identical in the output. Re-verified behaviourally in the 108-query sweep (a `DISTINCT`
+  variant of every generated shape) and in 76 NULL/degenerate queries.
+- **#8 semi-join first match**: the output SET is determined (each surviving probe row is emitted
+  once); its ORDER feeds a `LIMIT`, which now takes a cut — semi/anti joins are `LogicalJoin`, and
+  `orderIsPlanStable` returns false for `JOIN` *without* special-casing them, which is the right
+  answer. Verified on `IN` and `NOT IN` under a `LIMIT`.
+- **#9 aggregate group order**: see A-3.
+- **#10 chunk pruning**: skips whole chunks, so it cannot reorder. But see **E-13(c)** — pruning
+  can remove the rows on which the *other* engine throws, which is an observable difference in
+  behaviour even though it is not a reordering.
