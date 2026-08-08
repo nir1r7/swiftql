@@ -1,4 +1,30 @@
 # Phase 5 orchestrator state
+Current: **SEAM AUDIT COMPLETE — CLOSING GATE GREEN on fe9119a.** Next: q21 + doc sweep, then sf0.1.
+
+## CLOSING GATE — GREEN, every count exact
+build 56 TUs 0 warnings; unit **959**/103 suites; oracle **1768** (1722+46) 0 failed 0 errors;
+regression **345** (340+5); tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous;
+1 unported). Baseline md5 7cee17dae5398e3f20ef92f05ba78d5b unchanged. Tracked fingerprint
+5886c7548db667857ed59c18fa464ca1 identical before and after.
+**FOUR pin matrices clean and they GATE** (all four accumulate into `findings`; exit at
+compare_against_sqlite.py:4519): join-key 7/7, INT-narrowing 21/21, screening refusals 3/3,
+partial-expression 5/5 = **36 pins**, each "matches its own producer and no other". Rejection
+sweep 41 suites / 268 entries / 268 executed, clean.
+**THE STALE-BINARY TRAP WAS REAL**: pre-run binaries dated Aug 7 16:59 against a HEAD of Aug 8
+16:35 — stale by ~24h. Gate 1 was a GENUINE 56-TU recompile; `swiftql` 20,788,136 -> 22,341,768
+bytes. Had the verifier trusted "Built target", the whole gate would have measured a tree it
+never saw.
+**TWO REBOOTS during this gate.** The first rolled the repo back to a Week-35 commit (recovered by
+fetch + ancestor-check + reset). The second hit BETWEEN gates 4 and 5; gates 1-4 were carried
+forward from the INCREMENTAL LOG rather than re-run, and the verifier re-established binary
+provenance BY CONSTRUCTION (re-ran the build: rc=0, ZERO `Building CXX` lines, all `Built target`)
+rather than by timestamp. Incremental logging saved ~40 minutes of measurement.
+Every long gate CONFIRMED COMPLETED — `setsid --fork` with PPID=1 verified, `$?` written to an rc
+file (all 0), and its own final summary line. Gate 5 full 22 queries, 88 cells, zero `PARTIAL`.
+Pruner type rule confirmed live in gate 2: `tests/data/test_alt.csv` registered as table `alt`
+with `season` STRING vs `laps.season` INT — the clash the rule needs, WITHOUT touching the oracle
+catalog. Both end-to-end tests ran and passed.
+
 
 ## FIX ROUND 5 — screening agent: **DONE** (501ee80 + 3769d9d). Gates: unit **919**, oracle
 1722/0/0, regression 340/0/0, tpch PASS 20/22, BASELINE OK.
