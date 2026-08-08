@@ -38,10 +38,23 @@ namespace {
     // one shared with the optimizer. It answers "may raise" for a conjunct this
     // scan's schema cannot type — which is every conjunct naming another
     // relation, so an un-pushed WHERE handed to the FROM-side scan of a join
-    // stops contributing hints at its first cross-relation conjunct. That is a
-    // real loss of pruning on the `--no-optimize` leg and it is the honest
-    // price: the hint arrives here without the schema it was written against,
-    // and guessing is what the wrong answer above was made of.
+    // stops contributing hints at its first cross-relation conjunct.
+    //
+    // THAT COST IS REAL AND MEASURED, not a theoretical concession. On
+    // `laps JOIN drivers WHERE dr.nationality = 'British' AND l.season = 2024`
+    // (shipped catalog, columnar/vectorized, median of 3): the OPTIMIZED leg is
+    // unchanged at `chunks_skipped=1/2`, because pushdown gives each scan a hint
+    // made only of its own conjuncts; the `--no-optimize` leg drops to
+    // `chunks_skipped=0/2` and 42.5 ms becomes 51.5 ms, +21%.
+    //
+    // It is the honest price of the hint arriving here WITHOUT the schema it was
+    // written against — guessing is what the wrong answer above was made of. The
+    // fix is not in this file: `pruningHintForPreservedSide`
+    // (predicate_pushdown.h) is the single place both planners route a hint
+    // through, and threading the filter's child schema alongside the hint would
+    // let this walker type every conjunct instead of only the scan-local ones.
+    // That is one line in each of the two builders and is left to a round that
+    // owns them.
     bool collectSimplePredicates(const Expr* expr, const Schema& schema,
                                  std::vector<std::tuple<std::string, std::string, Value>>& out){
         if (!expr) return true;
