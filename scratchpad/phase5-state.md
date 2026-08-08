@@ -1,6 +1,30 @@
 # Phase 5 orchestrator state
-Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 complete (all 5 seams).
-  Fix round 1 GATED GREEN.
+Current: **FIX ROUND 2 COMPLETE (all 3 fixers done, 3 BLOCKERS closed). GATE RUNNING on 70570dc**,
+  log scratchpad/gates/seam-fix-round-2.log. Fixers' own final numbers: oracle 1496/0/0
+  (rejection sweep 22 suites / 205 entries), regression 318/318, unit 823/823.
+  AFTER THE GATE: seam PASS 3 (five auditors), then q21.
+  DO NOT run the doc sweep concurrently with pass 3 — auditors are told to verify development.md
+  against code, so editing it underneath them corrupts their findings.
+
+## STILL OPEN after fix round 2 — for a doc sweep AFTER pass 3
+- **B-4**: stale deleted-refusal claims in `development.md` AND `src/cli/main.cc`
+  (`has_correlated_subquery` is written and never read). Both were outside every fixer's file set.
+- `development.md` is WRONG A THIRD TIME: `:855` carries VERBATIM the paragraph 18af84f deleted
+  from the .cc as "false in both halves" — the .md copy is now the ONLY surviving statement of the
+  retracted claim. `:854` also false; `:808` ("the decline is silent") unswept; CardinalityEstimator
+  MISSING from the Week 34 consumer table despite being pass 1's HIGH.
+- `join_enumeration.h:84-91` carries the same retracted paragraph verbatim.
+- `docs/week-36-plan.md` records the byte-identical `--explain` check as "re-verified" — it ran on
+  the UNALIASED pair only. Misleading, still there.
+- **B-8 coverage hole, still real**: 17 `NOT IN` oracle entries and NOT ONE has a NULL in the body.
+- B-5.1 / B-5.2: dead HAVING and arity guards. A4: `$kN` leaks into `--explain` (cosmetic).
+- `catalog.cc`'s `tables_.emplace(meta.name, ...)` silently keeps the FIRST of two same-named
+  TABLES — same class as the column fix, one level up.
+- `JoinEnumeration` never recurses into its own result, so a derived/subquery body's joins are
+  never enumerated when the outer block has a join (62729 vs 38417 measured). Plan quality.
+- `containsOuterJoin` recurses into a DERIVED body, declining ordering for enclosing inner blocks.
+- `VecDerivedNode::nextChunk` forwards its child's chunk pointer — a derived table on both sides of
+  a self-join would forward the same `DataChunk*` twice. Not traced to a reachable plan.
   Fixer A (subquery): owns compare_against_sqlite.py, subquery_decorrelation.cc, logical_plan.cc,
     planner.cc, schema.h (comment-only). **B-1 DONE + verified** by counterfactual: rebuilt with
     the fix removed, all 6 correlated-scalar entries fail (4 FAIL + 2 internal-error ERROR);
