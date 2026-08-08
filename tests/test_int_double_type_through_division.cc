@@ -10,6 +10,7 @@
 #include "planner/logical_plan.h"
 #include "planner/predicate_pushdown.h"
 #include "planner/subquery_materialization.h"
+#include "planner/validator.h"
 #include "planner/vectorized_plan_builder.h"
 #include "storage/csv_loader.h"
 #include "storage/csv_to_columnar.h"
@@ -106,10 +107,83 @@ std::unique_ptr<VecPlanNode> buildVec(const std::string& sql, const Catalog& cat
     return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
 }
 
+// The CLI's pipeline for a query that CONTAINS A SUBQUERY, which is a different
+// pipeline: Validator, then materializeSubqueries (which runs each uncorrelated
+// body as its OWN plan through its own VectorizedPlanBuilder::build), then the
+// outer build. The two builds share no logical tree, which is the whole subject
+// of section 4 below — buildVec above cannot express it, because it never
+// materializes.
+std::unique_ptr<VecPlanNode> buildVecWithSubqueries(const std::string& sql,
+                                                   const Catalog& cat, bool optimize) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    Validator::validate(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    if (needsSubqueryMaterialization(stmt)) {
+        materializeSubqueries(stmt, [&](SelectStatement body, bool int_type_observable) {
+            std::unordered_map<std::string, ColumnarTable> body_tables;
+            std::vector<std::string> names;
+            collectQueryTables(body, names);
+            for (const auto& n : names) body_tables.emplace(n, tables.at(n));
+            auto logical = LogicalPlanBuilder::build(std::move(body), cat);
+            if (optimize) {
+                logical = PredicatePushdown::apply(std::move(logical), cat);
+                logical = JoinEnumeration::apply(std::move(logical), cat);
+                CardinalityEstimator::estimate(*logical, cat);
+            }
+            auto node = VectorizedPlanBuilder::build(std::move(logical),
+                                                     std::move(body_tables), cat,
+                                                     int_type_observable);
+            node->open();
+            std::vector<Row> rows;
+            while (DataChunk* chunk = node->nextChunk()) {
+                const int n = chunk->filter_applied
+                                  ? static_cast<int>(chunk->sel.indices.size())
+                                  : chunk->num_rows;
+                for (int i = 0; i < n; ++i) {
+                    const int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
+                    Row row;
+                    for (const auto& cv : chunk->columns) row.push_back(valueAt(cv, r));
+                    rows.push_back(std::move(row));
+                }
+            }
+            SubqueryResult out{node->outputSchema(), std::move(rows)};
+            node->close();
+            return out;
+        }, &cat);
+    }
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    if (optimize) {
+        logical = PredicatePushdown::apply(std::move(logical), cat);
+        logical = JoinEnumeration::apply(std::move(logical), cat);
+        CardinalityEstimator::estimate(*logical, cat);
+    }
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+}
+
 // Rendered text, not Value: what the user sees is the thing the two engines are
 // supposed to agree on, and a Value comparison coerces INT against DOUBLE —
 // which would call 3 and 3.5 unequal but 7 and 7.0 equal, hiding exactly the
 // step this file is about.
+std::vector<std::string> drainText(std::unique_ptr<VecPlanNode> node) {
+    node->open();
+    std::vector<std::string> out;
+    while (DataChunk* chunk = node->nextChunk()) {
+        const int n = chunk->filter_applied
+                          ? static_cast<int>(chunk->sel.indices.size())
+                          : chunk->num_rows;
+        for (int i = 0; i < n; ++i) {
+            const int r = chunk->filter_applied ? chunk->sel.indices[i] : i;
+            std::string s;
+            for (const auto& cv : chunk->columns) { s += valueAt(cv, r).toString(); s += '|'; }
+            out.push_back(std::move(s));
+        }
+    }
+    node->close();
+    return out;
+}
+
 std::vector<std::string> runVecText(const std::string& sql, const Catalog& cat,
                                     bool optimize) {
     auto node = buildVec(sql, cat, optimize);
@@ -145,6 +219,25 @@ void expectRowsBothWays(const std::string& sql, const Catalog& cat,
     for (bool optimize : {false, true}) {
         std::vector<std::string> got;
         ASSERT_NO_THROW(got = runVecText(sql, cat, optimize))
+            << "unexpected refusal with optimize=" << optimize << " for: " << sql;
+        EXPECT_EQ(got, expected) << "optimize=" << optimize << " for: " << sql;
+    }
+}
+
+// The same two, for a query whose subquery has to be materialized first.
+void expectSubqueryRefusedBothWays(const std::string& sql, const Catalog& cat) {
+    for (bool optimize : {false, true}) {
+        EXPECT_THROW(drainText(buildVecWithSubqueries(sql, cat, optimize)),
+                     std::runtime_error)
+            << "no refusal with optimize=" << optimize << " for: " << sql;
+    }
+}
+
+void expectSubqueryRowsBothWays(const std::string& sql, const Catalog& cat,
+                                const std::vector<std::string>& expected) {
+    for (bool optimize : {false, true}) {
+        std::vector<std::string> got;
+        ASSERT_NO_THROW(got = drainText(buildVecWithSubqueries(sql, cat, optimize)))
             << "unexpected refusal with optimize=" << optimize << " for: " << sql;
         EXPECT_EQ(got, expected) << "optimize=" << optimize << " for: " << sql;
     }
@@ -342,4 +435,259 @@ TEST_F(TypeThroughDivision, GuardOrdinaryDoubleDivisionIsUnaffected) {
         "SELECT team, SUM(speed) / COUNT(*) AS manual_avg FROM laps "
         "WHERE lap_id < 4 GROUP BY team ORDER BY team", catalog_,
         {"Ferrari|311.31|", "McLaren|308.91|"});
+}
+
+
+// ===========================================================================
+// 4. The materialization cut — the boundary the walk could not cross
+//
+// `materializeSubqueries` runs an uncorrelated body as its OWN plan and
+// substitutes the value it returned. Two builds, and `collectIntOrigins` runs
+// once per build: the body's plan holds no `/`, so nothing armed and the INT was
+// flattened into a DOUBLE column — correct for that plan alone — and the outer
+// plan then saw a DOUBLE Literal and correctly found nothing to arm. Neither
+// walk was wrong; no walk spanned both. Measured on data/laps.csv: 10000 rows
+// where both Volcano modes and SQLite return 0 (seam subquery pass 4, B-1).
+//
+// What crosses is the REQUEST, not the taint: materializeSubqueries knows, from
+// the outer AST it still holds, that the body's value is about to be divided by
+// an INTEGER, and hands that to the runner as `int_type_observable`. The body's
+// own root columns are then armed exactly as an in-plan division would arm them,
+// and the refusal stays VALUE-driven — which is what keeps the guards in
+// section 5 answering.
+//
+// EVERY WITNESS HERE IS 7 OR 2, over the five rows of test_laps_full.csv.
+// ===========================================================================
+
+// FAILS WITHOUT THE FIX: no throw, and five rows come back.
+// Pre-fix run on 689ea9a: 5 rows (lap_id 1..5).
+// Volcano and SQLite: zero rows — MAX(...) is the INT 2, `7 / 2` is 3, and 3
+// does not exceed 3. Flattened to 2.0 it is 3.5, and every row passes.
+//
+// The AGGREGATE materialization site, reached across the cut.
+TEST_F(TypeThroughDivision, MaterializedScalarDividedByAnIntegerRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT lap_id FROM laps WHERE 7 / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw, five rows.
+// Pre-fix run on 689ea9a: 5 rows. Volcano/SQLite: zero.
+//
+// The PROJECT materialization site — no aggregate anywhere — so the cut is not
+// a property of VecHashAggregateNode.
+TEST_F(TypeThroughDivision, MaterializedProjectionDividedByAnIntegerRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT lap_id FROM laps WHERE 7 / "
+        "(SELECT CASE WHEN lap_id = 2 THEN 2 ELSE 0.5 END FROM laps WHERE lap_id = 2) > 3",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw, five rows.
+// Pre-fix run on 689ea9a: 5 rows. Volcano/SQLite: zero (`7 / 2` is 3).
+//
+// The subquery as the DIVIDEND rather than the divisor. Both polarities, one
+// rule — the same reason MixedCaseUsedAsTheDIVISORRefuses exists in section 2.
+TEST_F(TypeThroughDivision, MaterializedScalarAsTheDIVIDENDRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT lap_id FROM laps WHERE "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 7 ELSE 0.5 END) FROM laps l2) / 2 > 3",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw, five rows where Volcano returns two.
+// Pre-fix on 689ea9a: 5 rows; row-Volcano and SQLite: 2 (lap_id 3 and 4).
+//
+// NOT IN THE AUDIT, and the reason the other operand is TYPED rather than
+// assumed. `round` is an INT column, so `round / 2` truncates in Volcano —
+// 1/2 = 0, 2/2 = 1 — and `round / 2.0` does not. A rule that only recognised an
+// INTEGER LITERAL beside the `/` would leave this one silently wrong, and a rule
+// that armed every operand would refuse the REAL-column twin in section 5 that
+// is correct today. Both need the catalog, which is why materializeSubqueries
+// now takes one.
+TEST_F(TypeThroughDivision, MaterializedScalarDividedByAnIntegerCOLUMNRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT lap_id FROM laps WHERE round / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw, five rows.
+// Pre-fix on 689ea9a: 5 rows. SQLite: zero. Volcano cannot adjudicate this one
+// at all (it refuses derived tables by capability), which is exactly why the
+// wrong answer survived four audit passes.
+//
+// The cut INSIDE a derived body: materializeSubqueries recurses into the body
+// before the outer statement, so the request has to be computed per statement
+// rather than once for the query.
+TEST_F(TypeThroughDivision, MaterializedScalarInsideADerivedBodyRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT k FROM (SELECT lap_id AS k FROM laps WHERE 7 / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3) t",
+        catalog_);
+}
+
+
+// ===========================================================================
+// 5. The fence around the cut — answers that are right today and must not move
+// ===========================================================================
+
+// GUARD. The three controls the audit named, each of which a shape-only refusal
+// at the cut would have broken. The refusal is armed by the plan and fired by
+// the VALUE, so an armed body that never produces an INT still answers.
+TEST_F(TypeThroughDivision, GuardTheArmedBodyStillAnswersWhenNoIntArrives) {
+    // MIN picks the REAL branch, so the Value crossing the cut is 0.5.
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE 7 / "
+        "(SELECT MIN(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+    // `THEN 2.0` — no INT branch at all, nothing to lose.
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE 7 / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2.0 ELSE 0.5 END) FROM laps l2) > 3",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+    // An INT-DECLARED body column: nothing narrows, so `7 / 5` is 1 in both
+    // engines. `= 1` rather than `> 0` on purpose — a body that came back as
+    // 5.0 would make this 1.4 and the suite would report zero rows.
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE 7 / (SELECT COUNT(*) FROM laps l2) = 1",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+}
+
+// GUARD. THE ANSWER THE CONSERVATIVE VERSION OF THIS FIX WOULD HAVE COST.
+// `speed` is REAL, so `speed / <anything>` is REAL division in Volcano too and
+// the body's stored type cannot change the answer. Arming on "the subquery is
+// under a `/`" — without typing the other operand — refuses this, and it is
+// right in all four modes today.
+TEST_F(TypeThroughDivision, GuardAREALOperandBesideTheDivisionIsNotArmed) {
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE speed / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 150",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+    // the literal form of the same fact
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE 7.0 / "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 3",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+}
+
+// GUARD. The subquery's value is only COMPARED, which coerces, so nothing is
+// observable and the body must not be armed at all — the cut's analogue of
+// GuardAdditionComparisonAndOrderByAreNotObservers.
+TEST_F(TypeThroughDivision, GuardAMaterializedScalarThatIsNotDividedIsUntouched) {
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE speed > "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2)",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+    expectSubqueryRowsBothWays(
+        "SELECT lap_id FROM laps WHERE speed + "
+        "(SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 300",
+        catalog_, {"1|", "2|", "3|", "4|", "5|"});
+}
+
+
+// ===========================================================================
+// 6. The over-firing fix — `/` needs BOTH operands, not one
+//
+// Every test here FAILS WITHOUT THE FIX by REFUSING a query that is correct in
+// every mode that can run it. Fix round 3 armed both operands of `/` with no
+// test on their types; `INTEGER/INTEGER truncates while INTEGER/REAL does not`
+// is the entire justification and it needs the divisor as well as the dividend.
+// Seam pass 4 reported this as E-14; the derived-table form had NO working mode,
+// because Volcano refuses derived tables by capability.
+// ===========================================================================
+
+// FAILS WITHOUT THE FIX: refused. Post-fix: 3.5, which is what both Volcano
+// modes answer. `7 / 2.0` and `7.0 / 2.0` are both 3.5 — the stored type cannot
+// reach this answer.
+TEST_F(TypeThroughDivision, DividingAMixedCaseByAREALLiteralAnswers) {
+    expectRowsBothWays(
+        "SELECT MAX(CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END) / 2.0 AS y "
+        "FROM laps WHERE lap_id < 4",
+        catalog_, {"3.5|"});
+}
+
+// FAILS WITHOUT THE FIX: refused, in the only mode that can run it — Volcano
+// refuses a derived table by capability, so before this the query had no
+// working mode anywhere. Post-fix: the answer it gave before fix round 3.
+TEST_F(TypeThroughDivision, TheDerivedFormOfThatQueryHasAWorkingModeAgain) {
+    expectRowsBothWays("SELECT x / 2.0 FROM " + std::string(MIXED_BODY),
+                       catalog_, {"0.25|", "3.5|", "0.25|"});
+}
+
+// FAILS WITHOUT THE FIX: refused. The taint reaches a `/`, but by the time it
+// gets there the value is REAL in BOTH engines — `x + 0.5` is 7.5 whether x was
+// the INT 7 or the double 7.0 — so there is no truncation left to lose. Dropping
+// the origins at an arithmetic node that can no longer be INTEGER is the same
+// `both operands` rule, applied one level down.
+TEST_F(TypeThroughDivision, TaintThroughArithmeticThatCanNoLongerBeIntegerAnswers) {
+    expectRowsBothWays("SELECT (x + 0.5) / 2 FROM " + std::string(MIXED_BODY),
+                       catalog_, {"0.5|", "3.75|", "0.5|"});
+    expectRowsBothWays("SELECT (x * 2.0) / 4 FROM " + std::string(MIXED_BODY),
+                       catalog_, {"0.25|", "3.5|", "0.25|"});
+}
+
+// GUARD. One character apart from the first test in this section, and it must
+// STILL refuse: `/ 2` is INTEGER division in Volcano and in SQLite, so the
+// flattened column really does change the answer (3 against 3.5). Getting this
+// pair wrong in either direction is the whole difficulty.
+TEST_F(TypeThroughDivision, GuardTheINTEGERDivisorTwinStillRefuses) {
+    expectRefusedBothWays(
+        "SELECT MAX(CASE WHEN lap_id = 2 THEN 7 ELSE 0.5 END) / 2 AS y "
+        "FROM laps WHERE lap_id < 4",
+        catalog_);
+    expectRefusedBothWays("SELECT x / 2 FROM " + std::string(MIXED_BODY), catalog_);
+}
+
+
+// ===========================================================================
+// 7. The magnitude rule's other half — the %.15g bound on a value never printed
+//
+// narrowToDoubleColumn enforces BOTH "is it the same number" (2^53) and "does it
+// still print the same" (1e15), and 1e15 binds first. The second question has no
+// answer for a column whose text is never read, and the plan can tell: an origin
+// that does not appear in the origin sets of the ROOT's output columns cannot
+// reach %.15g. See tests/test_int_double_materialization.cc's
+// ValueBoundIsExactlyTwoToThe53 for the boundary itself.
+// ===========================================================================
+
+// FAILS WITHOUT THE FIX: refused. Volcano answers 1.
+// 2e15 is below 2^53, so the double IS the integer; only the rendering differs,
+// and the comparison consumes the value without rendering it.
+TEST_F(TypeThroughDivision, AMagnitudeThatIsNeverPrintedIsNotRefused) {
+    expectRowsBothWays(
+        "SELECT MAX(CASE WHEN lap_id = 2 THEN 2000000000000000 ELSE 0.5 END) > 1 AS big "
+        "FROM laps WHERE lap_id < 4",
+        catalog_, {"1|"});
+    // the same value reached through a derived column and consumed by a filter
+    expectRowsBothWays(
+        "SELECT COUNT(*) AS n FROM (SELECT CASE WHEN lap_id = 2 THEN 2000000000000000 "
+        "ELSE 0.5 END AS x FROM laps WHERE lap_id < 4) t WHERE t.x > 1",
+        catalog_, {"1|"});
+}
+
+// GUARD. The same magnitude in the OUTPUT still refuses, because %.15g really
+// does render it `2e+15` while Volcano prints all sixteen digits. This is the
+// half E10_VOLCANO_ONLY's render witness pins, and the relaxation must not
+// reach it.
+TEST_F(TypeThroughDivision, GuardTheSameMagnitudeIsStillRefusedWhenItIsPRINTED) {
+    expectRefusedBothWays(
+        "SELECT MAX(CASE WHEN lap_id = 2 THEN 2000000000000000 ELSE 0.5 END) AS m "
+        "FROM laps WHERE lap_id < 4",
+        catalog_);
+    expectRefusedBothWays(
+        "SELECT x FROM (SELECT CASE WHEN lap_id = 2 THEN 1000000000000001 ELSE 0.5 END "
+        "AS x FROM laps WHERE lap_id < 4) t ORDER BY x DESC",
+        catalog_);
+}
+
+// GUARD. Above 2^53 the VALUE is gone, and no plan shape can make that
+// unobservable — 9007199254740993 and 9007199254740992 are one double. The
+// relaxation is to the text bound only.
+TEST_F(TypeThroughDivision, GuardAboveTwoToThe53TheUnprintedColumnStillRefuses) {
+    expectRefusedBothWays(
+        "SELECT MAX(CASE WHEN lap_id = 2 THEN 9007199254740993 ELSE 0.5 END) > 1 AS big "
+        "FROM laps WHERE lap_id < 4",
+        catalog_);
 }

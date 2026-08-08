@@ -471,12 +471,23 @@ TEST(ChunkPrunerCanSkip, NotEqualNeverSkips) {
 
 // ===== ChunkPruner::shouldSkip Tests =====
 
+// The schema the hint's refs are resolved against — since the totality screen
+// (parser/expr_totality.h) reached ChunkPruner, shouldSkip needs the scanning
+// node's own schema to type a conjunct's operands. `unknown_col` is IN the
+// schema and absent from the zone maps on purpose: that keeps
+// ColNotInZoneMapNoSkip testing the zone-map lookup rather than the screen.
+static Schema prunerSchema() {
+    return makeColumnarSchema({{"season", TypeId::INT},
+                               {"speed", TypeId::DOUBLE},
+                               {"unknown_col", TypeId::INT}});
+}
+
 TEST(ChunkPrunerShouldSkip, SinglePredicateProveSkip) {
     std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
     zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
 
     auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2025))));
-    EXPECT_TRUE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+    EXPECT_TRUE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0, prunerSchema()));
 }
 
 TEST(ChunkPrunerShouldSkip, SinglePredicateNoSkip) {
@@ -484,7 +495,7 @@ TEST(ChunkPrunerShouldSkip, SinglePredicateNoSkip) {
     zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
 
     auto pred = makeColumnarBinary("=", columnarColRef("season"), columnarLit(Value(int64_t(2022))));
-    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0, prunerSchema()));
 }
 
 // AND walk: season sub-predicate alone proves skip; speed not in zone_maps.
@@ -496,7 +507,7 @@ TEST(ChunkPrunerShouldSkip, AndWalkOneProvesSkip) {
     auto speed_pred  = makeColumnarBinary(">",   columnarColRef("speed"),  columnarLit(Value(300.0)));
     auto and_pred    = makeColumnarBinary("AND", std::move(season_pred),   std::move(speed_pred));
 
-    EXPECT_TRUE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0));
+    EXPECT_TRUE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0, prunerSchema()));
 }
 
 // AND walk: both sub-predicates fail to prove skip independently.
@@ -511,7 +522,7 @@ TEST(ChunkPrunerShouldSkip, AndWalkBothFail) {
     auto speed_pred  = makeColumnarBinary(">",   columnarColRef("speed"),  columnarLit(Value(100.0)));
     auto and_pred    = makeColumnarBinary("AND", std::move(season_pred),   std::move(speed_pred));
 
-    EXPECT_FALSE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(and_pred.get(), zone_maps, 0, prunerSchema()));
 }
 
 // Predicate column absent from zone_maps: no crash, returns false.
@@ -520,7 +531,7 @@ TEST(ChunkPrunerShouldSkip, ColNotInZoneMapNoSkip) {
     zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
 
     auto pred = makeColumnarBinary("=", columnarColRef("unknown_col"), columnarLit(Value(int64_t(2025))));
-    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), zone_maps, 0, prunerSchema()));
 }
 
 // nullptr WHERE always returns false without crashing.
@@ -528,7 +539,7 @@ TEST(ChunkPrunerShouldSkip, NullWhereNoSkip) {
     std::unordered_map<std::string, std::vector<ColumnChunk>> zone_maps;
     zone_maps["season"] = {{0, 4, Value(int64_t(2020)), Value(int64_t(2023))}};
 
-    EXPECT_FALSE(ChunkPruner::shouldSkip(nullptr, zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(nullptr, zone_maps, 0, prunerSchema()));
 }
 
 
@@ -704,7 +715,7 @@ TEST(ChunkPrunerSlots, JoinSlotRefNeverPrunes) {
     auto pred = makeColumnarBinary("=", std::move(ref), columnarLit(Value(int64_t(2025))));
 
     // the zone map would prove a skip, but the slot guard must win
-    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), tbl.zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(pred.get(), tbl.zone_maps, 0, schema));
 }
 
 // Week 30 round 3. `relation_slot < 1` is a test on a slot, and since Week 30 a
@@ -729,7 +740,7 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
     local->id = ColumnId::local(0);
     auto local_pred = makeColumnarBinary("=", std::move(local),
                                          columnarLit(Value(int64_t(2025))));
-    EXPECT_TRUE(ChunkPruner::shouldSkip(local_pred.get(), zone_maps, 0));
+    EXPECT_TRUE(ChunkPruner::shouldSkip(local_pred.get(), zone_maps, 0, prunerSchema()));
 
     // the finding: the SAME slot one block out must contribute nothing. Declining
     // is correct-and-slower; acting on it prunes another relation's chunks.
@@ -737,7 +748,7 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
     correlated->id = ColumnId::outer(1, 0);
     auto corr_pred = makeColumnarBinary("=", std::move(correlated),
                                         columnarLit(Value(int64_t(2025))));
-    EXPECT_FALSE(ChunkPruner::shouldSkip(corr_pred.get(), zone_maps, 0))
+    EXPECT_FALSE(ChunkPruner::shouldSkip(corr_pred.get(), zone_maps, 0, prunerSchema()))
         << "a correlated ref's slot indexes an enclosing block's range table";
 
     // and a slot >= 1 stays ignored, as it has since Week 26
@@ -745,5 +756,5 @@ TEST(ChunkPrunerShouldSkip, ACorrelatedRefContributesNoPruningHint) {
     join_side->id = ColumnId::local(1);
     auto join_pred = makeColumnarBinary("=", std::move(join_side),
                                         columnarLit(Value(int64_t(2025))));
-    EXPECT_FALSE(ChunkPruner::shouldSkip(join_pred.get(), zone_maps, 0));
+    EXPECT_FALSE(ChunkPruner::shouldSkip(join_pred.get(), zone_maps, 0, prunerSchema()));
 }

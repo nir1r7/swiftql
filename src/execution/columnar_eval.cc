@@ -140,6 +140,15 @@ SelectionVector evalPredicate(const Expr* pred, const DataChunk& chunk, const Sc
     // rows the left kept. Equivalent to intersect for AND, but the right touches
     // only survivors, so ordering the most-selective conjunct left (Week 21
     // pushdown) pays off. OR must stay a union — it cannot cascade.
+    //
+    // SEAM AUDIT PASS 4, E-13: this is not only a speed-up, it is the SEMANTICS.
+    // Per-row evaluation can throw, so "the right operand sees only the left's
+    // survivors" decides whether the query errors. evaluator.cc's
+    // evaluatePredicate is the scalar twin of these two branches — cascading
+    // AND, eager OR — and exists because Volcano's filter used the eager
+    // evaluate() and the two engines therefore answered differently on
+    // `WHERE age > 30 AND SUBSTRING(name, age-30, 3) = 'er_'`. If either branch
+    // changes, change the other in the same commit.
     if (bin->op == "AND"){
         SelectionVector left = evalPredicate(bin->left.get(), chunk, schema, input_sel, cache);
         return evalPredicate(bin->right.get(), chunk, schema, &left, cache);

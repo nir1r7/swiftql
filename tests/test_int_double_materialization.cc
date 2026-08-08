@@ -335,6 +335,58 @@ TEST(IntDoubleMaterialization, AppendRefusesTheIntegerItCannotRENDER) {
     EXPECT_THROW(appendColumnValue(cv, Value(TEN_15)), std::runtime_error);
 }
 
+// FAILS WITHOUT THE UNRENDERED RELAXATION (it does not compile there: the state
+// does not exist). What it pins is the boundary of the OTHER bound.
+//
+// The 1e15 constant above is the TEXT bound, and it applies to a column whose
+// text is read. Seam pass 4's E-14 ran a query that reads none of it —
+// `SELECT MAX(CASE WHEN c THEN 2000000000000000 ELSE 0.5 END) > 1`, which
+// Volcano answers `1` — and the text bound refused it for a rendering that never
+// happens. When the plan proves the column is never printed
+// (IntNarrowing::UNRENDERED) only the VALUE has to survive, and 2^53 is exactly
+// where that stops being true.
+TEST(IntDoubleMaterialization, ValueBoundIsExactlyTwoToThe53) {
+    // The constant IS the last integer that is still its own double, and the
+    // next one is not — derived, not asserted.
+    auto roundTrips = [](int64_t i) {
+        return static_cast<int64_t>(static_cast<double>(i)) == i;
+    };
+    EXPECT_TRUE(roundTrips(MAX_EXACT_INT_IN_DOUBLE_COLUMN));
+    EXPECT_TRUE(roundTrips(-MAX_EXACT_INT_IN_DOUBLE_COLUMN));
+    EXPECT_FALSE(roundTrips(MAX_EXACT_INT_IN_DOUBLE_COLUMN + 1));
+    EXPECT_FALSE(roundTrips(-(MAX_EXACT_INT_IN_DOUBLE_COLUMN + 1)));
+    EXPECT_EQ(MAX_EXACT_INT_IN_DOUBLE_COLUMN, TWO_53);
+
+    // An UNRENDERED column takes values between the two bounds that a RENDERED
+    // one refuses — and stops at 2^53 in both signs.
+    ColumnVector u = makeColumnVector(TypeId::DOUBLE);
+    u.int_narrowing = IntNarrowing::UNRENDERED;
+    ASSERT_NO_THROW(appendColumnValue(u, Value(TEN_15)));
+    ASSERT_NO_THROW(appendColumnValue(u, Value(TEN_15_PLUS)));
+    ASSERT_NO_THROW(appendColumnValue(u, Value(int64_t(2000000000000000LL))));
+    ASSERT_NO_THROW(appendColumnValue(u, Value(TWO_53)));
+    ASSERT_NO_THROW(appendColumnValue(u, Value(-TWO_53)));
+    EXPECT_THROW(appendColumnValue(u, Value(TWO_53_PLUS)), std::runtime_error);
+    EXPECT_THROW(appendColumnValue(u, Value(-TWO_53_PLUS)), std::runtime_error);
+
+    // The same values in the DEFAULT state are refused exactly as before, which
+    // is what makes the relaxation a plan-shape decision and not a widening.
+    ColumnVector r = makeColumnVector(TypeId::DOUBLE);
+    EXPECT_THROW(appendColumnValue(r, Value(TEN_15)), std::runtime_error);
+    EXPECT_THROW(appendColumnValue(r, Value(TEN_15_PLUS)), std::runtime_error);
+    EXPECT_EQ(static_cast<int>(IntNarrowing::RENDERED),
+              static_cast<int>(ColumnVector{}.int_narrowing))
+        << "RENDERED must stay the default: a mask that is never set has to "
+           "behave as the engine did before either refusal existed";
+
+    // And UNRENDERED does NOT relax the TYPE rule: OBSERVABLE is a third state,
+    // not a stronger magnitude.
+    ColumnVector o = makeColumnVector(TypeId::DOUBLE);
+    o.int_narrowing = IntNarrowing::OBSERVABLE;
+    EXPECT_THROW(appendColumnValue(o, Value(int64_t(7))), std::runtime_error);
+    ASSERT_NO_THROW(appendColumnValue(u, Value(int64_t(7))));
+}
+
 // GUARD — passes before and after. The fix must not move a single answer that is
 // right today, and every value any shipped dataset or ordinary query produces is
 // in this range. Also pins the three conversions that were never lossy: INT into

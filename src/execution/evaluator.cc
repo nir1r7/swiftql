@@ -107,6 +107,15 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
         // the vectorized path answered with all of them — two engines disagreeing
         // on the same query, which Phase 5 cannot ship as "a documented dialect".
         // TPC-H Q19 is an OR chain over nullable columns.
+        //
+        // THIS BRANCH IS EAGER AND STAYS EAGER. It is the VALUE of `a AND b`,
+        // which SQL defines with no evaluation order, and a caller that wants
+        // the value (a SELECT list, a CASE arm) must get the exact 3VL answer.
+        // A FILTER wants something else — the row set each conjunct is
+        // evaluated on — and that is evaluatePredicate() at the bottom of this
+        // file. Seam audit pass 4's E-13 is what happens when a filter uses this
+        // one: it evaluates the right conjunct on rows the left rejected, and
+        // the vectorized cascade does not.
         if (op == "AND" || op == "OR") {
             // tri-state: -1 unknown (NULL), 0 false, 1 true
             const int l = left.isNull()  ? -1 : (left.asInt()  != 0);
@@ -259,6 +268,65 @@ Value evaluate(const Expr* expr, const Row& row, const Schema& schema){
     }
 
     throw std::runtime_error("evaluate(): unknown Expr subtype");
+}
+
+
+// ── PREDICATE EVALUATION — THE VOLCANO HALF OF ONE RULE ─────────────────────
+//
+// SEAM AUDIT PASS 4, E-13. `evaluate()` above computes BOTH operands of an AND
+// before applying the tri-state rule, and `evalPredicate` (columnar_eval.cc)
+// CASCADES the selection vector — it evaluates the right conjunct only over the
+// rows the left kept. Since per-row evaluation is not total, that is not two
+// implementations of one semantics; it is two different semantics, and it was
+// measured as such on the shipped `drivers` table:
+//
+//   SELECT name, age FROM drivers WHERE age > 30 AND SUBSTRING(name, age-30, 3) = 'er_'
+//     Volcano     Error: SUBSTRING: start position must be >= 1
+//     vectorized  the correct three rows
+//
+// The vectorized answer is the right one — the guard `age > 30` is exactly what
+// makes `age - 30 >= 1` well-defined — and it is the one this function now
+// implements, so the ENGINE no longer decides. The rule, stated once in
+// parser/expr_totality.h and obeyed by the optimizer and the chunk pruner as
+// well:
+//
+//   A CONJUNCT IS EVALUATED ON THE ROWS FOR WHICH EVERY CONJUNCT WRITTEN BEFORE
+//   IT EVALUATED TRUE.
+//
+// Consequences worth stating rather than discovering:
+//
+//   * AND IS NOT COMMUTATIVE for error behaviour. `p AND q` and `q AND p` are
+//     different programs when q can raise, exactly as they are in C or in
+//     SQLite. That is the definition, not a defect — and it is what obliges
+//     PredicatePushdown to freeze a raising conjunct in its written position.
+//   * OR IS EAGER, in both engines. `sv_union` cannot cascade (it needs both
+//     sides over the SAME input rows), so this function evaluates both operands
+//     of an OR too. The two engines agree; the asymmetry with AND is a property
+//     of the connectives, and `evalPredicate`'s OR branch is its twin.
+//   * ONE INEXACTNESS, deliberate. Three-valued AND says NULL AND FALSE = FALSE;
+//     this returns UNKNOWN, because the right operand was not evaluated. Both
+//     answers REJECT the row, and this function's contract is "is it TRUE", so
+//     no caller can observe the difference. `evaluate()` is untouched and still
+//     returns the exact 3VL value for `SELECT a AND b`, where it IS observable.
+//     Cascading on TRUE rather than on non-FALSE is what makes this identical to
+//     the selection-vector cascade, which is the whole point.
+int evaluatePredicate(const Expr* pred, const Row& row, const Schema& schema) {
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(pred)) {
+        if (bin->op == "AND") {
+            const int l = evaluatePredicate(bin->left.get(), row, schema);
+            if (l != 1) return l;   // FALSE or UNKNOWN: the right is not reached
+            return evaluatePredicate(bin->right.get(), row, schema);
+        }
+        if (bin->op == "OR") {
+            const int l = evaluatePredicate(bin->left.get(), row, schema);
+            const int r = evaluatePredicate(bin->right.get(), row, schema);
+            if (l == 1 || r == 1) return 1;      // true dominates
+            if (l < 0 || r < 0) return -1;
+            return 0;
+        }
+    }
+    const Value v = evaluate(pred, row, schema);
+    return v.isNull() ? -1 : (v.asInt() != 0);
 }
 
 

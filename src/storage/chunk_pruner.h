@@ -2,21 +2,60 @@
 
 #include "columnar_table.h"
 #include "parser/ast.h"
+#include "parser/expr_totality.h"
+#include "common/schema.h"
 #include <tuple>
 
 namespace {
     // collect triples (col_name, operator, literal_value) from AND connected predicates
     // skip OR predicates, complexity not worth pay off
-    void collectSimplePredicates(const Expr* expr, std::vector<std::tuple<std::string, std::string, Value>>& out){
-        if (!expr) return;
+    //
+    // WALKS THE AND SPINE IN WRITTEN ORDER and STOPS at the first conjunct that
+    // may raise. Returns false once it has stopped, so the caller's spine walk
+    // unwinds without collecting anything further.
+    //
+    // SEAM AUDIT PASS 4, P4-1's second raise site — generalized, because the
+    // throw was only half of it. A zone-map skip removes rows BEFORE the filter
+    // runs, so it can mask a raise the filter owed. Measured at HEAD on the
+    // shipped catalog, `--no-optimize` in every mode, so no optimizer pass is
+    // involved:
+    //
+    //   SELECT lap_id FROM laps
+    //   WHERE lap_id * 9223372036854775807 > 0 AND lap_id > 999999
+    //     row storage       Error: integer overflow in '*'
+    //     columnar storage  0 rows      (`lap_id > 999999` prunes every chunk)
+    //
+    // The rule that closes it is the SAME one PredicatePushdown obeys and the
+    // same index: a conjunct is evaluated on the rows every conjunct written
+    // BEFORE it kept, so only a conjunct written ahead of every raising one may
+    // prove a skip. If C_k proves the skip and C_j may raise:
+    //   j > k  — C_j would never have been evaluated on that chunk anyway, since
+    //            C_k is false for every row in it. Skipping is invisible.
+    //   j < k  — C_j IS evaluated on rows of that chunk, and skipping removes
+    //            them. Unsound; this walker stops before reaching C_k.
+    //
+    // The screen is exprMayRaise/conjunctMayRaise (parser/expr_totality.h), the
+    // one shared with the optimizer. It answers "may raise" for a conjunct this
+    // scan's schema cannot type — which is every conjunct naming another
+    // relation, so an un-pushed WHERE handed to the FROM-side scan of a join
+    // stops contributing hints at its first cross-relation conjunct. That is a
+    // real loss of pruning on the `--no-optimize` leg and it is the honest
+    // price: the hint arrives here without the schema it was written against,
+    // and guessing is what the wrong answer above was made of.
+    bool collectSimplePredicates(const Expr* expr, const Schema& schema,
+                                 std::vector<std::tuple<std::string, std::string, Value>>& out){
+        if (!expr) return true;
         const auto* bin = dynamic_cast<const BinaryExpr*>(expr);
-        if (!bin) return;
+        if (!bin) return !conjunctMayRaise(expr, schema);
 
         if (bin->op == "AND"){
-            collectSimplePredicates(bin->left.get(), out);
-            collectSimplePredicates(bin->right.get(), out);
-            return;
+            if (!collectSimplePredicates(bin->left.get(), schema, out)) return false;
+            return collectSimplePredicates(bin->right.get(), schema, out);
         }
+
+        // One conjunct. Whatever else is true of it, if it can raise then
+        // nothing written after it may prune.
+        if (conjunctMayRaise(bin, schema)) return false;
 
         // accept ColumnRef operator Literal.
         // A conjunct is only prunable when its refs belong to the scanned
@@ -70,13 +109,34 @@ namespace {
             && col->id.localSlot("collectSimplePredicates") < 1){
             out.emplace_back(col->column_name, bin->op, lit->value);
         }
+        return true;
     }
 }
 
 struct ChunkPruner {
+    // A zone map answers "can any row of this chunk satisfy `col op val`?".
+    //
+    // IT MUST NOT THROW. `val < mn` is Value::operator<, which raises
+    // "Type mismatch in Value comparison" across the STRING boundary
+    // (value.cc's NUMERIC_COERCE) — and this runs at SCAN time, on metadata,
+    // before a single row exists. Seam audit pass 4's P4-1 turned that into a
+    // divergence in both directions on the shipped catalog
+    // (`WHERE team = 5 AND speed > 999999`), decided purely by which conjunct
+    // came first in the WHERE.
+    //
+    // The guard is a decline, not a fix for the query: a predicate comparing a
+    // STRING column against a number still raises PER ROW, from the filter,
+    // which is where it is written and where both engines and both legs agree
+    // it belongs. All this rule says is that a metadata skip cannot be the
+    // thing that decides it. Same "an optimization declines and falls back"
+    // stance as collectSimplePredicates' three other declines above.
     static bool canSkipChunk(const std::string& op, const Value& val, const ColumnChunk& chunk){
         const Value& mn = chunk.min_val;
         const Value& mx = chunk.max_val;
+        if (mn.isNull() || mx.isNull() || val.isNull()) return false;
+        const bool val_str = val.type() == TypeId::STRING;
+        if (val_str != (mn.type() == TypeId::STRING)
+            || val_str != (mx.type() == TypeId::STRING)) return false;
 
         if (op == "=") return val < mn || val > mx;
         if (op == "<") return val <= mn;
@@ -86,11 +146,14 @@ struct ChunkPruner {
         return false;
     }
 
-    static bool shouldSkip(const Expr* where, const std::unordered_map<std::string, std::vector<ColumnChunk>>& zone_maps, int chunk_idx){
+    // `schema` is the scanning node's own output schema — the one the hint's
+    // refs are looked up in. See collectSimplePredicates for why it is needed
+    // and what it costs when a hint names a column this scan does not have.
+    static bool shouldSkip(const Expr* where, const std::unordered_map<std::string, std::vector<ColumnChunk>>& zone_maps, int chunk_idx, const Schema& schema){
         if (!where) return false;
         std::vector<std::tuple<std::string, std::string, Value>> preds;
-        collectSimplePredicates(where, preds);
-    
+        collectSimplePredicates(where, schema, preds);
+
 
         for (const auto& [col, op, val] : preds) {
             auto it = zone_maps.find(col);

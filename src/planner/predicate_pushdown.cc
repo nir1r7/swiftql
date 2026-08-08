@@ -288,6 +288,15 @@ bool remapOntoDerivedBody(Expr* conjunct, const LogicalDerived& derived) {
 // by substitution here without duplicating the expression, and a projected
 // AGGREGATE does not exist below the project at all. Both decline.
 //
+// THAT IS A SET EQUIVALENCE AND IT IS ONLY HALF THE OBLIGATION (seam audit pass
+// 4, P4-B1). π is evaluated on FEWER ROWS after the descent, so the rule also
+// needs an ERROR-BEHAVIOUR condition, and it is about the expressions this
+// function never looks at: the SIBLINGS of the ones the conjunct names. That
+// second condition is not checkable here — this function is handed one conjunct
+// and answers for it — so it lives at the single call site in apply(), which
+// screens `project.exprs` as a whole before any conjunct is offered. Do not
+// read a `true` from here as permission to descend.
+//
 // All-or-nothing, like remapOntoDerivedBody, and for the same reason.
 bool remapThroughProject(Expr* conjunct, const LogicalProject& project) {
     // A project whose select list and output schema are not 1:1 is a shape this
@@ -348,15 +357,23 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
 //             WHERE d.nationality = 'Zzz' AND SUBSTRING(l.team, l.lap_id - l.lap_id, 2) = 'x'
 //             optimized -> Error,   --no-optimize -> 0 rows
 //
-// SQL does not fix predicate evaluation order, so each of those answers is legal
-// in isolation. This project nevertheless asserts `optimized == --no-optimize`
-// (compare_against_sqlite.py's fourth mode, run_optimizer_invariant), so the two
-// legs DISAGREEING is the defect. THE PROPERTY BEING RESTORED IS THEREFORE
-// NARROW AND STATABLE: every conjunct is evaluated on exactly the ROW SET that
-// written order gives it, so it raises in the optimized leg if and only if it
-// raises in the `--no-optimize` leg.
+// SQL does not fix predicate evaluation order. SwiftQL DOES — see
+// parser/expr_totality.h for the rule in full and for the screen itself. The
+// half of it this file has to honour:
 //
-// THE PRECONDITION, which was written down nowhere before:
+//   A conjunct is evaluated on the rows for which every conjunct WRITTEN BEFORE
+//   IT evaluated TRUE. Both engines implement exactly that cascade
+//   (evaluatePredicate in evaluator.cc, evalPredicate in columnar_eval.cc), so
+//   the row set a conjunct sees is a property of the WRITTEN ORDER, and this
+//   pass may not change it for a conjunct that can raise.
+//
+// That is strictly stronger than "the two legs agree", which is what pass 3
+// aimed at; it is what makes the four movers below, the two engines and the
+// chunk pruner obey ONE rule instead of three. `optimized == --no-optimize`
+// (compare_against_sqlite.py's fourth mode, run_optimizer_invariant) then falls
+// out of it rather than being asserted separately.
+//
+// THE PRECONDITION:
 //
 //   Permuting conjuncts C1..Cn preserves both the result set and the error
 //   behaviour IFF every conjunct that can RAISE is evaluated on the same row set
@@ -376,80 +393,27 @@ StatsContext scanStats(const LogicalPlanNode* scan_child, const Catalog& catalog
 // query, every query in both harnesses) is unaffected, which is why this costs
 // nothing measurable.
 //
-// mayRaise is a CONSERVATIVE over-approximation of "evaluate() can throw on some
-// row". Over-approximating costs plan quality on the queries it hits and nothing
-// else; under-approximating is a divergence, so the two errors are not
-// symmetric. What it does NOT have to cover, because `inferExprType`
-// (logical_plan.cc) decides it at PLAN time — in both legs, before any pass in
-// this file runs — is every TYPE error: STRING arithmetic, a non-STRING LIKE or
-// SUBSTRING operand, a mixed IN list, a CASE with mixed branches. Those raise
-// identically in both legs no matter how the conjuncts are arranged. What is
-// left is exactly the DATA-dependent raises:
+// THE FOUR MOVES THIS PASS MAKES, all four screened — the list is exhaustive
+// and must stay that way, because pass 4 found the divergence in the one move
+// that had been added without being added to this list:
 //
-//   * substringOf  — start < 1 or length < 0 (evaluator.cc). Only reachable with
-//     a COMPUTED position: inferExprType refuses a constant one at plan time, so
-//     a SUBSTRING whose start and length are both Literals cannot raise here.
-//     That carve-out is what keeps TPC-H Q22's `SUBSTRING(c_phone, 1, 2)` total.
-//   * checkedAdd/Sub/Mul/Div/Negate — INT overflow (checked_arith.h). Screened by
-//     OPERATOR rather than by inferred type: DOUBLE arithmetic cannot overflow,
-//     but deciding that needs a schema this function does not have, and post-
-//     folding an arithmetic conjunct in a WHERE is rare enough that the extra
-//     conservatism is free (no TPC-H query has one — Q19's `:QTY1 + 10` is two
-//     literals and folds).
-//   * integer division by zero is NOT in the list: it yields NULL (verified —
-//     `SELECT 100 / (lap_id - lap_id) FROM laps LIMIT 1` prints NULL). Only
-//     INT64_MIN / -1 raises, and that is covered by the operator screen anyway.
+//   1. reordering conjuncts inside one filter          (orderByWork)
+//   2. pushing a conjunct below an inner join          (distribute)
+//   3. pushing a conjunct into a derived body          (pushIntoDerived)
+//   4. descending below that body's projection         (apply's PROJECT arm)
 //
-// IntervalLiteral and SubqueryExpr both throw unconditionally in evaluate();
-// neither can reach a built plan (foldConstants removes the first,
-// materializeSubqueries the second), and both are screened here rather than
-// argued about, since the cost of screening them is zero.
+// Move 4 needs a SECOND screen that the other three do not, and pass 4's P4-B1
+// is what happens without it: σ_p(π(R)) ≡ π(σ_p'(R)) is a SET equivalence, and
+// the expression whose row count changes is not the conjunct — it is the
+// SIBLING expression in the projection, which the conjunct never names. So the
+// PROJECT arm screens `project.exprs` as well. See remapThroughProject.
 //
-// Same dispatch as collectSlots/restampSlots. A MISSED subtype here answers
-// "total" and is therefore the unsafe direction — unlike dispatch site 8, whose
-// miss only costs pushdown. Keep the three in lockstep.
-bool mayRaise(const Expr* expr) {
-    if (!expr) return false;
-    if (dynamic_cast<const Literal*>(expr)) return false;
-    if (dynamic_cast<const ColumnRef*>(expr)) return false;
-    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
-        const std::string& op = bin->op;
-        if (op == "+" || op == "-" || op == "*" || op == "/") return true;
-        return mayRaise(bin->left.get()) || mayRaise(bin->right.get());
-    }
-    if (dynamic_cast<const UnaryExpr*>(expr)) return true;   // checkedNegate
-    if (auto* isn = dynamic_cast<const IsNullExpr*>(expr)) return mayRaise(isn->operand.get());
-    if (auto* in = dynamic_cast<const InExpr*>(expr)) return mayRaise(in->operand.get());
-    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) return mayRaise(lk->operand.get());
-    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
-        // evaluate() short-circuits an untaken branch, but ExpressionExecutor
-        // declines to compile CaseExpr at all for exactly that reason, so which
-        // branches run is an ENGINE detail. Screen every arm.
-        for (const auto& w : c->when_clauses) {
-            if (mayRaise(w.condition.get()) || mayRaise(w.result.get())) return true;
-        }
-        return mayRaise(c->else_expr.get());
-    }
-    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
-        const bool const_start = dynamic_cast<const Literal*>(sub->start.get()) != nullptr;
-        const bool const_len = !sub->length
-                             || dynamic_cast<const Literal*>(sub->length.get()) != nullptr;
-        if (!const_start || !const_len) return true;
-        return mayRaise(sub->operand.get());
-    }
-    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) return mayRaise(agg->argument.get());
-    // IntervalLiteral, SubqueryExpr, and any Expr subtype added later.
-    return true;
-}
-
-// Index of the first conjunct that can raise, or conjuncts.size() when none can.
-// Everything from here on is frozen: see the screen's comment above.
-size_t firstMayRaise(const std::vector<std::unique_ptr<Expr>>& conjuncts) {
-    for (size_t i = 0; i < conjuncts.size(); ++i) {
-        if (mayRaise(conjuncts[i].get())) return i;
-    }
-    return conjuncts.size();
-}
+// The screen itself is `exprMayRaise` / `conjunctMayRaise`
+// (parser/expr_totality.h), shared with ChunkPruner and with the LIMIT rule in
+// logical_plan.cc. It is SCHEMA-AWARE, and that is not a refinement: pass 4's
+// P4-2 measured 87x on a three-conjunct WHERE whose only defect was a screen
+// that judged arithmetic by OPERATOR (`l.speed * 2`, DOUBLE, cannot overflow)
+// instead of by operand type.
 
 // Order conjuncts most-selective-first (smallest keep-fraction). Stable so ties
 // and stat-less predicates (fallback selectivity) keep their original order.
@@ -461,13 +425,17 @@ size_t firstMayRaise(const std::vector<std::unique_ptr<Expr>>& conjuncts) {
 // selection only.
 //
 // Only the TOTAL PREFIX is sorted (seam audit pass 3, B3-2). The conjuncts from
-// the first one that can raise onward keep their written positions, because the
-// columnar predicate cascade evaluates the right conjunct only over the left's
-// survivors (columnar_eval.cc's AND) and per-row evaluation can throw — so their
-// order decides whether the query errors, not how fast it runs. See mayRaise.
+// the first one that can raise onward keep their written positions, because BOTH
+// engines evaluate a conjunct only over the rows every earlier conjunct kept
+// (columnar_eval.cc's cascading AND, evaluator.cc's evaluatePredicate) and
+// per-row evaluation can throw — so their order decides whether the query
+// errors, not how fast it runs. See the screen above.
+//
+// The conjuncts are written against the CHILD's schema (this filter sits
+// directly above it), which is what the screen needs to decide operand types.
 void orderByWork(std::vector<std::unique_ptr<Expr>>& conjuncts,
                  const LogicalPlanNode* scan_child, const Catalog& catalog) {
-    const size_t frozen = firstMayRaise(conjuncts);
+    const size_t frozen = firstMayRaise(conjuncts, scan_child->output_schema);
     if (frozen < 2) return;   // nothing sortable ahead of the frozen tail
     StatsContext ctx = scanStats(scan_child, catalog);
     std::stable_sort(conjuncts.begin(), conjuncts.begin() + static_cast<long>(frozen),
@@ -553,6 +521,10 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
                                               const Catalog& catalog) {
     // steal the join tree out from under the filter
     auto join = std::unique_ptr<LogicalPlanNode>(filter->children[0].release());
+    // The WHERE was written against the join's output schema; the screen below
+    // needs it to type the conjuncts' operands, and it must be read before the
+    // tree is rewritten.
+    const Schema join_schema = join->output_schema;
 
     std::vector<std::unique_ptr<Expr>> conjuncts;
     splitConjuncts(std::move(filter->predicate), conjuncts);   // filter is now empty
@@ -566,7 +538,7 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
     // raise it was owed. Both were reproduced on the shipped catalog; see
     // mayRaise. Freezing the suffix in `residual` costs pushdown only on queries
     // that contain a raising conjunct at all.
-    const size_t frozen = firstMayRaise(conjuncts);
+    const size_t frozen = firstMayRaise(conjuncts, join_schema);
 
     // std::map, not unordered_map: the leftover loop below must be deterministic
     std::map<int, std::vector<std::unique_ptr<Expr>>> by_slot;
@@ -646,7 +618,9 @@ std::unique_ptr<LogicalPlanNode> pushIntoDerived(std::unique_ptr<LogicalFilter> 
 
     std::vector<std::unique_ptr<Expr>> conjuncts;
     splitConjuncts(std::move(filter->predicate), conjuncts);
-    const size_t frozen = firstMayRaise(conjuncts);
+    // Written against the DERIVED RELATION's schema — remapOntoDerivedBody has
+    // not run yet, so this is the schema the conjuncts still read.
+    const size_t frozen = firstMayRaise(conjuncts, d->output_schema);
 
     std::vector<std::unique_ptr<Expr>> entering, staying;
     const char* decline = nullptr;
@@ -747,14 +721,43 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
     else if (node->type == LogicalNodeType::FILTER &&
              node->children[0]->type == LogicalNodeType::PROJECT) {
         auto* f = static_cast<LogicalFilter*>(node.get());
+        auto* project = static_cast<LogicalProject*>(f->children[0].get());
         std::vector<std::unique_ptr<Expr>> conjuncts;
         splitConjuncts(std::move(f->predicate), conjuncts);
-        const size_t frozen = firstMayRaise(conjuncts);
+        const size_t frozen = firstMayRaise(conjuncts, project->output_schema);
 
-        auto* project = static_cast<LogicalProject*>(f->children[0].get());
+        // SEAM AUDIT PASS 4, P4-B1. THE SECOND SCREEN, and the one the other
+        // three moves do not need. Descending moves the filter BELOW the
+        // projection, so every expression in the SELECT LIST is evaluated on
+        // fewer rows — including the ones the conjunct never names, which is
+        // exactly why screening the conjunct is not enough here. Measured before
+        // this existed, on the shipped catalog:
+        //
+        //   SELECT COUNT(*) FROM (SELECT l.lap_id, l.lap_id * 1000000000000000
+        //                         AS big FROM laps l) x WHERE x.lap_id < 100
+        //     optimized -> 99      --no-optimize -> Error: integer overflow
+        //
+        // `lap_id` is a plain passthrough, so remapThroughProject's own
+        // precondition was satisfied while `big` was the expression whose row
+        // count changed. All-or-nothing: one raising select-list expression
+        // stops the whole descent, because the filter lands in one place.
+        //
+        // Screened against the projection's INPUT schema — that is where its
+        // expressions are evaluated. Type-aware, which is what makes this
+        // affordable: a derived body computing `l.speed * 2` is the ordinary
+        // case and DOUBLE arithmetic cannot raise, so it still descends. Under
+        // the old operator-only screen this rule would have cost B3-3's whole
+        // 9.4x on precisely the body shape it was written for.
+        const Schema& project_input = project->children[0]->output_schema;
+        bool projection_total = true;
+        for (const auto& e : project->exprs) {
+            if (exprMayRaise(e.get(), project_input)) { projection_total = false; break; }
+        }
+
         std::vector<std::unique_ptr<Expr>> descending, staying;
         for (size_t i = 0; i < conjuncts.size(); ++i) {
-            if (i < frozen && remapThroughProject(conjuncts[i].get(), *project))
+            if (projection_total && i < frozen
+                && remapThroughProject(conjuncts[i].get(), *project))
                 descending.push_back(std::move(conjuncts[i]));
             else
                 staying.push_back(std::move(conjuncts[i]));
@@ -768,14 +771,21 @@ std::unique_ptr<LogicalPlanNode> PredicatePushdown::apply(std::unique_ptr<Logica
         } else {
             f->predicate = conjoinAll(std::move(staying));
         }
-        // A conjunct refused HERE is not stamped, and the reason it does not need
-        // to be is that its refusal is READABLE FROM THE PLAN: the filter is
-        // drawn directly above the project whose select list --explain prints on
-        // the same line, so `LogicalFilter [(s2 > 688)]` over
-        // `LogicalProject [team, s2]` says which column is computed. The derived
-        // boundary was different — a filter above a LogicalDerived looks the same
-        // whether there was a decision or not — which is why the stamp is there
-        // and not here. Narrower than "every decline is named"; recorded as such.
+        // A conjunct refused HERE is not stamped, and the argument first written
+        // for that was FALSE (seam audit pass 4, P4-3): it claimed the refusal is
+        // "readable from the plan" because --explain draws the filter above the
+        // project's select list. It does not — LogicalProject::explain prints
+        // OUTPUT COLUMN NAMES, never the expressions, so `LogicalProject [t, s2]`
+        // is byte-identical whether `s2` is `speed * 2 AS s2` (refused) or a
+        // passthrough (descended). What is true, and is all that is claimed now:
+        // a LogicalFilter surviving directly above a LogicalProject in the
+        // OPTIMIZED plan means at least one conjunct was refused, since a fully
+        // descended filter is removed outright three lines above. WHICH reason
+        // is not readable, and the projection-totality refusal added for P4-B1
+        // is not readable at all. That is a real gap, left open deliberately
+        // rather than by omission: a stamp needs somewhere to live, and
+        // LogicalProject has no `pushdown_decision` field the way LogicalDerived
+        // does. If a fifth move is added here, add the field first.
         //
         // fall through to the child loop, which reaches the new filter.
     }

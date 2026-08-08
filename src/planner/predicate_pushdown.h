@@ -19,15 +19,28 @@
 // a LEFT join and such conjuncts stay above the whole join tree.
 //
 // !! RESULT PRESERVATION IS NOT THE WHOLE OBLIGATION, and Week 37 is where that
-// stopped being an oversight. PER-ROW EVALUATION CAN THROW (substringOf, and
-// checkedArith overflow), so MOVING a conjunct — reordering it inside one filter
-// OR pushing it below a join OR pushing it into a derived body — decides whether
-// the query ERRORS. The row sets above are equal; the ERROR BEHAVIOUR is not,
-// and `optimized != --no-optimize` was reproducible in BOTH directions on the
-// shipped catalog. Every move this pass makes is now screened: see the totality
-// screen and `firstMayRaise` in the .cc, which state the precondition and what
-// property it restores. The screen is a no-op on a query with no raising
-// conjunct, which is every TPC-H query and every harness entry.
+// stopped being an oversight. PER-ROW EVALUATION CAN THROW (substringOf,
+// checkedArith overflow, and a comparison across the STRING boundary), so
+// MOVING a conjunct decides whether the query ERRORS. The row sets are equal;
+// the ERROR BEHAVIOUR is not, and `optimized != --no-optimize` was reproducible
+// in BOTH directions on the shipped catalog.
+//
+// THIS PASS MAKES FOUR MOVES, and the count is part of the claim rather than
+// prose around it: reordering a conjunct inside one filter, pushing it below an
+// inner join, pushing it into a derived body, and DESCENDING BELOW THAT BODY'S
+// PROJECTION. Seam audit pass 4's P4-B1 is what an earlier revision of this
+// paragraph cost: it listed three, stated the guarantee absolutely ("every move
+// this pass makes is now screened"), and the unlisted fourth was the unscreened
+// one. All four are screened now, and the fourth carries a SECOND screen the
+// others do not need — the projection it moves a conjunct below is itself
+// evaluated on fewer rows, so `project.exprs` is screened as well as the
+// conjuncts.
+//
+// The screen is `exprMayRaise` / `firstMayRaise` in parser/expr_totality.h,
+// shared with ChunkPruner and with the LIMIT rule in logical_plan.cc, and the
+// .cc states the precondition and what property it restores. It is a no-op on a
+// query with no raising conjunct, which is every TPC-H query and every harness
+// entry.
 //
 // Since Week 37 the pass also ENTERS a derived relation's body (seam audit pass 3,
 // B3-3) and DESCENDS past the first node it can rewrite (pass 2, B-2) — it used

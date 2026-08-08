@@ -19,7 +19,7 @@ DataChunk* VecScanNode::nextChunk(){
     while (pruning_where_ && row_cursor_ < columnar_table_.num_rows
            && row_cursor_ % CHUNK_SIZE == 0) {
         int chunk_idx = row_cursor_ / CHUNK_SIZE;
-        if (!ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx))
+        if (!ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx, schema_))
             break;
         row_cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - row_cursor_);
         ++skipped_chunks_;

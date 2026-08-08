@@ -64,7 +64,7 @@ Row* SeqScanNode::next() {
             // decide whether to skip the entire chunk
             if (pruning_where_ && cursor_ % CHUNK_SIZE == 0) {
                 int chunk_idx = cursor_/CHUNK_SIZE;
-                if (ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx)) {
+                if (ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx, schema_)) {
                     // advance past the whole chunk, never call getValue()
                     cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - cursor_);
                     ++skipped_chunks_;
@@ -135,9 +135,13 @@ Row* FilterNode::next() {
             return nullptr;
         }
         stats.rows_in++;
-        Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
+        // evaluatePredicate, not evaluate: a conjunct is evaluated only on the
+        // rows every earlier conjunct kept, which is what the vectorized
+        // selection-vector cascade does and what the optimizer's totality screen
+        // assumes. See evaluator.cc (seam audit pass 4, E-13).
+        const int result = evaluatePredicate(predicate_.get(), *row, child_->outputSchema());
         // pass rows if predicate is true (not zero + not null)
-        if (!result.isNull() && result.asInt() != 0) {
+        if (result == 1) {
             stats.rows_out++;
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
@@ -419,8 +423,11 @@ Row* HavingNode::next() {
             return nullptr;
         }
         stats.rows_in++;
-        Value result = evaluate(predicate_.get(), *row, child_->outputSchema());
-        if (!result.isNull() && result.asInt() != 0) {
+        // Same rule as FilterNode: HAVING is a LogicalFilter above the
+        // aggregate, and the vectorized path runs it through the same cascading
+        // evalPredicate a WHERE goes through.
+        const int result = evaluatePredicate(predicate_.get(), *row, child_->outputSchema());
+        if (result == 1) {
             stats.rows_out++;
             stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             return row;
