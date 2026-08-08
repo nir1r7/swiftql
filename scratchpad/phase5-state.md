@@ -155,15 +155,58 @@ claim could be true-but-useless rather than accepting it:
   LEFT-JOIN NULL entries are already in the tree. Only the mixed-body case is missing, and the
   behaviour behind it is correct.
 
-## !!! THE SYSTEMIC COVERAGE HOLE — fix this or the next green gate means as little as this one
-**`catalog.json` has TWO TABLES, and `MIN_ENUMERATED_RELATIONS = 3`. So NO QUERY IN THE ENTIRE
-ORACLE SUITE EVER REACHES JOIN ENUMERATION.** The DP — the thing three auditors just found a
-blocker in — is exercised by ZERO of the 1496 oracle queries and ZERO of the 119 invariant checks.
-That is why every gate has been green. TPC-H is the only place the shape exists at all, and only q2
-has it (5-relation join, ORDER BY, no GROUP BY); it is byte-identical both ways only because its key
-list happens to end in `p_partkey`.
-**ROUND 3 MUST ADD A THIRD TABLE TO THE ORACLE CATALOG** and real multi-relation join coverage.
-Without it the fix cannot be shown to work and the next regression is invisible again.
+## ~~THE SYSTEMIC COVERAGE HOLE~~ — **RETRACTED. THE PREMISE WAS FALSE.**
+I recorded, and told the user, that "`catalog.json` has two tables and `MIN_ENUMERATED_RELATIONS`
+= 3, so no query in the oracle suite ever reaches join enumeration", and called it the systemic
+finding bigger than any blocker. **It is wrong.** `MIN_ENUMERATED_RELATIONS` counts **RELATIONS,
+NOT TABLES**, and a self-join supplies three from two. `WEEK27_QUERIES`/`WEEK28_QUERIES` have been
+feeding the DP since Week 28 — `--explain` on `w28_nonzero_leftmost_projection` prints
+`order=drivers@1,drivers@2,laps@0 cost=1692 (written=2045) method=dp`.
+**NO THIRD TABLE WAS ADDED, and that was the right call**: it would have bought nothing while
+perturbing `CardinalityEstimator` inputs, existing `w28_*` order decisions, and every harness that
+loads the catalog into SQLite. A self-join is also the HARDER case — the merged schema then carries
+several columns of the SAME NAME at different relation slots, which is exactly what a positional
+tie-break trips over. Recorded as a `WHY NO THIRD TABLE` note in the harness file.
+**What was actually missing was the DEFECT SHAPE**, four preconditions of which existing entries
+had three: (1) >=3 relations, (2) the DP picks a different order, (3) the sort sits DIRECTLY above
+the join with no aggregate between, (4) the ORDER BY is not total and the tie is MATERIAL.
+Lesson: I amplified one auditor's claim into a systemic conclusion without checking what the
+constant counted. The auditor's own finding (that the invariant checks miss B3-1) stands; my
+generalisation of it did not.
+
+## Wave A — harness coverage: DONE
+`TIE_STRADDLE_QUERIES`, 11 entries, INVARIANT-ONLY — `ORDER BY <non-unique> LIMIT n` has no single
+correct answer so SQLite is NOT an oracle for it, stated in the block header. Added
+`normalize_ordered()`/`_invariant_compare()`: ORDER BY queries now compare POSITIONALLY, everything
+else as sets — measured against the whole suite first, all 65 pre-existing ORDER BY entries already
+agreed under it, so it cost nothing. Ties are EARNED FROM THE DATA: `laps.season` has 4 values over
+10000 rows, `round` ~24, `drivers.nationality` 6, and every projection carries a per-row-distinct
+column so which tied row survives is observable.
+Two-sided discrimination vs a pinned pre-fix binary (cb59ff8) AND the post-fix binary:
+  8 tie/subquery entries FAIL pre-fix, PASS post; `b31_plain_limit_no_order_by` same;
+  **2 CONTROLS (total order; aggregate between) PASS ON BOTH** — without them the block would only
+  prove that SOME 3-relation query diverges. 318->320 passed/9 failed pre-fix; 331/0 post-fix.
+  Nothing existing moved; TPC-H q2 and q20 still byte-identical in both legs.
+`random_diff.py`: TRAP-1 rewritten — it now emits `FORM_TIED_LIMIT` (~35%) off a low-cardinality
+  `TIE_KEYS` pool. Default seed goes from 0 tied shapes to 7, catching 3 divergences pre-fix, 0
+  post-fix; 13 of 64 across 20 seeds. Leg 2 SKIPS the tied form (SQLite breaks ties by its own plan)
+  and counts it as skipped so the coverage loss stays VISIBLE. A guard shouts if a run emits zero
+  tied shapes, so the original silent failure cannot recur. **Correction: it already generated 3-8
+  relation joins and already reached the DP** — that part of my brief was also inaccurate.
+`INVARIANT_SCOPE` now prints with the result: --no-optimize gates 3 passes; 5 more are identical in
+  both legs BY CONSTRUCTION and are therefore NOT tested (only the SQLite oracle sees those); the
+  6th, `materializeSubqueries`, threads the flag into the nested runner so subquery bodies ARE
+  covered. Re-verified against main.cc:566 and :134.
+
+## !! WAVE A INTRODUCED A 200x REGRESSION — must not ship unremarked
+Commit `d085230` ("a LIMIT cuts a determined order") fixes the plain-LIMIT shape CORRECTLY, but the
+**`--no-optimize` leg of a plain LIMIT over a `driver_id` self-join went 0.32s -> 64s** (two runs
+each, back-to-back, same machine). Optimized leg fine (0.10s -> 0.35s). Cause: --no-optimize does
+not push the WHERE, so the LIMIT is handed the full 10000x10000/20 product, and giving it a
+DETERMINED ORDER means ordering that product instead of streaming it. The harness agent worked
+around it by keying its entry on a 1:1 join and documented why — **a harness workaround, not a
+fix.** Raised with the comparator agent: find a bounded top-N / streaming selection, or quantify the
+trade in the open. Do not let a correctness fix silently make an unoptimized query 200x slower.
 
 ## !! MY RECOMMENDATION WAS WRONG — CORRECTED FIX DESIGN FOR ROUND 3
 I offered the user "deterministic tiebreak" vs "unify build-side selection" and RECOMMENDED the
