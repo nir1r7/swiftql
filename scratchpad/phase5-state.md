@@ -1,10 +1,93 @@
 # Phase 5 orchestrator state
-Current: **FIX ROUND 2 COMPLETE (all 3 fixers done, 3 BLOCKERS closed). GATE RUNNING on 70570dc**,
-  log scratchpad/gates/seam-fix-round-2.log. Fixers' own final numbers: oracle 1496/0/0
-  (rejection sweep 22 suites / 205 entries), regression 318/318, unit 823/823.
-  AFTER THE GATE: seam PASS 3 (five auditors), then q21.
-  DO NOT run the doc sweep concurrently with pass 3 — auditors are told to verify development.md
-  against code, so editing it underneath them corrupts their findings.
+Current: **SEAM PASS 3 RUNNING — join-chain reported 2 BLOCKERS. Audit does NOT end at pass 3.**
+  Fix round 2 gate was **GREEN** on 922ca15 (carries 70570dc): build genuine recompile 56 TUs
+  0 warnings; unit 823/823; oracle 1496/0/0 (22 suites / 205 rejection entries); regression 318
+  incl. 119 invariant, 0 divergences; tpch PASS 20/22 meaningful; baseline md5 unchanged both ends;
+  tree fingerprint d766100110d12f899c4026715011c55b identical before and after.
+  **AND THAT GREEN GATE SAT ON A TREE CONTAINING BOTH BLOCKERS BELOW.** Second time this phase
+  (Week 30 round 1 was the first). A green gate proves the harness passes, not that the code is right.
+
+## PASS 3 — join chain: 2 BLOCKERS (73e71e3)
+**B3-1 (BLOCKER) — FIX ROUND 2'S OWN TIE-BREAK IS THE CAUSE.** `sort_comparator::rowLess`
+compares the whole row "in schema order" when declared keys tie. Above a join that schema is the
+MERGED JOIN SCHEMA, which `rebuild` builds in the DP's chosen order. Same columns, PERMUTED ->
+different total order -> different LIMIT cut. The fix made ties deterministic PER PLAN, not
+PLAN-INVARIANT, which is the property it needed.
+  SELECT c.c_name, o.o_orderkey FROM orders o JOIN customer c ... JOIN nation n ...
+  ORDER BY n.n_regionkey LIMIT 5     (data/tpch/sf0.01)
+    optimized      Customer#000000002 x5 (orderkeys 1116, 2866, 3420, 3908, 4886)
+    --no-optimize  Customer#000000644, ...  (orderkeys 1, 9, 12, 14, 15)
+  FIVE ROWS, ZERO OVERLAP. Carried into a scalar subquery (LIMIT 1 survives materialization;
+  main.cc:521 threads no_optimize into the subquery runner) it becomes a wrong VALUE:
+  count(*) = **1115 vs 0**. Same failure the tie-break commit exists to close (its own header
+  records "977 versus 1536"), with a cause the header LISTS and does not neutralize.
+  **AND THE TOOL THAT WOULD HAVE CAUGHT IT IS BLINDED BY AN EXPIRED ASSUMPTION**: `random_diff.py`'s
+  TRAP-1 rationale deliberately NEVER generates a tied ORDER BY, because a reordered join breaking
+  ties differently used to be "a FALSE FAILURE". Since the tie-break landed that is a TRUE failure —
+  so the generator produces the shape zero times. Fix the generator, not just the comparator.
+**B3-2 (BLOCKER) — Week 29's STRING-vs-numeric join-key refusal covers 1 of 4 `JoinKey` producers.**
+  The guard lives inside `Validator::validate`'s `for (stmt.joins)` loop. `subquery_lowering`,
+  `splitCorrelation` and the correlated-scalar rewrite ALL SHIPPED LATER and are uncovered, so the
+  text encoding decides and half-matches. `FROM…JOIN…ON` is refused (containment works) while
+  IN / NOT IN / EXISTS / NOT EXISTS / correlated-scalar SILENTLY RETURN WRONG ROW SETS.
+  **Reachable on the SHIPPED catalog.json**: `l.driver_id IN (SELECT '016' …)` -> SwiftQL 0,
+  SQLite 495 (same for `'16.0'`, `' 16'`, `'+16'`); `'16'` agrees. Exactly the "half a match, with
+  no error either way" the Week 29 comment named and CLAIMED TO HAVE CLOSED.
+## PASS 3 — engine divergence: 2 BLOCKERS, 1 HIGH (33e7052). CONVERGES ON THE SAME ROOT.
+**E-9 == B3-1** — found independently by two auditors. Schema-index-order tie-break, permuted by
+  `JoinEnumeration::rebuild`. Its own written precondition ("the sort's INPUT row must be the same
+  in every mode") is FALSE for any multi-way join. Demo: 3-way TPC-H join whose single ORDER BY key
+  is constant over all survivors, so the tie-break decides the WHOLE order -> disjoint row sets;
+  `COUNT(*)` 281 vs 1 transported into a scalar.
+**E-8 (BLOCKER) — THE TIE-BREAK LIVES IN THE SORT COMPARATOR, SO IT DOES NOT FIRE WITH NO SORT.**
+  Delete the ORDER BY from pass 2's own repro and E-1 and E-1b come straight back at HEAD with the
+  gate green: {AlphaTauri,Alpine,McLaren} vs {RedBull,AlphaTauri,McLaren}, and COUNT(*) 977 vs 1536.
+  No GROUP BY, no contrivance. An ordinary shape — `customer JOIN orders WHERE o_orderstatus='F'
+  AND o_orderpriority='1-URGENT' LIMIT 3` — returns DISJOINT ROW SETS between Volcano and optimized
+  vectorized and violates `optimized == --no-optimize`. Prevalence **2 of 45** mechanically
+  generated join+LIMIT queries.
+**E-10 (HIGH) — new, missed by passes 1 AND 2.** The vectorized path coerces every value it
+  re-materializes to its schema-declared type at SEVEN sites; Volcano has no such site.
+  `appendColumnValue`'s comment calls the INT->DOUBLE widening "lossless" — it is not above 2^53.
+  `CASE ... THEN 9007199254740993 ELSE 0.5 END` returns a DIFFERENT INTEGER on the vectorized path,
+  and `SELECT DISTINCT` of it returns 2 rows vs 3 — **the vectorized path contradicting ITSELF**,
+  since `COUNT(DISTINCT e)` says 3. Pass 2's type sweep could not see it: it compared the two
+  EVALUATORS and this lives one layer above both.
+WHY THE GATE IS GREEN ANYWAY — measured, not assumed: of 211 distinct harness queries, 6 have LIMIT
+  without ORDER BY, exactly 1 contains a join, and that one has no WHERE clause, so pushdown moves
+  no estimate and the two build-side rules provably coincide. TPC-H: 21/22 agree opt-vs-noopt.
+  **The corpus contains no instance of the class — exactly as it did not before pass 2 either.**
+
+## !! MY RECOMMENDATION WAS WRONG — CORRECTED FIX DESIGN FOR ROUND 3
+I offered the user "deterministic tiebreak" vs "unify build-side selection" and RECOMMENDED the
+tiebreak, framing the problem as "where ORDER BY is not a total order". **That framing was too
+narrow and it is the reason fix round 2 shipped an incomplete fix.** The divergence is not about
+ORDER BY ties; it is about ANY plan-dependent row order reaching ANY cut.
+Neither option as I wrote them is sufficient, so do NOT simply switch to the other one:
+  - Unifying build-side selection would close E-8, but NOT E-9/B3-1 — the DP still permutes the
+    merged schema, and permuting the schema is the DP's job.
+  - The sort tie-break closes neither when there is no sort.
+**THE CORRECT DESIGN, both halves required:**
+  1. **Canonical column order.** The tie-break must order columns by a PLAN-INDEPENDENT identity —
+     qualified name, or relation-slot identity — NEVER by schema index, which the optimizer is
+     free to permute and does.
+  2. **Every cut site, not just sorts.** Enumerate and close all of them: LIMIT without ORDER BY,
+     DISTINCT, a scalar subquery's LIMIT 1, a semi-join's first match. The engine auditor reports
+     nine of eleven cut sites already closed — get the list from `seam-engine-divergence-pass-3.md`
+     rather than re-deriving it.
+  3. **Fix `random_diff.py`'s TRAP-1 too.** It deliberately never generates a tied ORDER BY because
+     that used to be a false failure. It is now a TRUE failure, so the one tool that would have
+     caught this generates the shape ZERO times. An expired assumption blinding the generator.
+
+**ORDERING CONSTRAINT — do not get this wrong:** pass 2's B-2 and B-3 MUST NOT be fixed before
+  B3-1. Both widen where the DP runs, and B-3's defect is currently the ACCIDENTAL CONTAINMENT on
+  B3-1's blast radius.
+Everything else on this seam checked clean: scan-schema narrowing touches no join-side consumer
+  (12 shapes x 4 legs); `reachesOutsideThisBody` cannot hide a real correlation from key selection
+  (8 shapes, 3-way); `hidden` invisible to join planning and preserved by `rebuild` (6 shapes);
+  240 randomized oracle shapes over two seeds, 0 diffs; 41 hand batteries. `VecDerivedNode`'s
+  chunk-pointer item is NOT worse than recorded — a plan tree cannot route one node's output to
+  two consumers.
 
 ## STILL OPEN after fix round 2 — for a doc sweep AFTER pass 3
 - **B-4**: stale deleted-refusal claims in `development.md` AND `src/cli/main.cc`
