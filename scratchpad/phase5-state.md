@@ -1,6 +1,30 @@
 # Phase 5 orchestrator state
-Current: seam-audit PASS 2 in flight. Fix round 1 GATED **GREEN**. 3 of 5 pass-2 auditors still
-  running (engine-divergence, subquery-chain, storage).
+Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 complete (all 5 seams).
+  Fix round 1 GATED GREEN.
+  Fixer A (subquery): owns compare_against_sqlite.py, subquery_decorrelation.cc, logical_plan.cc,
+    planner.cc, schema.h (comment-only). **B-1 DONE + verified** by counterfactual: rebuilt with
+    the fix removed, all 6 correlated-scalar entries fail (4 FAIL + 2 internal-error ERROR);
+    restored, 10/10 pass in both vec modes, 809/809 C++ tests. 11 new oracle entries. B-2, B-3 next.
+    Fix shape: mark the synthetic $scalarN columns `hidden` — hence the schema.h doc sweep, because
+    `ColumnDef::hidden` had documented itself as "aggregate outputs referenced only in
+    HAVING/ORDER BY", which the fix falsifies.
+  Fixer B (constant folding + catalog + explain): owns validator.cc, ast.h, parser.cc, binder.cc,
+    tests/test_logical_plan.cc, constant_folding, catalog.cc, vectorized_plan_builder.cc.
+  Fixer C (deterministic tiebreak, E-1/E-1b): owns vec_sort_node, vec_limit_node, and the Volcano
+    sort/limit in plan_nodes. **USER DECISION: deterministic tiebreak**, NOT unifying build-side
+    selection (that would permanently constrain the optimizer). Where ORDER BY is not a total
+    order, the surviving row must be fixed regardless of plan/engine/storage.
+  AFTER ALL THREE: gate, then **seam pass 3** (pass 2 had blockers, so the audit did not stop).
+
+## !! CONCURRENT FIXERS SHARE ONE build/swiftql — USE flock
+`pgrep`-before-build does NOT protect a harness RUN. A relink underneath a sweep produces a wall
+of correctness failures in suites the agent never touched — one fixer collected **256 spurious
+ERRORs** before reporting it. Every build AND every binary/harness run must be wrapped:
+  flock -w 1800 /tmp/swiftql-build.lock -c '<command>'
+Hold the lock across a whole build+run when the binary you just built must still be yours when you
+run it. **Any red harness result taken on this branch without the lock must be re-run before it is
+believed.** This bites an agent investigating RESULT DIFFERENCES hardest — a binary changing
+mid-comparison produces exactly the row-set difference it is hunting.
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅ 36 ✅ — WEEK PLAN COMPLETE

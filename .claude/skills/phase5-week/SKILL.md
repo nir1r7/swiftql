@@ -141,6 +141,27 @@ keep that honest:
     useful input to their audit;
   - keep `pgrep` for its one honest use: don't start a second build or harness while one is
     already running, because they contend on `build/`.
+- **Concurrent agents share ONE `build/swiftql`, and `pgrep` does not protect a RUN.** Two
+  fixers working in the same tree will relink the binary underneath each other's harness sweeps.
+  The failure does not look like a race — it looks like a wall of correctness failures in suites
+  the agent never touched. One fixer collected **256 spurious `ERROR`s** this way before
+  reporting it. A concurrent agent that trusts such a result will "fix" a defect that was a
+  relink, or dismiss a real one as noise. Give every concurrent agent a lock, not a check:
+  ```
+  flock -w 1800 /tmp/swiftql-build.lock -c 'cmake --build build -j$(nproc)'
+  flock -w 1800 /tmp/swiftql-build.lock -c 'python3 python_tools/compare_against_sqlite.py'
+  flock -w 1800 /tmp/swiftql-build.lock -c './build/swiftql --catalog ... --query "..."'
+  ```
+  Anything that compiles, links, or reads `build/swiftql` goes inside it, and an agent that needs
+  the binary it just built holds the lock across the whole build+run sequence. This hits an agent
+  investigating *result differences* hardest: a binary changing mid-comparison produces exactly
+  the row-set difference it is hunting.
+- **Give concurrent fixers explicit, disjoint file ownership in their prompts**, and name the
+  files the *other* agents own so a collision is recognisable from inside. Expect the boundary to
+  be crossed legitimately — a `SELECT *` fix genuinely reaches the binder, and the standing sweep
+  rule genuinely reaches headers whose comments a fix falsifies. **A comment-only touch outside
+  the lane is compliance with the sweep rule, not a violation; do not make an agent revert one.**
+  Ask who owns what rather than assuming a shared file means a conflict.
 
 ---
 
