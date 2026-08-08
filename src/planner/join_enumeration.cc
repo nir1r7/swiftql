@@ -267,6 +267,24 @@ std::unique_ptr<LogicalPlanNode> rebuild(const std::vector<int>& order,
         // loop var: a reference would mutate the join scan's own schema and
         // destroy its slot-0 stamping. Copying whole ColumnDefs also preserves
         // `hidden`.
+        //
+        // !! THIS IS THE LINE THE SORT TIE-BREAK USED TO READ AS DATA (seam audit
+        // pass 3: engine E-9, join-chain B3-1, optimizer B3-1). The permutation
+        // is deliberate and stays — it is the DP doing its job, and the two
+        // output blocks genuinely must stay contiguous. What was wrong was a
+        // CONSUMER that treated column POSITION as column IDENTITY:
+        // `sort_comparator::rowLess` walked the row in schema index order when
+        // the declared ORDER BY keys tied, so the two legs produced two different
+        // total orders over the same rows and a LIMIT cut different ones.
+        //
+        // The distinction this comment did not draw, and now does: a canonical
+        // MATERIALIZED order is not available, but a canonical COMPARISON order
+        // is — the `c.relation_slot = r` stamp two lines below is the binder's
+        // written-order slot, so `(relation_slot, name)` names a column
+        // identically on every leg. `sort_comparator::tieBreakOrder` derives the
+        // comparison order from exactly that. Any future consumer that needs a
+        // plan-independent column ORDER must do the same; the schema's own
+        // sequence is a physical detail of this fold.
         for (ColumnDef c : rels[r].subtree->output_schema.columns()) {
             c.relation_slot = r;
             merged.push_back(c);
