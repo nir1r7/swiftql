@@ -286,6 +286,47 @@ LEFT UNFIXED DELIBERATELY: extending the refusal to all INT->DOUBLE narrowing wo
   output?") is a PLAN-SHAPE fact `appendColumnValue` cannot see; it lives in
   `vectorized_plan_builder.cc`. **WAVE B / ROUND 4 OWNS THIS.**
 
+## !! DECISION PENDING — plain LIMIT: determinism vs SQLite agreement
+`QUERIES` line 55 — `SELECT season, speed FROM laps JOIN drivers ON ... LIMIT 5`, diffed against
+SQLite in ALL FOUR MODES — **now FAILS in every mode.** `--explain` shows
+`Limit [5] -> Sort [canonical row order] -> ...`: the plain-LIMIT determinism fix gives every
+unordered LIMIT a canonical sort, so SwiftQL returns the five SMALLEST rows while SQLite returns
+its scan's first five.
+**Neither is wrong. SQL does not define which rows a plain LIMIT returns**, so that oracle entry
+has always been asserting a non-guarantee — it passed by luck because both engines happened to scan
+in the same order. Same situation as the tie-at-the-cut queries, which is why those went
+invariant-only into `TIE_STRADDLE_QUERIES`.
+LIKELY RESOLUTION: move line 55 out of the SQLite-diffed suite and into invariant-only coverage,
+exactly as the tie case was handled. **But do not decide it until the comparator agent reports** —
+it owns `6ab8848` ("the deterministic cut is a bounded top-N, not a full sort"), which is its answer
+to the 200x regression, and the cost of a top-N on EVERY unordered LIMIT is the other half of the
+trade. Get its number first, then decide (and surface to the user if the cost is material).
+
+## Wave A — harness coverage, unit 2: **IT CAUGHT TWO BAD ENTRIES I HANDED IT**
+I relayed four E-10 queries from the E-10 fixer. **Entries 1 and 2 were wrong and it refused to
+write them as given.** They were specified `ORDER BY c LIMIT 2` — ASCENDING. Run against the current
+binary they do NOT refuse: all four modes return `0.5, 0.5` and match SQLite. Cause: `6ab8848`
+landed AFTER the E-10 fixer verified, and with an ascending sort the two smallest rows win, so the
+big integer is discarded before anything materializes it.
+**They would have been dead TWICE OVER**: pinned to a message never raised, AND vacuous as diffed
+entries — the Volcano leg's output is `0.5, 0.5`, which agrees with SQLite whether or not the
+integer survives. `DESC` fixes both. Same defect in guard 5. The ascending form was KEPT and moved
+into the guards as the SCOPE-OF-REFUSAL pin: it holds that the refusal covers values reaching the
+output column, and would fail if someone widened the guard to "any INT in the expression" or
+dropped the top-N.
+LESSON: a verified expectation goes stale the moment another agent lands a fix. **Re-verify handed-
+over expectations against the CURRENT binary, never against the reporting agent's snapshot.**
+It also built `assert_b32_pins_discriminate()` — collects each entry's actual message once and
+cross-checks the FULL pin matrix: every pin must match its own message and NO other entry's, with
+genuinely-shared producers compared as equal-expectation pairs rather than exempted by index.
+**Then it proved the check can fail**: injecting my own first-draft bare pin `"EXISTS subquery"` on
+rows 1 and 3 gives `run_rejection_suite`: 7 passed / 0 failed — GREEN AND WRONG — while the pin
+check reports 10 findings naming exactly which pins cannot tell which producers apart. Wired into
+the exit code beside the sweep.
+B32: 28/28 pass. E-10 discrimination vs a `return v.toNumeric()` build: `E10_VECTORIZED_REFUSED`
+**0/8 pre-fix** ("expected a rejection, got rows") -> 8/8 post; guards 16/16 both ways;
+`E10_VOLCANO_ONLY` 8/8 both ways (Volcano was always right). Sweep: 25 suites, 223 entries, clean.
+
 ## !! WAVE A INTRODUCED A 200x REGRESSION — must not ship unremarked
 Commit `d085230` ("a LIMIT cuts a determined order") fixes the plain-LIMIT shape CORRECTLY, but the
 **`--no-optimize` leg of a plain LIMIT over a `driver_id` self-join went 0.32s -> 64s** (two runs
