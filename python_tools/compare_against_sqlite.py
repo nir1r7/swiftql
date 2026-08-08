@@ -1786,6 +1786,39 @@ MULTIWAY_VOLCANO_REJECTED = [
     (query, VOLCANO_MULTIWAY) for query in MULTIWAY_QUERIES
 ]
 
+# SEAM AUDIT (phase 5, engine-divergence pass 1) — GROUP BY EMISSION ORDER.
+#
+# These are NOT diffed against SQLite, and the reason is the point of the suite.
+#
+# `HashAggregateNode` used to emit its groups by iterating its accumulator
+# `unordered_map` directly (hash-bucket order); `VecHashAggregateNode` emits in
+# first-encounter order. SQL leaves GROUP BY row order unspecified, so both are
+# legal and `normalize`'s sort hides the difference -- EXCEPT under
+# `ORDER BY <aggregate> LIMIT n` with a TIE spanning the cut. Both sort nodes are
+# `std::stable_sort`, so tied rows are broken by INPUT order, and the two engines
+# kept DIFFERENT ROWS. Sorting cannot mask that: the difference is in which rows
+# survive, not in their order.
+#
+# Why SQLite cannot adjudicate it: with a tie at the cut EVERY choice of the tied
+# rows is a correct answer, SQLite's included (SQLite emits its own group order,
+# which happens to be sorted by group key, and picks a third set again). Putting
+# such a query in QUERIES would assert a non-guarantee and fail for the wrong
+# reason. The property that IS real, and that the fix establishes, is that the
+# four SwiftQL modes agree with EACH OTHER and are deterministic -- Volcano is
+# the correctness baseline, so a baseline whose row order is decided by a hash
+# seed is not one. That is what this suite pins.
+#
+# Each query must have a tie SPANNING the LIMIT cut, or it proves nothing: with
+# no tie the total order does all the work and any emission order passes.
+ENGINE_AGREEMENT_QUERIES = [
+    # all seven teams tie on MIN(season)=2022, cut at 3 -- four of the seven are
+    # discarded purely on emission order
+    "SELECT team, MIN(season) FROM laps GROUP BY team ORDER BY MIN(season) LIMIT 3",
+    # the same exposure one level up: a tie at the cut over a JOIN's output
+    "SELECT d.team, MIN(l.season) FROM laps l JOIN drivers d "
+    "ON l.driver_id = d.driver_id GROUP BY d.team ORDER BY MIN(l.season) LIMIT 3",
+]
+
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
     query for query in REGRESSION_QUERIES
     if query not in PHASE2_WEEK12_BENCHMARK_QUERY_SET
@@ -2095,6 +2128,43 @@ def run_query_suite(conn, queries, label: str, extra_args: list = None):
     return passed, failed, errors
 
 
+def run_engine_agreement_suite(queries, label: str, modes):
+    """Assert the SwiftQL modes return the SAME rows, in the same order.
+
+    The oracle for this suite is SwiftQL's first mode, not SQLite — see the
+    comment on ENGINE_AGREEMENT_QUERIES for why SQLite cannot adjudicate a tie
+    at a LIMIT cut. Comparison is ORDERED and unnormalized-by-sort
+    (`preserve_order=True`), because an emission-order difference is precisely
+    what sorting would hide.
+    """
+    passed = failed = errors = 0
+    print(f"\n--- {label} ---")
+    for query in queries:
+        try:
+            baseline_label, baseline_extra = modes[0]
+            baseline = normalize(run_swiftql(query, baseline_extra), True)
+            mismatch = None
+            for mode_label, extra in modes[1:]:
+                other = normalize(run_swiftql(query, extra), True)
+                if not rows_equal(baseline, other):
+                    mismatch = (mode_label, other)
+                    break
+            if mismatch is None:
+                print(f"  PASS  {query[:70]}")
+                passed += 1
+            else:
+                mode_label, other = mismatch
+                print(f"  FAIL  {query[:70]}")
+                print(f"    {baseline_label}: {baseline[:4]}")
+                print(f"    {mode_label}: {other[:4]}")
+                failed += 1
+        except Exception as e:
+            print(f"  ERROR {query[:70]}\n    {e}")
+            errors += 1
+    print(f"{passed} passed, {failed} failed, {errors} errors")
+    return passed, failed, errors
+
+
 # Week 35, Task 8 — THE BEHAVIOURAL REJECTION SWEEP.
 #
 # Week 34's lesson, recorded in its own commits: A TEXTUAL CROSS-CHECK CANNOT
@@ -2350,6 +2420,21 @@ def main():
         m_passed += mp
         m_failed += mf
         m_errors += me
+
+    # Cross-engine agreement on GROUP BY emission order (seam audit, pass 1).
+    # Counted with the query suites, not the rejections: these are answers.
+    ea_p, ea_f, ea_e = run_engine_agreement_suite(
+        ENGINE_AGREEMENT_QUERIES,
+        "GROUP BY emission order — the four modes must agree with each other",
+        [("row-volcano", None),
+         ("col-volcano", ["--storage", "columnar"]),
+         ("col-vec", ["--execution", "vectorized", "--storage", "columnar"]),
+         ("col-vec --no-optimize",
+          ["--execution", "vectorized", "--storage", "columnar", "--no-optimize"])],
+    )
+    m_passed += ea_p
+    m_failed += ea_f
+    m_errors += ea_e
 
     # SQL that must be refused rather than answered, in all four modes. The
     # refusal is raised from a different place on each path (Planner::plan on

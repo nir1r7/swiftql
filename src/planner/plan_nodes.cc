@@ -219,6 +219,14 @@ void HashAggregateNode::open() {
 
     std::unordered_map<std::string, std::vector<AggAccumulator>> accumulators;
     std::unordered_map<std::string, std::vector<Value>> group_keys;
+    // Iterating `accumulators` directly emits groups in unordered_map bucket
+    // order, which is arbitrary and differs from VecHashAggregateNode's
+    // first-encounter order. SQL leaves GROUP BY row order unspecified, so that
+    // is legal in isolation — but under ORDER BY <agg> LIMIT n both engines sort
+    // with a STABLE sort, so rows tied at the cut are broken by input order and
+    // the two engines return different row SETS. Recording first-encounter order
+    // here makes Volcano deterministic and makes the two engines agree.
+    std::vector<std::string> group_order;
 
     while (true) {
         Row* row = child_->next();  // child time excluded from self-clock
@@ -250,6 +258,7 @@ void HashAggregateNode::open() {
         if (accumulators.find(key_str) == accumulators.end()) {
             accumulators[key_str].resize(aggregates_.size());
             group_keys[key_str] = key;
+            group_order.push_back(key_str);
         }
 
         // update each aggregate
@@ -312,12 +321,14 @@ void HashAggregateNode::open() {
     if (group_by_cols_.empty() && accumulators.empty()) {
         accumulators[""].resize(aggregates_.size());
         group_keys[""] = {};
+        group_order.push_back("");
     }
 
     // materialize results — self-work only, no child calls
     auto t0 = std::chrono::high_resolution_clock::now();
     results_.clear();
-    for (auto& [key_str, group_accs] : accumulators) {
+    for (const auto& key_str : group_order) {   // first-encounter order, not hash order
+        auto& group_accs = accumulators[key_str];
         Row result_row = group_keys[key_str];   // group-by column values come first
 
         for (size_t i = 0; i < aggregates_.size(); ++i) {
