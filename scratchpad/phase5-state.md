@@ -43,9 +43,26 @@ Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 co
       FIRST of two same-named TABLES. Same class one level up; no cross-storage divergence.
     - Its pre-lock results were re-run under the lock and held. One earlier subset run produced
       ~180 spurious "NO LONGER ERRORS" across suites it never touched — artifact, not finding.
-  Fixer C (deterministic tiebreak, E-1/E-1b): **ITEM 1 DONE** (7b84952, record-only — content was
-    swept into 733596e/119bf75 by wip commits). Item 2 in progress: it has the
-    compare_against_sqlite.py window until ~02:45.
+  Fixer C (deterministic tiebreak, E-1/E-1b): **DONE — BOTH BLOCKERS CLOSED.** 7b84952 (engine,
+    record-only), 1d6da04 (suite), 435a87f (comment fix). New `src/execution/sort_comparator.h`
+    is called by BOTH `SortNode` and `VecSortNode`, which previously held two byte-identical
+    lambdas — a tie-break only one engine applies is the same divergence with a new cause, so they
+    now share a function and cannot drift. 11 new C++ tests.
+    E-1 {AlphaTauri,Alpine,McLaren} vs {RedBull,AlphaTauri,McLaren} -> all four modes
+    AlphaTauri/Alpine/Ferrari. E-1b `977|977|1536|977` -> 977 in all four.
+    Suite-level discrimination: PRE-FIX 2 passed/4 failed -> HEAD 6 passed/0 failed. Self-check
+    verified to FAIL FIVE WAYS (total ORDER BY; immaterial tie of 977 identical rows; drifted
+    probe; cut past the end; the E-4 scenario verbatim).
+    **NEW ITEM, HANDED TO FIXER A — `planner.cc:236-240` asymmetry.** Row storage hands
+    `SeqScanNode` the FULL table schema; every columnar mode hands it the NARROWED one, so the two
+    legs tie-break over DIFFERENT COLUMN SETS whenever a sort sits over a raw join row. Benign
+    today ONLY because the first discriminating column happens to be `driver_id` in both — luck,
+    not design. Fixer C could not fix it (planner.cc is fixer A's) so it pinned the behaviour with
+    a DISTINCT oracle entry that goes red if it stops being benign. Tripwire but no fix.
+    It also REJECTED THE AUDIT'S OWN PROPOSED ASSERTION as insufficient: the audit suggested
+    checking "at least limit+1 groups share the boundary aggregate value", which passes on a tie
+    among IDENTICAL rows while asserting nothing. It required two DISTINCT rows in the tied block.
+    Totals on its worktree: oracle 1468/0/0, regression 318/0/0, unit 823/823 warning-clean.
     **USER DECISION: deterministic tiebreak**, NOT unifying build-side selection (that would
     permanently constrain the optimizer).
     RULE CHOSEN: when every declared ORDER BY key ties, compare the whole row column-by-column in
