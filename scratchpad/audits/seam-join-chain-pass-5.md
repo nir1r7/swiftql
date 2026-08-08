@@ -626,9 +626,29 @@ not as agreement: a leg that did not finish has not agreed with anything. (These
 are real — the unoptimized leg materialises the whole join product on a 4-relation
 spine, in a Debug build.)
 
-**Result: pending at the time this section was written; the tally is appended
-below rather than estimated.** Everything reported above is hand-built and
-reproducible from the CLI, so no finding in this file depends on the sweep.
+**Result: INCOMPLETE at the close of this pass, and reported as what it is
+rather than as a number I do not have.** Three runs were launched (mode A, seeds
+4242/7777; mode B with the original generator, seeds 999/5150; mode B with a
+corrected partial-`ON` expression, seeds 31337/8642 — the first B generator's
+`driver_id * 1e15` could not overflow on a 1..20 key, so only the third B run
+actually plants a raising `ON` residual). None printed its final tally before
+this pass ended: this is a Debug build, each `--no-optimize` leg on a 4-relation
+spine materialises the whole join product, and the 90-second cap is hit often
+enough to dominate the wall clock.
+
+**What the partial output does say, and it is only this: no semantic divergence
+was flagged.** Across the shapes completed, five entries were flagged and ALL
+FIVE are a `--no-optimize` TIMEOUT rather than a difference — one in mode A
+(seed 4242, i=0, `vec` and SQLite both 1062030) and four in the corrected mode B
+(seed 31337, i=14/16/19/22, `vec` OK and `vecno` TIMEOUT in every case). Zero
+diffs of any other kind, and zero mismatched error texts. The last flagged index
+gives a lower bound of ~23 shapes into the corrected B run; I do not know the
+completed count for any of the three and will not guess it.
+
+**No finding in this file depends on the sweep.** Every blocker, medium and low
+above is hand-built and reproducible from the CLI in one command, on catalogs
+already in the repo. Recording the number I actually have rather than the number
+I planned, as pass 4 did for the same reason.
 
 ---
 
