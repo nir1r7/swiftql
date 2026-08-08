@@ -626,3 +626,110 @@ not as agreement: a leg that did not finish has not agreed with anything. (These
 are real — the unoptimized leg materialises the whole join product on a 4-relation
 spine, in a Debug build.)
 
+**Result: pending at the time this section was written; the tally is appended
+below rather than estimated.** Everything reported above is hand-built and
+reproducible from the CLI, so no finding in this file depends on the sweep.
+
+---
+
+## Summary
+
+| Severity | Count | IDs |
+|---|---|---|
+| BLOCKER | 1 | P5-B1 |
+| HIGH | 0 | — |
+| MEDIUM | 2 | P5-M1 (new), P4-M1 (carried, re-confirmed and re-sized) |
+| LOW | 2 | P4-L1 (carried, still open — and a SECOND copy found), P4-L2 (carried from pass 2's B-1, still open after three fix rounds) |
+
+**Fix round 4 closed both of pass 4's blockers, and closed them well.** P4-B1's
+FILTER-over-PROJECT descent now screens the whole select list against the
+projection's input schema, all-or-nothing — and because the screen is type-aware,
+the ordinary DOUBLE-arithmetic body still descends, which is the third of the
+three options I recorded in A.4.4 and the only one that costs nothing. All three
+of pass 4's failing shapes now refuse on both legs, and B3-3's pushdown is intact
+on the exact body its 9.4x was claimed on. P4-B2's carve-out is gone: `mayRaise`
+moved into `parser/expr_totality.h`, took a schema, and now screens a comparison
+by operand type — verified across the full cross product of six operators, both
+operand orders and all three movers, 36/36 agreeing where pass 4 measured `Error`
+vs `0`, with the freeze and its control both visible in `--explain`. P4-L3 is
+closed. The structural probe still reports SAME pair-sets on every shape,
+including the two the new `applyLimit` moves.
+
+**What this pass returns is the same defect one construct further out.** Round 4
+did something larger than fix two bugs: it made SwiftQL **define** evaluation
+order, in one file, for one screen, with three named consumers. I worked that
+definition through the join layer shape by shape — the INNER ON residual, the
+semi/anti probe predicate, the straddling conjunct, the predicate pushed to one
+side, the DP reordering under a frozen conjunct, GROUP BY / HAVING / ORDER BY over
+a join, a decorrelated body — and seven of the eight hold, several of them for
+reasons that are structural rather than lucky.
+
+The eighth is **P5-B1**. A LEFT JOIN's `ON` residual is the one per-row expression
+in the join layer that is not a conjunct of any list the screen reads: Week 29
+split it off from the WHERE fold precisely because ON and WHERE are not
+interchangeable for an outer join, and it has been evaluated inside the probe loop
+ever since. `distribute` recurses into the preserved side unconditionally on
+σ_p(R) ⟕ S ≡ σ_p(R ⟕ S) — which is a SET equivalence about the join's OUTPUT and
+says nothing about its CANDIDATE PAIRS, the thing the residual is actually
+evaluated on. That is the identical shape of argument P4-B1 turned on, one round
+later, in the neighbouring function.
+
+    SELECT COUNT(*) FROM laps l LEFT JOIN drivers d
+      ON l.driver_id = d.driver_id AND l.lap_id * 1000000000000000 > 0
+    WHERE l.lap_id < 5
+      optimized -> 4      --no-optimize -> Error      row/volcano -> Error      columnar/volcano -> Error
+
+Six instances, four movers (`distribute` at the top join and at a deeper one,
+`pushIntoDerived` + the PROJECT descent, and a LEFT join at the bottom of a
+three-relation spine), three partial operators, on both the shipped `catalog.json`
+and TPC-H `sf0.01`; five negative controls including the INNER analogue, which is
+safe *because* its residual becomes a conjunct in the list the screen reads. The
+attribution is airtight: the three legs that agree are exactly the three that
+never call `PredicatePushdown`. The fix is one condition in `distribute`, in the
+same per-join test that already distinguishes INNER from LEFT.
+
+**P5-M1** is what makes P5-B1 possible and outlives it: inside a LEFT JOIN's ON
+clause there is no conjunct cascade at all, so `ON k = k AND A AND B` evaluates B
+on rows where A is FALSE while the same text in a WHERE, or on an INNER join, does
+not. All four legs agree, so it is not a gate divergence — it is the central
+sentence of `expr_totality.h` being false for a construct the parser accepts.
+
+**P4-M1 is unchanged and now measured with a clock**: the fully inner spine below
+a declined semi/anti join is still never enumerated (43104 against 60637 by the
+model; **1.58x on the spine's join time and 1.23x on total execution** by
+`--explain-analyze`), and both halves of pass 4's "not one line" still hold at
+HEAD — the semi join still stores a copy of the spine's schema and the equality
+check that would catch the drift is still deliberately absent, with only a SIZE
+check downstream.
+
+**And the standing rule held for the fifth pass running.** The retracted paragraph
+is in `parser/expr_totality.h` — the file written this round to be the single
+statement of the rule. It opens with "THE THREE CONSUMERS" and asserts that every
+expression outside them "is evaluated on every row that reaches its node", which
+quietly assumes no rewrite changes what reaches a node. `distribute` changes it.
+`predicate_pushdown.h` inherits the claim ("All four are screened now") and
+`development.md`'s Week 32 table states the mechanism as a virtue. Separately,
+pass 4's own P4-L1 is still open and has a **second** live copy of the false
+sentence, at `logical_plan.cc:987`; and P4-L2 — three source comments naming a
+function deleted in `18af84f`, plus `development.md:808` asserting the opposite of
+what the code does — is now open after three fix rounds.
+
+**Verdict: the join chain's seam is NOT clean. One blocker — `optimized` answers
+where `--no-optimize` and both Volcano legs throw, on a LEFT JOIN whose `ON`
+residual can raise — and it is the same class as the two this round fixed, in the
+one per-row expression the new rule's own enumeration does not name.**
+
+---
+
+## Provenance
+
+Every measurement in this file was taken against `b14d086`, from an out-of-tree
+Debug build in a private worktree (`$SCRATCH/wt5` + `$SCRATCH/b5`); no shared
+build lock was taken and no source file in `/home/user/swiftql` was modified by
+this pass. The only file its commits touch is this one. Concurrent auditors
+pushed to the same branch throughout; none of their commits touched `src/`.
+
+Every finding here is reproduced from the CLI on catalogs already in the repo
+(`catalog.json`, `data/tpch/sf0.01/catalog.json`) plus the two-CSV key-type
+catalog passes 3 and 4 used, so re-pinning any of them against a newer HEAD is one
+command each.
