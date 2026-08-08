@@ -127,6 +127,20 @@ keep that honest:
 - **Do not buy a gate cycle for a lone minor.** If the only findings left are minors, carry
   them into the next week's "Starting notes" rather than running another fix+gate round. A
   blocker or major always earns its round.
+- **You own the "gate is finished" signal — never delegate it to a process check.** A concurrent
+  auditor that pushes mid-gate forces the verifier to disclose a moved HEAD and prove the code
+  surface did not change, which costs it work and weakens its provenance. The obvious guard is
+  to tell auditors "check `pgrep` for a running build or harness before you push". **That guard
+  does not work**: the verifier goes quiet between gate steps while it writes its log and
+  reasons, so an empty `pgrep` means "nothing running this second", not "gate finished". Seven
+  audit commits landed mid-gate this way in the seam audit. The rule that does work:
+  - tell every concurrent auditor to **commit locally as often as it likes** — local commits are
+    its crash insurance and cost the verifier nothing — but **not to `git push` until you message
+    it that the gate has reported**;
+  - message them the moment the gate reports, along with the verdict, since the numbers are
+    useful input to their audit;
+  - keep `pgrep` for its one honest use: don't start a second build or harness while one is
+    already running, because they contend on `build/`.
 
 ---
 

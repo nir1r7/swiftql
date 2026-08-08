@@ -1,124 +1,154 @@
 # Phase 5 orchestrator state
-Current: seam-audit FIX ROUND 1 COMPLETE, all four items pushed. Gate launching ~00:47 UTC.
-  87c08a2 fix(volcano): emit GROUP BY in first-encounter order so the two engines agree
-    — the cross-engine WRONG ANSWER.
-  17bfcea fix(estimator): give CardinalityEstimator a DERIVED case — the HIGH two auditors
-    found independently.
-  8a23b9d fix(decorrelation): name $scalarN's group keys POSITIONALLY, closing F1 and F2
-    TOGETHER — the right resolution: relaxing the duplicate check would have opened F2's
-    bare-name wrong answer, so the collision was removed instead of the guard.
-  18af84f fix(planner): the four lows — residual forwarding, semi/anti floor, a false
-    invariant, a silent decline.
-  AFTER THE GATE: seam pass 2 (five auditors again), then stop as soon as a pass returns no
-  blockers. Week 37 is the user's.
-  CARRY TO WEEK 37: S-0 — the row/columnar oracle does NOT span any Phase 5 shape (vectorized
-  needs columnar; Volcano refuses derived/multi-way/semi/correlated), so the two storage modes
-  never execute the same Phase 5 query and this phase's storage safety rests on hand-computed
-  answers. Also: q21 unported (correlated inequality has no equi-join to lower to); q18 vacuous
-  by choice; the pre-existing "BetweenExpr would cost 17 dispatch sites" drift in three files.
+Current: seam-audit PASS 2 in flight. Fix round 1 GATED **GREEN**. 3 of 5 pass-2 auditors still
+  running (engine-divergence, subquery-chain, storage).
 Working branch: `claude/phase5-week26-qomtkb` (env mandate; stands in for `main` everywhere in
   the skill — never push elsewhere)
 Weeks done: 26 ✅ 27 ✅ 28 ✅ 29 ✅ 30 ✅ 31 ✅ 32 ✅ 33 ⚠️ (partial) 34 ✅ 35 ✅ 36 ✅ — WEEK PLAN COMPLETE
-Last gate: GREEN (week 36 round 2, closing) — build PASS (CONFIRMED stale then genuinely
-  rebuilt, zero warnings), unit 805/805, sqlite 169 queries, regression 119 queries all modes,
-  tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous; 1 unported).
-  Baseline md5 unchanged; report md5 unchanged; REPORT/BASELINE EQUALITY VERIFIED by deep JSON
-  comparison across all seven keys. Tree fingerprint identical before and after.
-Week 36 verdict: checkpoint met. The figure moved 19 -> 20 and the move is independently
-  confirmed. Q17 runs TPC-H's own unaltered text, discriminates under mutation, and still
-  refuses every shape it should. q18 stays vacuous BY CHOICE; q21 is declined in the open with
-  its blocker recorded (a correlated inequality has no equi-join to lower to).
-Week 34 verdict: checkpoint met, INCLUDING Q17 — the deliverable week 33 recorded as a miss.
-  2 gates (one RED), 1 audit. One blocker (COUNT over a zero-row group returned NULL, not 0)
-  and one stale-rejection pair, both fixed.
-RULE FOR MYSELF: NEVER commit the state file while a gate is running. Two verifiers in a row
-  had to disclose a mid-run HEAD move and prove it was outside the measurement surface. It is
-  harmless (scratchpad only) but it costs them work and weakens the verdict's provenance.
-  Journal BEFORE launching a gate or AFTER it reports.
-Previous: GREEN (week 33 round 4, closing) — unit 786/786, sqlite 1076, regression 318 all
-  modes; staleness disproved. Week 33 took 4 gates (one RED) and 2 audits.
-Week 33 verdict: CHECKPOINT PARTIALLY MET. EXISTS/NOT EXISTS decorrelation works (Q4, Q21);
-  correlated SCALAR (Q17, Q22's correlated half) is REFUSED — blocked on derived-table
-  range-table entries, which is Week 34's core deliverable and now Week 34's explicit ownership.
-  The "retain a correct fallback" bullet shipped as a REFUSAL, recorded as a conscious deviation.
-  Three silent wrong answers were found and fixed this week, all one shape: code trusting a
-  refusal that had been deleted. Two lived in header comments.
-Previous: RED (week 33 round 2) — the phase's first and so far only red gate.
-  build PASS (verified not stale); unit 769/775 with 6 SubqueryValidation/SubqueryMaterialization
-  failures; sqlite 952 passed / 56 failed / 4 errors, first being "expected a rejection, got
-  rows" on a correlated scalar in the Rejections mode; regression 318 PASS.
-  Measured ecee221, i.e. the shipped week-33 tree BEFORE the critical fix round.
-  PACING RULE NOW IN FORCE: back to SERIAL — no concurrent audit until a gate is GREEN again.
-Week 32 verdict: checkpoint met. 4 gates / 4 audits; 1 blocker, 1 high, 6 medium, 8 low.
-  The HIGH was a REGRESSION a green 988-query oracle could not see, because the test guarding
-  that capability had been narrowed to a scalar stand-in.
-Week 31 verdict: checkpoint met. 2 gates / 2 audits; round 2 audit was CLEAN (0/0/0/0).
 
+## Seam audit — where it stands
+PASS 1 (5 auditors): 1 cross-engine WRONG ANSWER, 1 HIGH found independently by two auditors,
+  1 coupled pair, 4 lows, 0 result divergences. All fixed in round 1:
+    87c08a2 volcano GROUP BY first-encounter order — the wrong answer
+    17bfcea CardinalityEstimator DERIVED case — the corroborated HIGH
+    8a23b9d $scalarN group keys named POSITIONALLY — closed F1+F2 together by removing the
+            collision rather than relaxing the guard that caught it
+    18af84f the four lows — residual forwarding, semi/anti floor, a false invariant, a silent
+            decline
+  Implementer's closing report: scratchpad/audits/seam-fix-round-1-report.md (READ IT — it lists
+  three places the fix was narrower than the finding, and three things found but NOT fixed).
+
+GATE on fix round 1: **GREEN** (log scratchpad/gates/seam-fix-round-1.log, uncommitted by design).
+  build genuine recompile (8 files touched + relinked), ZERO warnings; unit 808/808;
+  sqlite 1336 passed 0 failed 0 errors, rejection sweep 171/171 executed clean;
+  regression 318 passed incl. 119 optimizer-invariant; tpch PASS (20/22 meaningful vs SQLite:
+  5 four-mode, 15 vec-only; 1 vacuous; 1 unported) — full 22-query run, 4m58s, not narrowed.
+  Baseline md5 7cee17dae5398e3f20ef92f05ba78d5b before AND after. Staleness disproven twice.
+  HEAD moved mid-run (ee9c9d7 -> 532183e) from CONCURRENT AUDITOR PUSHES; verifier proved the
+  code surface was byte-identical at both ends (`git diff ee9c9d7..HEAD -- . ':(exclude)scratchpad/'`
+  empty; code fingerprint 785a8d3094304eea958f78998dc467fc at both). Verdict stands for both SHAs.
+
+PASS 2 results so far — **0 BLOCKERS, 0 HIGH** in both completed seams:
+  join-chain (532183e): 3 MEDIUM, 2 LOW. Corrected pass 1: the DERIVED phantom manufactured the
+    join-order *margin*, NOT the order — the order was byte-identical and already the better one.
+    28 constructed shapes, three-way differential vs SQLite, 0 disagreements. DP search space is
+    result-preserving; semi/anti cannot be moved/reach build side/be projected from; NULL keys
+    dropped on both sides of all three join operators; '\x01' composite-key class closed by a
+    length prefix; NOT EXISTS vs NOT IN over an all-NULL key column returns 20 vs 0 matching
+    SQLite both ways.
+  optimizer-preservation (d0c0a5f, 4d010e7, 7901864): 4 MEDIUM, 4 LOW. Found NO shape where
+    optimized and --no-optimize disagree. Switch now exhaustive 9/9 LogicalNodeType. The false
+    invariant had no code callers.
+
+### Pass-2 findings queued for FIX ROUND 2 (none blocking)
+CORROBORATED BY TWO AUDITORS — treat as the real ones:
+- **JoinEnumeration never recurses into its own result**, so a derived/subquery body's joins are
+  never enumerated and its WHERE never pushed *when the outer block has a join* — but the same
+  body IS optimized when the outer block has none. Measured 62729 vs 38417 on sf0.01, with NO
+  decline line printed. (join-chain B-3 / optimizer B-2.) Plan quality, not correctness.
+- **development.md is wrong a THIRD time**, and `:855` carries VERBATIM the paragraph 18af84f
+  deleted from the .cc as "false in both halves" — the .md copy is now the only surviving
+  statement of the retracted claim. `join_enumeration.h:84-91` carries it verbatim too.
+  Also `:854` now false, `:808` ("the decline is silent") unswept, and CardinalityEstimator is
+  MISSING from the Week 34 consumer table despite being pass 1's HIGH.
+  (join-chain B-5/B-1 / optimizer B-4.)
+SINGLE-AUDITOR:
+- **Constant folding is ungated and its justification is FALSE.** "Folding cannot change results"
+  — but `ORDER BY 1 + 1` folds to `Literal(2)`, the Validator's ordinal rule tests Literal-ness,
+  and a LEGAL query is refused with `ORDER BY 2: column ordinals are not supported`, naming an
+  ordinal the user never wrote. Confirmed by execution. The C++ test that claims to cover this
+  picks `ORDER BY speed + 1` — the one witness that CANNOT fold. (optimizer B-5.) This is a
+  user-visible wrong refusal and the most fixable thing in pass 2.
+- `containsOuterJoin` recurses into a DERIVED body, so a LEFT JOIN sealed inside a derived table
+  declines ordering for an enclosing fully-inner block — and, running before `slotDeclineReason`,
+  misattributes semi/anti declines as `(outer join)`. (join-chain B-2.)
+- DERIVED lowering calls `lowerNode` not `lower`, so a derived body's ROOT physical node prints
+  no `est=` — visible unremarked in 17bfcea's own pasted evidence. One-token fix, EXPLAIN-only.
+  (join-chain B-4.)
+
+### Carried from the fix-round implementer, NOT yet fixed
+- **`VecDerivedNode` re-entry**: `nextChunk` forwards its child's chunk pointer, so a derived
+  table on both sides of a self-join would forward the same `DataChunk*` twice. Not traced to a
+  reachable plan.
+- More pre-Week-34 `countRelations` comments likely survive (one stale test was found passing for
+  the wrong reason — 2-relation spine while claiming to be past a `<3` guard).
+
+### The measurement-blindness finding — biggest thing pass 2 has produced
+**`--no-optimize` gates exactly THREE passes** (pushdown, enumeration, estimation). SIX other
+plan-rewriting passes run in BOTH legs: constant folding, all three subquery lowerings, subquery
+materialization, derived normalization. So `optimized == --no-optimize` is blind to all six BY
+CONSTRUCTION — including the entire subquery lowering path — and nothing anywhere says so.
+Every reassuring subquery number comes from SQLite agreement alone, never from the invariant.
+This changes what "0 divergences" means and must be written down wherever that figure is quoted.
+
+## STOP CRITERION
+The skill: repeat the seam pass up to 5 times, stopping as soon as a pass returns NO BLOCKERS.
+Pass 2 has returned no blockers in 2 of 5 seams so far. If the remaining three also return none,
+the seam audit ENDS after a fix round 2 for the above + a closing gate. **Then stop and report.
+Week 37 is the user's.**
+
+## CARRY TO WEEK 37
+- **S-0** — the row/columnar oracle does NOT span any Phase 5 shape (vectorized needs columnar;
+  Volcano refuses derived/multi-way/semi/correlated), so the two storage modes never execute the
+  same Phase 5 query and this phase's storage safety rests on hand-computed answers. The storage
+  pass-2 auditor is settling its truth, severity, and the cheapest fix.
+- **The CSV loader cannot express NULL.** Any NULL test not manufacturing its NULLs via an outer
+  join is testing NULL handling against data containing none.
+- q21 unported (correlated inequality has no equi-join to lower to); q18 vacuous BY CHOICE.
+- Pre-existing "BetweenExpr would cost 17 dispatch sites" drift in three files.
+- `ColumnId {level, slot}` — still deferred. 87 non-comment mentions / 6 source layers.
 
 ## !! Container reclaim — read this first after any reboot
-The container is reclaimed ON THE HOUR, EVERY HOUR (05:31, 06:31, 07:31 UTC observed) and comes
-back rolled to a stale WEEK-28-ERA snapshot: HEAD a91c7f4, docs/ missing week 29+ plans,
-scratchpad wiped. Budget every agent to finish inside the current hour, and launch right after
-a reclaim when possible.
+The container has been reclaimed ON THE HOUR and comes back rolled to a stale snapshot with
+scratchpad wiped. Budget every agent to finish inside the current hour.
 - `run_in_background: false` is IGNORED by the harness — agents ALWAYS run in background, so a
-  blocked turn cannot be used to hold the container open. Short budgets are the only lever.
-- **Tell every long agent to write its artifact INCREMENTALLY**, not at the end. Whatever is on
-  disk when it dies is all that survives; a partial audit beats nothing.
-- **AUDITS MUST COMMIT THEMSELVES.** scratchpad/ is wiped by every reclaim, and the audit file
-  is the INPUT to the fix round — one was lost entirely this way. Every auditor is now told to
-  `git add -f scratchpad/audits/<file>` and push when it finishes, even if it stopped early.
-  Gate LOGS are deliberately NOT committed (150-250KB each); their verdict goes in this file.
+  blocked turn cannot hold the container open. Short budgets are the only lever.
+- **Tell every long agent to write its artifact INCREMENTALLY.** Whatever is on disk when it dies
+  is all that survives.
+- **AUDITS MUST COMMIT THEMSELVES** (`git add -f scratchpad/audits/<file>`). One was lost entirely.
+  Gate LOGS are deliberately NOT committed (150-300KB each); their verdict goes in this file.
 - **Never run two gates concurrently** — they contend on the same build/ directory.
-- **The git remote is the only durable store.** This file is force-added to git for that reason
-  (`git add -f scratchpad/phase5-state.md`) despite the skill saying not to commit scratchpad —
-  an uncommitted state file does not survive the exact event it exists for.
+- **The git remote is the only durable store.** This file is force-added (`git add -f`) despite
+  the skill saying not to commit scratchpad — an uncommitted state file does not survive the
+  exact event it exists for.
 - **Recovery, every reboot:** `git fetch origin claude/phase5-week26-qomtkb`, confirm local HEAD
   is an ancestor, then `git reset --hard origin/claude/phase5-week26-qomtkb`.
-  GIT IDENTITY — CORRECTED DIAGNOSIS. The environment sets GIT_AUTHOR_EMAIL /
-  GIT_COMMITTER_EMAIL / GIT_AUTHOR_NAME / GIT_COMMITTER_NAME to the repo owner, and env vars
-  OVERRIDE git config entirely. So `git config user.email ...` does nothing — it is never
-  consulted. An earlier entry here blamed container reclaims resetting .git/config; that was
-  WRONG and the commit that "fixed" it was ineffective.
-  To attribute a commit to the bot you must override the env per invocation, e.g.
+- **Background subagents do NOT keep the session alive.** A turn ending with only background
+  agents running reads as idle → reclaim → those agents are gone. Two gate+audit pairs lost.
+- GIT IDENTITY — env vars (`GIT_AUTHOR_EMAIL` etc.) OVERRIDE git config entirely, so
+  `git config user.email` does nothing. Prefix every commit:
     GIT_AUTHOR_NAME=Claude GIT_AUTHOR_EMAIL=noreply@anthropic.com \
     GIT_COMMITTER_NAME=Claude GIT_COMMITTER_EMAIL=noreply@anthropic.com git commit ...
   ~300 commits already carry the owner's identity, including Weeks 1-25 they wrote themselves.
-  DO NOT rewrite history for this — it is cosmetic (a GitHub "Unverified" badge) and force
-  pushing over their authorship is their call. Raised with the user; awaiting their preference.
-- **Root cause of lost agents:** background subagents do NOT keep the session alive. A turn that
-  ends with only background agents running reads as idle → reclaim → the next heartbeat boots a
-  fresh container and those agents are gone. Two gate+audit pairs were lost this way.
-- **Long work must be interruption-tolerant**, since nothing keeps the container alive:
-  commit+push after each coherent unit, and keep a "## Progress" section in the week's plan doc
-  naming done / in progress / next. Week 32's implementation survived a mid-run kill that way —
-  a successor resumed from the handoff instead of restarting the week.
+  DO NOT rewrite history — raised with the user, awaiting their preference.
 
-## Week 31 as shipped
-Uncorrelated + scalar subqueries by materialize-then-substitute; refusal NARROWED to correlated
-subqueries only; both Week 30 tripwires stay armed. Two divergences from SQLite are DOCUMENTED,
-not fixed: multi-row scalar errors (SQLite takes the first row) and IN caps at 1024 distinct
-values — WEEK 32 OWNS REMOVING THE CAP. Structural insight: the diffed oracle suite cannot hold
-a query that errors, so refusals need their own rejection suite.
+## Rules learned the hard way
+- **NEVER commit the state file while a gate is running.** Journal BEFORE launching a gate or
+  AFTER it reports.
+- **`pgrep` is NOT a "is the gate finished" test.** The verifier goes quiet between gate steps
+  while it writes its log and reasons, so empty `pgrep` means "nothing running this second".
+  Seven auditor commits landed mid-gate because I handed auditors that test. Correct rule: the
+  ORCHESTRATOR tells auditors when the gate has reported; `pgrep` is only for "don't start a
+  second build/harness right now".
+- **An agent past its expected duration with no artifact progress is dead** — relaunch, don't
+  wait. Stamp every launch with `date`; there is no internal clock.
 
-## Deferred
-- `ColumnId {level, slot}` — DEFERRED BY DECISION. Standalone change in whichever of Weeks 32/34
-  first lowers a correlated reference; never folded into a feature week. Cost: 87 non-comment
-  mentions / 6 source layers / every test hand-building a ColumnRef.
-- `extract(year from d)` STRING-vs-int → W36; masked-eval CASE kernel → W37; SUM/AVG double
-  precision declaration → W36; randomized RESULT differencing → W35 (needs scale-factor harness)
+## Week verdicts (condensed)
+W36 checkpoint met — the TPC-H figure moved 19 -> 20, independently confirmed; Q17 runs TPC-H's
+  own unaltered text and discriminates under mutation. W35 built the TPC-H harness; its honest
+  number moved 20->18->17->19->20, every move a correction to the MEASUREMENT.
+W34 checkpoint met INCLUDING Q17 — the deliverable W33 recorded as a miss.
+W33 PARTIALLY MET — EXISTS/NOT EXISTS decorrelation works; correlated SCALAR was REFUSED and
+  handed to W34. Three silent wrong answers found, ALL ONE SHAPE: code trusting a refusal that
+  had been deleted; two lived in header comments. A later sweep found seven more stale
+  preconditions. THIS IS THE CODEBASE'S MOST PRODUCTIVE BUG CLASS.
+W32 checkpoint met — the HIGH was a REGRESSION a green 988-query oracle could not see, because
+  the test guarding that capability had been narrowed to a scalar stand-in.
+W31 shipped uncorrelated + scalar subqueries; structural insight: `compare_against_sqlite.py`'s
+  diffed suite CANNOT hold a query that errors, so refusals need their own rejection suite.
+W30's round-1 gate was GREEN on a tree containing TWO BLOCKERS — the clearest justification in
+  the whole phase for separating measurement from judgment.
 
-## Open concerns
-- `development.md` → "Relation slots and query levels" is the map for the
-  (query_level, relation_slot) collapse class. It has been WRONG BY OMISSION twice. Point every
-  audit at it and have them verify against code, not trust it.
-- Stop-hook asks to re-author commits to noreply@anthropic.com. Config is set so NEW commits are
-  correct. DO NOT rewrite history: 135 commits carry the user's email including Weeks 1-25 they
-  authored themselves. That force-push is their call.
-
-## Heartbeats — three layers, all intentional
-1. ~25-min self-re-arming send_later chain. Re-arm every turn while work is in flight.
-2. Pre-armed 30-min one-shots, unbroken 04:30 → 14:00 UTC (14:00 = 10:00 user local, last one).
-   Rate-limits at ~10 per burst; batch ~5. The 09:00 message asks to create the 09:30-14:00
-   batch — SKIP it, they already exist.
-3. Hourly backstop Routine trig_011E7EYu3E7P9F3zKFUSsqhg at :44. Routine-fired sessions get NO
-   mcp__* tools so layer 3 cannot re-arm layer 1; send_later-fired ones can (verified).
+## Heartbeats
+~25-min self-re-arming send_later chain; re-arm every turn while work is in flight.
+Hourly backstop Routine trig_011E7EYu3E7P9F3zKFUSsqhg at :44. Routine-fired sessions get NO
+mcp__* tools so the backstop cannot re-arm the chain; send_later-fired ones can.
