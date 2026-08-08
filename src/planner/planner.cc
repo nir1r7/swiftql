@@ -185,6 +185,57 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     // the join table by the FROM table's column names
     Schema scan_schema = buildScanSchema(stmt, meta.schema);
 
+    // SEAM AUDIT pass 2 (E-1's leftover, handed over by the sort-tiebreak
+    // fixer). ROW STORAGE USED TO HAND SeqScanNode THE FULL CATALOG SCHEMA while
+    // every columnar mode handed it `scan_schema`. The scan node's row path
+    // returns `&rows_[cursor_]` verbatim, so a narrowed schema over a wide row
+    // would have mis-indexed every column — which is why the wide schema was
+    // there, and why closing the asymmetry means narrowing the ROWS, not just
+    // the schema.
+    //
+    // WHY IT MATTERS, and it is not projection pushdown. sort_comparator's
+    // tie-break compares the WHOLE ROW when every declared ORDER BY key ties,
+    // over `min(schema.size(), row.size())` columns. Two legs holding different
+    // column sets therefore tie-break over different data, so a LIMIT cut could
+    // survive different rows per mode — and the project asserts
+    // `optimized == --no-optimize == Volcano`, so that is a defect even though
+    // every such answer is legal SQL. It was benign only because the first
+    // discriminating column happened to be `driver_id` in both legs; that is
+    // luck, and it changes with the data. The comparator's header names this
+    // as the weakest premise it rests on, and it is now simply not a premise.
+    //
+    // Nothing is lost by narrowing: buildScanSchema collects from the select
+    // list, WHERE, GROUP BY, HAVING, ORDER BY and every ON condition, and
+    // returns the FULL schema for `SELECT *` or any subquery-bearing statement —
+    // so a column it drops is one no clause names. The columnar legs have run on
+    // exactly this schema since Week 30, which is the evidence that it suffices.
+    //
+    // Cost: one pass over the table's rows at plan time, moving Values rather
+    // than copying them, and only when the schema actually narrows. Skipped
+    // entirely when it does not (SELECT *, subqueries), which is where the wide
+    // tables are.
+    auto narrowRows = [](std::vector<Row> rows, const Schema& full,
+                         const Schema& narrowed) {
+        if (narrowed.size() == full.size()) return rows;   // nothing dropped
+        std::vector<int> keep;
+        keep.reserve(narrowed.size());
+        for (const ColumnDef& c : narrowed.columns()) {
+            const int i = full.indexOf(c.name);
+            if (i < 0)
+                throw std::runtime_error(
+                    "internal: Planner::plan narrowed a row-storage scan to a "
+                    "column '" + c.name + "' the catalog schema does not hold");
+            keep.push_back(i);
+        }
+        for (Row& r : rows) {
+            Row narrow;
+            narrow.reserve(keep.size());
+            for (int i : keep) narrow.push_back(std::move(r[i]));
+            r = std::move(narrow);
+        }
+        return rows;
+    };
+
     // capture before std::move transfers ownership into SeqScanNode
     int from_row_count = columnar_tables.count(from_table) > 0 ? columnar_tables.at(from_table).num_rows : (int)table_rows.at(from_table).size();
 
@@ -237,7 +288,10 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     if (columnar_tables.count(from_table) > 0) {
         node = std::make_unique<SeqScanNode>(from_table, std::move(columnar_tables.at(from_table)), scan_schema, prune_hint);
     } else {
-        node = std::make_unique<SeqScanNode>(from_table, std::move(table_rows.at(from_table)), meta.schema);
+        node = std::make_unique<SeqScanNode>(
+            from_table,
+            narrowRows(std::move(table_rows.at(from_table)), meta.schema, scan_schema),
+            scan_schema);
     }
 
     // hash join (exactly one, guarded above)
@@ -260,11 +314,18 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
             if (self_join_columnar.has_value())
                 right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(*self_join_columnar), right_scan_schema, nullptr);
             else
-                right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(*self_join_rows), join_meta.schema);
+                right = std::make_unique<SeqScanNode>(
+                    join_clause.relation.tableName("Planner::plan JOIN"),
+                    narrowRows(std::move(*self_join_rows), join_meta.schema, right_scan_schema),
+                    right_scan_schema);
         } else if (columnar_tables.count(join_clause.relation.tableName("Planner::plan JOIN")) > 0) {
             right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN"))), right_scan_schema, nullptr);
         } else {
-            right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(table_rows.at(join_clause.relation.tableName("Planner::plan JOIN"))), join_meta.schema);
+            right = std::make_unique<SeqScanNode>(
+                join_clause.relation.tableName("Planner::plan JOIN"),
+                narrowRows(std::move(table_rows.at(join_clause.relation.tableName("Planner::plan JOIN"))),
+                           join_meta.schema, right_scan_schema),
+                right_scan_schema);
         }
 
         // Keys were routed by binder-assigned slot above — the only way to
