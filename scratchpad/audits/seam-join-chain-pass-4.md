@@ -649,3 +649,86 @@ is not stale relative to the `.cc`; it is a stronger claim than the `.cc` delive
 the failure mode this project has logged repeatedly under "a dead assertion reads as a
 guarantee and stops anyone looking". It must be corrected with P4-B1 and P4-B2, not after
 them.
+
+---
+
+## Part B — hunting what three passes missed
+
+Both blockers came out of this part, found the way the standing rule predicts: **a
+precondition was written down for the first time, and the thing it enumerates is shorter
+than the thing it governs.** P4-B1's precondition enumerates the columns a conjunct NAMES
+and misses the columns a projection COMPUTES; P4-B2's enumerates four type errors and
+misses the fifth. Everything else I could construct is below, and it is clean.
+
+Method note. Pass 3 established the joints are clean under 240 randomized shapes and 41
+hand-built ones, so this pass aimed its randomizer at the surfaces fix round 3 WIDENED
+rather than re-covering that ground: derived bodies of eight shapes (plain, computed,
+filtered, grouped, LEFT-joined, 3-relation-joined, DISTINCT, ORDER-BY-LIMIT) in the FROM
+position and as join inputs, 2–4 relation spines, `IN` / `NOT IN` / `EXISTS` / `NOT EXISTS`
+/ correlated-scalar predicates stacked on them, and outer conjuncts that name derived
+columns (so the entry and descent rules fire). Three legs per query: optimized,
+`--no-optimize`, SQLite; positional TSV, sort-normalised; a shape both SwiftQL legs refuse,
+or SQLite cannot parse, is skipped rather than counted as agreement.
+
+### B4-1 — the derived boundary under the new pushdown (13 hand shapes, all agree three ways)
+
+`LEFT JOIN` body with the outer filter on the null-supplied column (`> 300` -> 2) and with
+`IS NULL` on it (-> 18); the same body as a JOIN INPUT with the `IS NULL` across the
+boundary (-> 18); a derived body inside a semi-join body and inside an anti-join body;
+`NOT IN` over a NULL-bearing derived body (-> 0) and `NOT EXISTS` over the same (-> 18) —
+the three-valued split, correct in both directions and matching SQLite; a residual spanning
+two relations over a 3-relation spine carrying a derived input; a semi join over a spine
+that also carries one; composite join key across the derived boundary; and the three body
+shapes the ENTRY rule's "any body shape" claim rests on (`LIMIT`, `DISTINCT`,
+`GROUP BY`/`HAVING`). A derived body with a `(a, b)` column alias list is correct on both
+legs and cannot be oracled — SQLite does not parse that form.
+
+### B4-2 — multi-way spines, residuals and semi/anti chains (13 shapes, all agree three ways)
+
+f1: an outer WHERE entering and descending into a 3-relation derived body; the same body as
+a join input with conjuncts on both sides; semi + anti stacked on a 3-relation spine; an
+anti join over a LEFT-joined spine; a residual spanning two relations on a 4-relation
+spine; a `LEFT` join with an ON residual and a WHERE on the preserved side; a composite key
+across the derived boundary; a 3-relation spine with a TOTAL `ORDER BY … LIMIT 10`.
+TPC-H `sf0.01`: a 4-relation spine whose derived input holds its own 3-relation join; a
+semi join over a 4-relation spine; an anti join plus a residual; a correlated scalar over a
+3-relation spine; a `GROUP BY` derived body joined to two relations. No conjunct dropped,
+doubled or applied on the wrong side on any of them.
+
+### B4-3 — the DP really does run in the newly reachable places, and the answers do not move
+
+Three widenings measured on `--explain` and then checked for result preservation:
+
+| newly enumerated region | order line | legs agree |
+|---|---|---|
+| a derived body under a **2-relation** outer block (below `MIN_ENUMERATED_RELATIONS`, so `reorder` returns early and only `applyToSpineLeaves` reaches it) | `order=customer@1,nation@2,orders@0 cost=32486 (written=54074) method=dp` | 239 = 239 = SQLite |
+| the body of a **correlated scalar**, i.e. `children[1]` of a LEFT join the pass DECLINED | `order=customer@1,nation@2,orders@0 cost=35486 (written=60074) method=dp` | 0 = 0 = SQLite |
+| a **semi join's** body | `order=drivers@1,drivers@2,laps@0 cost=43104 (written=60637) method=dp` | 20 = 20 = SQLite |
+
+The middle row is the one worth naming: a LEFT join declines the SPINE, and the walk still
+enters the declined node's `children[1]`. That is correct — the body is a separate block —
+and it is the exact asymmetry P4-M1 says is missing one case, since the semi/anti decline
+leaves `children[0]` unvisited while the LEFT decline leaves `children[1]` visited.
+
+### B4-4 — join key types: the parts that are CORRECT
+
+Re-confirmed from pass 3 and extended: `keyFieldText`'s numeric affinity is right everywhere
+(an integral DOUBLE takes the integer path), the `int_keys` SIMD gate independently requires
+`TypeId::INT` on both resolved key columns, and the new plan walk does not over-refuse — a
+composite key mixing an INT component and a STRING component that are each matched to their
+own type is accepted and correct (`l2.driver_id = d.driver_id AND l2.team = d.team` -> 20,
+SQLite 20), while the same shape with `l2.team = d.age` is refused by name and by producer.
+
+### B4-5 — the shapes I could NOT break, recorded so the negative means something
+
+* `mayRaise`'s dispatch: `InExpr`'s list is `std::vector<Value>` so it holds no raising
+  expression; `SUBSTRING` with literal bounds is refused at plan time in all three
+  out-of-range forms; integer division by zero yields NULL; an unrecognised `Expr` subtype
+  defaults to "may raise". Only the comparison carve-out is wrong (P4-B2).
+* `remapOntoDerivedBody` / `remapThroughProject` are both all-or-nothing, so a declined
+  conjunct is byte-identical for the caller and `entering`/`staying` partition the list —
+  no conjunct is dropped or doubled at either boundary.
+* `pushIntoJoin` re-sorts leftovers into written index order before `filterOnto`, so a
+  leftover cannot land behind a frozen conjunct.
+* `rebuild`'s key re-orientation is symmetric with respect to the type rule, so no
+  reordering can produce a key pair the validator did not already see (A.2.2).
