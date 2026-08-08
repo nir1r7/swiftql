@@ -872,3 +872,19 @@ beside it can do.
 fix round 3 itself, both `optimized != --no-optimize` on a query one leg answers and the
 other refuses, and both from an enumerated precondition that is one item short. The audit
 does not end here.**
+
+---
+
+## Provenance
+
+Every measurement in this file was taken against `b2bc70e` (the HEAD this pass was assigned,
+code-identical to the gated `9da0494`), from an out-of-tree Debug build. No source file was
+modified by this pass; the only file its commits touch is this one.
+
+Concurrent work landed on the shared branch during the pass (`8b332d7`, `33bb7ea` — the
+int/DOUBLE partiality seam, snapshots marked NOT verified / NOT gated) and other agents had
+uncommitted source edits in the working tree throughout. Those are a different seam and were
+not in the build I measured. Both blockers here are reproduced from the CLI on the shipped
+`catalog.json`, so re-pinning them against a newer HEAD is one command each — but they
+should be re-pinned rather than assumed, since `33bb7ea`'s subject line ("the partiality
+fix") names the same word P4-B2 turns on.
