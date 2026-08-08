@@ -425,12 +425,16 @@ assumed:
    stamps `c.relation_slot = r` with the binder's written-order slot) and the one
    pass 3's B3-1 showed the old positional tie-break did not have.
 
-The residual: where `(relation_slot, name)` is NOT unique — a body that projects
-two identically-named columns through a `LogicalDerived`, which stamps them both
-slot 0 — `tieBreakOrder`'s `stable_sort` falls back to schema order. That is
-still plan-independent, because `rebuild` copies a leaf's columns in their own
-order and a derived leaf's block stays contiguous, so the duplicates keep the
-same relative position on both legs. Checked by execution on
-`(SELECT l.team, dr.team FROM laps l JOIN drivers dr ON …) AS d(a,b)` with an
-`ORDER BY … LIMIT` straddling: identical. Not a finding, recorded so pass 5 does
-not re-derive it.
+The one residual `sort_comparator.h` flags — that `(relation_slot, name)` might
+not be unique — I closed by execution rather than by argument. A derived relation
+is the only construct that stamps several source relations' columns with one
+slot, and it REFUSES a repeated name outright:
+
+```
+$ ... "SELECT * FROM (SELECT l.team, dr.team FROM laps l JOIN drivers dr ON …) d"
+Error: derived table 'd': column 'team' is produced twice; give one of them an alias
+```
+
+With the alias list (`AS d(a,b)`) the names differ. So the pair is unique on
+every schema a sort can see, and the `stable_sort` fallback is unreachable there.
+Not a finding; recorded so pass 5 does not re-derive it.

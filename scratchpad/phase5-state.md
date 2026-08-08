@@ -1,4 +1,40 @@
 # Phase 5 orchestrator state
+
+## PASS 4 — subquery chain: **1 BLOCKER** (3f1794a). The seam that was CLEAN in pass 3.
+**The type-through-division refusal CANNOT CROSS THE MATERIALIZATION CUT**, and a scalar subquery
+turns it into a silent wrong answer:
+  SELECT COUNT(*) FROM laps l
+  WHERE 7 / (SELECT MAX(CASE WHEN l2.round > 10 THEN 2 ELSE 0.5 END) FROM laps l2) > 3
+    col-vec and col-vec --no-optimize: **10000 (WRONG)** | both Volcano modes and SQLite: **0**
+MECHANISM: `collectIntOrigins` runs ONCE PER `VectorizedPlanBuilder::build`, and
+`materializeSubqueries` cuts the query into TWO INDEPENDENT BUILDS. The body's own plan has no `/`,
+so nothing arms, so the INT is flattened into the DOUBLE column — correct for that plan, and
+exactly what `TYPEFIX_DIV_GUARDS_ALL_MODES` pins as answerable. The value crosses as a DOUBLE
+`Literal`; the outer walk correctly finds nothing to arm. `foldConstants` bakes `7/2.0 = 3.5` into
+the AST before either engine plans, which is why BOTH optimizer legs are wrong identically.
+**THE SHARPEST WITNESS**: adding ONE correlated conjunct (`AND l2.driver_id = l.driver_id`) puts
+the body in the SAME plan and the query is correctly REFUSED. Same CASE, same division, same
+engine. The identical arithmetic as a derived table is also refused. So the rule works for all
+three shapes I named in the brief — correlated body, $scalarN relation, derived body — and fails
+only on the FOURTH, the cut itself, which nobody named.
+Reachable through BOTH materializing sites (PROJECT and AGGREGATE), both polarities of `/`, and
+inside a derived body. The MAGNITUDE half does NOT leak (it is value-driven and fires inside the
+body's own run), which localizes the defect precisely to the ARMING WALK.
+**No suite can see it**: the whole `TYPEFIX_DIV_*` family is single-plan by its own selector
+(`if "FROM (SELECT" in q`), and no diffed entry anywhere puts a mixed-type CASE inside a subquery body.
+MEDIUM: `assert_refusal_pins_discriminate` covers **1 of this seam's 18 refusal suites**. Running
+  the harness's OWN function over the other 17 reports **4 findings**, executed: both
+  `WEEK33_NESTED_TRIPWIRE_REFUSED` entries produce one message; `WEEK34_CORRELATED_SCALAR_REFUSED`
+  entries 0 and 4 fire the same `refuse` call (entry 4 is VACUOUS — new). Pooling the seam's 146
+  messages adds WEEK35's needle that four distinct producers satisfy. Fix is ONE LOOP beside the
+  two existing calls.
+LOW x2: the join-key refusal's recorded loss is WIDER than the named `'16'` — an ordinary
+  SUBSTRING-derived string key is lost too (SQLite answers 10000); pass 3's four LOWs all still open.
+VERIFIED CLEAN: the LIMIT cut is plan-independent in every shape, and the injected caps'
+  order-invariance ground IS true; all four JoinKey producers refuse identically and the
+  positional/by-name split names the right column pair from either key position; INT-vs-DOUBLE keys
+  correctly NOT refused; NULL semantics, cardinality and zero-row rules unmoved.
+
 Current: **FIX ROUND 3 GATED GREEN on 9da0494. Launching SEAM PASS 4.**
   build 0 warnings; unit **874/874** (97 suites); oracle **1602 passed / 0 failed / 0 errors**;
   regression **335/0/0**; tpch PASS (20/22 meaningful: 5 four-mode, 15 vec-only; 1 vacuous;
