@@ -249,6 +249,16 @@ TypeId inferExprType(const Expr* expr, const Schema& schema) {
     }
     if (dynamic_cast<const IntervalLiteral*>(expr)) {
         // Unfolded interval: the query is malformed. Loud at plan time, by design.
+        //
+        // !! AND THIS THROW IS WHY `foldConstants` IS NOT OPTIONAL (seam audit
+        // pass 3, L-2). `foldDateInterval` is the ONLY thing that removes an
+        // IntervalLiteral, so this line fires on every well-formed
+        // `date ± interval` query — which is every TPC-H date-range predicate —
+        // the moment folding does not run before LogicalPlanBuilder::build.
+        // That ORDERING DEPENDENCY is guaranteed today only by folding being the
+        // last step of Binder::bind; nothing asserts it. A reader who took
+        // constant_folding.h's old word "canonicalization" at face value and
+        // gated the pass would land here, on the `--no-optimize` leg only.
         throw std::runtime_error(
             "INTERVAL is only valid in constant date arithmetic, "
             "e.g. date '1994-01-01' + interval '1' year");

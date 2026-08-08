@@ -171,9 +171,24 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     // Fold constant arithmetic last, so every downstream pass — Validator, the
     // logical planner, pushdown, cardinality estimation, the chunk pruner, and
     // the columnar comparison fast path — sees `season = 2024` rather than
-    // `season = 2020 + 4`. Unconditional, so it is canonicalization rather than
-    // a cost-based decision, and both execution paths and `--no-optimize` get
-    // it.
+    // `season = 2020 + 4`. Unconditional, and both execution paths and
+    // `--no-optimize` get it.
+    //
+    // !! IT IS NOT "JUST CANONICALIZATION", AND THE WORD IS DANGEROUS HERE
+    // (seam audit pass 3, L-2). This call is LOAD-BEARING FOR CORRECTNESS: it is
+    // the ONLY thing that removes an `IntervalLiteral`, and both `inferExprType`
+    // and `evaluate` THROW on one that survives ("INTERVAL is only valid in
+    // constant date arithmetic"). So every TPC-H `date ± interval '3' month`
+    // predicate depends on this line having run — moving it inside the
+    // `--no-optimize` gate on the strength of the word "canonicalization", or
+    // making it cost-based, breaks every interval query on the differential leg
+    // rather than merely making it slower. `foldDateInterval` (constant_folding.cc)
+    // is the code that consumes them; logical_plan.cc's IntervalLiteral case is
+    // the throw that makes the dependency load-bearing rather than cosmetic.
+    //
+    // The ORDERING dependency that follows is also not stated anywhere else:
+    // foldConstants must run BEFORE LogicalPlanBuilder::build. Today it does
+    // because it is the last step of Binder::bind; nothing enforces it.
     //
     // Week 37. This used to say "folding cannot change results", flat, and that
     // was FALSE — an audit refuted it by execution. What is actually true is
@@ -190,14 +205,53 @@ bool Binder::bindQuery(SelectStatement& stmt, const Catalog& catalog, Scope* par
     // It does NOT follow that folding cannot change a query's OUTCOME, and the
     // gap is any consumer downstream of here that tests the SHAPE of the tree
     // rather than the value it computes. Folding manufactures Literal nodes;
-    // such a consumer sees one that the user did not write. There was exactly
-    // one — the Validator's column-ordinal rule — and `ORDER BY 1 + 1` was
-    // refused as "ORDER BY 2", an ordinal nobody typed. That rule now tests the
-    // parser's `written_ordinal` instead of Literal-ness, which is what it
-    // always meant (see validator.cc). The obligation this comment carries
-    // forward: a new rule that tests for a Literal in a position the user could
-    // have written an expression in must ask what the user WROTE, or gate
-    // itself ahead of this call.
+    // such a consumer sees one that the user did not write.
+    //
+    // !! THE CENSUS THAT USED TO BE HERE SAID "there was exactly one". THERE ARE
+    // FIVE, and two of them change an outcome TODAY (seam audit pass 3, L-1,
+    // which enumerated all 15 downstream consumers with a verdict each; this is
+    // the subset that tests SHAPE). The bound on what folding can do is exact:
+    // `isArithOp` is `+ - * /` plus `foldDateInterval`, a comparison operator is
+    // never folded, and `Literal` is the only node kind folding creates — so
+    // exactly two flips are reachable, "is this a Literal?" false -> true, and
+    // "is this a BinaryExpr / UnaryExpr / IntervalLiteral?" true -> false.
+    // Folding can neither create nor destroy a `ColumnRef`.
+    //
+    //   1. validator.cc's column-ordinal rule — FIXED. `ORDER BY 1 + 1` was
+    //      refused as "ORDER BY 2", an ordinal nobody typed. It tests the
+    //      parser's `written_ordinal` now, which is what it always meant.
+    //   2. logical_plan.cc `inferExprType`'s Literal case — SAFE, WITH AN
+    //      OBLIGATION nobody had stated: safe only because evaluate()'s result
+    //      type equals inferExprType's promotion rule for the same tree (both
+    //      say INT⊗INT -> INT, any DOUBLE -> DOUBLE). `SELECT 7 / 2` printing 3
+    //      is that obligation being met.
+    //   3. logical_plan.cc's SUBSTRING constant start/length refusal —
+    //      OUTCOME-CHANGING. Folding ACTIVATES it: `SUBSTRING(team, 1 - 1, 2)`
+    //      is a plan-time error, while the value-identical
+    //      `SUBSTRING(team, lap_id - lap_id, 2)` is a per-row one. Deliberate,
+    //      identical in both legs, and the site says so itself.
+    //   4. logical_plan.cc's `IntervalLiteral` throw — SAFE, and it INVERTS this
+    //      comment's framing; see the load-bearing note at the call below.
+    //   5. expr_utils.h `exprToString` — OUTCOME-CHANGING, in the OUTPUT COLUMN
+    //      NAME: `SELECT 2020 + 4` is headed `2024` where SQLite heads it
+    //      `2020 + 4`. Identical in both legs, and both harnesses compare
+    //      `row.values()` rather than headers, so it is invisible by
+    //      construction rather than by luck.
+    //
+    // The rest of the audit's fifteen are value-based or provably closed under
+    // folding, each for a stated reason: `substituteInto`'s ColumnRef||Literal
+    // early return, `cardinality_estimator`'s `col op lit` shape test,
+    // `chunk_pruner`'s `collectSimplePredicates`, `columnar_eval`'s fast path,
+    // `subquery_decorrelation`'s `constantOnly` (monotone — it already accepted
+    // everything that folds), `exprKey` (both sides folded by the same call),
+    // `cloneExpr`, the two evaluators, `join_condition`'s key classification
+    // (needs a comparison op AND a ColumnRef on both sides, and folding can
+    // touch neither), and `parser.cc`, which runs BEFORE this.
+    //
+    // The obligation this comment carries forward, now stated against a census
+    // that is complete: a new rule that tests for a Literal in a position the
+    // user could have written an expression in must ask what the user WROTE, or
+    // gate itself ahead of this call.
     //
     // Week 30: this runs PER SCOPE. A subquery's own constants were folded by
     // its own bindQuery, and foldNode declines a SubqueryExpr (dispatch site
