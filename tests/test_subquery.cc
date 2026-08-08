@@ -38,7 +38,7 @@ Schema oneCol(const std::string& name, TypeId t) {
 
 // A runner that always returns the same canned result, counting its calls.
 SubqueryRunner canned(SubqueryResult res, int* calls = nullptr) {
-    return [res, calls](SelectStatement) {
+    return [res, calls](SelectStatement, bool) {
         if (calls) ++(*calls);
         return res;
     };
@@ -149,7 +149,7 @@ TEST(SubqueryMaterialization, ExistsAndNotExistsBecomeTheRightConstant) {
 TEST(SubqueryMaterialization, ExistsCapsTheBodyAtOneRowWithoutWideningAnExistingLimit) {
     Catalog cat(CATALOG);
     std::vector<std::optional<int>> seen;
-    auto record = [&seen](SelectStatement body) {
+    auto record = [&seen](SelectStatement body, bool) {
         seen.push_back(body.limit);
         return SubqueryResult{oneCol("x", TypeId::INT), {Row{Value(int64_t(1))}}};
     };
@@ -251,7 +251,7 @@ TEST(SubqueryMaterialization, MaterializesTheInnerBodyBeforeRunningTheOuterOne) 
                          "(SELECT MAX(driver_id) FROM laps WHERE speed > "
                          " (SELECT AVG(speed) FROM laps))", cat);
     std::vector<bool> nested_flag;
-    materializeSubqueries(stmt, [&](SelectStatement body) {
+    materializeSubqueries(stmt, [&](SelectStatement body, bool) {
         nested_flag.push_back(body.has_subquery);
         return SubqueryResult{oneCol("driver_id", TypeId::INT), {Row{Value(int64_t(1))}}};
     });

@@ -18,19 +18,23 @@ class VecProjectNode : public VecPlanNode {
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
 
-        // Output columns whose INT -> DOUBLE narrowing is observable to a
-        // division somewhere above this node. vectorized_plan_builder.cc
-        // computes the mask over the logical plan; vec_types.h's
-        // refuseObservableIntNarrowing enforces it. Empty — the default and the
-        // case for every node in almost every plan — means none.
-        void setIntObservableColumns(std::vector<bool> mask) { int_observable_ = std::move(mask); }
+        // How each output column must judge an INT Value narrowing into a
+        // DOUBLE column: OBSERVABLE (a `/` with an INTEGER partner reads it
+        // above), UNRENDERED (its text is never printed, so only 2^53 binds), or
+        // RENDERED. vectorized_plan_builder.cc computes the mask over the
+        // logical plan; vec_types.h enforces it. Empty — the default and the
+        // case for every node in almost every plan — is RENDERED throughout.
+        void setIntNarrowingColumns(std::vector<IntNarrowing> mask) {
+            int_narrowing_ = std::move(mask);
+        }
 
     private:
         // Classify each output expression once, in open(), rather than per chunk.
         void prepare();
 
-        bool intObservable(int c) const {
-            return c < static_cast<int>(int_observable_.size()) && int_observable_[c];
+        IntNarrowing intNarrowing(int c) const {
+            return c < static_cast<int>(int_narrowing_.size()) ? int_narrowing_[c]
+                                                               : IntNarrowing::RENDERED;
         }
 
         std::unique_ptr<VecPlanNode> child_;
@@ -45,7 +49,7 @@ class VecProjectNode : public VecPlanNode {
         //   otherwise          scalar evaluate() per row, needing a rebuilt Row
         std::vector<int> src_col_;
         std::vector<std::unique_ptr<ExpressionExecutor>> compiled_;
-        std::vector<bool> int_observable_;   // parallel to expressions_ when non-empty
+        std::vector<IntNarrowing> int_narrowing_;   // parallel to expressions_ when non-empty
         bool needs_row_ = false;   // any column on the scalar path
         bool prepared_ = false;
 };

@@ -107,6 +107,186 @@ void addTable(std::vector<std::string>& out, const std::string& name) {
     if (std::find(out.begin(), out.end(), name) == out.end()) out.push_back(name);
 }
 
+// ===================================================================
+// WHICH SCALAR SUBQUERIES ARE DIVIDED BY AN INTEGER
+//
+// The vectorized path stores a chunk column as ONE type, so a body whose select
+// item mixes INTEGER and REAL branches (a CASE is the general route) hands back
+// its INT flattened to REAL. That is correct for the body's own plan — the
+// value is the same number and prints the same — and it is a WRONG ANSWER for
+// `7 / (SELECT ...)`, because Volcano and SQLite truncate INTEGER/INTEGER and
+// the flattened REAL does not: seam subquery pass 4 measured 10000 rows where
+// both Volcano modes and SQLite return 0.
+//
+// The engine already refuses this shape when it is ONE plan (a derived table, a
+// correlated body decorrelated into the same tree). It could not see this one
+// because materializeSubqueries cuts the query into two independent builds and
+// the arming walk runs once per build — the body's plan holds no `/` and the
+// outer plan holds no INT. So the question is asked HERE, before the cut, where
+// both halves are still in one AST, and the answer is handed to the runner.
+//
+// It is asked at the AST, so the operand types come from the catalog rather
+// than from a plan schema. Only ONE thing has to be decided: can the OTHER
+// operand of the `/` be an INTEGER? A REAL other operand cannot truncate in
+// either engine, so `speed / (SELECT ...)` and `x / 2.0` must NOT arm — that
+// half of the rule is the one fix round 3 left out, and it cost `x / 2.0` its
+// answer (E-14). Unknown answers INTEGER, which over-refuses rather than
+// under-refuses; a DERIVED relation's column is the reachable unknown.
+// ===================================================================
+
+// The statement's own range table, as catalog schemas in slot order. A DERIVED
+// relation contributes a null: its column types are not decidable here, and the
+// conservative answer is what a null produces.
+using RangeTable = std::vector<const Schema*>;
+
+RangeTable rangeTableOf(const SelectStatement& stmt, const Catalog* catalog) {
+    RangeTable rt;
+    if (!catalog) return rt;
+    auto push = [&](const TableRef& ref) {
+        if (ref.isDerived()) { rt.push_back(nullptr); return; }
+        const std::string& name = ref.tableName("subquery division operand typing");
+        rt.push_back(catalog->hasTable(name) ? &catalog->getTable(name).schema : nullptr);
+    };
+    push(stmt.from);
+    for (const auto& j : stmt.joins) push(j.relation);
+    return rt;
+}
+
+// Same resolution order every consumer uses: by (slot, name) when the Binder
+// resolved it, by bare name otherwise. Unresolvable — a correlated reference, a
+// derived relation, an empty range table — is INTEGER, the conservative answer.
+bool columnMayBeInt(const ColumnRef& cr, const RangeTable& rt) {
+    if (rt.empty()) return true;
+    if (cr.id.isResolved() && cr.id.isLocal()) {
+        const int slot = cr.id.localSlot("subquery division operand typing");
+        if (slot >= 0 && slot < static_cast<int>(rt.size()) && rt[slot]) {
+            const int idx = rt[slot]->indexOf(cr.column_name);
+            if (idx >= 0) return rt[slot]->column(idx).type == TypeId::INT;
+        }
+        return true;
+    }
+    for (const Schema* s : rt) {
+        if (!s) continue;
+        const int idx = s->indexOf(cr.column_name);
+        if (idx >= 0) return s->column(idx).type == TypeId::INT;
+    }
+    return true;
+}
+
+// The SCALAR subqueries whose VALUE flows into this expression's value, plus
+// whether that value can be an INTEGER in Volcano. Mirrors taintWalk in
+// vectorized_plan_builder.cc, one AST level up: same `/` rule, same
+// "arithmetic is INT only when both operands are" propagation, same death of
+// the taint at a comparison.
+struct DivTaint {
+    // The BODIES, not the nodes: the ResultCache is keyed by statement and
+    // cloneExpr shares a body between two SubqueryExpr nodes, so a set of nodes
+    // would let the undivided node of a shared pair run the body first and
+    // decide the flag for both.
+    std::vector<const SelectStatement*> carried;
+    bool may_be_int = false;
+};
+
+void addCarried(std::vector<const SelectStatement*>& into,
+                const std::vector<const SelectStatement*>& from) {
+    for (const SelectStatement* s : from) {
+        if (std::find(into.begin(), into.end(), s) == into.end()) into.push_back(s);
+    }
+}
+
+DivTaint divWalk(const Expr* e, const RangeTable& rt,
+                 std::unordered_set<const SelectStatement*>& observed) {
+    DivTaint out;
+    if (!e) return out;
+
+    if (auto* lit = dynamic_cast<const Literal*>(e)) {
+        out.may_be_int = lit->value.isNull() ? lit->null_type == TypeId::INT
+                                             : lit->value.type() == TypeId::INT;
+        return out;
+    }
+    if (auto* cr = dynamic_cast<const ColumnRef*>(e)) {
+        out.may_be_int = columnMayBeInt(*cr, rt);
+        return out;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(e)) {
+        // COUNT is INT-typed; SUM and AVG accumulate into a double and emit a
+        // DOUBLE whatever the input was; MIN/MAX hand back an element of the
+        // input domain, so they inherit the argument's answer.
+        if (agg->function_name == "COUNT") { out.may_be_int = true; return out; }
+        if (agg->function_name == "SUM" || agg->function_name == "AVG") return out;
+        return divWalk(agg->argument.get(), rt, observed);
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
+        return divWalk(un->operand.get(), rt, observed);
+    }
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(e)) {
+        // Its operand belongs to this block and is walked for its own sake.
+        divWalk(sq->operand.get(), rt, observed);
+        // Only a SCALAR node is replaced by a value. EXISTS becomes a 0/1
+        // literal — an INT in both engines — and IN is lowered to a semi-join
+        // and never materialized at all.
+        if (sq->kind == SubqueryExpr::Kind::SCALAR && !sq->correlated && sq->subquery) {
+            out.carried.push_back(sq->subquery.get());
+        }
+        out.may_be_int = true;   // its body's type is exactly what is undecided
+        return out;
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
+        DivTaint l = divWalk(bin->left.get(), rt, observed);
+        DivTaint r = divWalk(bin->right.get(), rt, observed);
+        const std::string& op = bin->op;
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            const bool both = l.may_be_int && r.may_be_int;
+            if (op == "/" && both) {
+                for (const SelectStatement* s : l.carried) observed.insert(s);
+                for (const SelectStatement* s : r.carried) observed.insert(s);
+            }
+            if (both) { addCarried(out.carried, l.carried); addCarried(out.carried, r.carried); }
+            out.may_be_int = both;
+            return out;
+        }
+        out.may_be_int = true;   // comparison / AND / OR: boolean-as-INT
+        return out;
+    }
+    if (auto* isn = dynamic_cast<const IsNullExpr*>(e)) {
+        divWalk(isn->operand.get(), rt, observed);
+        out.may_be_int = true;
+        return out;
+    }
+    if (auto* in = dynamic_cast<const InExpr*>(e)) {
+        divWalk(in->operand.get(), rt, observed);
+        out.may_be_int = true;
+        return out;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(e)) {
+        divWalk(lk->operand.get(), rt, observed);
+        out.may_be_int = true;
+        return out;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(e)) {
+        divWalk(sub->operand.get(), rt, observed);
+        divWalk(sub->start.get(), rt, observed);
+        divWalk(sub->length.get(), rt, observed);
+        return out;   // STRING, never an INT
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(e)) {
+        for (const auto& w : c->when_clauses) {
+            divWalk(w.condition.get(), rt, observed);
+            DivTaint br = divWalk(w.result.get(), rt, observed);
+            addCarried(out.carried, br.carried);
+            out.may_be_int = out.may_be_int || br.may_be_int;
+        }
+        if (c->else_expr) {
+            DivTaint br = divWalk(c->else_expr.get(), rt, observed);
+            addCarried(out.carried, br.carried);
+            out.may_be_int = out.may_be_int || br.may_be_int;
+        }
+        return out;
+    }
+    out.may_be_int = true;
+    return out;
+}
+
 } // namespace
 
 void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& out) {
@@ -178,7 +358,8 @@ namespace {
 using ResultCache = std::unordered_map<const SelectStatement*, SubqueryResult>;
 
 const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
-                              ResultCache& cache) {
+                              ResultCache& cache, const Catalog* catalog,
+                              bool int_type_observable) {
     auto it = cache.find(sq->subquery.get());
     if (it != cache.end()) return it->second;
 
@@ -186,7 +367,7 @@ const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
     // own. This must happen BEFORE the move below — materializing the moved-from
     // husk is a silent no-op that leaves the inner node in place and surfaces as
     // site 12's throw from inside a nested run.
-    materializeSubqueries(*sq->subquery, run);
+    materializeSubqueries(*sq->subquery, run, catalog);
 
     SelectStatement body = std::move(*sq->subquery);
 
@@ -205,7 +386,10 @@ const SubqueryResult& runOnce(SubqueryExpr* sq, const SubqueryRunner& run,
     // consulted first, so a second node over the same statement never reaches
     // here. Anything added later that reads *sq->subquery past this point reads
     // an empty statement.
-    auto ins = cache.emplace(sq->subquery.get(), run(std::move(body)));
+    // The flag is keyed by BODY, exactly as this cache is, so a body shared by
+    // two SubqueryExpr nodes (BETWEEN clones its left operand) carries the
+    // union of what those nodes need — whichever of them reaches here first.
+    auto ins = cache.emplace(sq->subquery.get(), run(std::move(body), int_type_observable));
     return ins.first->second;
 }
 
@@ -283,7 +467,8 @@ bool needsSubqueryMaterialization(const SelectStatement& stmt) {
     return false;
 }
 
-void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
+void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run,
+                           const Catalog* catalog) {
     // Week 35 — A DERIVED TABLE'S BODY IS A STATEMENT, and its subqueries are as
     // unmaterialized as any other. `collectQueryTables`, ten lines above in this
     // same file, WAS extended to descend into a body when Week 34 landed derived
@@ -303,16 +488,26 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
     // recursion after it would leave the bug in place for precisely the failing
     // case.
     if (stmt.from.isDerived() && stmt.from.body()) {
-        materializeSubqueries(*stmt.from.body(), run);
+        materializeSubqueries(*stmt.from.body(), run, catalog);
     }
     for (auto& j : stmt.joins) {
         if (j.relation.isDerived() && j.relation.body()) {
-            materializeSubqueries(*j.relation.body(), run);
+            materializeSubqueries(*j.relation.body(), run, catalog);
         }
     }
 
     // One bool for the 99% case: every query in the engine calls this.
     if (!stmt.has_subquery) return;
+
+    // BEFORE anything is replaced, because the question is about the expression
+    // the subquery SITS IN and `visit` below destroys it. Two passes over the
+    // same slots; the second one is the substitution.
+    const RangeTable range_table = rangeTableOf(stmt, catalog);
+    std::unordered_set<const SelectStatement*> divided_by_int;
+    forEachStatementExpr(stmt, [&](std::unique_ptr<Expr>& e) {
+        divWalk(e.get(), range_table, divided_by_int);
+    });
+    for (const auto& g : stmt.group_by) divWalk(g.expr.get(), range_table, divided_by_int);
 
     ResultCache cache;
     // Week 32: a Kind::IN node SURVIVES this pass. It is the one shape lowered
@@ -354,7 +549,7 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
             // and must still be materialized before the body is planned. Same
             // caveats as the IN arm below — not moved, not limit-capped, not
             // cached.
-            materializeSubqueries(*sq->subquery, run);
+            materializeSubqueries(*sq->subquery, run, catalog);
             node_survives = true;
             return;
         }
@@ -389,11 +584,13 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run) {
             // LogicalPlanBuilder and inferExprType (dispatch site 12) throws its
             // "the materialization walker missed a subtype" message — an
             // internal-defect report for a perfectly ordinary query.
-            materializeSubqueries(*sq->subquery, run);
+            materializeSubqueries(*sq->subquery, run, catalog);
             node_survives = true;
             return;
         }
-        const SubqueryResult& res = runOnce(sq, run, cache);
+        const SubqueryResult& res =
+            runOnce(sq, run, cache, catalog,
+                    divided_by_int.count(sq->subquery.get()) != 0);
         std::unique_ptr<Expr> replacement = buildReplacement(sq, res);
         // An aliased constant keeps its name, for the same reason foldNode
         // preserves the alias. Always empty in WHERE/HAVING; kept anyway so the

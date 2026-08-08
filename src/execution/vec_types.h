@@ -13,6 +13,30 @@
 // distinct from zone map CHUNK_SIZE (8192)
 static constexpr int BATCH_SIZE = 1024;
 
+// What the plan knows about one materialized DOUBLE column, for the two
+// INT -> DOUBLE refusals below. Exactly one state per column; the vectorized
+// plan builder decides it from the LOGICAL plan (collectIntOrigins) and the two
+// materializing nodes stamp it onto the ColumnVector.
+//
+// RENDERED is the conservative default and the only state a column that the
+// builder said nothing about can be in, so a mask that is missing, short, or
+// never set behaves exactly as the engine did before either refusal existed.
+enum class IntNarrowing : uint8_t {
+    // The value may reach the query's output text, so BOTH halves of
+    // "indistinguishable from the INT it was" have to hold — including the
+    // %.15g rendering, which binds first (1e15).
+    RENDERED,
+    // The plan proves this column's own text is never read: its INT-ness dies
+    // in a comparison, a key encoding or an aggregate that emits a fresh
+    // DOUBLE, and no expression above carries it to an output column. Only the
+    // VALUE has to survive, so the bound is 2^53 rather than 1e15.
+    UNRENDERED,
+    // An INT stored here would change an answer at any magnitude, because the
+    // stored TYPE reaches a `/` whose other operand is also an INT. Refused
+    // outright; see refuseObservableIntNarrowing.
+    OBSERVABLE,
+};
+
 // one column of decoded, materialized data for batch
 // no encoding, scan nodes decode before data enters struct
 struct ColumnVector {
@@ -129,7 +153,24 @@ inline Value valueAt(const ColumnVector& cv, int row) {
 // which walks outward from the constant and asserts it is the first magnitude
 // that fails either half — so a change to `%.15g` in Value::toString() breaks a
 // test rather than silently widening this window.
+//
+// !! "BOTH HALVES BITE" IS A STATEMENT ABOUT A COLUMN THAT IS PRINTED, and it
+// was applied to every column until seam pass 4 (E-14) ran a query that prints
+// none of it: `SELECT MAX(CASE WHEN c THEN 2000000000000000 ELSE 0.5 END) > 1`
+// is `1` in Volcano and was REFUSED here, for a rendering that never happens.
+// A column whose text the plan proves is never read is judged by the VALUE
+// bound alone (`MAX_EXACT_INT_IN_DOUBLE_COLUMN`), which is the only half that
+// can change such an answer. Which half applies is the ColumnVector's
+// `int_narrowing`, not a property of the value — see IntNarrowing above.
 static constexpr int64_t MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN = 1000000000000000LL;
+
+// The VALUE half on its own: 2^53, the last magnitude at which every int64_t is
+// still its own double. |i| <= this and (double)i == i exactly; at 2^53 + 1 two
+// consecutive integers collapse onto one double and the value itself is gone.
+// Used only for an UNRENDERED column, where the %.15g cliff above cannot be
+// observed. `ValueBoundIsExactlyTwoToThe53` pins that this constant is the last
+// integer that round-trips and the next one is not.
+static constexpr int64_t MAX_EXACT_INT_IN_DOUBLE_COLUMN = 9007199254740992LL;
 
 // The INT -> DOUBLE narrowing, refused when it would be observable.
 //
@@ -170,19 +211,35 @@ static constexpr int64_t MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN = 1000000000000000LL;
 // 10k window either side of the bound, 200k pseudo-random int64_t and the
 // extrema. NaN and infinity fail both compares, fall through to the type check,
 // and pass — they are DOUBLEs, and this rule is only about INTs.
-inline double narrowToDoubleColumn(const Value& v) {
+// `unrendered` relaxes the TEXT half away; the fast path below 1e15 is reached
+// without consulting it, so the measurement above still describes every
+// ordinary DOUBLE cell.
+inline double narrowToDoubleColumn(const Value& v, bool unrendered) {
     // STRING raises bad_variant_access from toNumeric(), as it did before.
     const double d = v.toNumeric();
     const double bound = static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
     if (d < bound && d > -bound) return d;
     if (v.type() != TypeId::INT) return d;   // a genuine DOUBLE that big is fine
+    const int64_t i = v.asInt();
+    // Exact on the int64_t, not on the double, because THIS bound is about the
+    // integer surviving and the rounding it is testing for is the one that
+    // would have already happened to `d`.
+    if (unrendered && i >= -MAX_EXACT_INT_IN_DOUBLE_COLUMN
+                   && i <= MAX_EXACT_INT_IN_DOUBLE_COLUMN) {
+        return d;
+    }
     throw std::runtime_error(
         "vectorized execution cannot materialize the integer " +
-        std::to_string(v.asInt()) + " into a DOUBLE result column without "
+        std::to_string(i) + " into a DOUBLE result column without "
         "changing it. A chunk column holds one type, so an expression that "
         "mixes INTEGER and REAL results (typically a CASE) is stored as REAL, "
-        "which is exact and prints identically only below 1e15. Re-run with "
-        "--execution volcano, or give the branches the same type.");
+        + (unrendered
+               ? std::string("which holds it exactly only below 2^53 "
+                             "(9007199254740992)")
+               : std::string("which is exact and prints identically only "
+                             "below 1e15"))
+        + ". Re-run with --execution volcano, or give the branches the same "
+          "type.");
 }
 
 // The SECOND thing INT -> DOUBLE narrowing destroys, and it is not magnitude.
@@ -222,6 +279,18 @@ inline double narrowToDoubleColumn(const Value& v) {
 // asking the question at the DIVISION rather than at the materialization, and
 // the division runs in expression_executor.cc / evaluator.cc, which this rule
 // deliberately does not reach into.
+//
+// !! A SENTENCE THAT USED TO STAND HERE IS RETRACTED, because arming acted on
+// it and refused correct queries. It read that the taint reaches "an operand of
+// a `/`", full stop. `INTEGER/INTEGER truncates while INTEGER/REAL does not` is
+// the whole justification, and it needs BOTH operands: in `x / 2.0` the divisor
+// is already REAL, so Volcano divides in REAL too and the stored type cannot
+// change the answer. Fix round 3 armed both operands unconditionally and
+// refused `SELECT MAX(CASE WHEN c THEN 7 ELSE 0.5 END) / 2.0`, which Volcano
+// answers 3.5 — and its derived-table form, which then had no working mode at
+// all (seam pass 4, E-14). The test is now "an INT can reach an operand of `/`
+// WHOSE OTHER OPERAND CAN ALSO BE AN INT", and it lives in one place,
+// taintWalk's `/` arm in vectorized_plan_builder.cc.
 inline void refuseObservableIntNarrowing(const Value& v) {
     if (v.type() != TypeId::INT) return;
     throw std::runtime_error(
@@ -237,8 +306,9 @@ inline void refuseObservableIntNarrowing(const Value& v) {
 
 // Append one cell, NULL-aware. `cv.type` decides the storage type. An INT Value
 // narrows into a DOUBLE column through TWO refusals — refuseObservableIntNarrowing
-// (the value's TYPE is observable to a `/` above, at any magnitude) and
-// narrowToDoubleColumn (the value or its rendering changes, above 1e15) — both
+// (the value's TYPE is observable to a `/` whose other operand is also INT, at
+// any magnitude) and narrowToDoubleColumn (the value or its rendering changes,
+// above 1e15 — or above 2^53 when the plan proves the text is never read) — both
 // of which THROW rather than answer differently from Volcano and SQLite. Read
 // both comments before touching this. This comment called the conversion "lossless" from 85be432
 // (Week 24, the commit that added validity) until seam pass 3 found it. It is
@@ -274,11 +344,15 @@ inline void appendColumnValue(ColumnVector& cv, const Value& v) {
             std::get<std::vector<int64_t>>(cv.data).push_back(v.asInt()); break;
         case TypeId::DOUBLE:
             // The type rule first: it fires at any magnitude, and it is the one
-            // the plan armed. `int_observable` is false on all but a handful of
-            // columns in a plan, so the out-of-line Value::type() call inside
-            // stays off the path every ordinary DOUBLE cell takes.
-            if (cv.int_observable) refuseObservableIntNarrowing(v);
-            std::get<std::vector<double>>(cv.data).push_back(narrowToDoubleColumn(v)); break;
+            // the plan armed. OBSERVABLE holds on all but a handful of columns
+            // in a plan, so the out-of-line Value::type() call inside stays off
+            // the path every ordinary DOUBLE cell takes.
+            if (cv.int_narrowing == IntNarrowing::OBSERVABLE) {
+                refuseObservableIntNarrowing(v);
+            }
+            std::get<std::vector<double>>(cv.data).push_back(
+                narrowToDoubleColumn(v, cv.int_narrowing == IntNarrowing::UNRENDERED));
+            break;
         case TypeId::STRING:
             std::get<std::vector<std::string>>(cv.data).push_back(v.asString()); break;
     }

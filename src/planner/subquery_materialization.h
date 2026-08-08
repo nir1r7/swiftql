@@ -2,6 +2,7 @@
 
 #include "parser/ast.h"
 #include "common/schema.h"      // Row, Schema
+#include "catalog/catalog.h"    // column types, for the `/` operand test below
 #include <functional>
 #include <memory>
 #include <string>
@@ -49,7 +50,19 @@ struct SubqueryResult {
 // as the query containing it (handing a three-relation body to Volcano would
 // refuse TPC-H Q11's subquery in vectorized mode); and an injected runner makes
 // the whole rewrite unit-testable with canned rows and no data at all.
-using SubqueryRunner = std::function<SubqueryResult(SelectStatement)>;
+//
+// THE SECOND ARGUMENT IS THE ONE FACT THAT CANNOT BE RECOVERED INSIDE THE BODY.
+// `int_type_observable` says: the value this body returns is about to be an
+// operand of a `/` whose OTHER operand is an INTEGER, so whether that value is
+// an INT or a REAL decides the answer. The vectorized path stores a column as
+// one type, so a body whose result mixes INTEGER and REAL branches flattens the
+// INT to REAL — correct for the body's own plan, and a silent wrong answer for
+// the division above it, which is exactly what seam subquery pass 4 measured as
+// 10000 rows against SQLite's 0. The two builds share no plan and no walk spans
+// them; this flag is the whole of what crosses. Volcano runners ignore it: that
+// path never converts a Value to fit a column.
+using SubqueryRunner =
+    std::function<SubqueryResult(SelectStatement, bool /*int_type_observable*/)>;
 
 // Week 32 REMOVED MAX_MATERIALIZED_IN_VALUES. Week 31 capped an IN subquery's
 // materialized set at 1024 distinct values because evaluate()'s InExpr case
@@ -135,4 +148,12 @@ void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& o
 // logical_plan.cc. TPC-H Q22 is that shape; the Week 35 harness found it.
 bool needsSubqueryMaterialization(const SelectStatement& stmt);
 
-void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run);
+// `catalog`, when given, is used for ONE question and nothing else: the declared
+// type of a ColumnRef that shares a `/` with a subquery, which decides whether
+// that subquery's body is run with `int_type_observable`. Without it the answer
+// is conservative (assume INTEGER), which over-refuses `<REAL column> / (SELECT
+// <mixed>)` — a query that is correct today. Every production caller passes it;
+// the default exists so that unit tests driving canned runners, which never
+// materialize anything, do not have to.
+void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run,
+                           const Catalog* catalog = nullptr);

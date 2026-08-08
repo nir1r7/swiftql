@@ -127,16 +127,20 @@ std::vector<Row> drainVec(VecPlanNode* node) {
 // level: compare_against_sqlite.py runs the vectorized suite twice, and that
 // second leg is the differential oracle. A runner that always optimized would
 // give both legs the same subquery result and quietly stop testing the sub-plan.
+// `int_type_observable` is materializeSubqueries' answer to "is this body's
+// value about to be divided BY AN INTEGER?", and it is the only thing that
+// crosses the cut between the two builds — see subquery_materialization.h.
 SubqueryResult runVectorizedToRows(SelectStatement stmt, const Catalog& catalog,
                                    std::unordered_map<std::string, ColumnarTable> tables,
-                                   bool no_optimize) {
+                                   bool no_optimize, bool int_type_observable) {
     auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
     if (!no_optimize) {
         logical = PredicatePushdown::apply(std::move(logical), catalog);
         logical = JoinEnumeration::apply(std::move(logical), catalog);
         CardinalityEstimator::estimate(*logical, catalog);
     }
-    auto node = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), catalog);
+    auto node = VectorizedPlanBuilder::build(std::move(logical), std::move(tables), catalog,
+                                             int_type_observable);
     node->open();
     SubqueryResult out{node->outputSchema(), drainVec(node.get())};
     node->close();
@@ -506,7 +510,7 @@ int main(int argc, char* argv[]) {
 
                 SubqueryRunner run_subquery;
                 if (args.execution == "vectorized" && args.storage == "columnar") {
-                    run_subquery = [&](SelectStatement body) {
+                    run_subquery = [&](SelectStatement body, bool int_type_observable) {
                         // Its own copies: both scan nodes take their table BY
                         // VALUE and the outer query still needs the originals.
                         // Lowering's scan_uses counter already copies for a
@@ -518,10 +522,14 @@ int main(int argc, char* argv[]) {
                         collectQueryTables(body, names);
                         for (const auto& n : names) tables.emplace(n, columnar_tables.at(n));
                         return runVectorizedToRows(std::move(body), catalog,
-                                                   std::move(tables), args.no_optimize);
+                                                   std::move(tables), args.no_optimize,
+                                                   int_type_observable);
                     };
                 } else {
-                    run_subquery = [&](SelectStatement body) {
+                    // The Volcano path emits the Value the evaluator produced,
+                    // untouched by any column type, so there is no narrowing to
+                    // arm and the flag is not its business.
+                    run_subquery = [&](SelectStatement body, bool) {
                         std::unordered_map<std::string, std::vector<Row>> rows_copy;
                         std::unordered_map<std::string, ColumnarTable> cols_copy;
                         std::vector<std::string> names;
@@ -539,7 +547,7 @@ int main(int argc, char* argv[]) {
                 // refuse TPC-H Q11's subquery in vectorized mode, which is a
                 // capability difference invented by the plumbing rather than by
                 // either engine.
-                materializeSubqueries(stmt, run_subquery);
+                materializeSubqueries(stmt, run_subquery, &catalog);
                 subquery_us = std::chrono::duration<double, std::micro>(
                     std::chrono::high_resolution_clock::now() - sub_start).count();
             }

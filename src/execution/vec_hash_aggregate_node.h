@@ -23,14 +23,16 @@ class VecHashAggregateNode : public VecPlanNode {
         // that reaches it (MIN/MAX keep the argument's own Value and type).
         // vectorized_plan_builder.cc computes the mask, vec_types.h's
         // refuseObservableIntNarrowing enforces it. Empty (the default) = none.
-        void setIntObservableColumns(std::vector<bool> mask) { int_observable_ = std::move(mask); }
+        void setIntNarrowingColumns(std::vector<IntNarrowing> mask) {
+            int_narrowing_ = std::move(mask);
+        }
 
     private:
         std::unique_ptr<VecPlanNode> child_;
         std::vector<GroupByColumn> group_by_cols_;
         std::vector<AggregateSpec> specs_;
         Schema output_schema_;
-        std::vector<bool> int_observable_;   // parallel to output_schema_ when non-empty
+        std::vector<IntNarrowing> int_narrowing_;   // parallel to output_schema_ when non-empty
 
         struct Accumulator {
             int64_t count = 0;

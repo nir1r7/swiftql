@@ -22,13 +22,13 @@
 
 namespace {
 
-// per-build lowering state: the table map plus a remaining-use count per
-// table, so a self-join (two LogicalScans, one map entry) copies the table
-// for every scan except the last, which moves it
-// Which output columns of which materializing node must refuse an INT Value.
-// Keyed by LOGICAL node, filled by armIntObservableColumns below and read by
-// the PROJECT and AGGREGATE cases of lowerNode.
-using IntObservableMap = std::unordered_map<const LogicalPlanNode*, std::vector<bool>>;
+// How each output column of which materializing node must judge an INT Value.
+// Keyed by LOGICAL node, filled by collectIntOrigins below and read by the
+// PROJECT and AGGREGATE cases of lowerNode. A node that is absent, or a column
+// past the end of its vector, is IntNarrowing::RENDERED — the pre-existing
+// behaviour.
+using IntNarrowingMap =
+    std::unordered_map<const LogicalPlanNode*, std::vector<IntNarrowing>>;
 
 // per-build lowering state: the table map plus a remaining-use count per
 // table, so a self-join (two LogicalScans, one map entry) copies the table
@@ -37,16 +37,16 @@ struct Lowering {
     std::unordered_map<std::string, ColumnarTable>& tables;
     std::unordered_map<std::string, int> scan_uses;
     const Catalog& catalog;   // borrowed, read-only: build-side width stats
-    const IntObservableMap& int_observable;
+    const IntNarrowingMap& int_narrowing;
 
     std::unique_ptr<VecPlanNode> lower(LogicalPlanNode* node, const Expr* pruning_where);
     std::unique_ptr<VecPlanNode> lowerNode(LogicalPlanNode* node, const Expr* pruning_where);
 
-    // The arming mask for one materializing node, sized to its output schema.
-    // Empty when nothing on this node is armed, which is the normal case.
-    std::vector<bool> maskFor(const LogicalPlanNode* node) const {
-        auto it = int_observable.find(node);
-        return it == int_observable.end() ? std::vector<bool>() : it->second;
+    // The narrowing mask for one materializing node, sized to its output schema.
+    // Empty when the plan said nothing about this node, which is the normal case.
+    std::vector<IntNarrowing> maskFor(const LogicalPlanNode* node) const {
+        auto it = int_narrowing.find(node);
+        return it == int_narrowing.end() ? std::vector<IntNarrowing>() : it->second;
     }
 };
 
@@ -58,10 +58,25 @@ struct Lowering {
 // The question this pass answers is the plan-shape one: a materialized column
 // whose declared type is DOUBLE but whose runtime Value can be INT is harmless
 // when it is only rendered (%.15g prints 7.0 as "7"), and wrong the moment
-// another expression DIVIDES with it, because INT/INT truncates and INT/DOUBLE
-// does not. So: walk the logical plan bottom-up carrying, per output column,
-// the set of ORIGINS whose INT-ness that column's runtime type still depends
-// on; at every expression, arm the origins that reach an operand of `/`.
+// another expression DIVIDES with it BY AN INTEGER, because INT/INT truncates
+// and INT/DOUBLE does not. So: walk the logical plan bottom-up carrying, per
+// output column, the set of ORIGINS whose INT-ness that column's runtime type
+// still depends on; at every expression, arm the origins that reach an operand
+// of a `/` whose other operand can also be an INT.
+//
+// THE OTHER OPERAND IS PART OF THE RULE, and leaving it out was a defect rather
+// than a simplification: `x / 2.0` cannot truncate in either engine, and fix
+// round 3 refused it anyway (seam pass 4, E-14) — costing the derived-table
+// form of that query its only working mode, since Volcano refuses derived
+// tables by capability. `taintWalk` therefore carries `may_be_int` beside the
+// origin set: the Volcano type of the expression, which for a tainted
+// DOUBLE-declared column is INT and for a REAL literal is not.
+//
+// The same walk answers a SECOND question, for the magnitude rule next door:
+// the origin sets of the ROOT's output columns are exactly the origins whose
+// text can be printed. An origin missing from them is marked
+// IntNarrowing::UNRENDERED and judged on the value alone (2^53) rather than on
+// %.15g (1e15) — see build() at the bottom of this file.
 //
 // Why `/` alone and not "consumed by any expression". Everything else in the
 // dialect either coerces or normalizes, and widening would move answers that
@@ -150,17 +165,42 @@ bool mayYieldInt(const Expr* e, const Schema& schema) {
     return true;
 }
 
+// What one expression contributes to the walk.
+//
+// `may_be_int` is the VOLCANO question — "can the Value this expression hands
+// back be an INT?" — asked with the taint already applied, which is what makes
+// it different from mayYieldInt above: a DOUBLE-declared column that carries an
+// origin holds the INT 7 in Volcano and the double 7.0 here, so it answers YES
+// where mayYieldInt (which reads the declared schema) answers no. It is the
+// half of the `/` test that fix round 3 did not have; see
+// refuseObservableIntNarrowing in vec_types.h for what that cost.
+//
+// Conservative in the arming direction: an unknown shape answers yes, which can
+// only arm more, never less.
+struct Taint {
+    std::vector<IntOrigin> origins;
+    bool may_be_int = false;
+};
+
 // Walk one expression over the child's origin sets. Returns the origins whose
 // INT-ness can still change THIS expression's result type, and arms — into
-// `armed` — every origin that reaches an operand of `/`.
-std::vector<IntOrigin> taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
-                                 std::vector<IntOrigin>& armed) {
-    std::vector<IntOrigin> out;
+// `armed` — every origin that reaches an operand of a `/` WHOSE OTHER OPERAND
+// CAN ALSO BE AN INT.
+Taint taintWalk(const Expr* e, const Schema& schema, const OriginSets& in,
+                std::vector<IntOrigin>& armed) {
+    Taint out;
     if (!e) return out;
 
+    if (auto* lit = dynamic_cast<const Literal*>(e)) {
+        out.may_be_int = lit->value.isNull() ? lit->null_type == TypeId::INT
+                                             : lit->value.type() == TypeId::INT;
+        return out;
+    }
     if (auto* cr = dynamic_cast<const ColumnRef*>(e)) {
         const int idx = resolveColumnIndex(*cr, schema);
-        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out, in[idx]);
+        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out.origins, in[idx]);
+        out.may_be_int = (idx >= 0 && schema.column(idx).type == TypeId::INT)
+                      || !out.origins.empty();
         return out;
     }
     if (auto* agg = dynamic_cast<const AggregateExpr*>(e)) {
@@ -169,68 +209,114 @@ std::vector<IntOrigin> taintWalk(const Expr* e, const Schema& schema, const Orig
         // aggregate node's own output schema, so this pass must too — this is
         // the line that connects the HAVING reproduction to its origin.
         const int idx = schema.indexOf(aggregateOutputName(agg));
-        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out, in[idx]);
+        if (idx >= 0 && idx < static_cast<int>(in.size())) mergeOrigins(out.origins, in[idx]);
+        out.may_be_int = (idx >= 0 && schema.column(idx).type == TypeId::INT)
+                      || !out.origins.empty();
         return out;
     }
     if (auto* un = dynamic_cast<const UnaryExpr*>(e)) {
         return taintWalk(un->operand.get(), schema, in, armed);
     }
     if (auto* bin = dynamic_cast<const BinaryExpr*>(e)) {
-        std::vector<IntOrigin> l = taintWalk(bin->left.get(), schema, in, armed);
-        std::vector<IntOrigin> r = taintWalk(bin->right.get(), schema, in, armed);
+        Taint l = taintWalk(bin->left.get(), schema, in, armed);
+        Taint r = taintWalk(bin->right.get(), schema, in, armed);
         const std::string& op = bin->op;
-        if (op == "/") {
-            // Either side decides: `2 / x` is 0 in Volcano and 0.2857… here.
-            mergeOrigins(armed, l);
-            mergeOrigins(armed, r);
-        }
         if (op == "+" || op == "-" || op == "*" || op == "/") {
-            mergeOrigins(out, l);
-            mergeOrigins(out, r);
+            // evaluate(): INT only when BOTH operands are INT — so if either
+            // side is REAL in Volcano, this result is REAL in BOTH engines and
+            // nothing above it can tell the two apart. Dropping the origins
+            // there is what keeps `(x + 0.5) / 2` and `x * 2.0` answerable.
+            const bool both = l.may_be_int && r.may_be_int;
+            if (op == "/" && both) {
+                // Either side decides, once the division is INTEGER at all:
+                // `2 / x` is 0 in Volcano and 0.2857… here, and `x / 2` is 3
+                // against 3.5. With a REAL operand there is no truncation to
+                // lose, which is why the test is `both` and not "any".
+                mergeOrigins(armed, l.origins);
+                mergeOrigins(armed, r.origins);
+            }
+            if (both) {
+                mergeOrigins(out.origins, l.origins);
+                mergeOrigins(out.origins, r.origins);
+            }
+            out.may_be_int = both;
             return out;
         }
         // comparison / AND / OR: the result is a boolean INT in both engines, so
         // the taint stops here even though the operands carried it.
+        out.may_be_int = true;
         return out;
     }
     if (auto* isn = dynamic_cast<const IsNullExpr*>(e)) {
         taintWalk(isn->operand.get(), schema, in, armed);
+        out.may_be_int = true;   // boolean-as-INT
         return out;
     }
     if (auto* inx = dynamic_cast<const InExpr*>(e)) {
         taintWalk(inx->operand.get(), schema, in, armed);
+        out.may_be_int = true;
         return out;
     }
     if (auto* lk = dynamic_cast<const LikeExpr*>(e)) {
         taintWalk(lk->operand.get(), schema, in, armed);
+        out.may_be_int = true;
         return out;
     }
     if (auto* sub = dynamic_cast<const SubstringExpr*>(e)) {
         taintWalk(sub->operand.get(), schema, in, armed);
         taintWalk(sub->start.get(), schema, in, armed);
         taintWalk(sub->length.get(), schema, in, armed);
-        return out;   // STRING
+        return out;   // STRING, and never an INT
     }
     if (auto* c = dynamic_cast<const CaseExpr*>(e)) {
         for (const auto& w : c->when_clauses) {
             taintWalk(w.condition.get(), schema, in, armed);   // boolean; taint dies here
-            mergeOrigins(out, taintWalk(w.result.get(), schema, in, armed));
+            Taint br = taintWalk(w.result.get(), schema, in, armed);
+            mergeOrigins(out.origins, br.origins);
+            out.may_be_int = out.may_be_int || br.may_be_int;
         }
-        if (c->else_expr) mergeOrigins(out, taintWalk(c->else_expr.get(), schema, in, armed));
+        if (c->else_expr) {
+            Taint br = taintWalk(c->else_expr.get(), schema, in, armed);
+            mergeOrigins(out.origins, br.origins);
+            out.may_be_int = out.may_be_int || br.may_be_int;
+        }
         return out;
     }
-    return out;   // Literal, and anything with no column underneath it
+    out.may_be_int = true;   // anything with no column underneath it
+    return out;
+}
+
+// Everything the arming pass produces for one plan.
+//
+// `all` is every origin the walk CREATED, which is the same thing as "every
+// column in this plan at which an INT Value can reach a DOUBLE ColumnVector" —
+// mayYieldInt is the test in both places. build() uses it to decide the
+// magnitude bound: an origin the root's output sets do not mention cannot have
+// its text read, so it is judged on the value alone (IntNarrowing::UNRENDERED).
+struct Arming {
+    IntNarrowingMap mask;
+    std::vector<IntOrigin> all;
+};
+
+void markColumn(IntNarrowingMap& mask, const IntOrigin& o, IntNarrowing state) {
+    std::vector<IntNarrowing>& m = mask[o.first];
+    if (m.empty()) m.assign(o.first->output_schema.size(), IntNarrowing::RENDERED);
+    if (o.second >= 0 && o.second < static_cast<int>(m.size())) m[o.second] = state;
 }
 
 // Bottom-up over the logical plan. Returns the origin sets of `node`'s output
-// columns; records every armed origin in `arm`.
-OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm) {
-    auto armAll = [&arm](const std::vector<IntOrigin>& armed) {
-        for (const IntOrigin& o : armed) {
-            std::vector<bool>& mask = arm[o.first];
-            if (mask.empty()) mask.assign(o.first->output_schema.size(), false);
-            if (o.second >= 0 && o.second < static_cast<int>(mask.size())) mask[o.second] = true;
-        }
+// columns; records every armed origin in `st.mask` and every origin it creates
+// in `st.all`.
+OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
+    auto armAll = [&st](const std::vector<IntOrigin>& armed) {
+        for (const IntOrigin& o : armed) markColumn(st.mask, o, IntNarrowing::OBSERVABLE);
+    };
+    // Every origin passes through here, so `st.all` cannot drift from the set
+    // of columns that can actually narrow.
+    auto newOrigin = [&st](const LogicalPlanNode* n, int c) {
+        IntOrigin o{n, c};
+        st.all.push_back(o);
+        return std::vector<IntOrigin>{o};
     };
 
     switch (node->type) {
@@ -243,14 +329,14 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
         case LogicalNodeType::LIMIT: {
             // Pure pass-throughs: same width, same values, DERIVED only renames.
             // (The width equality is asserted for DERIVED in lowerNode.)
-            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets child = collectIntOrigins(node->children[0].get(), st);
             child.resize(node->output_schema.size());
             return child;
         }
 
         case LogicalNodeType::FILTER: {
             const LogicalFilter* f = static_cast<const LogicalFilter*>(node);
-            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets child = collectIntOrigins(node->children[0].get(), st);
             std::vector<IntOrigin> armed;
             // The predicate is evaluated against the CHILD's schema — for a
             // HAVING that is the aggregate's output schema, which is where the
@@ -263,7 +349,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
 
         case LogicalNodeType::SORT: {
             const LogicalSort* s = static_cast<const LogicalSort*>(node);
-            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets child = collectIntOrigins(node->children[0].get(), st);
             std::vector<IntOrigin> armed;
             for (const OrderByItem& item : s->order_by) {
                 taintWalk(item.expr.get(), node->children[0]->output_schema, child, armed);
@@ -275,8 +361,8 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
 
         case LogicalNodeType::JOIN: {
             const LogicalJoin* j = static_cast<const LogicalJoin*>(node);
-            OriginSets left  = collectIntOrigins(node->children[0].get(), arm);
-            OriginSets right = collectIntOrigins(node->children[1].get(), arm);
+            OriginSets left  = collectIntOrigins(node->children[0].get(), st);
+            OriginSets right = collectIntOrigins(node->children[1].get(), st);
             // Equi-join keys are NOT observers: both engines key through
             // key_encoding.h, whose keyFieldText renders an integral double as
             // INT text, so 7 and 7.0 land in the same bucket either way.
@@ -303,7 +389,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
         case LogicalNodeType::AGGREGATE: {
             const LogicalAggregate* a = static_cast<const LogicalAggregate*>(node);
             const Schema& cs = node->children[0]->output_schema;
-            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets child = collectIntOrigins(node->children[0].get(), st);
             std::vector<IntOrigin> armed;
 
             // buildAggregateSchema order: group-by columns, then aggregates.
@@ -314,7 +400,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
                 std::vector<IntOrigin> in_set;
                 bool own = false;
                 if (g.expr) {
-                    in_set = taintWalk(g.expr.get(), cs, child, armed);
+                    in_set = taintWalk(g.expr.get(), cs, child, armed).origins;
                     own = mayYieldInt(g.expr.get(), cs);
                 } else {
                     int idx = g.id.isResolved() ? cs.indexOf(g.column_name, g.id.localSlot(
@@ -328,7 +414,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
                 // from output_schema, so an expression key that returns INT
                 // reaches the same narrowing the aggregates do.
                 if (own && node->output_schema.column(c).type == TypeId::DOUBLE) {
-                    mergeOrigins(out[c], {IntOrigin{node, c}});
+                    mergeOrigins(out[c], newOrigin(node, c));
                 }
                 ++c;
             }
@@ -337,7 +423,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
                 std::vector<IntOrigin> in_set;
                 bool arg_int = false;
                 if (spec.argument && spec.column.empty()) {
-                    in_set = taintWalk(spec.argument, cs, child, armed);
+                    in_set = taintWalk(spec.argument, cs, child, armed).origins;
                     arg_int = mayYieldInt(spec.argument, cs);
                 } else if (!spec.is_star) {
                     int idx = spec.id.isResolved() ? cs.indexOf(spec.column, spec.id.localSlot(
@@ -356,7 +442,7 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
                 if (order_stat) {
                     out[c] = in_set;
                     if (arg_int && node->output_schema.column(c).type == TypeId::DOUBLE) {
-                        mergeOrigins(out[c], {IntOrigin{node, c}});
+                        mergeOrigins(out[c], newOrigin(node, c));
                     }
                 }
                 ++c;
@@ -368,20 +454,20 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, IntObservableMap& arm)
         case LogicalNodeType::PROJECT: {
             const LogicalProject* p = static_cast<const LogicalProject*>(node);
             const Schema& cs = node->children[0]->output_schema;
-            OriginSets child = collectIntOrigins(node->children[0].get(), arm);
+            OriginSets child = collectIntOrigins(node->children[0].get(), st);
             std::vector<IntOrigin> armed;
 
             OriginSets out(node->output_schema.size());
             for (int c = 0; c < static_cast<int>(p->exprs.size()); ++c) {
                 if (c >= static_cast<int>(out.size())) break;
-                out[c] = taintWalk(p->exprs[c].get(), cs, child, armed);
+                out[c] = taintWalk(p->exprs[c].get(), cs, child, armed).origins;
                 // This column is itself an origin when the type it DECLARES and
                 // the type it can RETURN disagree — a mixed CASE is the general
                 // route. A bare ColumnRef of a DOUBLE column is not: the value
                 // comes out of a DOUBLE ColumnVector already.
                 if (node->output_schema.column(c).type == TypeId::DOUBLE
                     && mayYieldInt(p->exprs[c].get(), cs)) {
-                    mergeOrigins(out[c], {IntOrigin{node, c}});
+                    mergeOrigins(out[c], newOrigin(node, c));
                 }
             }
             armAll(armed);
@@ -1043,7 +1129,7 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // fillChunk's MIN/MAX arm (and an expression group key) writes a
             // Value into a column typed before the value existed; see
             // collectIntOrigins.
-            n->setIntObservableColumns(maskFor(node));
+            n->setIntNarrowingColumns(maskFor(node));
             return n;
         }
 
@@ -1054,7 +1140,7 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 std::move(child), std::move(proj->exprs), proj->output_schema);
             // Pass 2's evaluate() path is the other site that writes a Value
             // into a pre-declared column type; see collectIntOrigins.
-            n->setIntObservableColumns(maskFor(node));
+            n->setIntNarrowingColumns(maskFor(node));
             return n;
         }
 
@@ -1086,14 +1172,57 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
 std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
         std::unordered_map<std::string, ColumnarTable> columnar_tables,
-        const Catalog& catalog) {
+        const Catalog& catalog,
+        bool result_int_type_observable) {
     // BEFORE lowering, not during: lowerNode MOVES the expressions out of the
     // logical nodes (proj->exprs, agg->aggregates, filter->predicate), so the
     // tree this walk reads no longer exists once lowering has run.
-    IntObservableMap int_observable;
-    collectIntOrigins(logical.get(), int_observable);
+    Arming arming;
+    OriginSets root = collectIntOrigins(logical.get(), arming);
 
-    Lowering lowering{columnar_tables, {}, catalog, int_observable};
+    // Every origin whose INT-ness can still be seen in THIS plan's RESULT. Two
+    // separate consumers, one set:
+    //
+    //  1. THE MATERIALIZATION CUT. `materializeSubqueries` splits a query into
+    //     two independent builds, and the taint walk runs once per build — so an
+    //     uncorrelated scalar body flattened its INT into a DOUBLE column, the
+    //     value crossed as a DOUBLE Literal, and the outer `7 / <it>` divided in
+    //     REAL where Volcano and SQLite truncate: 10000 rows against 0 (seam
+    //     subquery pass 4, B-1). Neither walk is wrong on its own and no walk
+    //     spans both, because the inner tree is destroyed before the outer one
+    //     exists. What DOES cross is the request: the caller running a body
+    //     whose value an INT-partnered `/` will divide sets
+    //     `result_int_type_observable`, and the body's own root columns are
+    //     armed exactly as an in-plan division would arm them. The refusal then
+    //     stays VALUE-driven — `MIN(...)` picking the REAL branch, or a body
+    //     whose branches are both REAL, still answers — which is the property
+    //     TYPEFIX_DIV_GUARDS_VEC_ONLY's first entry pins and a shape-only
+    //     refusal at the cut would have broken.
+    //
+    //  2. THE MAGNITUDE BOUND. An origin NOT in this set cannot have its own
+    //     text read: the taint dies in a comparison, a key encoding or an
+    //     aggregate that emits a fresh DOUBLE, and %.15g never sees it. Those
+    //     are judged on the value alone.
+    std::vector<IntOrigin> in_result;
+    for (const auto& col : root) mergeOrigins(in_result, col);
+
+    if (result_int_type_observable) {
+        for (const IntOrigin& o : in_result) {
+            markColumn(arming.mask, o, IntNarrowing::OBSERVABLE);
+        }
+    }
+    for (const IntOrigin& o : arming.all) {
+        if (std::find(in_result.begin(), in_result.end(), o) != in_result.end()) continue;
+        auto it = arming.mask.find(o.first);
+        if (it != arming.mask.end() && o.second >= 0
+            && o.second < static_cast<int>(it->second.size())
+            && it->second[o.second] == IntNarrowing::OBSERVABLE) {
+            continue;   // the type rule already refuses every INT here
+        }
+        markColumn(arming.mask, o, IntNarrowing::UNRENDERED);
+    }
+
+    Lowering lowering{columnar_tables, {}, catalog, arming.mask};
     countScans(logical.get(), lowering.scan_uses);
     return lowering.lower(logical.get(), nullptr);
 }

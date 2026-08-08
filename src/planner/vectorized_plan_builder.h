@@ -16,8 +16,16 @@
 // here, not in the logical plan
 class VectorizedPlanBuilder {
     public:
+        // `result_int_type_observable` — "somebody outside this plan is going to
+        // DIVIDE with the value this plan returns, using an INTEGER as the other
+        // operand". Default false, which is every top-level query: the divisions
+        // a query makes with its own columns are found by the builder's own
+        // walk. It is set only by the SUBQUERY RUNNER, because an uncorrelated
+        // scalar body is a SEPARATE build and no walk can see across the two —
+        // see the comment in build() and vec_types.h's IntNarrowing.
         static std::unique_ptr<VecPlanNode> build(
             std::unique_ptr<LogicalPlanNode> logical,
             std::unordered_map<std::string, ColumnarTable> columnar_tables,
-            const Catalog& catalog);
+            const Catalog& catalog,
+            bool result_int_type_observable = false);
 };
