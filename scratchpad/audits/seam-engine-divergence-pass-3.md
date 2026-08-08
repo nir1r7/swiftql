@@ -159,3 +159,71 @@ So E-8 is not a corner of pass 2's contrived predicate. `<any join> ... LIMIT n`
 moves one side's estimate across the other's raw count is the general shape, and TPC-H-scale
 tables (1500 vs 15000, two ordinary equality filters) reach it without help.
 
+
+---
+
+### A-1 (cont.) FINDING **E-9 (BLOCKER)** — the tie-break is a function of the row's values **and
+### of the schema's column ORDER**, and `JoinEnumeration` permutes that order. Two legs that both
+### run the tie-break, correctly, still cut differently.
+
+`sort_comparator.h` states the property it relies on:
+
+> It is a function of the row's VALUES alone. It cannot consult arrival order, hash bucket layout,
+> chunk boundaries, or which side built the hash table — precisely the things that differ between
+> the legs.
+
+That list is incomplete. `rowLess` walks `for (int i = 0; i < n; ++i) compareForTieBreak(a[i], b[i])`
+— a **lexicographic** order over the row **in schema index order**. Lexicographic order over a
+permuted tuple is a *different total order*. And the schema handed to the sort is the join's merged
+schema, whose column order is built from the **chosen join order**:
+
+`join_enumeration.cc:225-270`, `rebuild()`:
+```
+std::vector<ColumnDef> merged = node->output_schema.columns();   // order[0]'s columns
+for (ColumnDef& c : merged) c.relation_slot = order[0];
+for (k = 1 ...) { ... merged schema: [left block] ++ [this relation's columns, stamped r]; }
+```
+with the comment `// a slot-sorted "canonical" order is not available (invariant 1)`. Confirmed by
+`--explain`: `LogicalJoin ... order=customer@1,nation@2,orders@0` under the optimizer vs the written
+`orders, customer, nation` under `--no-optimize` — same relations, same rows, **columns in a
+different order**. The projection above the sort resolves by name/slot so the *printed* column order
+is unaffected; the *tie-break's* column order is not.
+
+**Concrete failing shape, run at HEAD** (`--catalog data/tpch/sf0.01/catalog.json`):
+
+```sql
+SELECT c.c_name, o.o_orderkey
+FROM orders o JOIN customer c ON c.c_custkey = o.o_custkey
+              JOIN nation   n ON n.n_nationkey = c.c_nationkey
+WHERE o.o_orderstatus = 'F'
+ORDER BY o.o_orderstatus
+LIMIT 3
+```
+
+```
+vec optimized      Customer#000000001  282 | Customer#000000001 7814 | Customer#000000002 1116
+vec --no-optimize  Customer#000000404    2 | Customer#000000830    3 | Customer#000001471    6
+```
+
+Disjoint row sets — a direct `optimized == --no-optimize` violation.
+
+**The mechanism is unambiguous here, in a way E-8's is not.** `o_orderstatus` is `'F'` for every
+surviving row, so the single declared key ties on *every* pair and the tie-break decides the entire
+order, in both legs. Both legs run it. Both are deterministic. They still disagree, because:
+
+- optimized leads with `customer` -> merged `[c_custkey, c_name, ...][n_...][o_...]` -> lexicographic
+  by `c_custkey` -> the three lowest customers.
+- `--no-optimize` keeps the written order -> merged `[o_orderkey, o_custkey, ...][c_...][n_...]` ->
+  lexicographic by `o_orderkey` -> order keys 2, 3, 6.
+
+Both answers are what the comparator promises; the comparator's promise is just not plan-independent.
+
+This is the *same* class 70570dc closed on the storage axis (two legs tie-breaking over different
+column SETS) reappearing on the optimizer axis (two legs tie-breaking over the same column set in a
+different ORDER). 70570dc's commit message says the asymmetry "was benign only because the first
+discriminating column happened to be `driver_id` in both legs. That is luck, and it changes with the
+data." The identical sentence applies here and no one checked the second axis.
+
+Volcano refuses three-way joins, so this is not observable as a Volcano-vs-vec difference — it is
+observable as the invariant the project actually gates on.
+
