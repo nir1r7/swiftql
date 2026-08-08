@@ -74,23 +74,38 @@ void requireDecorrelatableBody(const SelectStatement& body) {
 // forEachSubquery (dispatch site 19) is the maintained walk to every nested
 // SubqueryExpr; the flag is cleared across the single collectSlots call and put
 // back immediately, so what runs is site 8 itself answering a narrower
-// question. Every node cleared is recorded and restored — the flag is live data
-// (the body's own lowering passes route on it), not a scratch bit. collectSlots
-// cannot throw, so there is no path that skips the restore.
+// question. Every node cleared is recorded and restored, by a DESTRUCTOR rather
+// than by a trailing loop: `correlated` is live data — the body's own lowering
+// passes route on it, and forEachSubquery descends into nested BODIES, which are
+// held by a shared_ptr and may be reachable from another expression — so a throw
+// that skipped the restore would leave a shared tree silently mis-flagged.
+// collectSlots cannot in fact throw today (its one throwing call, localSlot, is
+// guarded by isLocal()), which is exactly why the restore must not depend on
+// that staying true.
 //
 // !! THIS IS HALF OF A COUPLED PAIR. See the depth refusal below.
+class SuppressNestedCorrelation {
+public:
+    explicit SuppressNestedCorrelation(std::unique_ptr<Expr>& e) {
+        forEachSubquery(e, [this](std::unique_ptr<Expr>& slot) {
+            auto* sq = static_cast<SubqueryExpr*>(slot.get());
+            if (!sq->correlated) return;
+            sq->correlated = false;
+            cleared_.push_back(sq);
+        });
+    }
+    ~SuppressNestedCorrelation() { for (auto* sq : cleared_) sq->correlated = true; }
+    SuppressNestedCorrelation(const SuppressNestedCorrelation&) = delete;
+    SuppressNestedCorrelation& operator=(const SuppressNestedCorrelation&) = delete;
+private:
+    std::vector<SubqueryExpr*> cleared_;
+};
+
 bool reachesOutsideThisBody(std::unique_ptr<Expr>& e) {
     if (!e) return false;
-    std::vector<SubqueryExpr*> suppressed;
-    forEachSubquery(e, [&](std::unique_ptr<Expr>& slot) {
-        auto* sq = static_cast<SubqueryExpr*>(slot.get());
-        if (!sq->correlated) return;
-        sq->correlated = false;
-        suppressed.push_back(sq);
-    });
+    SuppressNestedCorrelation guard(e);
     std::unordered_set<int> slots;
     collectSlots(e.get(), slots);
-    for (auto* sq : suppressed) sq->correlated = true;
     return slots.find(-1) != slots.end();
 }
 
