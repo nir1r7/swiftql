@@ -6,10 +6,13 @@ Repo `/home/user/swiftql`, branch `claude/phase5-week26-qomtkb`, HEAD `b2bc70e`
 (code identical to the gated `9da0494`).
 Predecessors: `seam-join-chain-pass-1.md`, `-2.md`, `-3.md`.
 
-STATUS: in progress — written incrementally.
+STATUS: COMPLETE.
 
-**One BLOCKER so far: P4-B1, below — fix round 3's own new rule (the FILTER-over-PROJECT
-descent) opens the exact divergence class that round's other new rule was written to close.**
+**Two BLOCKERS. P4-B1: fix round 3's own new rule (the FILTER-over-PROJECT descent) opens
+the exact divergence class that round's other new rule was written to close. P4-B2: that
+other rule — the totality screen — rests on a carve-out about what `inferExprType` decides
+at plan time, and the carve-out is false for comparisons, so all three movers still move a
+raising conjunct. Counts and verdict at the end.**
 
 Tooling for this pass, so a negative result means something:
 * an out-of-tree Debug build at `$SCRATCH/b4` (own directory, no shared build lock taken,
@@ -790,3 +793,57 @@ that would have to come back.
 This is why P4-M1 is MEDIUM and not "an easy win left on the table": the loss is real and
 measured (43104 vs 60637), the enabling property holds, and there is a second edit the
 change requires that today's code has explicitly argued itself out of needing.
+
+---
+
+## Summary
+
+| Severity | Count | IDs |
+|---|---|---|
+| BLOCKER | 2 | P4-B1, P4-B2 |
+| HIGH | 0 | — |
+| MEDIUM | 1 | P4-M1 (the half of pass-2 B-3 the fix did not reach) |
+| LOW | 3 | P4-L1, P4-L2 (carry-over: pass-2 B-1, still open), P4-L3 |
+
+**Pass 3's own two blockers are closed, and closed properly.** B3-1's tie-break now compares
+by column IDENTITY: `rebuild` preserves the SET of `(relation_slot, name)` pairs on every
+shape a structural probe could put to it, including a four-relation TPC-H spine with two
+`customer` relations and a DP order that moves the leading relation — the configuration
+pass 3 identified as the only one that fires. Where the pair is NOT unique (three schemas I
+constructed, all beneath a plain `LIMIT`), the stable sort falls back to a schema order that
+`LogicalPlanBuilder::build` fixed before any optimizer pass ran, so both legs agree. B3-2's
+join-key type rule now covers all four producers, resolves exactly as the physical builder
+resolves in every shape including the positional semi/anti rule (checked with a composite
+key whose two positions give DIFFERENT answers), and the AST loop is still, verifiably,
+Volcano's only cover. The sequencing constraint I raised in pass 3 held: the DP now runs
+inside derived bodies, semi-join bodies and the body of a declined LEFT join, and none of
+the newly enumerated regions moved an answer.
+
+**What did not survive is the round's own new rule.** Both blockers are the same failure at
+different depths, and it is the failure this file has now logged in four consecutive passes:
+**a precondition was written down, and the list it enumerates is shorter than the thing it
+governs.**
+
+- **P4-B1** — `remapThroughProject`'s precondition enumerates the columns the CONJUNCT
+  names. The expressions whose row count actually changes are the ones the PROJECT computes,
+  and they are never looked at. `SELECT COUNT(*) FROM (SELECT l.lap_id, l.lap_id *
+  1000000000000000 AS big FROM laps l) x WHERE x.lap_id < 100` -> **99 optimized, Error
+  under `--no-optimize`**, on the shipped catalog, with two more instances (as a join input;
+  with `SUBSTRING`) and seven negative controls that show the rest of the round works.
+- **P4-B2** — the totality screen's carve-out enumerates four type errors `inferExprType`
+  decides at plan time. A COMPARISON across the STRING boundary is a fifth and is NOT
+  decided there (`logical_plan.cc:171` returns `TypeId::INT` for every comparison without
+  looking at its operands), so `mayRaise` calls it total and all three movers move it —
+  including the mover this round added. `WHERE l.team LIKE 'zzz%' AND l.team = l.lap_id` ->
+  **Error optimized, 0 under `--no-optimize`**; the same through `distribute` below a join
+  with `=`, `<` and `!=`; the same inside a derived body.
+
+Both are silent in the harnesses for the same reason: every derived body and every conjunct
+in `compare_against_sqlite.py`, `test_new_queries.py` and TPC-H is total, and the eleven new
+derived-pushdown pins all pin WHICH NODE the filter lands on rather than what the projection
+beside it can do.
+
+**Verdict: the join chain's seam is NOT clean. Two blockers, both introduced or left open by
+fix round 3 itself, both `optimized != --no-optimize` on a query one leg answers and the
+other refuses, and both from an enumerated precondition that is one item short. The audit
+does not end here.**
