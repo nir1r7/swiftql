@@ -13,8 +13,7 @@ four modes (`columnar/vectorized`, the same `--no-optimize`, `row/volcano`,
 `columnar/volcano`), SQLite through the oracle's own
 `load_from_catalog(CATALOG_PATH)` so the data is byte-identical to the harness's.
 
-Status: **IN PROGRESS** (written incrementally; this line is the last thing to
-change).
+Status: **COMPLETE.**
 
 ---
 
@@ -495,9 +494,9 @@ are the round-4 cut family (`TYPEFIX_CUT_VECTORIZED_REFUSED` 5 +
 seam's *newest* refusals are now covered, which is the part of pass 4's B-2 that
 is genuinely addressed.
 
-**What remains.** The seam's pre-existing rejection suites number **19**
-(pass 4 counted 18; `WEEK34_DISTINCT_AGG_REFUSED` is the nineteenth) with **150**
-pins. Exactly one of them — `B32_JOIN_KEY_TYPE_REJECTED`, 7 pins — is in a gate
+**What remains.** The seam's pre-existing rejection suites number **19** by my
+enumeration (pass 4 counted 18 and 146 pins; the extra suite is
+`WEEK34_DISTINCT_AGG_REFUSED` with 4) with **150** pins. Exactly one of them — `B32_JOIN_KEY_TYPE_REJECTED`, 7 pins — is in a gate
 matrix. Not even its own Volcano twin is. Running the function over all 19:
 
 ```
@@ -675,3 +674,81 @@ Every refusal below was executed at HEAD, not read:
 * The correlated twin of the same query still refuses, and the derived-table twin
   still refuses — the three shapes pass 4 named are unchanged.
 
+* **The `COUNT` arm's early return is not observably wrong**, checked rather than
+  assumed: the only route by which `COUNT`'s NULL-count could differ between INT
+  and REAL division is a zero divisor, and `x / 0` and `x / 0.0` are both NULL in
+  every mode and in SQLite. Fixing it alongside `SUM`/`AVG` is uniformity, not a
+  defect.
+* **The two dead guards pass 3 logged** (EXISTS-body HAVING, scalar select-list
+  arity) and the three `use_count() > 1` guards were not re-derived this pass;
+  pass 4 found them unmoved and nothing in fix round 4 touches them.
+
+---
+
+## Summary
+
+| severity | count | findings |
+|---|---|---|
+| **BLOCKER** | 1 | B-1 |
+| **HIGH** | 2 | B-2, B-3 |
+| **MEDIUM** | 2 | B-4, B-5 |
+| **LOW** | 2 | B-6, B-7 |
+
+* **B-1 (BLOCKER)** — fix round 4 sent the arming request inward through
+  `divWalk`, and `divWalk`'s `AggregateExpr` arm returns for `SUM` and `AVG`
+  **without walking the argument**, while the plan-level walk it mirrors
+  (`collectIntOrigins`) walks `spec.argument` for every aggregate. So
+  `HAVING SUM(int_col / (SELECT <mixed CASE>))` is unarmed: **7 teams where both
+  Volcano modes and SQLite return 4**, at a threshold constructed from the two
+  divisions' actual sums. Also `AVG` (6 against 1) and the other polarity of the
+  `/` (7 against 1). The same aggregate-argument division refuses when it lives
+  in one plan, and `MAX` — whose arm does recurse — refuses from the same clause
+  on the same body. Both optimizer legs are wrong identically; no diffed entry in
+  the harness puts a subquery under an aggregate. One line fixes it.
+* **B-2 (HIGH)** — the Binder types a derived relation by calling
+  `blockOutputSchema` (`binder.cc:287`) before `materializeSubqueries` runs, so a
+  subquery that contributes to the derived body's OUTPUT SCHEMA — one in its
+  select list, or one inside an aggregate argument in its HAVING — reaches
+  `inferExprType`'s internal-defect guard. All four modes, no working mode,
+  SQLite answers. The HAVING form **answers correctly one nesting level out**;
+  the select-list form loses the position rule's own message. The guard's
+  reachability comment says these positions "hold no subquery at all … verified
+  rather than assumed" — verified at top level, false in a derived body.
+* **B-3 (HIGH)** — decorrelation lifts the correlated equality into a join key,
+  which removes it from the body's AND cascade, so a may-raise conjunct written
+  after it is evaluated on rows the written order excluded. `expr_totality.h`
+  states that no plan rewrite may do this. The discriminator is SwiftQL against
+  itself: with `d.driver_id = l.driver_id` as the guard the query raises; with
+  `d.driver_id = 1` in the same position it answers 0 = SQLite. All three
+  correlated lowerings, no working mode. Loud, never a wrong answer.
+* **B-4 (MEDIUM)** — `exprMayBeInt` passes `catalog = nullptr`, so the second
+  derived level gets an empty range table and always answers INTEGER. The stated
+  `MAX_TYPE_DEPTH = 3` is really 1: `t.s / (SELECT <mixed>)` over a REAL column
+  answers at one derived level and is refused at two, with no working mode.
+  Conservative direction, one parameter to fix.
+* **B-5 (MEDIUM)** — the gate now runs three pin matrices (7 / 17 / 5), six of
+  which cover this seam's new cut refusals. Of the seam's 19 pre-existing
+  rejection suites and 150 pins, exactly one suite (7 pins) is in a matrix.
+  Running the harness's own function over all 19 reports the **same four
+  findings pass 4 reported**, unchanged; the pooled matrix adds the same
+  `WEEK35` needle that three other producers satisfy.
+* **B-6 (LOW)** — a materialized body's value is judged by the RENDERED 1e15
+  bound although its text is never printed, so the round-4 UNRENDERED relaxation
+  never reaches a subquery body: 2e15 refuses across the cut and answers in the
+  single-plan form. Volcano still answers it, except inside a derived body where
+  nothing does.
+* **B-7 (LOW)** — pass 3's and pass 4's LOWs re-confirmed open at HEAD.
+
+**Verdict: the seam is NOT clean.** One blocker, and it is the *same defect the
+round fixed*, one AST node deeper: the arming request now crosses the
+materialization cut correctly through every slot except an aggregate argument,
+where the walk that was written to mirror `taintWalk` stops short of the subtree
+its model walks. Two HIGHs sit either side of it, both about a boundary rather
+than a rule — a derived relation typed before its subqueries exist, and a
+correlated equality that stops guarding the moment it becomes a join key. What
+continues to hold, probed again and correct in every shape: routing, NULL
+semantics across all four set predicates, cardinality and its documented
+divergence, zero-rows-is-NULL, correlation depth, the LIMIT cut, all five
+join-key producers, both magnitude bounds, and nesting to four levels. The
+lowering machinery is sound; what fails, for the fourth pass running, is a value
+or a question crossing a boundary that each side reasons about correctly alone.
