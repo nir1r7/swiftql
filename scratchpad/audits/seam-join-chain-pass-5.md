@@ -336,3 +336,155 @@ LIMIT, and they differ only because the three rows the two orderings cut to are
 different rows — one trio raises and the other does not. That is the rule working
 as designed (the PLAN decides which rows the projection sees), and it is the same
 in both legs.
+
+---
+
+## Part B — hunting what four passes missed
+
+Everything in Part B was aimed at the join layer specifically: multi-way spines
+under reordering, semi/anti in a chain, derived tables as join inputs,
+decorrelated subqueries lowered to joins, join key types / composite keys / NULL
+keys, and the predicate/residual split. **P5-B1 came out of the last of those** —
+the predicate/residual split is where the join chain keeps a per-row expression
+that is not a conjunct of any list, and that is exactly the object the round-4
+rule does not reach.
+
+### B5-1 — P5-B1's other movers, and the one negative that isolates the mechanism
+
+The blocker is not confined to `distribute` on a two-relation join. Three more
+instances, each with a different mover:
+
+    R4  the masker is the pushed WHERE conjunct ALONE — chunk pruning contributes
+        nothing (`chunks_skipped=0/2`, because `driver_id`'s zone map spans the
+        full range in both chunks)
+        SELECT COUNT(*) FROM laps l LEFT JOIN drivers d
+          ON l.driver_id = d.driver_id AND SUBSTRING(l.team, l.driver_id - 5, 2) = 'x'
+        WHERE l.driver_id > 10
+          opt -> 4915      noop / rvol / cvol -> Error
+
+    R5  the masker is `pushIntoDerived` + the FILTER-over-PROJECT descent: the
+        LEFT join's PRESERVED side is a derived relation and the conjunct enters
+        its body
+        SELECT COUNT(*) FROM (SELECT l.lap_id AS lid, l.driver_id AS k, l.team AS t
+                              FROM laps l) x
+        LEFT JOIN drivers d ON x.k = d.driver_id AND SUBSTRING(x.t, x.k - 12, 2) = 'x'
+        WHERE x.k > 15
+          opt -> 2422      noop -> Error
+          (optimized plan: LogicalFilter [(l.driver_id > 15)] lands BELOW the
+           body's LogicalProject, three nodes under the LogicalLeftJoin)
+
+    R6  the masker is `distribute` reaching relation 1 of a THREE-relation spine
+        whose top join is the LEFT one
+        SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id
+        LEFT JOIN drivers d2 ON d.team = d2.team AND SUBSTRING(d.name, d.age - 30, 2) = 'x'
+        WHERE d.age > 33
+          opt -> 4087      noop -> Error
+
+R4 matters most: it rules out the storage layer. In R1 the zone map skips a chunk
+in BOTH legs (`chunks_skipped=1/2` on the optimized and the `--no-optimize` leg
+alike — and it is not the skip that saves the optimized leg, since `laps` chunk 1
+carries `lap_id` up to 9998, i.e. the overflow), and R4 has no skip at all. So
+the mover is the pushed filter, in all four instances, and the fix belongs in
+`distribute`.
+
+### B5-2 (MEDIUM, P5-M1) — inside a LEFT JOIN's `ON` clause there is NO conjunct cascade, so the SAME predicate text has two different error behaviours depending on the join type, and the rule that now DEFINES evaluation order does not say so
+
+All four legs agree, so this is not a gate divergence — it is the project's own
+newly-written rule being false for a construct the CLI accepts.
+
+`expr_totality.h` states the rule as: *a conjunct is evaluated on the rows for
+which every conjunct WRITTEN BEFORE IT evaluated TRUE*, and cites
+`evaluatePredicate()` / `evalPredicate()` as implementing "exactly this cascade".
+A LEFT join's ON residual is not run through either: it is one `Expr` handed to
+`evaluate()` per candidate pair (`plan_nodes.cc:736-742`, and the vectorized
+join's residual path), and `evaluate()` computes BOTH operands of an `AND` before
+looking at the operator. Measured, same predicate text in three positions:
+
+    ON  … AND l.lap_id > 9990 AND SUBSTRING(l.team, l.lap_id - 9990, 2) = 'x'   (LEFT JOIN)
+          opt / noop / rvol / cvol -> Error: SUBSTRING: start position must be >= 1
+    ON  … the identical text on an INNER JOIN (residual folded into the WHERE)
+          all four legs -> 0
+    WHERE l.lap_id > 9990 AND SUBSTRING(l.team, l.lap_id - 9990, 2) = 'x'
+          all four legs -> 0
+
+So `A AND B` inside a LEFT join's ON evaluates B on rows where A is FALSE, and
+the same text one keyword away does not. That is a real semantic difference the
+user can neither see nor predict from the rule as written, and it is the reason
+P5-B1 is possible at all: an expression with no cascade has no "written before"
+row set to protect, so the screen has nothing to hook onto and the row set gets
+decided by whatever the optimizer leaves above the join.
+
+**Ranked MEDIUM, not LOW**: it is not cosmetic (it decides whether a query
+errors), it is not a leg divergence (all four agree), and the correct fix is a
+decision the fixer has to make rather than a mechanical edit — either give the
+residual the cascade (split it into conjuncts and evaluate them in order, which
+makes the LEFT and INNER forms agree) or write the exception into
+`expr_totality.h` and `join_condition.h`. Doing neither leaves the rule's central
+sentence false.
+
+### B5-3 — NULL semantics through the whole chain — **CLEAN** (16 shapes, three ways)
+
+Every shape below uses a derived body that manufactures NULL keys with a LEFT
+JOIN (`SELECT d.driver_id AS k, l.lap_id AS nk, d.team AS t FROM drivers d LEFT
+JOIN laps l ON d.driver_id = l.driver_id AND l.lap_id < 3`), then puts those NULL
+keys where the chain can drop or keep them. `vec`, `vecno` and SQLite agree on
+all 16:
+
+NULL key as an inner join key (2) and as a LEFT join key (20); `NOT IN` over a
+NULL-bearing body (0 — the three-valued answer) against `NOT EXISTS` over the
+same body (9998 — the two-valued one), which is the `ANTI_NOT_IN` / `ANTI` split
+live and correct in both directions; `IN` over it (2); a NULL OUTER key against
+`NOT IN` (0), `NOT EXISTS` (18) and `IN` (2); a COMPOSITE key with one NULL
+component through a semi join (2) and an anti join (18); semi + anti stacked on a
+spine carrying the NULL-key derived input (12); an anti join over a LEFT-joined
+spine (4409); a correlated scalar over a spine with a NULL key (2); two derived
+relations joined on a composite key, both aliasing the same names (10000); a
+DOUBLE key (`AVG(...)`) joined to an INT key with integral values (20); and a
+four-layer chain derived -> LEFT join -> semi -> anti (18).
+
+### B5-4 — join key types, re-confirmed at HEAD — **CLEAN**
+
+Pass 3's nine K-shapes re-run on the two-CSV catalog (`ids(code STRING)`,
+`nums(n INT)`), `columnar/vectorized`: all eight producible shapes are refused by
+name, and each names its producer (`JOIN ON:`, `IN / EXISTS subquery:`,
+`NOT IN subquery:`, `NOT EXISTS subquery:`, `join key: … the subquery's key
+column`), including K9 (derived relation as a join input). The two same-type
+controls answer. So `Validator::validateJoinKeyTypes` still covers all four
+`JoinKey` producers at `b14d086`.
+
+### B5-5 — the standing sweep
+
+**P4-L3 is CLOSED.** `predicate_pushdown.h:27-37` now names four moves, says the
+count is part of the claim, and names the second screen the fourth move carries.
+
+**P4-L1 is still OPEN, and it has a SECOND live copy** (LOW, carried).
+`sort_comparator.h:100-101` still says "a PROJECTED schema's order is a function
+of the SELECT list rather than of the plan", which is false for `SELECT *`
+(`logical_plan.cc:1247-1266` copies the CHILD's schema column by column). The
+copy pass 4 did not find is `logical_plan.cc:987`, in `deterministicCut`'s own
+header: "the projected schema's own order is a function of the SELECT list". Same
+sentence, same falsity, same surviving conclusion (both orders are fixed inside
+`LogicalPlanBuilder::build`, before any optimizer pass runs). Two files now, one
+of them the file the fix round touched.
+
+**P4-L2 is still OPEN after three fix rounds** (LOW, carried). Verbatim at HEAD:
+`join_enumeration.cc:585`, `cardinality_estimator.cc:464` and `:513` still name
+`hasSlotOutsideRangeTable`, gone since `18af84f`; and `development.md:808` still
+asserts "**The decline is silent** … there was no ordering decision to report",
+which `development.md:854` corrects, which
+`join-ordering=skipped (semi/anti join)` contradicts in the plan output, and
+which is the premise P4-M1 turns on.
+
+**The fifth retracted paragraph the prompt predicts is `expr_totality.h`'s own
+enumeration, and it is P5-B1's.** The file written this round to be the single
+statement of the rule opens with "THE THREE CONSUMERS, and why each needs the
+same answer" and the sentence "every other expression is evaluated on every row
+that reaches its node". A LEFT join's ON residual is a fourth site whose row set
+a plan rewrite moves, and the sentence quietly assumes no rewrite changes what
+reaches a node — which is precisely what `distribute` does. `predicate_pushdown.h`
+inherits it ("All four are screened now"), and `development.md`'s Week 32
+consumer table states the mechanism as a virtue: "The recursion into `children[0]`
+stays unconditional, which is what keeps a WHERE conjunct reaching the spine's
+scans". All three must be swept with the fix. **That is five consecutive passes in
+which the defect was an enumerated precondition one item shorter than the thing
+it governs.**
