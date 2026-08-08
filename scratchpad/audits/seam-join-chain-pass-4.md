@@ -389,3 +389,112 @@ declined node sits ABOVE a block that is legal to reorder and whose merged schem
 `(slot, name)` pairs (A.1) so the semi join's own `leftKeyIndices` still resolves.
 Plan-quality only — declining is always legal — hence MEDIUM, not a blocker. Worth naming
 because the comment that motivates the decline reads as though the loss were unavoidable.
+
+---
+
+## BLOCKER P4-B2 — the totality screen's carve-out is wrong: `inferExprType` does NOT decide a STRING-vs-numeric COMPARISON at plan time, so `mayRaise` calls a raising conjunct total and all three movers move it. `optimized -> Error` where `--no-optimize` answers
+
+**Severity: BLOCKER.** The exact divergence class fix round 3's totality screen was written
+to close, still open, in the INTRODUCED direction, on the shipped `catalog.json`, through
+three different movers including the one this round added.
+
+### The claim that is false
+
+`predicate_pushdown.cc:380-384`, the screen's own carve-out:
+
+> What it does NOT have to cover, because `inferExprType` (logical_plan.cc) decides it at
+> PLAN time — in both legs, before any pass in this file runs — is every TYPE error: STRING
+> arithmetic, a non-STRING LIKE or SUBSTRING operand, a mixed IN list, a CASE with mixed
+> branches. Those raise identically in both legs no matter how the conjuncts are arranged.
+
+Four constructs are listed. A COMPARISON across the STRING boundary is not among them, and
+it is not decided at plan time. `inferExprType` (`logical_plan.cc:159-171`):
+
+    if (op == "+" || op == "-" || op == "*" || op == "/") {
+        if (l == TypeId::STRING || r == TypeId::STRING) throw …;
+        …
+    }
+    return TypeId::INT;   // comparison / AND / OR
+
+It types a comparison as INT **without comparing its operand types at all**. The throw
+happens per row instead, in `Value`'s `NUMERIC_COERCE` macro (`value.cc:50-57`), which is
+shared by `== != < > <= >=` — every one of them raises `Type mismatch in Value comparison`
+across the STRING boundary. `mayRaise` (`predicate_pushdown.cc:413-417`) screens BinaryExpr
+by operator and returns `mayRaise(left) || mayRaise(right)` for anything that is not
+`+ - * /`, so `l.team = l.lap_id` — two plain `ColumnRef`s — is classified **total**.
+
+### The failing shapes, on the shipped catalog
+
+    T1  (mover: orderByWork)
+        SELECT COUNT(*) FROM laps l WHERE l.team LIKE 'zzz%' AND l.team = l.lap_id
+          optimized       -> Error: Type mismatch in Value comparison
+          --no-optimize   -> 0
+
+        --explain, the two legs:
+          optimized      VecFilter [((l.team = l.lap_id) AND l.team LIKE 'zzz%')]  est=500
+          --no-optimize  VecFilter [(l.team LIKE 'zzz%' AND (l.team = l.lap_id))]
+        The equality is scored more selective, so the sort moves it AHEAD of a LIKE that
+        matches nothing, and it is then evaluated on all 10000 rows.
+
+    T3  (mover: distribute)
+        SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id
+        WHERE d.nationality = 'Zzz' AND l.team = l.lap_id
+          optimized       -> Error       --no-optimize -> 0
+
+        LogicalJoin [driver_id = driver_id]
+          LogicalFilter [(l.team = l.lap_id)]     <- pushed below the join, 10000 rows
+            LogicalScan [laps, 3 columns]
+          LogicalFilter [(d.nationality = Zzz)]   est=1
+
+    T5  the same as T3 with `l.team < l.speed`      optimized -> Error, --no-optimize -> 0
+    T6  the same as T3 with `l.team != l.lap_id`    optimized -> Error, --no-optimize -> 0
+
+    T7  (mover: pushIntoDerived + the FILTER-over-PROJECT descent — fix round 3's own
+         new rule, so the screen and the rule that needs it shipped together)
+        SELECT COUNT(*) FROM (SELECT l.team AS t, l.lap_id AS n FROM laps l) x
+        WHERE x.t LIKE 'zzz%' AND x.t = x.n
+          optimized -> Error       --no-optimize -> 0
+
+    T2  control — the same two conjuncts written in the raising order:
+        both legs Error, which is correct and is what the invariant asks for.
+    T4  control — `l.team + 1 > 0`, which IS in the carve-out's list:
+        both legs `Error: '+' requires numeric operands`, at plan time, as claimed.
+
+**This is pass 3's B3-2 with a different operator class and the same three causes.** Fix
+round 3 corrected my pass-3 attribution by finding that B3-2 had three movers
+(`orderByWork`, `distribute`, `pushIntoJoin`'s leftover loop) rather than one; the fix then
+screened by OPERATOR and enumerated `+ - * /`, `SUBSTRING` with a computed position, unary
+minus, `IntervalLiteral` and `SubqueryExpr` — and rested the rest on a carve-out that
+mis-states what `inferExprType` checks. Every mover the round enumerated re-opens the
+divergence on this operator class, and the round's own new mover makes a fourth.
+
+### What the class is, stated so the fix can be bounded
+
+A conjunct raises through `Value`'s comparison operators exactly when the two operand
+VALUES have different `variant` indices and at least one is STRING. `inferExprType` proves
+neither side is STRING only for arithmetic. So the raising comparisons are those where the
+two operands' INFERRED types straddle the STRING boundary — which `inferExprType` already
+computes and throws away at `logical_plan.cc:171`.
+
+### Fix shape (minimum), and it is smaller than it looks
+
+Two independent options, and the first is strictly better because it removes the hazard
+rather than routing around it:
+
+1. **Make the carve-out true.** Have `inferExprType` refuse a comparison whose operands
+   straddle STRING, the way it already refuses arithmetic — one `if` beside the existing
+   one at `logical_plan.cc:165-169`. The predicate becomes a plan-time error in BOTH legs,
+   `mayRaise`'s classification becomes correct without changing, and this also closes the
+   same hole for every other consumer of per-row comparison (the WHERE cascade, the ON
+   residual, `HAVING`). It is the same stance Week 29 took for join keys, and
+   `validator.cc:125` already asserts the fact it rests on ("`Value::operator==` throws
+   `Type mismatch` across the STRING boundary, so the identical predicate in a WHERE clause
+   is an error") — a sentence that is true only for the col-vs-literal form today.
+2. **Or make `mayRaise` true**: give it the schema and return `true` for a comparison whose
+   operands straddle STRING. Strictly more code, keeps the query answerable, and leaves the
+   two legs agreeing on an error-free answer only when written order is lucky.
+
+Whichever is chosen, the carve-out paragraph (`predicate_pushdown.cc:377-404`) must be
+swept: its list of what `inferExprType` decides is the load-bearing claim, it is enumerated
+rather than derived, and this is the second time in two rounds that an enumerated list in
+this file has been short.
