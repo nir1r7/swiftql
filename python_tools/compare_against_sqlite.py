@@ -151,17 +151,20 @@ CONSTANT_FOLDING_QUERIES = [
     # Literal, the Validator's column-ordinal rule tested Literal-ness, and every
     # one of these was REFUSED as an ordinal the user had not typed
     # ("ORDER BY 1 + 1" -> "ORDER BY 2: column ordinals are not supported").
-    # SQLite accepts all of them — an integer literal is an ordinal to SQLite
-    # only when written as one, and `1 + 1` is a constant expression on which
-    # every row ties. The diffed suite could not hold them until now because it
-    # cannot hold a query that errors; the still-refused half is pinned in
-    # WEEK37_COLUMN_ORDINAL_REFUSED. Each carries a unique tie-break so a
-    # constant primary key still leaves a total order to compare in emitted
-    # order.
+    # SQLite accepts all of them, and BINARY ARITHMETIC is exactly the boundary:
+    # to SQLite an ordinal is an integer literal under any number of parens and
+    # unary signs, so `(1)` and `- -1` ARE ordinal 1 and stay refused (they are
+    # in WEEK37_COLUMN_ORDINAL_REFUSED), while `1 + 1` is a constant expression
+    # on which every row ties. This distinction is only visible on data whose
+    # insert order, column-1 order and column-2 order all differ; a first pass
+    # at this suite put `(1)` and `- -1` here and the diff caught it.
+    #
+    # The diffed suite could not hold any of these until now, because it cannot
+    # hold a query that errors. Each carries a unique tie-break so a constant
+    # primary sort key still leaves a total order to compare in emitted order.
     "SELECT team, speed FROM laps ORDER BY 1 + 1, lap_id LIMIT 10",
     "SELECT team, speed FROM laps ORDER BY 2 * 1, lap_id LIMIT 10",
-    "SELECT team, speed FROM laps ORDER BY (1), lap_id LIMIT 10",
-    "SELECT team, speed FROM laps ORDER BY - -1, lap_id LIMIT 10",
+    "SELECT team, speed FROM laps ORDER BY 1 + 0, lap_id LIMIT 10",
     "SELECT COUNT(*) AS c FROM laps GROUP BY 1 + 1",
     # ...and the same manufactured Literal from the OTHER rewrite that runs
     # before the Validator: the binder substitutes a clone of the select-list
@@ -199,6 +202,16 @@ WEEK37_COLUMN_ORDINAL_REFUSED = [
      "GROUP BY 1: column ordinals are not supported"),
     ("SELECT COUNT(*) FROM laps GROUP BY -1",
      "GROUP BY -1: column ordinals are not supported"),
+    # Parentheses and unary signs are TRANSPARENT to SQLite's ordinal rule, so
+    # these are ordinal 1 / ordinal 2 there and belong on this side of the line,
+    # not in the diffed suite. The message reports the ordinal the term denotes,
+    # which is what SQLite itself resolves it to.
+    ("SELECT team, speed FROM laps ORDER BY (1) LIMIT 10",
+     "ORDER BY 1: column ordinals are not supported"),
+    ("SELECT team, speed FROM laps ORDER BY - -1 LIMIT 10",
+     "ORDER BY 1: column ordinals are not supported"),
+    ("SELECT team, speed FROM laps ORDER BY ((2)) LIMIT 10",
+     "ORDER BY 2: column ordinals are not supported"),
 ]
 
 # Expressions in the WHERE and projection positions now compile to the
@@ -1396,6 +1409,13 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "SELECT l.lap_id AS id FROM laps l WHERE l.speed > "
     "(SELECT MAX(l2.speed) AS m FROM laps l2 WHERE l2.driver_id = l.driver_id "
     "AND l2.season = 2024) ORDER BY id",
+    # ...and the alias COLLIDING with the correlation key's own column name. The
+    # $kN rename (8a23b9d) makes this safe from the key side; this says so from
+    # the alias side, and it is the shape where "resolve by a name derived in one
+    # place and looked up in another" could have hit the WRONG column rather than
+    # no column. 4994, same as the unaliased form.
+    "SELECT COUNT(*) AS n FROM laps l WHERE l.speed > "
+    "(SELECT AVG(l2.speed) AS team FROM laps l2 WHERE l2.team = l.team)",
     # !! THE WRAPPED-COUNT PAIR, and the reason the wrapper is lifted OUT of the
     # body rather than pushed through it. COUNT over an empty group is 0, not
     # NULL, so the substitution site wraps the reference in
