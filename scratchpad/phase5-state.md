@@ -8,8 +8,30 @@ Current: seam-audit **FIX ROUND 2** in flight — 3 concurrent fixers. Pass 2 co
     Fix shape: mark the synthetic $scalarN columns `hidden` — hence the schema.h doc sweep, because
     `ColumnDef::hidden` had documented itself as "aggregate outputs referenced only in
     HAVING/ORDER BY", which the fix falsifies.
-  Fixer B (constant folding + catalog + explain): owns validator.cc, ast.h, parser.cc, binder.cc,
-    tests/test_logical_plan.cc, constant_folding, catalog.cc, vectorized_plan_builder.cc.
+  Fixer B (constant folding + catalog + explain): **DONE**, all three items pushed. 823/823 C++.
+    - Item 1 chose to make the ordinal rule test **WHAT THE USER WROTE**, not Literal-ness: the
+      parser stamps `written_ordinal` on OrderByItem/GroupByColumn and the Validator tests that.
+      Right call for a reason the audit did NOT name: **folding was not the only rewrite
+      manufacturing Literals there** — the binder's select-alias substitution does it too, so
+      `SELECT 1 AS one, team FROM laps ORDER BY one` was refused as `ORDER BY 1`. No amount of
+      gating folding would have reached that.
+    - **IT GOT THE BOUNDARY WRONG FIRST AND SAID SO.** Its first characterisation of SQLite came
+      from a TWO-ROW table where sorting by column 1, by column 2, and by a constant all return
+      the same order — every hypothesis passed and it read back the one it already had. Re-measured
+      on data whose insert order, column-1 order and column-2 order all differ:
+        ORDER BY 1 / (1) / -1     -> ordinal (parens and unary signs are TRANSPARENT)
+        ORDER BY 1+1 / 2*1 / 1+0  -> NOT an ordinal (insert order)
+      **Binary arithmetic is the whole boundary.** This is the single best piece of method in the
+      phase: a test bed that cannot distinguish hypotheses will confirm whichever one you hold.
+    - The test that passed either way: every witness in `ColumnOrdinals.RejectedInOrderByAndGroupBy`
+      contained a ColumnRef and so COULD NOT FOLD. New exhaustive test fails pre-fix (all six
+      EXPECT_NO_THROW threw).
+    - No stale rejection entry existed to delete — `grep -rn ordinal python_tools/` returned
+      NOTHING, which is the other half of why the refusal survived unnoticed.
+    - NOT fixed, adjacent: `catalog.cc`'s `tables_.emplace(meta.name, ...)` silently keeps the
+      FIRST of two same-named TABLES. Same class one level up; no cross-storage divergence.
+    - Its pre-lock results were re-run under the lock and held. One earlier subset run produced
+      ~180 spurious "NO LONGER ERRORS" across suites it never touched — artifact, not finding.
   Fixer C (deterministic tiebreak, E-1/E-1b): owns vec_sort_node, vec_limit_node, and the Volcano
     sort/limit in plan_nodes. **USER DECISION: deterministic tiebreak**, NOT unifying build-side
     selection (that would permanently constrain the optimizer). Where ORDER BY is not a total

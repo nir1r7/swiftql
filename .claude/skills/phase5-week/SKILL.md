@@ -156,6 +156,13 @@ keep that honest:
   the binary it just built holds the lock across the whole build+run sequence. This hits an agent
   investigating *result differences* hardest: a binary changing mid-comparison produces exactly
   the row-set difference it is hunting.
+- **A snapshot commit costs the agent its commit.** Snapshotting a fixer's in-progress work as
+  crash insurance sweeps up whatever it had staged, so its own commit lands **empty**, carrying
+  the rationale while the content sits in your `wip` commit. That is a real loss — the reasoning
+  and the diff end up in different places, and `git log -p` on the fix shows nothing. Snapshot
+  anyway when a reclaim would destroy the work, but say in the snapshot message which agents' work
+  it swept, and tell the agent to reference your `wip` SHA in its own commit so the two can be
+  found together.
 - **Give concurrent fixers explicit, disjoint file ownership in their prompts**, and name the
   files the *other* agents own so a collision is recognisable from inside. Expect the boundary to
   be crossed legitimately — a `SELECT *` fix genuinely reaches the binder, and the standing sweep
