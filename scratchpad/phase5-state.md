@@ -1,5 +1,43 @@
 # Phase 5 orchestrator state
 
+## PASS 4 — storage: **0 BLOCKER / 0 HIGH / 2 MEDIUM / 5 LOW** (edccf92). Clean seam.
+**IT CORRECTED ITS OWN SEAM'S PASS-3 NUMBER.** S-9's headline 1540x was over **Plan+Execution
+only** — the flattering denominator. End-to-end it is **+73.8 ms on 2697 ms = +2.7%**, because
+~2.7 s of every run is CSV loading the engine never times. Pass 3 stated only the flattering one.
+S-9 otherwise UNCHANGED in code (still a plan-time lambda; no `keep_`; benchmark.py still greps
+`Execution:` only) and it found a SECOND call site: subquery materialization copies the whole table
+and re-narrows it — row plan time **1.93 s vs columnar 0.49 s** on one TPC-H query.
+**Three NEW findings, all from the deterministic cut — which landed AFTER pass 3's HEAD (verified
+by ancestry), so every LIMIT shape pass 3 tested predates it:**
+- **S-12 MEDIUM — the bounded top-N is wired to the CUT ONLY.** `row_cap` is assigned in exactly
+  two places, both in `deterministicCut`. So a DECLARED `ORDER BY l_orderkey LIMIT 5` on lineitem
+  sorts all 600865 rows (1.00 s), identical to the same query with NO LIMIT. Isolated on the same
+  comparator and input: `row_cap=0` 23987us vs `row_cap=5` 2898us = **8.3x**, plus O(input) ->
+  O(cap) memory. **Fix is one argument.** (This is exactly the "narrower than the finding" item the
+  comparator agent flagged about its own work.)
+- **S-10 LOW — `LIMIT 0` over a join is the MOST expensive cut**: `row_cap=0` reads as "unbounded",
+  so returning zero rows costs 8.3x returning one. Volcano pays it, vectorized short-circuits —
+  12.8 ms vs 13.3 us.
+- **S-11 LOW — adding an `ORDER BY` THAT CANNOT CHANGE THE ANSWER decides whether the query RUNS AT
+  ALL.** The cut's sort sits ABOVE the projection (a declared ORDER BY's sits below), and on the
+  vectorized path that is where the new refusals live: refused without the ORDER BY, answered with
+  it. Volcano answers both, in both storage formats.
+ANSWERS TO THE BRIEF: `orderIsPlanStable` classifying SCAN stable unconditionally is **TRUE for both
+  formats** — verified for order, for pruning-preserves-survivor-order, and for the one shape that
+  could break it (a LIMIT directly over a pruning scan with no filter) not existing on any of the
+  eight hint routes. `&rows_[cursor_]` is safe under the new sort (it copies in every branch). The
+  two new refusals **WIDEN** the storage oracle rather than escaping it — every shape they push off
+  vectorized lands in Volcano, the one engine running both formats, and A/B agree on all of them.
+EVIDENCE: **1072 queries x 4 invocations, 0 storage-format divergences** — 322 hand-written (LIMIT at
+  every chunk boundary, pruning-with-a-cut, disjoint-zone-map leak detectors, a 120-query zone-map
+  sweep straddling 2^53) + 750 randomized, 85% carrying a LIMIT. The 2 randomized "divergences" are
+  row-order-only on unordered joins (identical multiset) — the accepted JOIN rule, logged as a
+  NON-finding.
+WEEK 37 SIZING REVISED UP to ~95-120 lines (was 85-105): `appendColumnValue` now carries two
+  throwing refusals, so a row-backed `VecScanNode` must write `cv.data` directly rather than route
+  base-table values through them. **Do S-9 first** — its `keep_` vector is exactly what the fill
+  loop needs.
+
 ## PASS 4 — optimizer preservation: 0 BLOCKER / 2 HIGH / 1 MEDIUM / 3 LOW. B3-2 IS NOT CLOSED.
 **P4-1 (HIGH) — `mayRaise` is UNDER-approximate, and the sentence it rests on was NEVER TRUE.**
 The fix's precondition cites *"`inferExprType` decides every TYPE error at PLAN time — in both
