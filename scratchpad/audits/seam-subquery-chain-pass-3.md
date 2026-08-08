@@ -351,3 +351,161 @@ added there later inherits the weak pin automatically.
 
 This is the same class as pass 2's B-6 (one entry, fixed in `b24f46e`) — five
 more entries of it, in three suites, one of which documents the rule it breaks.
+
+### NULL semantics — the open coverage hole, assessed. NOT a blocker.
+
+The brief's standing item: *"17 `NOT IN` oracle entries and not one has a NULL
+in the body."* Two things have changed since pass 2 wrote that, and I checked
+both.
+
+**(a) The count is now 19, and the hole is partly closed at HEAD.**
+`WEEK32_SEMI_JOIN_VEC_ONLY` carries three LEFT-JOIN-manufactured NULL entries
+(the join-chain auditor's, present in this tree):
+
+```
+... WHERE driver_id NOT IN (SELECT l.driver_id FROM drivers d
+                            LEFT JOIN laps l ON d.driver_id = l.driver_id
+                                            AND l.speed > 99999)     -- all-NULL BODY
+... FROM drivers d LEFT JOIN laps l ON ... AND l.speed > 99999
+    WHERE l.driver_id NOT IN (SELECT driver_id FROM laps)            -- NULL on the OUTER side
+... the same, IN rather than NOT IN
+```
+
+So "not one has a NULL" is no longer true of this tree. What is still missing is
+the **MIXED** body — one NULL beside real keys — which is the case an all-NULL
+body cannot reach: an implementation that only set its unmatchable flag when the
+build side is *entirely* NULL passes every entry above.
+
+**(b) The behaviour is correct, in every shape I could manufacture.** Two
+independent NULL routes (expression `x/0`, and LEFT-JOIN null-extension),
+against SQLite:
+
+| shape | SwiftQL | SQLite | what a wrong impl would give |
+|---|---|---|---|
+| `NOT IN` all-NULL body | 0 | 0 | 20 (two-valued) |
+| `IN` all-NULL body | 0 | 0 | — |
+| `NOT IN` **mixed** body (`l.driver_id/(l.driver_id-5)`) | 0 | 0 | 16 (NULL dropped from build) |
+| `NOT IN` **mixed** body (LEFT JOIN route) | 0 | 0 | **15** |
+| ...same body with the NULL rows filtered out (counterfactual) | 15 | 15 | — |
+| `IN` mixed body (LEFT JOIN route) | 5 | 5 | — |
+| `NOT IN` over an EMPTY body | 20 | 20 | 0 |
+| NULL outer, non-empty body, `NOT IN` | 0 | 0 | 20 |
+| NULL outer, EMPTY body, `NOT IN` | **20** | 20 | 0 — the empty set makes `NOT IN` TRUE even for a NULL operand |
+| NULL outer, EMPTY body, `IN` | 0 | 0 | — |
+| NULL outer, `NOT EXISTS` (two-valued: KEEP the row) | **20** | 20 | 0 if `ANTI` had `ANTI_NOT_IN`'s rule |
+| NULL outer, `EXISTS` | 0 | 0 | — |
+| NULL correlation key on the BUILD side of `NOT EXISTS` | 20 | 20 | — |
+| ...and of `EXISTS` | 0 | 0 | — |
+| `NOT IN` NULL body inside a DERIVED body | 0 | 0 | — |
+| `NOT IN` whose body is itself a DERIVED table, NULL-bearing | 0 | 0 | — |
+
+The three rows in bold are the ones that part `ANTI` from `ANTI_NOT_IN` on the
+same data: a NULL operand makes `NOT IN` unknown but leaves `NOT EXISTS` true,
+and an empty right side makes `NOT IN` true again. All three are right.
+
+**One producer of NULL that structurally cannot reach a `NOT IN` build key**,
+worth recording because it looks like a gap and is not: a correlated scalar's
+zero-row rule manufactures NULL, but its value can never become a set-membership
+key — a subquery is refused in the SELECT position by the Validator
+(`allow_subqueries=false`), so the only way to project it is impossible, and the
+`IN` operand must be a plain `ColumnRef` (`subquery_lowering.cc:70`). So the two
+NULL mechanisms in this seam do not compose.
+
+So: **the hole is narrower than recorded and the behaviour behind it is
+correct**. It stays a coverage item (L-3), not a blocker.
+
+### Cardinality — the documented divergence has not widened.
+
+`README.md:104` states the only deliberate cardinality divergence in the
+subquery rules: a MATERIALIZED scalar over more than one row is an error here
+and SQLite's first row there. Re-verified end to end at HEAD:
+
+```
+WHERE l.speed > (SELECT l2.speed FROM laps l2)                -> Error: scalar subquery
+                                                                 returned more than one row
+                                                                 (SQLite answers 1852)
+WHERE l.speed > (SELECT l2.speed FROM laps l2 WHERE l2.lap_id = 1)      -> 3410 = SQLite
+WHERE l.speed > (SELECT l2.speed FROM laps l2 WHERE l2.lap_id = 999999) -> 0    = SQLite  (zero rows -> NULL)
+WHERE l.speed > (SELECT MAX(l2.speed) FROM laps l2 WHERE l2.speed > 9999) -> 0  = SQLite  (one NULL row)
+```
+
+The **correlated** path keeps the guarantee structurally rather than by a check,
+and the structure still holds: `requireDecorrelatableScalarBody` refuses LIMIT /
+DISTINCT / HAVING / an own GROUP BY, and `constantWrapperAggregateSlot` requires
+exactly one aggregate under constant-only arithmetic — verified firing for a
+non-aggregate body, for two aggregates, and for a non-constant wrapper naming an
+OUTER column. The zero-row rules are exercised with predicates that
+**discriminate** rather than with `> 0`:
+
+```
+WHERE (SELECT COUNT(*)     ... empty group) = 0   -> 20 = SQLite    (NULL would give 0)
+WHERE (SELECT 1 + COUNT(*) ... empty group) = 1   -> 20 = SQLite    (the lifted-wrapper CASE;
+                                                                    pushing it through the body
+                                                                    would answer 0 and give 0 rows)
+WHERE (SELECT AVG(l.speed) ... empty group) IS NULL -> 20 = SQLite
+```
+
+Nothing has widened: the error still fires, zero rows is still NULL, and no
+correlated body that could return two rows for one key is admitted.
+
+### ANY / ALL — not in either grammar.
+
+`> ANY (SELECT ...)` / `> ALL (SELECT ...)` are parse errors in **both**
+engines (SwiftQL: *unexpected trailing input*; SQLite: *syntax error*). SQLite
+does not implement them either, so there is no divergence and no oracle entry is
+possible in either direction. Recorded so the brief's NULL-semantics item is
+closed rather than left open.
+
+### The refusal boundary, re-derived from the code at HEAD and each one executed
+
+Every `refuse(...)` / `throw` reachable from the three lowering passes, with a
+constructed query for each and what actually fired. This supersedes pass 2's
+table: B-3's fix and `b24f46e` moved three rows.
+
+| refusal (site) | constructed shape fires it? | pinned? |
+|---|---|---|
+| EXISTS body GROUP BY (`decorr.cc:22`) | yes | `test_logical_plan.cc` |
+| EXISTS body HAVING (`:23`) | **NO — dead**, `HAVING requires GROUP BY` wins (B-5.1, recorded) | no |
+| EXISTS body LIMIT (`:24`) | yes | no |
+| EXISTS body DISTINCT (`:25`) | yes | no |
+| EXISTS body aggregate (`:30`) | yes | `test_logical_plan.cc` |
+| correlated non-equality conjunct (`:139`) | yes — **and no longer over-fires**: the three pass-2 B-3 shapes now run | oracle x3 + `SEAM2_NESTED_CORRELATION` |
+| computed side of a correlated equality (`:147`) | yes | no |
+| both sides outer / unresolved (`:160`) | yes (constructed the both-outer half) | no |
+| **depth `!= 1` (`:202`)** | **yes, six distinct shapes** — live since B-3 | `SEAM2_CORRELATION_DEPTH_REFUSED` x2 |
+| survivor in JOIN ... ON (`:270`) | yes (needs a real inner key beside the correlated ref) | `WEEK33_CORRELATED_BINDS` |
+| survivor in SELECT list (`:270`) | yes | oracle |
+| survivor in ORDER BY (`:270`) | yes | no |
+| survivor in WHERE (`:270`) | not constructible — `splitCorrelation` empties it | no |
+| two aggregates under one wrapper (`:358`) | yes | oracle |
+| non-aggregate body (`:377`) | yes | oracle |
+| non-constant wrapper (`:377`) | yes **only when the wrapper names an OUTER column**; a wrapper naming a BODY column is refused earlier by the Validator's grouped-reference rule, which README:115 says is deliberate | oracle |
+| scalar body LIMIT (`:404`) | yes | `WEEK34_CORRELATED_SCALAR_REFUSED` (now pinned precisely — `b24f46e`) |
+| scalar body DISTINCT (`:405`) | yes | no |
+| scalar body HAVING (`:406`) | yes (guard order differs from the EXISTS pair, which is why this one lives) | no |
+| scalar body own GROUP BY (`:408`) | yes | no |
+| scalar select-list arity (`:411`) | **NO — dead**, Validator's arity rule wins (B-5.2, recorded) | no |
+| shared body, SCALAR (`:439`) | yes — `(SELECT ...) BETWEEN a AND b` | `test_subquery.cc` |
+| shared body, EXISTS (`:756`) | **NO — unreachable** (see below) | no |
+| shared body, IN (`lowering.cc:21`) | **NO — unreachable** (see below) | no |
+| scalar: no correlated equality (`:457`) | yes — reachable **only** through B-3's new route | no |
+| EXISTS: no correlated equality (`:770`) | yes — same new route | `test_logical_plan.cc` (a different shape) |
+| `renamed.size() != keys.size()+1` (`:599`) | not constructible | no |
+| correlated IN / NOT IN (`:878`) | yes, both polarities | oracle x3 |
+| correlated not a top-level conjunct (`:883`) | yes, WHERE-under-OR and HAVING | oracle |
+| IN computed operand (`lowering.cc:70`) | yes | `WEEK32_LOWERING_REFUSED` |
+| IN not a top-level conjunct (`lowering.cc:142`) | yes, both positions | `WEEK32_LOWERING_REFUSED` x2 |
+| materialized scalar > 1 row (`materialization.cc:230`) | yes | `WEEK31_MATERIALIZATION_REFUSED` |
+| IN reached materialization (`materialization.cc:258`) | internal, unreachable by design | no |
+
+**The two shared-body refusals for IN and EXISTS are unreachable, and it is the
+same class as pass 2's B-5 rather than a new one** — recorded here as fact, not
+as a finding. `cloneExpr` has twelve call sites; only `parser.cc:340` (BETWEEN's
+desugaring) can duplicate a user's subquery node, and it clones the LEFT
+operand of `BETWEEN`, which the grammar makes an *additive* — so a `SCALAR`
+node can land there (and does: `(SELECT ...) BETWEEN 1 AND 10` fires `:439`)
+while an `IN` or `EXISTS` node, which sits at predicate level, cannot. The
+remaining clone sites are ON residuals (subqueries refused in `ON`) and the
+Binder's select-list alias substitution (subqueries refused in `SELECT`), both
+closed by the Validator. So one of the three identical `use_count() > 1` guards
+fires and two cannot — pass 2's B-5 shape, two more instances.
