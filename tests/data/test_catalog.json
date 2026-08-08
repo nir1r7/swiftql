@@ -4,35 +4,100 @@
       "name": "laps",
       "file": "test_laps_full.csv",
       "columns": [
-        {"name": "lap_id",    "type": "INT"},
-        {"name": "driver_id", "type": "INT"},
-        {"name": "team",      "type": "STRING"},
-        {"name": "speed",     "type": "DOUBLE"},
-        {"name": "sector_1",  "type": "DOUBLE"},
-        {"name": "sector_2",  "type": "DOUBLE"},
-        {"name": "sector_3",  "type": "DOUBLE"},
-        {"name": "season",    "type": "INT"},
-        {"name": "round",     "type": "INT"}
+        {
+          "name": "lap_id",
+          "type": "INT"
+        },
+        {
+          "name": "driver_id",
+          "type": "INT"
+        },
+        {
+          "name": "team",
+          "type": "STRING"
+        },
+        {
+          "name": "speed",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_1",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_2",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "sector_3",
+          "type": "DOUBLE"
+        },
+        {
+          "name": "season",
+          "type": "INT"
+        },
+        {
+          "name": "round",
+          "type": "INT"
+        }
       ]
     },
     {
       "name": "drivers",
       "file": "test_drivers.csv",
       "columns": [
-        {"name": "driver_id",   "type": "INT"},
-        {"name": "name",        "type": "STRING"},
-        {"name": "nationality", "type": "STRING"},
-        {"name": "team",        "type": "STRING"},
-        {"name": "age",         "type": "INT"}
+        {
+          "name": "driver_id",
+          "type": "INT"
+        },
+        {
+          "name": "name",
+          "type": "STRING"
+        },
+        {
+          "name": "nationality",
+          "type": "STRING"
+        },
+        {
+          "name": "team",
+          "type": "STRING"
+        },
+        {
+          "name": "age",
+          "type": "INT"
+        }
       ]
     },
     {
       "name": "sj",
       "file": "sj.csv",
       "columns": [
-        {"name": "id",  "type": "INT"},
-        {"name": "grp", "type": "INT"},
-        {"name": "val", "type": "INT"}
+        {
+          "name": "id",
+          "type": "INT"
+        },
+        {
+          "name": "grp",
+          "type": "INT"
+        },
+        {
+          "name": "val",
+          "type": "INT"
+        }
+      ]
+    },
+    {
+      "name": "alt",
+      "file": "test_alt.csv",
+      "columns": [
+        {
+          "name": "driver_id",
+          "type": "INT"
+        },
+        {
+          "name": "season",
+          "type": "STRING"
+        }
       ]
     }
   ]

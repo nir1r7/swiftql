@@ -742,3 +742,146 @@ TEST_F(TypeThroughDivision, GuardAnINTColumnOfADerivedRelationStillRefuses) {
         "WHERE t.round / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
         catalog_);
 }
+
+// ===========================================================================
+// 8. The arming REQUEST crosses the cut through an aggregate argument too
+//    (seam subquery pass 5, B-1 — BLOCKER)
+// ===========================================================================
+//
+// Round 4 sent the request inward through divWalk, whose own docstring says it
+// "mirrors taintWalk in vectorized_plan_builder.cc, one AST level up". It did
+// not mirror it at one node: the AggregateExpr arm returned for SUM and AVG
+// WITHOUT walking `agg->argument`. The early return is right about the
+// aggregate's own TYPE — both emit a DOUBLE, so `may_be_int` is correctly false
+// — and wrong about `observed`, which is a pure side channel and has nothing to
+// do with this node's type. Every other non-arithmetic arm of the same walk
+// (IsNullExpr, InExpr, LikeExpr, SubstringExpr) already recursed for the side
+// effect alone and discarded the result.
+//
+// The walk it mirrors has no such hole: collectIntOrigins' AGGREGATE case calls
+// taintWalk(spec.argument, ...) for EVERY aggregate, outside its own order_stat
+// test. So the identical arithmetic was armed in one plan and unarmed across the
+// materialization cut.
+
+// FAILS WITHOUT THE FIX: no throw. On the shipped catalog the same shape gave
+// 7 teams where both Volcano modes and SQLite give 4, at a threshold built from
+// the two divisions' actual sums — a silent wrong answer, in both optimizer
+// legs identically, so the harness's optimizer-invariant mode reports it clean.
+TEST_F(TypeThroughDivision, SumOverADivisionByAMaterializedMixedCaseRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING SUM(l.round / (SELECT MAX(CASE WHEN l2.round > 0 THEN 2 ELSE 0.5 END) "
+        "FROM laps l2)) > 0",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw. AVG takes the identical early return.
+TEST_F(TypeThroughDivision, AvgOverThatDivisionRefusesToo) {
+    expectSubqueryRefusedBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING AVG(l.round / (SELECT MAX(CASE WHEN l2.round > 0 THEN 2 ELSE 0.5 END) "
+        "FROM laps l2)) > 0",
+        catalog_);
+}
+
+// FAILS WITHOUT THE FIX: no throw. The subquery is the DIVIDEND here rather than
+// the divisor — the request never left the outer AST in either polarity, because
+// what swallowed it was the enclosing SUM and not anything about the `/`.
+TEST_F(TypeThroughDivision, TheOtherPolarityOfTheDivisionRefusesToo) {
+    expectSubqueryRefusedBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING SUM((SELECT MAX(CASE WHEN l2.round > 0 THEN 7 ELSE 0.5 END) FROM laps l2) "
+        "/ l.round) > 0",
+        catalog_);
+}
+
+// GUARD, and it is THE DISCRIMINATOR that named the arm rather than the shape:
+// MIN/MAX's arm always recursed, so this refuses on BOTH sides of the fix — same
+// clause, same body, same division, differing only in which aggregate wraps it.
+TEST_F(TypeThroughDivision, GuardMaxOverTheIdenticalBodyAlreadyRefused) {
+    expectSubqueryRefusedBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING MAX(l.round / (SELECT MAX(CASE WHEN l2.round > 0 THEN 2 ELSE 0.5 END) "
+        "FROM laps l2)) > 0",
+        catalog_);
+}
+
+// GUARD. The same division with an INT literal instead of the subquery: no cut
+// to cross, nothing to arm, and the answer is the one Volcano and SQLite give.
+// Ferrari has rounds 1 and 2 (SUM(round/2) = 0 + 1 = 1), McLaren 1 and 1 (0),
+// Mercedes 2 (1).
+TEST_F(TypeThroughDivision, GuardTheSameSumWithNoSubqueryStillAnswers) {
+    expectSubqueryRowsBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING SUM(l.round / 2) > 0 ORDER BY l.team",
+        catalog_, {"Ferrari|", "Mercedes|"});
+}
+
+// GUARD. A SUM whose argument holds a materialized body that is NOT divided must
+// stay answerable — the fix adds the subtree to `observed`, it does not arm it.
+TEST_F(TypeThroughDivision, GuardASumOverAnUndividedMaterializedBodyAnswers) {
+    expectSubqueryRowsBothWays(
+        "SELECT l.team AS t FROM laps l GROUP BY l.team "
+        "HAVING SUM(l.round + (SELECT MAX(CASE WHEN l2.round > 0 THEN 2 ELSE 0.5 END) "
+        "FROM laps l2)) > 0 ORDER BY l.team",
+        catalog_, {"Ferrari|", "McLaren|", "Mercedes|"});
+}
+
+// ===========================================================================
+// 9. MAX_TYPE_DEPTH means what it says (seam subquery pass 5, B-4 — MEDIUM)
+// ===========================================================================
+//
+// exprMayBeInt called divWalk with `catalog = nullptr`, under a comment saying
+// the catalog "reached this far through the RangeTable already". It had not: a
+// body one level down needs its OWN range table, derivedColumnMayBeInt builds
+// that with rangeTableOf(body, catalog), and rangeTableOf returns an EMPTY table
+// at its first line when the catalog is null — on which columnMayBeInt answers
+// "may be INT" for every name. So the SECOND derived level always answered
+// INTEGER and the stated budget of 3 was really 1.
+//
+// The direction was safe (it refused, it never answered wrongly), which is why
+// this was MEDIUM — but the refused query had NO WORKING MODE, since Volcano
+// refuses derived tables by capability, which is the exact criterion round 4
+// used to rank E-14 worth fixing.
+
+// FAILS WITHOUT THE FIX: refused. `t.s` is laps.speed, a REAL column, one alias
+// further out than the depth-1 form directly below it — so INT/INT truncation is
+// impossible and there is nothing to arm.
+TEST_F(TypeThroughDivision, ARealColumnTwoDerivedLevelsDownIsTypedAndAnswers) {
+    expectSubqueryRowsBothWays(
+        "SELECT t.s FROM (SELECT a.s AS s FROM (SELECT l.speed AS s FROM laps l "
+        "WHERE l.lap_id < 4) a) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) "
+        "> 150 ORDER BY t.s",
+        catalog_, {"308.91|", "310.17|", "312.45|"});
+}
+
+// FAILS WITHOUT THE FIX: refused. Three levels, which is the stated budget.
+TEST_F(TypeThroughDivision, AndAtThreeLevelsWhichIsTheStatedBudget) {
+    expectSubqueryRowsBothWays(
+        "SELECT t.s FROM (SELECT b.s AS s FROM (SELECT a.s AS s FROM "
+        "(SELECT l.speed AS s FROM laps l WHERE l.lap_id < 4) a) b) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) "
+        "> 150 ORDER BY t.s",
+        catalog_, {"308.91|", "310.17|", "312.45|"});
+}
+
+// GUARD. The INT twin two levels down. Typing the column correctly has to make
+// this one REFUSE, or the tests above would be satisfied by simply not arming.
+TEST_F(TypeThroughDivision, GuardAnINTColumnTwoDerivedLevelsDownStillRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT t.s FROM (SELECT a.s AS s FROM (SELECT l.round AS s FROM laps l) a) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+        catalog_);
+}
+
+// GUARD. Past the budget the answer is still the conservative one. The budget
+// bounds the walk; it does not express a limit, and exhausting it must refuse
+// rather than answer.
+TEST_F(TypeThroughDivision, GuardPastTheBudgetItStillRefuses) {
+    expectSubqueryRefusedBothWays(
+        "SELECT t.s FROM (SELECT c.s AS s FROM (SELECT b.s AS s FROM (SELECT a.s AS s FROM "
+        "(SELECT l.speed AS s FROM laps l) a) b) c) t "
+        "WHERE t.s / (SELECT MAX(CASE WHEN l2.lap_id = 2 THEN 2 ELSE 0.5 END) FROM laps l2) > 0",
+        catalog_);
+}

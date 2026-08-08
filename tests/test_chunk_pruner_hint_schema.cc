@@ -6,6 +6,17 @@
 #include "parser/ast.h"
 #include "storage/chunk_pruner.h"
 #include "storage/columnar_table.h"
+#include "catalog/catalog.h"
+#include "parser/parser.h"
+#include "planner/binder.h"
+#include "planner/cardinality_estimator.h"
+#include "planner/join_enumeration.h"
+#include "planner/logical_plan.h"
+#include "planner/predicate_pushdown.h"
+#include "planner/subquery_materialization.h"   // collectQueryTables
+#include "planner/vectorized_plan_builder.h"
+#include "storage/csv_loader.h"
+#include "storage/csv_to_columnar.h"
 
 #include <memory>
 #include <string>
@@ -229,4 +240,128 @@ TEST(ChunkPrunerHintSchema, GuardASingleRelationHintIsUnaffected) {
     EXPECT_TRUE(ChunkPruner::shouldSkip(where.get(), zoneMaps(), 0, scanSchema()));
     auto not_prunable = bin(">", col("k", 0), lit(static_cast<int64_t>(5)));
     EXPECT_FALSE(ChunkPruner::shouldSkip(not_prunable.get(), zoneMaps(), 0, scanSchema()));
+}
+
+// ── 7. END TO END, through the builders that choose the schema ─────────────
+//
+// Sections 1 to 6 pin the SCREEN: the same expression, screened in two schemas,
+// two answers. They deliberately pass on the pre-fix tree as well, because
+// shouldSkip's signature did not change — only what its callers hand it did. So
+// they are the mechanism, not the discrimination, and on their own they would be
+// a test that cannot fail.
+//
+// These two are the discrimination. They run the real pipeline against a
+// catalog that has what the shipped one does not: two relations declaring the
+// same column NAME with different TYPES (`laps.season` INT, `alt.season`
+// STRING). Both were run against this worktree's parent (8fba8a1) and both
+// failed there, with the answers quoted in each comment.
+
+namespace {
+
+const char* E2E_CATALOG = "../tests/data/test_catalog.json";
+
+std::unordered_map<std::string, ColumnarTable> loadFor(const SelectStatement& stmt,
+                                                       const Catalog& cat) {
+    std::unordered_map<std::string, ColumnarTable> tables;
+    std::vector<std::string> names;
+    collectQueryTables(stmt, names);
+    for (const auto& n : names) {
+        if (tables.count(n)) continue;
+        const auto& m = cat.getTable(n);
+        tables.emplace(n, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema),
+                                                 m.schema));
+    }
+    return tables;
+}
+
+std::unique_ptr<VecPlanNode> buildVec(const std::string& sql, const Catalog& cat,
+                                      bool optimize) {
+    Parser parser(sql);
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadFor(stmt, cat);
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+    if (optimize) {
+        logical = PredicatePushdown::apply(std::move(logical), cat);
+        logical = JoinEnumeration::apply(std::move(logical), cat);
+        CardinalityEstimator::estimate(*logical, cat);
+    }
+    return VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat);
+}
+
+int drain(VecPlanNode& node) {
+    int rows = 0;
+    while (DataChunk* chunk = node.nextChunk()) {
+        rows += chunk->filter_applied ? static_cast<int>(chunk->sel.indices.size())
+                                      : chunk->num_rows;
+    }
+    return rows;
+}
+
+// The scan node's own explain() carries chunks_skipped=n/m once the plan has
+// run, which is the only place the decision is observable — there is no decision
+// field for it anywhere in the logical layer.
+std::string findScanExplain(VecPlanNode* node, const std::string& table) {
+    if (node->explain().rfind("VecScan [" + table, 0) == 0) return node->explain();
+    for (VecPlanNode* c : node->children()) {
+        std::string s = findScanExplain(c, table);
+        if (!s.empty()) return s;
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(ChunkPrunerHintSchemaEndToEnd, TheMaskedRaiseIsGone) {
+    // `a.season = 5` is STRING vs INT: it raises per row, from the filter, where
+    // it is written. Screened in laps' own schema it typed off laps.season (INT)
+    // and read as total, so `l.lap_id > 999999` behind it skipped the only chunk
+    // and the filter never ran.
+    //
+    // At 8fba8a1 this test FAILED: both legs returned one row holding 0 instead
+    // of throwing — an error masked into a printed wrong value, which is the
+    // sharpest form of storage pass 5's S-13.
+    Catalog cat{E2E_CATALOG};
+    for (bool optimize : {false, true}) {
+        EXPECT_THROW(
+            {
+                auto node = buildVec(
+                    "SELECT COUNT(*) AS n FROM laps l JOIN alt a "
+                    "ON l.driver_id = a.driver_id "
+                    "WHERE a.season = 5 AND l.lap_id > 999999", cat, optimize);
+                node->open();
+                drain(*node);
+                node->close();
+            },
+            std::runtime_error) << "no raise with optimize=" << optimize;
+    }
+}
+
+TEST(ChunkPrunerHintSchemaEndToEnd, TheLostPruningIsBack) {
+    // The performance half (storage pass 5's S-14), observed rather than timed:
+    // `a.season = '2022'` is STRING vs STRING, cannot raise, and must not stop
+    // the walk — so `l.lap_id > 999999` behind it still prunes.
+    //
+    // optimize=false is where the un-pushed WHERE reaches the scan whole, which
+    // is the case the previous round regressed. (With the optimizer on, pushdown
+    // hands this scan a hint made only of its own conjuncts and the skip
+    // survived either way; on the Volcano path Planner::plan hands the raw
+    // stmt.where to the FROM scan REGARDLESS of the optimizer, which is why the
+    // storage auditor corrected this from a `--no-optimize` effect to a
+    // written-order one.)
+    //
+    // At 8fba8a1 this test FAILED: `chunks_skipped=0/1`, because laps' schema
+    // has no way to type `a.season` as anything but its own INT column, the
+    // conjunct read as may-raise, and the walk stopped before the one that
+    // prunes.
+    Catalog cat{E2E_CATALOG};
+    auto node = buildVec(
+        "SELECT COUNT(*) AS n FROM laps l JOIN alt a ON l.driver_id = a.driver_id "
+        "WHERE a.season = '2022' AND l.lap_id > 999999", cat, /*optimize=*/false);
+    node->open();
+    EXPECT_EQ(drain(*node), 1);          // COUNT(*) over no rows is one row of 0
+    const std::string scan = findScanExplain(node.get(), "laps");
+    node->close();
+    EXPECT_NE(scan.find("chunks_skipped=1/1"), std::string::npos)
+        << "scan reported: " << scan;
 }
