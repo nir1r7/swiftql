@@ -6,7 +6,7 @@
 #include <memory>
 #include <vector>
 
-// ── THE TOTALITY SCREEN — ONE FUNCTION, THREE CONSUMERS ─────────────────────
+// ── THE TOTALITY SCREEN — ONE FUNCTION, FOUR CONSUMERS ──────────────────────
 //
 // THE RULE THIS FILE SERVES (seam audit pass 4; see predicate_pushdown.cc for
 // the full statement and the reproductions):
@@ -20,7 +20,29 @@
 //       conjunct WRITTEN BEFORE IT evaluated TRUE (evaluatePredicate() in
 //       evaluator.cc and evalPredicate() in columnar_eval.cc both implement
 //       exactly this cascade);
+//     * AN OUTER JOIN'S `ON` RESIDUAL is evaluated on every CANDIDATE PAIR the
+//       join keys matched — not on rows of either input, and not on rows of the
+//       join's output, since a pair the residual rejects never becomes one.
+//       Both engines evaluate it EAGERLY over the whole residual conjunction, in
+//       the probe loop, against the assembled merged row (plan_nodes.cc's
+//       HashJoinNode::next and vec_hash_join_node.cc's probe both hold the same
+//       `passes` lambda);
 //     * every other expression is evaluated on every row that reaches its node.
+//
+//   THE SECOND BULLET IS NEW TEXT AND IT IS A CORRECTION, not an addition. This
+//   file was written to be THE single statement of the rule and it had two
+//   sentences that were false of the same construct: it enumerated three
+//   consumers, and it said "every other expression is evaluated on every row
+//   that reaches its node" — which an `ON` residual is not, in either engine.
+//   Seam audit pass 5 (engine, A-1) found it by running the shape rather than
+//   reading it: `LEFT JOIN ... ON k AND age > 30 AND SUBSTRING(name, age-30, 3)
+//   = 'er_'` errors in all six modes, where the SAME two conjuncts written in a
+//   WHERE answer in all six. That is not an engine divergence — the two agree —
+//   but a reader who trusted this file would have concluded the residual was a
+//   filter conjunct and inherited the cascade. It does not. An INNER join has no
+//   such case: its residuals are folded into the WHERE conjunction, residuals
+//   first and the user's WHERE after, by BOTH planners (logical_plan.cc and
+//   planner.cc), so they ARE filter conjuncts and the first bullet governs them.
 //
 //   Nothing may change that set for an expression that CAN RAISE: not a plan
 //   rewrite (predicate_pushdown.cc), not a storage-level chunk skip
@@ -35,15 +57,29 @@
 // when the operand TYPES decide it. Hence the schema parameter. There is one
 // screen and it is precise; there is no second, coarser copy anywhere.
 //
-// THE THREE CONSUMERS, and why each needs the same answer:
+// THE FOUR CONSUMERS, and why each needs the same answer:
 //   1. predicate_pushdown.cc — a conjunct that may raise is frozen: it does not
 //      move, and nothing may move across it.
 //   2. chunk_pruner.h — a zone-map skip removes rows before the filter runs, so
 //      only a conjunct written AHEAD of every conjunct that may raise is allowed
-//      to prove a skip.
+//      to prove a skip. IT MUST BE HANDED THE SCHEMA ITS HINT WAS WRITTEN
+//      AGAINST, not the scanning relation's: staticTypeOf's ColumnRef arm falls
+//      back to a bare name, so the wrong schema does not make it answer "I
+//      cannot type this" — it makes it answer "I typed it", off a same-named
+//      column of another relation. That is the one answer a conservative screen
+//      must never give, and it was a live divergence in three seams at once
+//      (pass 5's E-20 / S-13 / P5-2). See chunk_pruner.h.
 //   3. logical_plan.cc — a LIMIT above a projection that may raise is placed
 //      BELOW it, so the plan (not the engine's laziness) says how many rows the
 //      projection is evaluated on.
+//   4. an OUTER JOIN'S `ON` RESIDUAL — the consumer the enumeration used to
+//      omit, together with the sentence that would have told a reader it did not
+//      exist. Its row set is the key-matched candidate pairs, and BOTH engines
+//      evaluate the whole residual eagerly over them, so the two agree today by
+//      symmetry rather than by rule: nothing screens the residual and nothing
+//      states which rows it is owed. That makes it a dialect fact rather than a
+//      seam defect right now, and a rule this file states absolutely is not
+//      allowed to have a construct it does not describe.
 //
 // Same dispatch as collectSlots / forEachLocalColumnRef in
 // predicate_pushdown.cc. A MISSED Expr subtype here must answer TRUE, which the

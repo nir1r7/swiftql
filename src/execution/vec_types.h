@@ -368,23 +368,33 @@ inline void refuseDivergentVolcanoInt(const Value& v, bool unrendered) {
     // applied to the same value straight after, with the same bound.
     if (v.type() == TypeId::INT) return;
     const double d = v.toNumeric();
-    const double bound = static_cast<double>(unrendered
-                                                 ? MAX_EXACT_INT_IN_DOUBLE_COLUMN
-                                                 : MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
-    if (d < bound && d > -bound) return;          // agrees; the fast path
+    // The TEXT bound first and unconditionally, so the fast path is one pair of
+    // compares on every ordinary cell — the same shape, and the same constant,
+    // as narrowToDoubleColumn's, including its exclusivity: 1e15 ITSELF renders
+    // as "1e+15" and so is already outside.
+    const double text_bound = static_cast<double>(MAX_LOSSLESS_INT_IN_DOUBLE_COLUMN);
+    if (d < text_bound && d > -text_bound) return;
     // NaN and infinity fail both compares above and are not integral, so they
     // fall out here — they are genuine DOUBLEs and this rule is only about the
     // integers Volcano would have produced.
     if (!std::isfinite(d) || d != std::floor(d)) return;
-    char rendered[64];
-    std::snprintf(rendered, sizeof(rendered), "%.15g", d);
+    if (unrendered) {
+        // The VALUE bound, INCLUSIVE, exactly as narrowToDoubleColumn's is:
+        // 2^53 is the last magnitude at which every integer is still its own
+        // double, so at |d| == 2^53 the two engines still hold the same number
+        // and only its text — which the plan proves is never read — differs.
+        const double exact = static_cast<double>(MAX_EXACT_INT_IN_DOUBLE_COLUMN);
+        if (d <= exact && d >= -exact) return;
+    }
+    char text[64];
+    std::snprintf(text, sizeof(text), "%.15g", d);
     throw std::runtime_error(
         "vectorized execution cannot compute this expression the way the Volcano "
         "engine does: its operands are INTEGER there and REAL here, because a "
         "column below it mixes INTEGER and REAL results (typically a CASE) and a "
         "chunk column holds one type. The two agree while the result stays below "
         + std::string(unrendered ? "2^53 (9007199254740992)" : "1e15")
-        + "; this one reached " + rendered
+        + "; this one reached " + text
         + ". Re-run with --execution volcano, or give the branches the same type.");
 }
 

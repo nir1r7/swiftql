@@ -19,6 +19,8 @@ add_executable(swiftql_tests
     test_sort_tiebreak.cc
     test_int_double_materialization.cc
     test_int_double_type_through_division.cc
+    test_int_double_arithmetic_result.cc
+    test_chunk_pruner_hint_schema.cc
 )
 
 target_link_libraries(swiftql_tests swiftql_lib gtest gtest_main)
