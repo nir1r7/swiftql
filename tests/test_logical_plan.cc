@@ -610,6 +610,17 @@ TEST(ColumnOrdinals, RejectedInOrderByAndGroupBy) {
 // every row ties — were refused, and the refusal quoted back an ordinal the
 // user had not typed ("ORDER BY 2" for `ORDER BY 1 + 1`). Every EXPECT_NO_THROW
 // below threw before the fix; that is the whole point of the case.
+//
+// The scope is exactly the terms SQLite does NOT call ordinals, which is
+// BINARY ARITHMETIC only. Measured on a table whose insert order, column-1
+// order and column-2 order all differ — the only shape that tells the three
+// behaviours apart:
+//
+//   ORDER BY 1  (1)  - -1   -> column 1   |  ORDER BY 1+1  2*1  1+0 -> tied
+//   ORDER BY 2  ((2))  +2   -> column 2   |  ORDER BY -1   0        -> error
+//
+// so the parenthesised and doubly-negated forms are pinned as REFUSALS in the
+// test above, not as acceptances here.
 TEST(ColumnOrdinals, AFoldedOrSubstitutedConstantIsNotAnOrdinal) {
     Catalog cat(CATALOG);
     // folds to Literal(2) / Literal(1) before the Validator sees it
@@ -621,11 +632,16 @@ TEST(ColumnOrdinals, AFoldedOrSubstitutedConstantIsNotAnOrdinal) {
     EXPECT_NO_THROW(buildLogical("SELECT COUNT(*) FROM laps GROUP BY 1 + 1", cat));
     // the binder replaces `one` with a clone of the select-list Literal
     EXPECT_NO_THROW(buildLogical("SELECT 1 AS one, team FROM laps ORDER BY one", cat));
-    // parentheses make it an expression to SQLite, and parsePrimary strips them,
-    // so this is the one shape where only the FIRST TOKEN can tell the two apart
-    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY (1)", cat));
-    // one minus is an ordinal to SQLite (rejected above); two is an expression
-    EXPECT_NO_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY - -1", cat));
+    // ...and the boundary, which is where an earlier attempt at this fix got it
+    // wrong: `(1)` and `- -1` are ordinal 1 to SQLite too (parentheses and unary
+    // signs are transparent to its rule), so they stay REFUSED. Only binary
+    // arithmetic makes a term a constant expression.
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY (1)", cat),
+                 std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY - -1", cat),
+                 std::runtime_error);
+    EXPECT_THROW(buildLogical("SELECT team, speed FROM laps ORDER BY ((2))", cat),
+                 std::runtime_error);
     // and the refusal, when it does fire, quotes the text the user typed
     EXPECT_THROW({
         try {

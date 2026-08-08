@@ -222,10 +222,11 @@ enum class JoinType { INNER, LEFT };
 struct OrderByItem {
     std::unique_ptr<Expr> expr;
     bool desc = false;
-    // Week 37. The column ordinal EXACTLY AS TYPED ("1", "-1"), or "" when this
-    // item is not an ordinal. The ordinal rule (validator.cc) is a rule about
-    // what the user WROTE, so it is decided by the only layer that knows — the
-    // parser — and carried here rather than re-derived downstream.
+    // Week 37. The column ordinal this item denotes ("1", "-1"), or "" when the
+    // item is not an ordinal at all. The ordinal rule (validator.cc) is a rule
+    // about what the user WROTE, so it is decided by the only layer that knows
+    // — the parser, in ordinalAsWritten — and carried here rather than
+    // re-derived downstream, where the answer would be different.
     //
     // Testing Literal-ness of `expr` instead was wrong, because two rewrites
     // that run before the Validator MANUFACTURE a Literal in this position out
@@ -238,6 +239,9 @@ struct OrderByItem {
     //
     // Only the parser sets this, so a hand-built OrderByItem is never an
     // ordinal, which is correct: nobody wrote it.
+    //
+    // Not the raw source text: `(1)` and `- -1` are ordinals 1 to SQLite as
+    // well as to us, and this holds the ordinal they denote.
     std::string written_ordinal;
 };
 

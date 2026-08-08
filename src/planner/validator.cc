@@ -334,21 +334,27 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
     // !! Week 37. The test is `written_ordinal`, stamped by the PARSER
     // (ordinalAsWritten), and NOT `dynamic_cast<Literal*>` on the tree in front
     // of us — which is what it used to be, and which was WRONG in a way an
-    // audit refuted by execution. The rule is syntactic, and SQLite's own is
-    // too: a term is an ordinal iff it is an integer literal with at most one
-    // leading minus. By the time the Validator runs, two rewrites have
-    // manufactured Literals in exactly these two positions out of source text
-    // that was never an ordinal — constant folding (binder.cc, `ORDER BY 1 + 1`
-    // -> Literal(2)) and the select-alias substitution just above it
-    // (`SELECT 1 AS one FROM laps ORDER BY one` -> Literal(1)). Testing the
-    // tree refused both of those legal queries, and quoted back "ORDER BY 2" /
-    // "ORDER BY 1", an ordinal the user had not typed. The message now quotes
-    // the parser's own record of the text, so it cannot invent one.
+    // audit refuted by execution.
     //
-    // What this deliberately did NOT change: `ORDER BY -1` and `ORDER BY 0` are
-    // still refused (both are ordinals to SQLite, which answers "term out of
-    // range"), and `ORDER BY (1)` is now accepted as the constant expression
-    // SQLite treats it as.
+    // The rule is SYNTACTIC, and SQLite's own is too: a term is an ordinal iff
+    // it is an integer literal under any number of parentheses and unary signs.
+    // BINARY ARITHMETIC IS NOT — SQLite evaluates `1 + 1` and sorts on the
+    // constant, leaving every row tied. See ordinalAsWritten (parser.cc) for
+    // the measured table that separates the three behaviours.
+    //
+    // By the time the Validator runs, two rewrites have manufactured Literals
+    // in exactly these two positions out of source text that was never an
+    // ordinal — constant folding (binder.cc, `ORDER BY 1 + 1` -> Literal(2))
+    // and the select-alias substitution just above it (`SELECT 1 AS one FROM
+    // laps ORDER BY one` -> Literal(1)). Testing the tree refused both of those
+    // legal queries, and quoted back "ORDER BY 2" / "ORDER BY 1", an ordinal
+    // the user had not typed. The message now quotes the parser's own record,
+    // so it cannot invent one.
+    //
+    // What this deliberately did NOT change: `-1`, `0`, `(1)` and `- -1` are
+    // all still refused. Every one of them is an ordinal to SQLite as well, so
+    // refusing them is agreement rather than extra strictness — the scope of
+    // this fix is exactly the terms SQLite does NOT treat as ordinals.
     for (const auto& item : stmt.order_by) {
         if (!item.written_ordinal.empty()) {
             throw std::runtime_error(
