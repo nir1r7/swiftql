@@ -308,3 +308,175 @@ fourteen weeks: *"the column just goes blank and reads as 'the estimator didn't
 run'"* (`main.cc:302` prints `est=` only when `estimated_rows >= 0.0`). One-line
 fix; no correctness impact.
 
+### FINDING B-4 (MEDIUM) — `development.md` is wrong a **third** time, and the wrongest row is the exact false invariant `18af84f` corrected in the source
+
+The task flagged this file as having been wrong by omission twice. It is wrong
+again, and this time not by omission — by carrying forward a claim the codebase has
+already formally retracted.
+
+`development.md:855`, in the "Week 34 consumers" table:
+
+> \| `joinCardinality`'s no-statistics branch \| **NEWLY LIVE, and this is the real
+> consequence.** A derived relation has no `TableStats`, so `max(l, r)` — not
+> multiplicative — runs on a query the CLI can type … Week 28 recorded that
+> `method=written-floor` had never executed; **it is reachable now** \|
+
+That is, sentence for sentence, the paragraph `18af84f` deleted from
+`join_enumeration.cc` as *"FALSE IN BOTH HALVES"*. The commit swept the `.cc` copy
+and left the `.md` copy standing — in the table whose own header says *"A missing
+row is worse than a wrong one. A future week reads this as already-checked and
+skips the verification."* The doc is now the **only** surviving statement of the
+retracted claim, and it is the one a future week will read.
+
+`development.md:854`, same table, is false for a second reason:
+
+> \| `hasSlotOutsideRangeTable` … **No reported decline was added**: Week 30's
+> condition for earning one is that a supported query pays a real cost, and none
+> does \|
+
+A reported decline **was** added, by `18af84f`, on exactly the argument this row
+denies — `reorder` now stamps `join-ordering=skipped (semi/anti join)`. (The
+function is also called `slotDeclineReason` now; the join-chain pass-2 auditor
+independently found that rename drift and `development.md:808`'s "the decline is
+silent" — see `scratchpad/audits/seam-join-chain-pass-2.md` B-1. **:854 and :855
+are not in their list**, and :855 is the substantive one.)
+
+**And a missing row, by the table's own rule.** `CardinalityEstimator::estimateNode`
+is not listed as a Week 34 consumer, despite the DERIVED case being the single
+HIGH two independent auditors found in pass 1. The table has rows for
+`countRelations`, `hasSlotOutsideRangeTable`, `joinCardinality`, `leafScanTable*`,
+`collectSlotTables`, `PredicatePushdown::distribute`, `Lowering::lowerNode` — the
+estimator, which *silently returned a -1 for fourteen weeks*, has none. That is
+precisely the mechanism the header describes: a consumer absent from the list reads
+as considered-and-dismissed.
+
+Three wrong claims and one missing row in one table, all in the seam this audit
+covers. Ranked MEDIUM: no wrong answer, but the file is the codebase's declared
+audit trail and it now actively misleads on the finding pass 1 just closed.
+
+### FINDING B-5 (MEDIUM) — constant folding is ungated, its self-justification ("folding cannot change results") is FALSE, and the counterexample is a refusal of a legal query
+
+`src/planner/binder.cc:174-180`:
+
+> *"Unconditional: folding cannot change results, so it is canonicalization rather
+> than a cost-based decision, and both execution paths and `--no-optimize` get it."*
+
+Folding runs at `binder.cc:181`, inside `Binder::bind`, which `main.cc:407` calls
+**before** `LogicalPlanBuilder::build` → `Validator::validate`
+(`logical_plan.cc:900`). So the Validator sees the *folded* tree. And the Validator
+has a rule that tests **Literal-ness**, not value — `validator.cc:333-351`:
+
+```cpp
+for (const auto& item : stmt.order_by) {
+    if (auto* lit = dynamic_cast<const Literal*>(item.expr.get())) {
+        if (!lit->value.isNull() && lit->value.type() == TypeId::INT) {
+            throw std::runtime_error("ORDER BY " + lit->value.toString()
+                + ": column ordinals are not supported; ...");
+```
+
+Folding **manufactures** the Literal that rule fires on. Concrete failing shapes:
+
+```sql
+SELECT team, speed FROM laps ORDER BY 1 + 1;
+SELECT team, COUNT(*) FROM laps GROUP BY team ORDER BY 2 * 1;
+SELECT team, COUNT(*) FROM laps GROUP BY 1 + 1;
+```
+
+`1 + 1` folds to `Literal(2)`, and the query is refused with
+`ORDER BY 2: column ordinals are not supported` — naming an ordinal the user never
+wrote, for a query that is legal in SQLite (a constant sort key: every row ties).
+Unfolded, the same expression is an ordinary constant expression and is accepted.
+So folding **does** change the outcome, from "accepted" to "refused".
+
+Two aggravating facts:
+
+1. **Invisible to the invariant harness by construction.** Folding is one of the
+   six ungated passes in B-0's table, so `optimized` and `--no-optimize` refuse
+   identically. Only the SQLite leg could see it, and no query of this shape is in
+   the suite: `grep -rn "ordinal" python_tools/ tests/` returns **no coverage of
+   the refusal at all** outside one C++ unit test.
+2. **That unit test picks the one case that hides it.**
+   `tests/test_logical_plan.cc:583` asserts *"a non-ordinal expression that merely
+   contains an integer is unaffected"* and demonstrates it with
+   `ORDER BY speed + 1` — which contains a `ColumnRef` and therefore **cannot
+   fold**. The property as stated is false for a fully-constant expression, and the
+   test's chosen witness is exactly the one that cannot show it.
+
+Not a wrong answer (a refusal is loud), so not a BLOCKER. Ranked MEDIUM because the
+comment that justifies leaving the pass ungated is demonstrably false, and that
+comment is the whole reason nobody has questioned the pass being outside the oracle.
+
+**Otherwise `constant_folding.cc` is sound for result preservation**: `foldNode`
+evaluates through the *same* `evaluate()` the per-row path uses (`:89`), declines on
+any `std::runtime_error` so overflow/ill-typing surfaces from its usual site
+(`:92-97`), declines on a NULL result (`:98`), never folds `IS NULL` (`:121-125`),
+never folds an `AggregateExpr` (`:127-130`), and never descends into a
+`SubqueryExpr` body (`:165-169`). All twelve `Expr` subtypes are dispatched.
+
+### B-6 — predicate pushdown: preconditions CHECKED, not merely believed
+
+Working through the task's five named hazards against `predicate_pushdown.cc`:
+
+| hazard | what the code does | checked or believed? |
+|---|---|---|
+| push below an **outer join**'s null-supplying side | `distribute` (:296-303) tests `join->join_type == JoinType::INNER`, spelled positively so a future RIGHT/FULL is refused by omission. The bucket is *left in* `by_slot` and lifted above the whole tree by `pushIntoJoin`'s leftover loop (:352-354) | **checked** |
+| push below an **aggregate** | structurally impossible: `apply` (:361-372) rewrites only a `FILTER` whose direct child is a `JOIN` or a `SCAN`. There is no code path that moves a predicate below an `AGGREGATE`, `SORT`, `DISTINCT` or `LIMIT` at all | **checked, structurally** |
+| push below a **semi/anti join** | `distribute` tests `semantics == JoinSemantics::STANDARD` in the same conjunction, and recursion into `children[0]` stays unconditional so the spine's own conjuncts still reach their scans | **checked** |
+| push into a **correlated derived body** | two independent guards: (a) `collectSlots` maps any `query_level > 0` ref and any correlated `SubqueryExpr` to `-1` (:57, :129), and `soleSlot` (:163-167) returns `-1` for any conjunct whose slot set contains `-1`, so it is never pushed; (b) `filterOnto` **wraps** — a conjunct routed to a derived relation becomes a `LogicalFilter` *above* the `LogicalDerived`, never inside the body | **checked, twice** |
+| push across a **LIMIT** | same as the aggregate row: a `LIMIT` inside a derived body sits under the `LogicalDerived`, and pushdown never descends past it | **checked, structurally** |
+
+`collectSlots` and `restampSlots` are in lockstep and between them dispatch on all
+twelve `Expr` subtypes of `ast.h` (ColumnRef, Literal, Binary, Unary, IsNull,
+Aggregate, In, Like, Case, Substring, Subquery, IntervalLiteral). I checked the two
+containers that could hide a `ColumnRef` from the walker — `InExpr::values` is
+`std::vector<Value>` and `LikeExpr::pattern` is a `std::string`, so neither can
+hold an expression. **No hole.**
+
+One thing that is *believed*, not checked, and it is fine: `distribute`'s
+"children[1] is exactly relation `join_slot`" rests on the tree still being in
+written order. That holds because `main.cc` runs pushdown **before** join
+enumeration (:571 then :583). If those two were ever swapped, `distribute` would
+attach conjuncts to the wrong relation with no error. Not a finding today — the
+ordering is stated at both call sites — but it is the pass-order dependency the
+task asks about, and it is the only one I found that is load-bearing for
+*correctness* rather than quality.
+
+### B-7 (LOW) — `JoinEnumeration` is not idempotent, and its precondition is only half-checked
+
+`decompose` (`join_enumeration.cc:194-211`) documents: *"Only ever called on the
+tree `LogicalPlanBuilder::build` produced, so `joins[i] -> slot i+1` still holds."*
+After `rebuild`, that is false — the join at spine position k carries
+`join_slot = order[k]`, not `k`. A second `JoinEnumeration::apply` on the same tree
+would therefore decompose a different graph than the one present.
+
+Half-checked: `decompose` throws `internal: join enumeration saw a relation slot
+outside the range table` when `join_slot < 1`, which catches the case where the
+chosen order begins with a relation other than 0 (the first rebuilt join then
+carries `join_slot = order[1]`… but the *bottom* one carries `order[0]`, which can
+be 0). For an order like `0, 2, 1` every slot is ≥ 1 and the second decomposition
+proceeds **silently** on wrong edges. Nothing calls `apply` twice today
+(`main.cc:583` and `main.cc:136`, once each), so this is LOW and I could not
+construct a reachable query.
+
+### B-8 — join enumeration's rebuild is result-preserving, and the reason is checkable
+
+`rebuild` (`join_enumeration.cc:214-278`) consumes **each edge exactly once**, at
+the step its later-in-order endpoint arrives (`placed.count(...)` on both
+orientations), and throws `internal: join enumeration produced a cross product` if
+a relation arrives with no edge to the placed set. Every key of the written tree is
+in `edges` (`decompose` pushes all of `join->keys`), so no conjunct can be dropped
+— the failure mode the file names ("a dropped key is MORE rows, not an error") is
+guarded by construction plus a throw.
+
+**One thing `decompose` silently drops and gets away with**: `join->on_residual`.
+It moves `children[1]` out and recurses on `children[0]`; the `LogicalJoin` node
+itself — and with it the residual — is destroyed. Safe only because
+`containsOuterJoin` declines every tree with a non-INNER join first, and residuals
+exist only on LEFT joins (`logical_plan.cc:973`). That is the **same single fact**
+LATENT-1 depends on. So an INNER `on_residual`, if one is ever created, is dropped
+in **three** independent places (`decompose`, the swapped `VecHashJoinNode` branch,
+the `VecSimdLoopJoinNode` branch) and caught in **none**. Still LOW individually —
+no query creates one — but the concentration is worth recording: the codebase has
+one load-bearing fact holding up three silent drops, and only one of the three
+(the semi/anti branch, fixed in `18af84f`) has a guard behind it.
+
