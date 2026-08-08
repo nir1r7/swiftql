@@ -198,6 +198,44 @@ Two-sided discrimination vs a pinned pre-fix binary (cb59ff8) AND the post-fix b
   6th, `materializeSubqueries`, threads the flag into the nested runner so subquery bodies ARE
   covered. Re-verified against main.cc:566 and :134.
 
+## Wave A — join-key type refusal (B3-2): **CLOSED**
+**Chose REFUSE in all four producers, not affinity.** Three reasons, weightiest first:
+  1. `LogicalPlanBuilder::build` FOLDS an inner join's non-key ON conjuncts into the WHERE
+     conjunction (Week 27's `R (join)_(p^q) S == sigma_q(R (join)_p S)`), and `Value::operator==`
+     THROWS across the STRING boundary. Give keys affinity and one written predicate means two
+     different things depending on whether `classifyJoinCondition` happened to make it a key —
+     the same "half a match" one layer up.
+  2. `keyFieldText` sees ONE `Value`; affinity would need the OPPOSING column's type threaded
+     through six serializers and both engines.
+  3. The encoding is NOT the defect, the missing guard is — re-measured live: an INT key vs an
+     integral DOUBLE returns 10000 = SQLite after the fix. The rule is coarse (both STRING or both
+     numeric) exactly so `7.0` keeps joining `7`.
+FIX: `Validator::validateJoinKeyTypes(const LogicalPlanNode&)`, ONE walk over the FINISHED plan at
+  the end of `LogicalPlanBuilder::build` (logical_plan.cc:1230). It resolves keys EXACTLY as the
+  physical builder does (`from_slot`-aware left; POSITIONAL right for SEMI/ANTI, by name otherwise).
+  It must be on the finished node to be CORRECT, not merely to avoid a fourth copy: `semantics` is
+  set AFTER construction, so only the finished node knows which right-side resolution applies.
+  The AST loop in `Validator::validate` is KEPT and re-scoped in its comment — `Planner::plan`
+  builds a `HashJoinNode` straight from `stmt.joins` and never builds a logical plan, so that loop
+  is Volcano's ONLY cover. Both sites raise one message from one function.
+All 9 audit shapes now refuse; on shipped catalog.json `IN (SELECT '016')` was 0 vs SQLite 495 and
+  `NOT IN` was 10000 vs 9505 — both now refused.
+**COVERAGE LOSS IT NAMED RATHER THAN HID**: `IN (SELECT '16' …)` returned 495 = SQLite before and
+  is now REFUSED. That is the half that agreed BY ACCIDENT on canonical text. Four doors with one
+  behaviour was the requirement; keeping it answering would have been a fifth behaviour.
+Unit 842/842. Oracle 1492 passed / 4 failed — **the 4 are NOT its work**: same query in 4 modes,
+  `--explain` shows `LogicalSort [canonical row order]` under the LIMIT, i.e. the CONCURRENT
+  comparator agent's uncommitted `deterministicCut`. Its code only throws; it cannot alter a row set.
+Its first draft pinned BARE WORDS and its own suite caught it — `"EXISTS subquery"` is a substring
+  of BOTH `"IN / EXISTS subquery"` and `"NOT EXISTS subquery"`. Pins are now the full clause.
+**No C++ test pinned the Week 29 refusal before this work** — only the python rejection suite did.
+  That is why a four-week regression in three producers was invisible to `ctest`.
+Swept: validator.cc's "closed here / covers all four modes"; README's Limitations row;
+  development.md:731's level-audit row (was FALSE as of the hoist); both lowering headers now say
+  the condition is NOT enforced at their site. `docs/week-29-plan.md:1540` deliberately LEFT — it is
+  a dated plan record and editing it would falsify the history that makes the finding legible.
+Oracle entries SEQUENCED to the harness agent (7 queries x 2 suites, vec-only + Volcano-rejected).
+
 ## !! WAVE A INTRODUCED A 200x REGRESSION — must not ship unremarked
 Commit `d085230` ("a LIMIT cuts a determined order") fixes the plain-LIMIT shape CORRECTLY, but the
 **`--no-optimize` leg of a plain LIMIT over a `driver_id` self-join went 0.32s -> 64s** (two runs

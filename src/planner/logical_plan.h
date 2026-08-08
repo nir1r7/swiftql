@@ -256,6 +256,11 @@ struct LogicalProject : LogicalPlanNode {
 // sort rows by specified expressions
 struct LogicalSort : LogicalPlanNode {
     std::vector<OrderByItem> order_by;  // owns the sort exprs
+    // > 0: only the row_cap smallest rows are needed, because the parent is a
+    // LIMIT. Set by deterministicCut (logical_plan.cc) on the sort it inserts,
+    // and lowered to VecSortNode's bounded top-N. Left 0 on a user-written
+    // ORDER BY, whose sort predates this and is unchanged by it.
+    int row_cap = 0;
 
     LogicalSort(std::unique_ptr<LogicalPlanNode> child, std::vector<OrderByItem> order_by) : LogicalPlanNode(LogicalNodeType::SORT, child->output_schema), order_by(std::move(order_by)) {
         children.push_back(std::move(child));

@@ -475,7 +475,8 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         // raw row counts while the vectorized builder picks it from post-pushdown
         // estimates.
         if (!order_is_plan_stable) {
-            node = std::make_unique<SortNode>(std::move(node), std::vector<OrderByItem>{});
+            node = std::make_unique<SortNode>(std::move(node), std::vector<OrderByItem>{},
+                                              /*row_cap=*/stmt.limit.value());
         }
         node = std::make_unique<LimitNode>(std::move(node), stmt.limit.value());
     }

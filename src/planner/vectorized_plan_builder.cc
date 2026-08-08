@@ -692,7 +692,10 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
         case LogicalNodeType::SORT: {
             auto* sort = static_cast<LogicalSort*>(node);
             auto child = lower(sort->children[0].get(), nullptr);
-            return std::make_unique<VecSortNode>(std::move(child), std::move(sort->order_by));
+            // row_cap: a bounded top-N when the planner knows only that many
+            // rows survive (deterministicCut, logical_plan.cc). 0 otherwise.
+            return std::make_unique<VecSortNode>(std::move(child), std::move(sort->order_by),
+                                                 sort->row_cap);
         }
 
         case LogicalNodeType::DISTINCT: {

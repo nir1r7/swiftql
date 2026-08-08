@@ -499,27 +499,12 @@ std::vector<PlanNode*> DistinctNode::children() const {
 
 
 // SortNode
-SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by) : child_(std::move(child)), order_by_(std::move(order_by)), cursor_(0) {}
+SortNode::SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by, int row_cap) : child_(std::move(child)), order_by_(std::move(order_by)), cursor_(0), row_cap_(row_cap) {}
 
 void SortNode::open() {
     child_->open();  // child time excluded from self-clock
     sorted_rows_.clear();
 
-    while (true) {
-        Row* row = child_->next();  // child time excluded from self-clock
-        auto t0 = std::chrono::high_resolution_clock::now();
-        if (!row) {
-            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-            break;
-        }
-        stats.rows_in++;
-        sorted_rows_.push_back(*row);  // copy
-        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
-    }
-
-    // sort — self-work only, no child calls
-    auto t0 = std::chrono::high_resolution_clock::now();
-    const Schema& schema = child_->outputSchema();
     // ONE comparator, shared with VecSortNode — including the deterministic
     // tie-break below the declared keys, which is what makes the row that
     // survives a LIMIT cut independent of the plan shape. See
@@ -529,10 +514,44 @@ void SortNode::open() {
     // The canonical column order is computed ONCE here, not inside the
     // comparator: it is O(n log n) in the column count, and deriving it per
     // comparison would be the same answer at a much worse price.
+    const Schema& schema = child_->outputSchema();
     const std::vector<int> tie_order = sort_comparator::tieBreakOrder(schema);
-    std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), [&](const Row& a, const Row& b) {
+    auto less = [&](const Row& a, const Row& b) {
         return sort_comparator::rowLess(order_by_, schema, tie_order, a, b);
-    });
+    };
+
+    // BOUNDED TOP-N when the parent is a LIMIT (row_cap_ > 0) — the same rule,
+    // and for the same reason, as VecSortNode::consumeAndSort, where it is
+    // written out. Volcano gains one thing the vectorized node cannot: a losing
+    // row is compared in place and never copied at all.
+    while (true) {
+        Row* row = child_->next();  // child time excluded from self-clock
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (!row) {
+            stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            break;
+        }
+        stats.rows_in++;
+        if (row_cap_ <= 0) {
+            sorted_rows_.push_back(*row);  // copy
+        } else if (static_cast<int>(sorted_rows_.size()) < row_cap_) {
+            sorted_rows_.push_back(*row);
+            std::push_heap(sorted_rows_.begin(), sorted_rows_.end(), less);
+        } else if (less(*row, sorted_rows_.front())) {
+            std::pop_heap(sorted_rows_.begin(), sorted_rows_.end(), less);
+            sorted_rows_.back() = *row;
+            std::push_heap(sorted_rows_.begin(), sorted_rows_.end(), less);
+        }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+    }
+
+    // sort — self-work only, no child calls
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (row_cap_ > 0) {
+        std::sort_heap(sorted_rows_.begin(), sorted_rows_.end(), less);
+    } else {
+        std::stable_sort(sorted_rows_.begin(), sorted_rows_.end(), less);
+    }
     cursor_ = 0;
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
 }

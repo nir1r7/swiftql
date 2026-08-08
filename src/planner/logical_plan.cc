@@ -980,9 +980,16 @@ bool orderIsPlanStable(const LogicalPlanNode* node) {
 // two can be had. SQLite's own arbitrary choice is a third answer again, which
 // is why compare_against_sqlite.py's `run_engine_agreement_suite` already says
 // "SQLite cannot adjudicate a tie at a LIMIT cut".
-std::unique_ptr<LogicalPlanNode> deterministicCut(std::unique_ptr<LogicalPlanNode> node) {
+std::unique_ptr<LogicalPlanNode> deterministicCut(std::unique_ptr<LogicalPlanNode> node, int limit) {
     if (orderIsPlanStable(node.get())) return node;
-    return std::make_unique<LogicalSort>(std::move(node), std::vector<OrderByItem>{});
+    auto sort = std::make_unique<LogicalSort>(std::move(node), std::vector<OrderByItem>{});
+    // BOUNDED. Only `limit` rows survive, so only `limit` need ordering — which
+    // is what keeps this from turning a streaming LIMIT into a full
+    // materialization of whatever reaches it. On the --no-optimize leg that can
+    // be the un-pushed join product; measured at 1.8s streaming versus 74s
+    // sorted on a `driver_id` self-join over `laps` (5,000,000 rows).
+    sort->row_cap = limit;
+    return sort;
 }
 
 } // namespace
@@ -1209,7 +1216,7 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
 
     // limit — over a determined input order; see deterministicCut above
     if (stmt.limit.has_value()) {
-        node = deterministicCut(std::move(node));
+        node = deterministicCut(std::move(node), stmt.limit.value());
         node = std::make_unique<LogicalLimit>(std::move(node), stmt.limit.value());
     }
 

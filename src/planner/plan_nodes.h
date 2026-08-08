@@ -145,7 +145,13 @@ class DistinctNode : public PlanNode {
 // sort rows by specified expressions (apply ORDER BY)
 class SortNode : public PlanNode {
     public:
-        SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by);
+        // row_cap > 0 turns this into a bounded TOP-N: only the row_cap
+        // smallest rows are kept, so a sort under a LIMIT costs O(row_cap)
+        // memory instead of O(input). Set by Planner::plan when the parent is a
+        // LIMIT. 0 = sort everything. See VecSortNode::consumeAndSort for the
+        // measurement that made it necessary.
+        SortNode(std::unique_ptr<PlanNode> child, std::vector<OrderByItem> order_by,
+                 int row_cap = 0);
 
         void open() override;
         Row* next() override;
@@ -158,6 +164,7 @@ class SortNode : public PlanNode {
         std::vector<OrderByItem> order_by_;
         std::vector<Row> sorted_rows_;
         int cursor_;
+        int row_cap_ = 0;
 };
 
 
