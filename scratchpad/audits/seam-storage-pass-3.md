@@ -351,3 +351,176 @@ encodings were read for it:
 This is consistent with, and does not re-derive, the standing conclusion that NULL
 *representation* cannot be differentially tested because `ColumnArray` has no validity
 concept.
+
+### B.4 Scan order
+
+Both storage modes emit in file order: the row path walks `rows_[cursor_]` upward, the
+columnar path walks `row_idx` upward and reconstructs. Pruning does not perturb that —
+it advances `cursor_` past a whole chunk, so the relative order of what survives is
+unchanged. The sharpest test of this is a `LIMIT` with **no** `ORDER BY` over a query
+where columnar prunes and row does not:
+
+    SELECT l_orderkey FROM lineitem WHERE l_orderkey > 58000 LIMIT 3
+
+Row storage starts at row 0 and filters; columnar skips chunks 0-6 and starts inside
+chunk 7. Both must nevertheless return the same three rows, and do. Same for
+`SELECT l_orderkey, l_quantity ... WHERE l_orderkey > 58000 ORDER BY ... LIMIT 7`,
+`SELECT team FROM laps LIMIT 1025` and `SELECT k FROM t8193 LIMIT 8192`.
+
+### B.5 Randomized differencing across the three cells — 1 200 queries, 0 divergences
+
+`python_tools/random_diff.py` is vectorized-only (`VEC = ["--execution","vectorized",
+"--storage","columnar"]`, line 65), so **the row leg has never been randomly
+differenced** — every row-vs-columnar claim in this project rests on hand-written
+entries. Closed here for this pass: a seeded generator emitting shapes `Planner::plan`
+can actually run (<=1 join, no derived tables, no IN/correlated subqueries) — inner and
+LEFT joins in both orders, ON residuals, conjunctive and disjunctive WHERE, GROUP BY with
+HAVING, scalar aggregates, DISTINCT, and **partial `ORDER BY` + `LIMIT`**, which is the
+shape whose cut SQL leaves unspecified and this project nonetheless requires to agree.
+
+Three seeds x 400 queries, byte-exact across all four invocations: **0 divergent.**
+Not vacuous — on seed 20260808, 284 of 400 return non-empty results, 64 return zero
+rows, and 52 are refusals whose message must also match in all four cells.
+
+Grand total for this pass: **1 588 query x cell comparisons, 0 divergences.**
+
+### B.6 Does the scan-schema fix make the Week 37 `VecScanNode` item easier or harder?
+
+**Slightly harder as written, and easier if S-9 is fixed first.** Both halves matter.
+
+Harder, because the fix created a new obligation and hid the tool that discharges it.
+`VecScanNode` reads its columns **by name** out of `ColumnarTable`
+(`vec_scan_node.cc:50-58`), so it is width-agnostic today. A row-backed constructor
+cannot be: it must index `rows_[r][i]` positionally, and the logical layer already hands
+its SCAN a NARROWED schema (`blockOutputSchema` -> `buildScanSchema`,
+`logical_plan.cc:512`). So a row-backed `VecScanNode` needs exactly the same
+rows-must-match-the-narrowed-schema step `Planner::plan` now performs — and `narrowRows`
+is a **local lambda inside `Planner::plan`**, unreachable from
+`vectorized_plan_builder.cc`. Week 37 therefore either duplicates it (the two-paths
+drift this codebase keeps paying for, and pass 2's own estimate says "no planner
+change") or first hoists it into `logical_plan.{h,cc}` beside `narrowSchema` — about
+15 extra lines, moving pass 2's 70-90 to roughly **85-105**.
+
+Easier, if S-9's fix lands first. If the narrowing becomes a `keep_` index vector
+consumed inside the scan node rather than a plan-time rewrite of the data, then the
+row-backed `VecScanNode` fill loop pass 2 already sized ("walk `rows_[start..start+count)`
+and push `row[i]`") becomes `row[keep_[i]]` — **one indirection in a loop that has to be
+written anyway**, no shared helper, no hoist, no drift risk. The two items are
+complementary and should be done in that order.
+
+### B.7 S-8 re-checked, and the level above it
+
+`S-8` (duplicate COLUMN name in `catalog.json`, silently wrong in columnar only) is
+**fixed and live**. `catalog.cc:49-55` refuses it at load, verified in every cell:
+
+    Error: catalog: table 't': column 'k' is declared twice; give one of them a distinct name
+
+against `t(k INT, k INT, b INT)` over `k,k,b / 1,100,7 / ...` — the exact input pass 2
+used. See A.5 for the second, undocumented reason that refusal is now load-bearing.
+
+**The level above it — `catalog.cc:90` `tables_.emplace(meta.name, ...)` — is
+reachable, and it is NOT a storage-seam defect.** Measured rather than reasoned. With
+
+    {"tables":[{"name":"t","file":"data/t1.csv", cols k,b},
+               {"name":"t","file":"data/t2.csv", cols k,b}]}
+
+`std::unordered_map::emplace` does not overwrite, so the FIRST entry wins and the second
+is discarded whole — file, schema and all. `SELECT k,b FROM t` returns `t1.csv`'s three
+rows in **all three cells**, identically; and with a wider second entry,
+`SELECT c FROM t` reports `SELECT: column not found: 'c'` in all three. So:
+
+- it is a **silent wrong answer at the catalog layer** (you queried the table you
+  declared second and got the one you declared first, with no diagnostic);
+- it is **not** a row-vs-columnar divergence, and cannot become one: both storage modes
+  read the same single `TableMetadata` and `main.cc` builds the columnar table from the
+  rows that metadata loaded. There is no second implementation to disagree with.
+
+That is the material difference from S-8, which WAS a divergence. Severity **LOW**, and
+it belongs to catalog input validation rather than to this seam. The fix is four lines
+in the same loop that now refuses duplicate columns — `if (tables_.count(name)) throw` —
+and it is strictly cheaper than the S-8 fix already merged beside it.
+
+---
+
+## Findings
+
+### S-9 — MEDIUM — `narrowRows` is an O(rows x width) plan-time pass on the row leg, and every instrument this project owns reports it with the wrong sign
+
+Concrete shape, TPC-H sf0.1, `--storage row --execution volcano`, Release build:
+
+    SELECT l_quantity FROM lineitem LIMIT 1
+      pre  6748cfc   Plan 64 µs      Execution 7 µs      total 71 µs
+      post 922ca15   Plan 109 312 µs Execution 63 µs     total 109 375 µs   (1540x)
+
+Full table and the two-sided analysis at A.6/A.6b. `benchmark.py` reports this query
+9x FASTER, because `run_once` greps `Execution:` and nothing else; three of the four
+measured queries got slower while all four of its numbers improved. Not a correctness
+defect and the answers are right in every cell — but the regression is unbounded in the
+data size, `--explain` pays it in full, and the project's own harnesses are structurally
+unable to see it, which is exactly how it passed a green gate. Fix at A.6: move the
+narrowing into `SeqScanNode::next()` as a `keep_` index vector, mirroring the columnar
+branch's existing `reconstructed_row_`. This also makes the Week 37 item cheaper (B.6).
+
+### L-1 — LOW — the S-8 refusal is now load-bearing for a second reason its comment does not state
+
+`narrowRows` resolves kept columns with `full.indexOf(c.name)` (first match) while
+`narrowSchema` keeps EVERY same-named column, so a duplicate column name would put one
+index into `keep` twice and the second `std::move(r[i])` would move an already-moved
+`Value`. `catalog.cc:49-55` makes that unreachable — but its 20-line comment justifies
+itself entirely by the COLUMNAR interleaving bug. A future reader relaxing it "because
+row storage was never affected" would break the row path. One sentence in that comment
+closes it. (A.5)
+
+### L-2 — LOW — duplicate TABLE name in `catalog.json` silently keeps the first, in every mode
+
+Reachable, measured, and consistent across all three cells — so it is a catalog
+input-validation gap, not a storage divergence. `tables_.emplace` does not overwrite;
+the second entry's file and schema are discarded with no diagnostic. Four lines beside
+the S-8 refusal fix it. (B.7)
+
+### L-3 — LOW — `narrowRows`' early return is correct only because of an unstated property of `narrowSchema`
+
+`if (narrowed.size() == full.size()) return rows;` leaves the rows WIDE. That is safe
+only because `narrowSchema` builds the narrowed schema as an order-preserving subset of
+`full`, so equal size implies identity. Nothing states or tests that coupling, and it is
+in a different file. Give `buildScanSchema` any reordering or synthesising step and this
+becomes a silent wrong-column bug on the row leg. Comparing the column NAMES rather than
+the sizes would cost nothing and remove the dependency. (A.1)
+
+### Already-recorded items — one is marginally sharper than recorded
+
+`development.md`, `week-36-plan.md`'s half-run verification claim, and `run_tpch.py`'s
+dead-and-loose refusal pins are all queued and none is worse than recorded, with one
+detail worth a line: of `VOLCANO_BOUNDARIES`' six entries, the two IN-subquery pins do
+not merely duplicate the catch-all, **they never matched their intended message at all**.
+`planner.cc:72` emits "IN subqueries are lowered to a semi-join..."; the pins read
+"IN (subquery) is lowered to a semi-join" and "IN subquery", and neither is a substring
+of it (`subqueries` vs `subquery`). Verified by string comparison. Every Volcano IN
+refusal in the TPC-H matrix is therefore classified by the catch-all
+`"not supported on the Volcano path"`. So the item is not "specific pins made redundant
+by a catch-all" but "specific pins that were never live, masked by a catch-all" —
+same fix, slightly worse provenance.
+
+---
+
+## Summary
+
+| severity | count |
+|---|---|
+| BLOCKER | 0 |
+| HIGH | 0 |
+| MEDIUM | 1 (S-9) |
+| LOW | 3 (L-1, L-2, L-3) |
+
+Evidence base for this pass: **1 588 query x cell comparisons across all three real
+storage x engine cells plus `--no-optimize`, 0 divergences** — 106 hand-written
+(including 37 built specifically to break the new tie-break symmetry), 182 chunking and
+boundary shapes (TPC-H sf0.01 plus synthetic tables at 0/1/8192/8193/16384/16385 rows and
+a single RLE run spanning three chunks), and 1 200 randomized, which is the first
+randomized differencing the ROW leg has ever had.
+
+**Verdict: the storage seam is clean. `narrowRows` is correct — it moves rather than
+aliases, no consumer indexes by catalog position, and the tie-break symmetry it bought
+holds on the adversarial shapes the original fix did not test — but it was landed as
+free and it is not: it is an unbounded plan-time cost that this project's benchmark
+reports as a speed-up. No blockers; the audit ends here.**
