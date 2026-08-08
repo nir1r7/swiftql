@@ -151,8 +151,60 @@ Note this is *also* an optimize-vs-`--no-optimize` divergence inside the vectori
 alone, so it is in scope for the optimizer-preservation seam too, which sorts and so
 cannot see it.
 
-**Run pending** — the formal gate re-acquired `build/` (PID 18173,
-`compare_against_sqlite.py`) after my first check. Results appended below when it frees.
+#### A1-repro — RUN, at HEAD `ee9c9d7`, gate green. **The divergence is live.**
+
+```
+$ ./build/swiftql --catalog catalog.json --no-cache [MODE] --format tsv --query "<above>"
+
+row-volcano      AlphaTauri 2022 | Alpine     2022 | McLaren 2022
+col-volcano      AlphaTauri 2022 | Alpine     2022 | McLaren 2022
+col-vec          RedBull    2022 | AlphaTauri 2022 | McLaren 2022      <-- DIFFERENT ROW SET
+col-vec-noopt    AlphaTauri 2022 | Alpine     2022 | McLaren 2022
+```
+
+`{AlphaTauri, Alpine, McLaren}` vs `{RedBull, AlphaTauri, McLaren}`. Predicted before
+running, from the source alone; matched exactly.
+
+`--explain` confirms the mechanism is the build side and nothing else:
+
+```
+col-vec (optimized)
+      VecHashAggregate [group_by=d.team, agg=MIN(season)]                       est=2
+        VecSimdLoopJoin [...] build=laps cost=3 (alt=21) algo=simd (hash=25)    est=2
+          VecScan [drivers, 2 columns]                                          est=20     <-- PROBE
+          VecFilter [(l.season = 2022) AND ... x6]                              est=2
+            VecScan [laps, 3 columns]                                           est=10000  <-- BUILD
+
+col-vec --no-optimize
+      VecHashAggregate [group_by=d.team, agg=MIN(season)]
+        VecFilter [(l.season = 2022) AND ... x6]
+          VecHashJoin [driver_id = driver_id]
+            VecScan [laps, 3 columns]                                                      <-- PROBE
+            VecScan [drivers, 2 columns]                                                   <-- BUILD
+```
+
+The optimized leg's estimate for the filtered `laps` is `est=2` (10000 x 0.25^6, floored),
+against `drivers` at `est=20`, so the cost model puts `laps` on the build side and `drivers`
+on the probe. Volcano and the `--no-optimize` leg both use raw counts (20 < 10000) and probe
+`laps`. Probe order is group first-encounter order; the sort is stable; the tie spans the
+cut; the row SETS differ.
+
+**Severity: BLOCKER.** Three reasons it outranks pass 1's MEDIUM on the same class:
+
+1. It is a live disagreement between the two engines *after* the fix that was supposed to
+   make them agree — the fix's premise, not a new corner.
+2. It is simultaneously a violation of **`optimized == --no-optimize`**, which this project
+   gates on as a hard invariant with 119 entries in `run_optimizer_invariant`
+   (test_new_queries.py:542). By the project's own doctrine that is a defect, not a
+   dialect choice — and unlike the Volcano-vs-vec direction, this one **is** catchable by an
+   existing harness mechanism. It is missed only because no query of this shape is in the
+   list (measured: B8).
+3. The predicate that triggers it is contrived only in that it makes the *estimator* wrong
+   while leaving the data unchanged. Every real cause of estimator error — correlated
+   columns, a `LIKE` at `FALLBACK_SELECTIVITY`, an unrecognized predicate shape, a
+   `DERIVED` input with no `TableStats` — produces the same crossing without any
+   contrivance at all. `SELECT ... FROM small s JOIN big b ON ... WHERE <b predicate the
+   estimator underestimates> GROUP BY k ORDER BY <agg> LIMIT n` is the general shape.
 
 ### A2. Is the fixed ordering now load-bearing, and is the load-bearing part tested?
 
