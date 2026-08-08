@@ -286,7 +286,31 @@ LEFT UNFIXED DELIBERATELY: extending the refusal to all INT->DOUBLE narrowing wo
   output?") is a PLAN-SHAPE fact `appendColumnValue` cannot see; it lives in
   `vectorized_plan_builder.cc`. **WAVE B / ROUND 4 OWNS THIS.**
 
-## !! DECISION PENDING — plain LIMIT: determinism vs SQLite agreement
+## RESOLVED — plain LIMIT (was the pending decision). Entry 55 made TOTAL. (30df719)
+Two invariants conflict at a plain LIMIT and only one can hold: `optimized == --no-optimize`
+(plan-independent) vs `swiftql == sqlite` (mimic an arbitrary pick). **Chose the first** — it is
+what this phase rests on, and SQL guarantees nothing about the second. Entry 55 had been asserting
+a non-guarantee and passing BY COINCIDENCE (both engines probed `laps` in storage order).
+Entry 55 is now `ORDER BY season, speed, laps.lap_id LIMIT 5` — natural keys plus a unique
+tiebreak. Chosen over `ORDER BY laps.lap_id` because its answer is IDENTICAL to what the
+deterministic cut already returns, so the change aligns the ORACLE with the ENGINE rather than
+moving the engine's answer. 4/4 modes. Header records the coincidence, both invariants, which won,
+the measured divergence, and **"DO NOT PUT THE UNORDERED FORM BACK IN THIS SUITE"** with the reason.
+**AND IT CAUGHT ANOTHER VACUOUS ENTRY — one I specified.** I told it to re-add entry 55's unordered
+form as invariant-only coverage. It CHECKED whether that text can discriminate. **It cannot**: with
+the LIMIT removed, the two legs emit all 10000 rows BYTE-IDENTICALLY despite planning DIFFERENT
+JOIN ALGORITHMS (`VecSimdLoopJoin` optimized vs `VecHashJoin` unoptimized) — both probe `laps`,
+both emit probe-major in storage order, so any `LIMIT n` cuts the same n rows in either leg whether
+or not the fix exists. Copied verbatim it would have been a green tick proving nothing — the exact
+failure mode `TIE_STRADDLE_QUERIES` exists to end, re-entering through the front door.
+Instead: `b31_plain_limit_two_relations`, same join + `WHERE l.lap_id < 15`, so filtered cardinality
+(14) drops below `drivers` (20) and the optimized leg builds on the OPPOSITE side. Pre-fix
+discrimination RECONSTRUCTED EXACTLY (a plain LIMIT only truncated the stream, so the first 5 rows
+of unsorted output are precisely what it returned): **four of five rows differ**. 12/12 pass.
+Structural: QUERIES still 174 (one string replaced by one), mode_census untouched, disjointness
+guard unaffected.
+
+## ~~DECISION PENDING~~ — plain LIMIT: determinism vs SQLite agreement
 `QUERIES` line 55 — `SELECT season, speed FROM laps JOIN drivers ON ... LIMIT 5`, diffed against
 SQLite in ALL FOUR MODES — **now FAILS in every mode.** `--explain` shows
 `Limit [5] -> Sort [canonical row order] -> ...`: the plain-LIMIT determinism fix gives every
