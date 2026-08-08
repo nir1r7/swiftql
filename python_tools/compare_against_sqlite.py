@@ -1815,6 +1815,157 @@ SEAM2_CORRELATION_DEPTH_REFUSED = [
      "more than one level out"),
 ]
 
+# ─── B3-2: a STRING join key against a numeric one is REFUSED, at all four
+# ─── JoinKey producers ──────────────────────────────────────────────────────
+#
+# WHAT WAS WRONG. Semi-join keys are matched as SERIALIZED TEXT, which carries no
+# type tag. So a STRING column joined against a numeric one matched only when the
+# string was already the number's canonical rendering: `'16'` matched the INT 16,
+# `'016'` did not, and SQLite's affinity converts and matches BOTH. No error, no
+# plan difference — a wrong row count. The fix refuses in all four producers
+# rather than adding affinity, via `Validator::validateJoinKeyTypes` walking the
+# FINISHED plan at the end of `LogicalPlanBuilder::build`.
+#
+# THE COVERAGE THIS DELIBERATELY GIVES UP, recorded because giving it up was a
+# choice and a later reader is owed the choice rather than the outcome. The
+# canonical-text half of the shape — `l.driver_id IN (SELECT '16' ...)` —
+# returned 495 and MATCHED SQLITE before this change. It is now REFUSED. That
+# answer was correct by accident: it agreed only because the literal happened to
+# be the INT's canonical rendering, and its `'016'` twin was silently wrong by
+# 495 rows in each direction on this same shipped catalog. Four doors with one
+# behaviour was the requirement; leaving the canonical spelling answering would
+# have been a fifth behaviour, decided by how the user spelled a literal. So a
+# previously-correct answer was traded for a uniform refusal, on purpose.
+#
+# WHY THE PINS CARRY THEIR FULL CLAUSE UP TO ": cannot join". `"EXISTS
+# subquery"` is a SUBSTRING of both `"IN / EXISTS subquery"` and `"NOT EXISTS
+# subquery"`, so a bare pin is satisfied by the WRONG message and the entry
+# stops discriminating between two different producers. That is the same defect
+# class as the shared `"not supported on the Volcano path"` tail the VOLCANO_*
+# constants above exist to undo, and it is not hypothetical — it was written and
+# caught here. `assert_b32_pins_discriminate()` below re-proves it by execution
+# rather than leaving it as a comment.
+#
+# VECTORIZED-ONLY, and the Volcano twin asserts a DIFFERENT message on purpose:
+# `Planner::plan` refuses IN and correlated subqueries by CAPABILITY before a
+# join key is ever built, so the four modes do not share one message here. The
+# split follows planner.cc's guard order (multi-way, IN, correlated, derived),
+# same rule the other _VOLCANO_REJECTED lists follow.
+B32_JOIN_KEY_TYPE_REJECTED = [
+    ("SELECT COUNT(*) FROM laps l WHERE l.team IN "
+     "(SELECT d.driver_id FROM drivers d)",
+     "IN / EXISTS subquery: cannot join a STRING column with a numeric one"),
+
+    ("SELECT COUNT(*) FROM laps l WHERE l.team NOT IN "
+     "(SELECT d.driver_id FROM drivers d)",
+     "NOT IN subquery: cannot join a STRING column with a numeric one"),
+
+    ("SELECT COUNT(*) FROM laps l WHERE EXISTS "
+     "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
+     "IN / EXISTS subquery: cannot join a STRING column with a numeric one"),
+
+    ("SELECT COUNT(*) FROM laps l WHERE NOT EXISTS "
+     "(SELECT 1 FROM drivers d WHERE d.driver_id = l.team)",
+     "NOT EXISTS subquery: cannot join a STRING column with a numeric one"),
+
+    # the correlated-scalar producer, which names no subquery form in its message
+    ("SELECT COUNT(*) FROM laps l WHERE "
+     "(SELECT COUNT(*) FROM drivers d WHERE d.driver_id = l.team) > 0",
+     "join key: cannot join a STRING column with a numeric one"),
+
+    # THE ENTRY THAT WAS SILENTLY WRONG. `'016'` is not the INT's canonical
+    # rendering, so this returned 0 where SQLite returns 495; its `'16'` twin
+    # returned 495 and agreed. Same shape, opposite errors, neither visible.
+    # Keep this one under any trimming.
+    ("SELECT COUNT(*) FROM laps l WHERE l.driver_id IN "
+     "(SELECT '016' AS s FROM drivers d)",
+     "IN / EXISTS subquery: cannot join a STRING column with a numeric one"),
+
+    # THE ENTRY THE AST LOOP STRUCTURALLY CANNOT SEE. The offending key is
+    # produced behind a LogicalDerived, so only a walk over the FINISHED plan
+    # reaches it — which is the whole reason the check moved off the AST. Keep
+    # this one under any trimming too.
+    ("SELECT COUNT(*) FROM laps l WHERE l.driver_id IN "
+     "(SELECT x.c FROM (SELECT d.team AS c FROM drivers d) x)",
+     "IN / EXISTS subquery: cannot join a STRING column with a numeric one"),
+]
+
+# The same seven queries on Volcano, refused EARLIER and for a different reason.
+# Built from the list above BY IDENTITY (index, not re-typed text) so the two
+# suites cannot drift apart: an edit to a query above is an edit here.
+#
+# The guard that fires is planner.cc's, top to bottom. Rows 0, 1, 5, 6 are IN /
+# NOT IN forms and hit the IN guard; rows 2, 3, 4 are EXISTS / NOT EXISTS /
+# correlated-scalar and hit the correlated one. Written as that classification
+# rather than as a hand-kept index list, so a query added above is classified by
+# its own text.
+def _b32_volcano_expectation(query: str) -> str:
+    # `" IN (SELECT"` matches `NOT IN (SELECT` too — there is a space before the
+    # `IN` either way — so one test covers both IN forms. Everything else here
+    # (EXISTS, NOT EXISTS, correlated scalar) carries a correlated reference and
+    # reaches the correlated guard.
+    return VOLCANO_IN if " IN (SELECT" in query.upper() else VOLCANO_CORRELATED
+
+
+B32_JOIN_KEY_TYPE_VOLCANO_REJECTED = [
+    (query, _b32_volcano_expectation(query))
+    for query, _ in B32_JOIN_KEY_TYPE_REJECTED
+]
+
+
+def assert_b32_pins_discriminate():
+    """Prove each B3-2 pin matches ITS OWN message and NO OTHER entry's.
+
+    run_rejection_suite only asks "does the actual message contain the expected
+    substring". That is satisfied by a pin so short it also matches a sibling —
+    which is exactly how `"EXISTS subquery"` passes against `"IN / EXISTS
+    subquery"` and against `"NOT EXISTS subquery"`, three different producers
+    behind one green tick. The suite above has four distinct producer messages
+    and would not notice three of them being replaced by a fourth.
+
+    So this collects every entry's ACTUAL message once and cross-checks the full
+    pin matrix: pin[i] must match message[i] and must NOT match message[j != i]
+    unless the two entries genuinely share a producer (rows 0, 2 and 5, 6 do —
+    IN and EXISTS are one producer, and the two IN-literal shapes are another
+    instance of it). Shared pins are compared as equal-expectation pairs rather
+    than exempted by index.
+    """
+    VEC = ["--execution", "vectorized", "--storage", "columnar"]
+    actual = []
+    findings = []
+    for query, expected in B32_JOIN_KEY_TYPE_REJECTED:
+        try:
+            run_swiftql(query, VEC)
+            findings.append(f"expected a rejection, got rows: {query[:60]}")
+            actual.append(None)
+        except RuntimeError as e:
+            actual.append(str(e))
+        except Exception as e:                                # pragma: no cover
+            findings.append(f"unexpected error kind {e!r}: {query[:60]}")
+            actual.append(None)
+
+    for i, (qi, pin_i) in enumerate(B32_JOIN_KEY_TYPE_REJECTED):
+        if actual[i] is None:
+            continue
+        if pin_i not in actual[i]:
+            findings.append(f"pin {i} does not match its own message: {pin_i!r}")
+        for j, (_qj, pin_j) in enumerate(B32_JOIN_KEY_TYPE_REJECTED):
+            if i == j or actual[j] is None or pin_i == pin_j:
+                continue
+            if pin_i in actual[j]:
+                findings.append(
+                    f"pin {i} ({pin_i!r}) ALSO matches entry {j}'s message — "
+                    f"it cannot tell the two producers apart")
+
+    print(f"\n--- B3-2 join-key pin discrimination ---")
+    print(f"{len(B32_JOIN_KEY_TYPE_REJECTED)} pins cross-checked against "
+          f"{sum(a is not None for a in actual)} actual messages")
+    for f in findings:
+        print(f"  FINDING  {f}")
+    if not findings:
+        print("  clean — every pin matches its own producer and no other")
+    return findings
+
 WEEK34_DISTINCT_AGG_QUERIES = [
     # the plain grouped shape (TPC-H Q16)
     "SELECT team, COUNT(DISTINCT driver_id) AS d FROM laps GROUP BY team ORDER BY team",
@@ -3334,9 +3485,29 @@ def main():
         r_failed += rf
         r_errors += re_
 
+    # B3-2 — a STRING join key against a numeric one. Refused in the two vec
+    # modes for the TYPE reason; refused in the two Volcano modes earlier and for
+    # the CAPABILITY reason, which is why the two halves pin different messages.
+    for label, extra in vec_modes:
+        rp, rf, re_ = run_rejection_suite(
+            B32_JOIN_KEY_TYPE_REJECTED,
+            f"B3-2 STRING join key refused — {label}", extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+    for label, extra in volcano_modes:
+        rp, rf, re_ = run_rejection_suite(
+            B32_JOIN_KEY_TYPE_VOLCANO_REJECTED,
+            f"B3-2 STRING join key refused earlier (capability) — {label}",
+            extra_args=extra)
+        r_passed += rp
+        r_failed += rf
+        r_errors += re_
+
     # Week 35 — the behavioural sweep and the computed census. Both run AFTER the
     # suites, so a sweep finding is read alongside the run it describes.
     findings = sweep_rejection_suites()
+    findings += assert_b32_pins_discriminate()
     mode_census()
 
     total_passed = p1 + p2 + p3 + p4 + m_passed + r_passed
@@ -3346,7 +3517,8 @@ def main():
     if findings:
         # A sweep whose findings are printed but do not fail the run is a sweep
         # nobody reads.
-        print(f"Rejection-suite sweep: {len(findings)} finding(s)")
+        print(f"Rejection-suite sweep + B3-2 pin discrimination: "
+              f"{len(findings)} finding(s)")
     if total_failed > 0 or total_errors > 0 or findings:
         sys.exit(1)
 
