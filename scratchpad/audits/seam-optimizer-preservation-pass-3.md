@@ -465,3 +465,138 @@ identical code" holds for five of the six ungated passes, not all six.
 `materializeSubqueries` runs identical code over a leg-dependent input and
 produces a leg-dependent constant. That does not weaken B-1's point (the oracle
 is blind to the five); it sharpens it.
+
+## Part B — the passes, precondition by precondition
+
+### B.1 The table this seam should have had from Week 21
+
+For each pass: what makes it result-preserving, and is that CHECKED (the code
+tests it) or BELIEVED (a comment asserts it)?
+
+| pass | gated? | precondition for result preservation | checked or believed | can a LATER Phase-5 shape reach it? |
+|---|---|---|---|---|
+| `PredicatePushdown` — `distribute` | yes | pushed side is not null-supplying; not a semi/anti body; conjunct is single-slot and non-correlated | **checked** — `join_type == INNER && semantics == STANDARD` (`:301-303`), `soleSlot < 0` containment (`:341`) | verified again this pass; pass 2's B-6 stands |
+| `PredicatePushdown` — never below AGGREGATE / SORT / DISTINCT / LIMIT | yes | structural: `apply` rewrites only `FILTER` over `JOIN` or `SCAN` (`:361-380`) | **checked, structurally** | no |
+| `PredicatePushdown` — `filterOnto` over a `LogicalDerived` | yes | a conjunct on a derived relation is WRAPPED above it, never pushed into the body | **checked** (correctness) — but see B3-3, it is also an unstated performance decline | derived tables are Week 34, after the pass |
+| `PredicatePushdown` — `distribute` assumes WRITTEN order | yes | pushdown must run BEFORE `JoinEnumeration` | **believed**, guaranteed only by call order at `main.cc:571/583` and `:135/136` | — |
+| `PredicatePushdown` — `orderByWork` | yes | **conjunct evaluation must be TOTAL** — no conjunct may fail on a row another conjunct would have removed | **BELIEVED, and FALSE** | **YES — `SUBSTRING` (Week 25) raises per row. B3-2** |
+| `JoinEnumeration` — `containsOuterJoin` / `slotDeclineReason` | yes | declines outer and semi/anti trees outright | **checked**, over-declining | — |
+| `JoinEnumeration` — `rebuild` | yes | (a) the reordered tree computes the same RELATION — each edge consumed exactly once, cross-product throw; (b) **no consumer above depends on the merged schema's COLUMN ORDER** | (a) **checked**; (b) **BELIEVED, and FALSE** | **YES — the Week-37 sort tie-break reads schema order. B3-1** |
+| `JoinEnumeration` — written-cost floor | yes | bounds a misestimate, does not need path-independent `rows` | **checked** | — |
+| `CardinalityEstimator::estimate` | yes | every consumer of `estimated_rows` is a plan-SHAPE choice | **believed**; pass 2's A.3 traced all five consumers and they hold | — |
+| `CardinalityEstimator::selectivity` | yes (via pushdown) | *nothing states one* — it now decides conjunct ORDER, which B3-2 shows is not shape-only | **not stated at all** | yes |
+| `foldConstants` | **no** | folded node has the same value on every row; no downstream consumer tests SHAPE | **believed**, and the census is short by four (A.1) | yes — SUBSTRING (W25), intervals (TPC-H) |
+| `lowerInSubqueries` / `lowerExistsSubqueries` / `lowerCorrelatedScalars` / derived normalization | **no** | run before the gate on an input the flag cannot touch | **checked, structurally** (A.3) | — |
+| `materializeSubqueries` | **no**, but its RESULT is gate-dependent | the nested body's result must be plan-independent | **BELIEVED, and FALSE** | **YES — B3-1b** |
+
+Two of the three "BELIEVED and FALSE" rows are new this pass; the third
+(`selectivity` having no stated precondition at all) is the mechanism behind
+one of them.
+
+### B.2 Idempotency and ordering
+
+- **`JoinEnumeration` is not idempotent** and its guard is half a guard — pass 2's
+  B-7, re-confirmed, unchanged. Nothing calls `apply` twice.
+- **`PredicatePushdown` IS effectively idempotent.** A second `apply` on the
+  rewritten tree sees `FILTER`(residual) over `JOIN`; every residual conjunct
+  still has `soleSlot < 0` so it stays residual, and the already-pushed
+  conjuncts now live in `LogicalFilter`s *below* the join where `apply`'s
+  `FILTER`-over-`SCAN` branch only re-orders them by the same key. The one
+  non-idempotent operation is `restampSlots(c, 0)` (`:312`), and it is applied
+  only to conjuncts newly routed to `children[1]`, so a second pass has none to
+  restamp. No fixpoint hazard.
+- **`CardinalityEstimator::estimate` is idempotent** — a pure function of the
+  tree, overwriting `estimated_rows` with the same value.
+- **Ordering is load-bearing in exactly one place and it is stated**: pushdown
+  before enumeration (`distribute` needs written order). Confirmed at both call
+  sites. **A second ordering dependency is NOT stated**: `foldConstants` must run
+  before `LogicalPlanBuilder`, because `logical_plan.cc:250` throws on any
+  surviving `IntervalLiteral` (A.1 #4). Today that holds because folding is at
+  the end of `Binder::bind`, but nothing says the dependency exists.
+
+### B.3 (MEDIUM) A third silent decline — predicate pushdown never enters a derived body at all, and it costs 9.4× on the simplest possible shape
+
+Phase 5 has found two silent declines. Here is a third, measured.
+
+`filterOnto` (`predicate_pushdown.cc:259-265`) attaches a conjunct **above** the
+node it is routed to. When that node is a `LogicalDerived`, the predicate stops
+there — permanently, in every shape, including the one with no join anywhere.
+
+```sql
+SELECT d.team, d.speed FROM (SELECT team, speed, season FROM laps) d
+WHERE d.speed > 344 ORDER BY d.speed LIMIT 3
+```
+
+`--explain` (optimized):
+```
+LogicalFilter [(d.speed > 344)]            est=3333
+  LogicalDerived [d, 3 columns]            est=10000
+    LogicalProject [team, speed, season]   est=10000
+      LogicalScan [laps, 3 columns]        est=10000
+```
+
+`--explain-analyze`, against the flat query that is its exact semantic
+equivalent (`SELECT team, speed FROM laps WHERE speed > 344 ORDER BY speed LIMIT 3`):
+
+| | derived form | flat form |
+|---|---|---|
+| execution | **18465 µs** | **1969 µs** |
+| body `VecProject (materialize)` | `rows_in=10000 rows_out=10000`, 16221 µs (87.8%) | — |
+| scan annotation | `VecScan [laps, 3 columns]` — no `chunks_skipped`, no `pruning=on` | `VecScan [laps, 2 columns] chunks_skipped=0/2` |
+
+**9.4× slower**, and the cost is not the filter — it is the body's projection
+materializing 10000 rows that the filter immediately discards down to 174.
+Pushing a non-correlated conjunct through a derived relation's projection is
+textbook and legal here (no aggregate, no `DISTINCT`, no `LIMIT` in the body);
+declining it is a choice, and it costs the whole body.
+
+Two aggravating details:
+
+1. **The decline is silent.** `--explain` prints no `pushdown=skipped (derived)`
+   line, unlike `join-ordering=skipped (outer join)` which `18af84f` added on
+   exactly the "a decision was available and was refused" argument. Nothing in
+   `--explain` distinguishes "there was nothing to push" from "there was, and we
+   didn't".
+2. **The chunk-pruning hint does not reach the body's scan either.** The flat
+   form's scan prints `chunks_skipped=0/2`; the derived form's prints nothing.
+   So the derived form loses zone-map pruning as well as pushdown.
+
+Distinct from what is already recorded: pass 2's B-2 is about
+`PredicatePushdown::apply` and `JoinEnumeration::apply` not RECURSING into their
+own result when the outer block has a join. This one needs no join at all and
+is not about recursion — `filterOnto` is reached, and wraps by design. Ranked
+**MEDIUM**: pure plan quality, invisible to every correctness harness by
+construction, measured at 9.4× on the simplest shape that exhibits it.
+
+### B.4 The invariant harness, interrogated a third time
+
+Beyond pass 2's B-1 (the oracle is blind to five ungated passes — corrected
+count, see A.3), two properties of `run_optimizer_invariant`
+(`python_tools/test_new_queries.py:560-584`) that decide what "119 checks, 0
+divergences" means:
+
+1. **It compares SORTED rows.** `normalize()` (`:496-514`) ends
+   `return sorted(...)`. Every divergence that is an ORDER difference and not a
+   SET difference is invisible. B3-1 without its `LIMIT` is exactly that shape,
+   and the harness would pass it.
+2. **It runs against `catalog.json`, which has two tables.** `JoinEnumeration`
+   returns unchanged below `MIN_ENUMERATED_RELATIONS = 3`
+   (`join_enumeration.cc:444`, `join_enumeration.h:99`). The suite's only
+   multi-relation join shapes are 2-relation, including `self_join_where_both`.
+   **No query in the invariant suite can make `reorder` change anything.** The
+   pass with the most surface in this seam is exercised by zero of the 119
+   checks.
+3. It DOES catch an exception from either leg and record it as an ERROR, so
+   B3-2's shape would be caught — if a query of that shape existed. None does:
+   `SUBSTRING` appears in the harnesses only in select lists and with constant
+   arguments.
+
+The three coverage holes are independent, and each one alone is sufficient to
+let B3-1 through.
+
+**What the invariant would need to be worth its reputation**, stated as
+obligations rather than a patch: compare rows **in order** when the query has an
+`ORDER BY`; include at least one **3-relation** shape (a self-join on
+`catalog.json` reaches `MIN_ENUMERATED_RELATIONS`, or point a leg at
+`data/tpch/sf0.01/catalog.json`); and include one query whose `ORDER BY` is
+deliberately **not a total order** with a `LIMIT` that cuts inside the tie.
