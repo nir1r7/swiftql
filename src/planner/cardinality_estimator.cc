@@ -327,6 +327,35 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             return ctx;
         }
 
+        case LogicalNodeType::DERIVED: {
+            // Week 34's relation-that-is-a-plan. Without this case the switch
+            // fell through to `return StatsContext{}` at the bottom: the body
+            // was never walked, so nothing inside it was stamped either, and the
+            // node kept the -1.0 default from logical_plan.h WITH THE OPTIMIZER
+            // ON. JoinEnumeration then read max(-1.0, 0.0) = 0 rows
+            // (join_enumeration.cc), so every subset containing the derived
+            // relation costed as empty and the DP hoisted it ahead of genuinely
+            // small relations; and vectorized_plan_builder's
+            // `estimate_driven = from_est >= 0 && join_est >= 0` went false for
+            // the whole spine above it, silently dropping back to the
+            // pre-Week-22 build-side heuristic and disabling SIMD costing.
+            //
+            // A derived relation is row-preserving over its body: the body IS
+            // the relation. So recurse and adopt the body's count.
+            estimateNode(*node.children[0], catalog);
+            node.estimated_rows = node.children[0]->estimated_rows;
+            // The context is deliberately NOT forwarded. Its entries are named
+            // by the columns of whatever node tops the body — PROJECT returns
+            // its CHILD's context unchanged, so the names are the body's inputs,
+            // not its outputs — while the derived relation's columns are the
+            // body's select list, optionally renamed by column aliases
+            // (derivedRelationSchema). There is no mapping between the two that
+            // this pass can compute, and a bare-name match across that boundary
+            // would attribute one column's NDV to another. "No statistics" is
+            // the honest answer, and joinCardinality already models it.
+            return StatsContext{};
+        }
+
         case LogicalNodeType::FILTER: {
             auto& f = static_cast<LogicalFilter&>(node);
             StatsContext ctx = estimateNode(*node.children[0], catalog);

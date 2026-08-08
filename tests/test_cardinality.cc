@@ -743,3 +743,51 @@ TEST(Cardinality, SemiJoinWithAnOnResidualIsAnInternalError) {
     join->on_residual = std::move(lit);
     EXPECT_THROW(CardinalityEstimator::estimateSubtree(*join, cat), std::runtime_error);
 }
+
+// ===== Seam audit (phase 5, pass 1) — DERIVED =====
+//
+// `estimateNode`'s switch had no DERIVED case, so a relation-that-is-a-plan fell
+// through to the trailing `return StatsContext{}`: the body was never walked and
+// the node kept the -1.0 default from logical_plan.h WITH THE OPTIMIZER ON.
+// JoinEnumeration reads `max(estimated_rows, 0.0)`, so the DP priced the derived
+// relation as EMPTY and reordered on that; and VectorizedPlanBuilder's
+// `estimate_driven = from_est >= 0 && join_est >= 0` went false for every join
+// above it, disabling the Week 22 build-side choice and SIMD costing for the
+// whole spine. Results were unaffected, which is why it survived fourteen weeks.
+//
+// Three separate assertions, because each failure mode is separately reachable:
+// the node's own count, the body being stamped at all, and the -1 not surviving
+// upward into the join.
+TEST(Cardinality, DerivedRelationAdoptsItsBodyRowCount) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    seedDriversStats(cat);
+    auto plan = buildLogical(
+        "SELECT d.k FROM drivers dr JOIN (SELECT laps.driver_id AS k FROM laps) d "
+        "ON dr.driver_id = d.k", cat);
+    CardinalityEstimator::estimate(*plan, cat);
+
+    std::vector<const LogicalPlanNode*> nodes;
+    collectAllNodes(plan.get(), nodes);
+
+    const LogicalPlanNode* derived = nullptr;
+    for (const auto* n : nodes)
+        if (n->type == LogicalNodeType::DERIVED) derived = n;
+    ASSERT_NE(derived, nullptr);
+
+    // (1) row-preserving over its body: laps has 1000 rows
+    EXPECT_DOUBLE_EQ(derived->estimated_rows, 1000.0);
+
+    // (2) NOTHING is left unstamped — the body included. -1.0 is the unvisited
+    //     default, and it is the value that propagates the damage.
+    for (const auto* n : nodes)
+        EXPECT_GE(n->estimated_rows, 0.0)
+            << "unstamped node of type " << static_cast<int>(n->type);
+
+    // (3) the join above it is costed from real numbers. With no NDV from the
+    //     derived side, joinCardinality takes the max(l, r) fallback: the
+    //     pre-fix value was max(20, 0) == 20, the true shape is max(20, 1000).
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_DOUBLE_EQ(join->estimated_rows, 1000.0);
+}
