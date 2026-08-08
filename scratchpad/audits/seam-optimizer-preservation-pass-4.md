@@ -25,7 +25,7 @@ The fix round's precondition rests on one load-bearing sentence
 > no matter how the conjuncts are arranged.
 
 **That list is missing the most common type error of all, and it is missing it
-because `inferExprType` does not check it.** `logical_plan.cc:159-173`, the
+because `inferExprType` does not check it.** `logical_plan.cc:159-171`, the
 `BinaryExpr` branch:
 
 ```cpp
@@ -131,7 +131,7 @@ col-vec is again the only diverging mode, and for two reasons. `--no-optimize`
 gates only the VECTORIZED optimizer (`main.cc:566`; the Volcano path plans
 through `Planner::plan` and is unaffected by the flag), so neither Volcano row
 is a differential at all. And Volcano's `evaluate()` is EAGER for AND
-(`evaluator.cc:98-107` computes BOTH operands before the three-valued rule), so
+(`evaluator.cc:99-101` computes BOTH operands before the three-valued rule), so
 `row`+`volcano` raises unconditionally — the same asymmetry pass 3 recorded for
 `SUBSTRING`. `columnar`+`volcano` answers 0 rows because that path prunes the
 chunks away before the predicate is reached.
@@ -269,7 +269,7 @@ any of them below an inner join, freeze from the first raiser on — is right, a
 I could not break it on its own terms:
 
 * AND over TOTAL conjuncts is commutative under 3VL because a filter keeps only
-  TRUE (`columnar_eval.cc:107-111`, `evaluate`'s AND at `evaluator.cc:105-118`
+  TRUE (`columnar_eval.cc:108-110`, `evaluate`'s AND at `evaluator.cc:105-118`
   returns FALSE when either side is FALSE regardless of the other being NULL), so
   the survivor set entering position *k* is a function of the SET
   `{C0..C_{k-1}}`. Checked, not assumed.
@@ -298,7 +298,7 @@ I enumerated every throw site an expression can reach at execution
 | `IN: mixed STRING/numeric` | `value.cc` via `evaluator.cc:198` | recurses into `in->operand` | **safe**: `inferExprType` (`logical_plan.cc:174-186`) walks `in->values` and refuses the mixed shape at plan time. `InExpr::values` is `vector<Value>`, so it can hide no expression |
 | CASE branch raises | `evaluator.cc:220-227` | screens EVERY arm, including untaken ones | correct, and deliberately stricter than `evaluate` |
 | `IntervalLiteral` / `SubqueryExpr` unconditional throw | `evaluator.cc:238,256` | true (falls through to `return true`) | correct; unreachable anyway |
-| **`Type mismatch in Value comparison`** — a comparison whose operands are STRING vs numeric | **`value.cc:33,57`, reached from `evaluator.cc:126-131` and from `chunk_pruner.h:79-83`** | **FALSE** | **THE HOLE. P4-1** |
+| **`Type mismatch in Value comparison`** — a comparison whose operands are STRING vs numeric | **`value.cc:33,57`, reached from `evaluator.cc:127-132` and from `chunk_pruner.h:79-83`** | **FALSE** | **THE HOLE. P4-1** |
 | `Column not found in schema` | `evaluator.cc:92,182` | false | not data-dependent; the remappers are all-or-nothing and resolve before they write, so a moved conjunct always resolves where it lands |
 | `std::bad_variant_access` from `asInt()` on a bare DOUBLE predicate (`WHERE speed`) | `value.cc:28` | false | reachable (`WHERE speed AND lap_id > 999999`) but I could not make the two legs disagree: both answered 0 rows on every arrangement I tried, because the DOUBLE-typed predicate is refused by `ExpressionExecutor` and the fallback loop reaches `asInt()` only on surviving rows in BOTH legs. Recorded as unbroken, not as proven safe |
 
@@ -403,7 +403,7 @@ wrong answer. Two smaller things in the same 20 lines:
 
 **It runs in both legs.** `deterministicCut` is called from
 `LogicalPlanBuilder::build` at `logical_plan.cc:1231`, and `build` runs at
-`main.cc:554` — BEFORE the `if (!args.no_optimize)` block at `:566`. The Volcano
+`main.cc:556` — BEFORE the `if (!args.no_optimize)` block at `:566`. The Volcano
 path has the same rule open-coded at `planner.cc:459-481`. So the flag cannot
 reach it, and neither can any optimizer pass: it is decided on the written tree.
 
@@ -417,7 +417,7 @@ assumed:
    PROJECTED schema — a function of the SELECT list, not of the plan. For
    `SELECT *` the projection's `ColumnDef`s are copied from the child schema at
    BUILD time, i.e. in written order, with `relation_slot` intact
-   (`logical_plan.cc:1199-1215`).
+   (`logical_plan.cc:1199-1218`).
 3. It has no declared keys, so `rowLess` falls straight through to
    `compareCanonical` over `tieBreakOrder(schema)`, which sorts by
    `(relation_slot, name)` — column IDENTITY, not position. That is exactly the
