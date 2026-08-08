@@ -497,7 +497,21 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 double semi = l_rows * frac;
                 rows = (join.semantics == JoinSemantics::SEMI) ? semi : (l_rows - semi);
                 rows = std::max(0.0, std::min(rows, l_rows));   // never exceeds the left side
-                node.estimated_rows = rows;
+                // Seam audit (optimizer preservation, pass 1) L-1: this was the
+                // one stamping site that did NOT take the >=1 floor the STANDARD
+                // path and the FILTER case both take. With an aggregate-topped
+                // body the right context is empty, so `frac` stays 1.0 and an
+                // ANTI join stamped exactly 0 — and a stamped 0 propagates: it
+                // makes flooredJoinCardinality's own `left_rows >= 1.0` guard
+                // decline for every join ABOVE this one, so their estimates are
+                // unfloored too. Same mechanism as the missing DERIVED case.
+                //
+                // Correct place for it: this is a STAMPING site. The floor is
+                // deliberately kept out of joinCardinality because the DP's
+                // optimal substructure needs a path-independent estimate — and
+                // the DP never sees a semi/anti join anyway
+                // (hasSlotOutsideRangeTable declines the tree on join_slot -1).
+                node.estimated_rows = flooredJoinCardinality(l_rows, r_rows, rows);
                 return out;
             }
 

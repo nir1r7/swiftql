@@ -15,6 +15,7 @@
 #include "common/schema.h"
 #include "common/value.h"
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1362,4 +1363,49 @@ TEST(DerivedTableAliasList, SelectStarExpandsToTheRenamedColumns) {
     auto rows = drainVec(*plan);
     ASSERT_FALSE(rows.empty());
     EXPECT_EQ(rows[0].size(), 2u);
+}
+
+// Seam audit (phase 5, engine-divergence pass 1), ISSUE 2. The semi/anti branch
+// used to pass `/*on_residual=*/nullptr` instead of forwarding
+// `join->on_residual`, which DEFEATS VecHashJoinNode's own constructor guard
+// ("a semi/anti join takes no ON residual"): a residual set by some future
+// decorrelation would be dropped silently instead of raising. Nothing sets one
+// today, so the two spellings behave identically on every shipped query — which
+// is exactly why the guard needs a test that plants the state by hand.
+//
+// The CardinalityEstimator raises on the same state, so the estimator is
+// deliberately NOT run here: this asserts the BUILDER's leg of the check, the
+// one that runs under --no-optimize with no estimator in front of it.
+TEST(VecPlanBuilder, SemiJoinWithAnOnResidualIsRefusedByTheBuilder) {
+    Catalog cat(CATALOG);
+    Parser parser("SELECT d.driver_id FROM drivers d "
+                  "WHERE d.driver_id IN (SELECT driver_id FROM laps)");
+    auto stmt = parser.parse();
+    Binder::bind(stmt, cat);
+    auto tables = loadColumnar(stmt, cat);
+    if (!tables.count("laps")) {
+        const auto& bm = cat.getTable("laps");
+        tables.emplace("laps",
+                       CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema));
+    }
+    auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
+
+    // find the semi join and plant a residual on it
+    std::function<LogicalJoin*(LogicalPlanNode*)> findSemi =
+        [&](LogicalPlanNode* n) -> LogicalJoin* {
+            if (!n) return nullptr;
+            if (n->type == LogicalNodeType::JOIN) {
+                auto* j = static_cast<LogicalJoin*>(n);
+                if (j->semantics != JoinSemantics::STANDARD) return j;
+            }
+            for (auto& c : n->children)
+                if (LogicalJoin* f = findSemi(c.get())) return f;
+            return nullptr;
+        };
+    LogicalJoin* semi = findSemi(logical.get());
+    ASSERT_NE(semi, nullptr) << logical->explain();
+    semi->on_residual = std::make_unique<Literal>(Value(int64_t(1)));
+
+    EXPECT_THROW(VectorizedPlanBuilder::build(std::move(logical), std::move(tables), cat),
+                 std::runtime_error);
 }

@@ -798,46 +798,69 @@ TEST(JoinEnumeration, OuterJoinEstimateAppliesTheOnResidualToTheMatchTerm) {
 // outer tree. Semi-join lowering is what finally grafts a second range table
 // into ONE plan, so this is where the decline first fires on a real query.
 //
-// It matters which decline fires, not just that one did: the outer-join decline
-// is REPORTED and this one is SILENT, so a test that only checked "the order
-// did not change" would pass on either and would not notice the two swapping.
+// It matters which decline fires, not just that one did: a test that only
+// checked "the order did not change" would pass on either and would not notice
+// the two swapping. This used to be pinned by the outer-join decline being
+// REPORTED and this one SILENT.
+//
+// SEAM AUDIT (optimizer preservation, pass 1): this decline is now REPORTED too,
+// so the discriminator moved from "empty vs non-empty" to the reason string
+// itself — which is a strictly more specific assertion, not a weaker one. The
+// silence stopped being honest once a fully inner three-relation block could sit
+// below the semi join and lose its ordering with nothing printed.
 TEST(JoinEnumeration, DeclinesASemiJoinTreeAsSlotOutsideTheRangeTable) {
     Catalog cat(CATALOG);
     seedStats(cat);
-    // Three SCANs — laps, drivers, and the body's laps — so the pass is past its
-    // <3-relation guard and a decline is a real refusal rather than the no-op.
-    auto plan = optimize(
+    // THE SPINE MUST BE THREE RELATIONS, not three SCANs. The old query here was
+    // `laps JOIN drivers WHERE ... IN (...)` with the comment "three SCANs — laps,
+    // drivers, and the body's laps — so the pass is past its <3-relation guard".
+    // That comment predates Week 34: countRelations counts the SPINE now and
+    // skips a semi/anti body entirely, so that query is n=2 and `reorder` returns
+    // at the <3-relation guard BEFORE reaching this decline. The assertion still
+    // passed, for a decline it was not testing — which is why the query is the
+    // one the audit reproduced on, a fully inner THREE-relation block that the
+    // search could have reordered and does not because of the IN above it.
+    static const char* SQL =
         "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
-        "WHERE l.lap_id IN (SELECT lap_id FROM laps)", cat);
+        "JOIN drivers d2 ON d.team = d2.team "
+        "WHERE l.lap_id IN (SELECT lap_id FROM laps)";
+    auto plan = optimize(SQL, cat);
 
     std::vector<const LogicalJoin*> joins;
     collectJoins(plan.get(), joins);
-    ASSERT_EQ(joins.size(), 2u);
+    ASSERT_EQ(joins.size(), 3u);
     const LogicalJoin* semi = joins.front();
     ASSERT_EQ(semi->semantics, JoinSemantics::SEMI);
 
-    // SILENT: no order_decision on any join in the tree. The outer-join decline
-    // would have stamped "join-ordering=skipped (outer join)" on the top join,
-    // so an empty string here is what identifies WHICH decline fired.
-    for (const LogicalJoin* j : joins) EXPECT_TRUE(j->order_decision.empty());
-    EXPECT_TRUE(decisionOf(plan.get()).empty());
+    // REPORTED, and the reason names THIS decline: the outer-join decline would
+    // have stamped "join-ordering=skipped (outer join)", so the exact string is
+    // what identifies which one fired. It is deliberately not `order=` — no order
+    // was chosen, and that token must keep meaning "the search ran".
+    EXPECT_EQ(decisionOf(plan.get()), "join-ordering=skipped (semi/anti join)");
+    EXPECT_EQ(decisionOf(plan.get()).find("order="), std::string::npos);
+    // ...and only the declining node carries it. An inner join below it made no
+    // decision either and must not claim one.
+    EXPECT_TRUE(semi->order_decision.rfind("join-ordering=skipped", 0) == 0);
+    for (const LogicalJoin* j : joins) {
+        if (j != semi) EXPECT_TRUE(j->order_decision.empty());
+    }
 
     // ...and the condition it declined on is the one this test names: the semi
     // join has no slot in this block's range table.
     EXPECT_EQ(semi->join_slot, -1);
 
     // The written order survives untouched, which is the point of declining.
-    auto baseline = writtenOrder(
-        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
-        "WHERE l.lap_id IN (SELECT lap_id FROM laps)", cat);
+    auto baseline = writtenOrder(SQL, cat);
     EXPECT_EQ(chosenOrder(plan.get()), chosenOrder(baseline.get()));
 
-    // CONTROL: the same FROM spine WITHOUT the IN is only two relations, so it
-    // is left alone by the <3-relation guard rather than by this decline — the
-    // decline above is caused by the semi join, not by the shape of the spine.
+    // CONTROL, and it is what makes the decline a real COST rather than a no-op:
+    // the same three-relation FROM spine WITHOUT the IN is reordered by the DP.
+    // So the ordering the query above loses is one that was genuinely available.
     auto no_semi = optimize(
-        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id", cat);
-    EXPECT_EQ(topJoin(no_semi.get())->join_slot, 1);
+        "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
+        "JOIN drivers d2 ON d.team = d2.team", cat);
+    EXPECT_NE(decisionOf(no_semi.get()).find("method=dp"), std::string::npos)
+        << decisionOf(no_semi.get());
 }
 
 // The semi/anti rule is stamped at the estimator and is NEVER reachable from

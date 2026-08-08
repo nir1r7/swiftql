@@ -485,12 +485,22 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
             // No setCostDecision() here: estimates did not drive this choice,
             // and printing one would make --explain claim an optimizer decision
             // that never happened (the discipline at LogicalJoin::order_decision).
+            //
+            // `on_residual` is FORWARDED, not replaced with nullptr. Nothing
+            // sets it on a semi/anti node today (only LogicalPlanBuilder does,
+            // and only on a JoinType::LEFT node), so both spellings behave
+            // identically right now. They stop behaving identically the moment a
+            // future decorrelation produces an inequality residual: forwarding
+            // makes VecHashJoinNode's own guard ("a semi/anti join takes no ON
+            // residual") fire at plan time, while passing nullptr DEFEATS that
+            // guard and drops the predicate silently. A constructor check the
+            // caller routes around is not a check.
             if (join->semantics != JoinSemantics::STANDARD) {
                 return std::make_unique<VecHashJoinNode>(
                     std::move(from_child), std::move(join_child),
                     std::move(left_idx), std::move(right_idx),
                     join->output_schema, /*swapped=*/false, /*left_outer=*/false,
-                    /*on_residual=*/nullptr, join->semantics);
+                    std::move(join->on_residual), join->semantics);
             }
 
             // Week 22 (build side) + Week 23.5 (algorithm): cost every legal

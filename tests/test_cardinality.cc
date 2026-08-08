@@ -681,6 +681,15 @@ TEST(Cardinality, SemiAndAntiEstimatesPartitionTheLeftSide) {
 // left, the ratio exceeds 1 and an unclamped rule would estimate MORE rows than
 // the left input holds — for an operator that can only ever emit a subset of
 // it. The anti side is where that shows up as a negative row count.
+//
+// Seam audit (optimizer preservation, pass 1) L-1 CHANGED THE PINNED VALUE HERE,
+// deliberately, and the change is a STRENGTHENING: the clamp used to leave the
+// anti side stamped at exactly 0, and this test pinned that 0. A stamped 0 is
+// not merely imprecise — it makes flooredJoinCardinality's `left_rows >= 1.0`
+// guard decline for every join ABOVE this one, so their estimates lose the floor
+// too. The semi/anti path now takes the same >=1 floor the STANDARD path and the
+// FILTER case take, so the expectation moves 0 -> 1 and the property this test is
+// named for ("never goes negative") holds strictly more tightly than before.
 TEST(Cardinality, SemiJoinClampsAtTheLeftRowCountAndAntiNeverGoesNegative) {
     Catalog cat(CATALOG);
     seedLapsStats(cat, /*driver_id_ndv=*/5);   // right NDV 20 > left NDV 5
@@ -690,8 +699,27 @@ TEST(Cardinality, SemiJoinClampsAtTheLeftRowCountAndAntiNeverGoesNegative) {
     CardinalityEstimator::estimateSubtree(*semi, cat);
     CardinalityEstimator::estimateSubtree(*anti, cat);
     EXPECT_DOUBLE_EQ(semi->estimated_rows, 1000.0);   // min(1.0, 20/5) == 1.0
-    EXPECT_DOUBLE_EQ(anti->estimated_rows, 0.0);
-    EXPECT_GE(anti->estimated_rows, 0.0);
+    // the rule computes 1000 - 1000*min(1, 20/5) == 0; the stamping floor lifts it
+    EXPECT_DOUBLE_EQ(anti->estimated_rows, 1.0);
+    EXPECT_GE(anti->estimated_rows, 1.0);
+}
+
+// The floor is a property of the STAMP, and it must survive the shape that
+// produces the 0: a semi/anti body topped by an AGGREGATE returns an empty
+// StatsContext, so no right-side NDV exists, `frac` stays 1.0, and the anti rule
+// computes l_rows - l_rows == 0 for ANY left input. Both children still have
+// rows, which is the precondition flooredJoinCardinality requires, so the stamp
+// is 1 and not 0.
+TEST(Cardinality, AntiJoinWithNoRightSideNdvIsFlooredNotZero) {
+    Catalog cat(CATALOG);
+    seedLapsStats(cat);
+    // drivers deliberately gets NO stats: an empty right context is exactly what
+    // an aggregate-topped subquery body hands this rule.
+    auto anti = semiJoinOverLapsAndDrivers(JoinSemantics::ANTI);
+    CardinalityEstimator::estimateSubtree(*anti, cat);
+    EXPECT_GT(anti->children[0]->estimated_rows, 0.0);
+    EXPECT_GT(anti->children[1]->estimated_rows, 0.0);
+    EXPECT_DOUBLE_EQ(anti->estimated_rows, 1.0);
 }
 
 // The CONTEXT the semi/anti join hands upward, not the row count. Its output

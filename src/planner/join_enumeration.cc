@@ -127,17 +127,42 @@ bool containsOuterJoin(const LogicalPlanNode* node) {
 // consult from_slot for placement, so a throw here is the one place the
 // optimized path can fail on input `--no-optimize` accepts, and that
 // equivalence is the differential oracle compare_against_sqlite.py's fourth mode
-// exists to be. Same shape as containsOuterJoin's decline, and silent like the
-// <3-relation and >32-relation ones: no ordering decision was available to
-// report, so an `order=` line would claim a search that never ran.
-bool hasSlotOutsideRangeTable(const LogicalPlanNode* node, int n) {
-    if (node->type != LogicalNodeType::JOIN) return false;
+// exists to be. Same shape as containsOuterJoin's decline.
+//
+// SEAM AUDIT (optimizer preservation, pass 1) MADE THE SEMI/ANTI CAUSE REPORTED.
+// It used to be silent, on this file's own argument that "no ordering decision
+// was available to report". That argument stopped being true once IN-lowering
+// shipped: on `FROM a JOIN b JOIN c WHERE x IN (SELECT …)` the block below the
+// semi join is a FULLY INNER three-relation tree the search could have reordered,
+// and the whole query loses ordering because an unrelated subquery sits above it.
+// Measured on the shipped catalog: the same spine without the IN gets
+// `order=drivers@1,drivers@2,laps@0 cost=43104 (written=60637) method=dp`, and
+// with the IN it gets nothing at all. That is exactly the loss Week 29 added its
+// decline string for — "a supported query pays a real plan-quality cost".
+//
+// The reason is returned rather than a bool so the two causes stay
+// distinguishable. The UNBOUND-KEY cause stays reported too but names itself
+// differently; it is not reachable from the CLI (the Binder stamps every key),
+// so it would be a decline string nobody can trigger if it shared the semi/anti
+// wording — the dead-assertion failure this file records elsewhere.
+//
+// Returns nullptr when the tree is fine. The truth value is identical to the
+// bool predicate it replaces, test for test.
+const char* slotDeclineReason(const LogicalPlanNode* node, int n) {
+    if (node->type != LogicalNodeType::JOIN) return nullptr;
     const auto* join = static_cast<const LogicalJoin*>(node);
-    if (join->join_slot < 1 || join->join_slot >= n) return true;
-    for (const JoinKey& k : join->keys) {
-        if (k.from_slot < 0 || k.from_slot >= n) return true;
+    if (join->join_slot < 1 || join->join_slot >= n) {
+        // A semi/anti join's join_slot is -1 BY CONTRACT (logical_plan.h), not by
+        // accident, so this branch names the cause rather than the symptom.
+        return join->semantics != JoinSemantics::STANDARD
+             ? "semi/anti join" : "relation slot outside the range table";
     }
-    return hasSlotOutsideRangeTable(join->children[0].get(), n);
+    for (const JoinKey& k : join->keys) {
+        if (k.from_slot < 0 || k.from_slot >= n) {
+            return "relation slot outside the range table";
+        }
+    }
+    return slotDeclineReason(join->children[0].get(), n);
 }
 
 // Per-relation row width, the same rule VectorizedPlanBuilder's rowWidth uses on
@@ -435,7 +460,8 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
             "join-ordering=skipped (outer join)";
         return node;
     }
-    // Week 30 — also BEFORE decompose(), and still SILENT. See the function.
+    // Week 30 — also BEFORE decompose(). REPORTED as of the phase 5 seam audit;
+    // see the function for why the silence stopped being honest.
     //
     // !! WEEK 34 EXPECTED TO MAKE THIS FIRE FOR DERIVED TABLES AND IT DOES NOT,
     // which is worth recording because three prior weeks predicted otherwise
@@ -451,16 +477,33 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     // the dead-assertion failure Week 33 recorded — it reads as a guarantee and
     // stops anyone looking.
     //
-    // WHAT IS REAL, AND IS NEW: a derived relation has no TableStats, so
-    // `joinCardinality`'s no-statistics branch `max(l, r)` — which is NOT
-    // multiplicative — now runs on a query the CLI can type. A subset containing
-    // one therefore has an order-dependent row count and the DP's optimal
-    // substructure does not hold for it. The containment is unchanged and is the
-    // written-order bound in reorder() below, exactly as Week 28 specified; this
-    // is simply the first time that bound is load-bearing outside a fixture.
-    // Week 28 also recorded that `method=written-floor` had never executed. It
-    // is reachable from the CLI now.
-    if (hasSlotOutsideRangeTable(node.get(), n)) return node;
+    // WHAT IS REAL: a derived relation has no TableStats, so it supplies no key
+    // NDV of its own.
+    //
+    // !! THE PARAGRAPH THAT USED TO BE HERE WAS FALSE IN BOTH HALVES, and the
+    // phase 5 seam audit measured both. It claimed `joinCardinality`'s
+    // no-statistics branch `max(l, r)` runs on these queries, and that
+    // `method=written-floor` was therefore reachable from the CLI. Neither
+    // happens: `have_ndv` (cardinality_estimator.cc, inside joinCardinality) is
+    // set when EITHER side supplies an NDV, and the non-derived side always does,
+    // so the MULTIPLICATIVE branch runs and `max(l, r)` never does. And the DP
+    // won outright on both queries tested (`method=dp`), because the derived
+    // side's then-fabricated 0 rows made the reordered plan look strictly better
+    // rather than merely path-dependent — the estimator had no DERIVED case, so
+    // `rels[r].rows` below read `max(-1.0, 0.0)`.
+    //
+    // The DERIVED case now exists, so `rels[r].rows` is a real number here. The
+    // remaining truth is narrower and worth keeping: a derived relation
+    // contributes no NDV, so a subset containing one is priced from the other
+    // side's statistics alone. `max(l, r)` still runs when NEITHER side has any —
+    // it is not multiplicative, so such a subset has an order-dependent row count
+    // and the DP's optimal substructure does not hold for it. The containment is
+    // unchanged and is the written-order bound in reorder() below.
+    if (const char* why = slotDeclineReason(node.get(), n)) {
+        static_cast<LogicalJoin*>(node.get())->order_decision =
+            std::string("join-ordering=skipped (") + why + ")";
+        return node;
+    }
 
     std::vector<std::unique_ptr<LogicalPlanNode>> leaves(n);
     std::vector<Edge> edges;
