@@ -264,8 +264,12 @@ inline double narrowToDoubleColumn(const Value& v, bool unrendered) {
 // The distinction is therefore a PLAN-SHAPE fact, not a value fact: is this
 // materialized column read by another expression, or is it the query's output?
 // appendColumnValue sees one Value and cannot know. vectorized_plan_builder.cc
-// can, and it arms `cv.int_observable` on exactly the columns whose INT-ness
-// can reach an operand of a `/` somewhere above them (collectIntOrigins).
+// can, and it sets `cv.int_narrowing` to OBSERVABLE on exactly the columns whose
+// INT-ness can reach an operand of a `/` whose OTHER operand can also be an INT
+// (collectIntOrigins). When the plan is CUT IN TWO by materializeSubqueries the
+// division and the column live in different builds, and the request crosses the
+// cut instead of the taint — see VectorizedPlanBuilder::build's
+// `result_int_type_observable`.
 //
 // Both halves are needed and both are narrow:
 //   - plan shape alone would refuse `SELECT x/2 FROM (SELECT CASE WHEN c THEN
