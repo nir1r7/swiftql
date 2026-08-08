@@ -1312,6 +1312,34 @@ WEEK34_CORRELATED_SCALAR_VEC_ONLY = [
     "SELECT d.driver_id AS did, d.age AS age FROM drivers d WHERE d.age > 1 + "
     "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id AND l.lap_id < 60) "
     "ORDER BY did",
+
+    # SEAM AUDIT (subquery chain, pass 1) — F1/F2. TWO CORRELATED EQUALITIES ON
+    # ONE BODY COLUMN. This used to be REFUSED, with
+    #   "derived table '$scalar0': column 'driver_id' is produced twice;
+    #    give one of them an alias"
+    # — a message naming a relation the user never wrote, advising an alias they
+    # cannot spell, for SQL SQLite answers (20 here).
+    #
+    # It is diffed rather than merely "no longer refused" because the semantics
+    # are the point: two keys on one body column mean the join must test BOTH
+    # (`d.driver_id = l.driver_id AND d.age = l.driver_id`). Deduplicating the
+    # group key down to one and dropping a join key would also stop the refusal
+    # and would answer 20 on this data by coincidence — l.driver_id and
+    # d.driver_id agreeing is what the second key adds — so a suite entry that
+    # only asserted "it runs" would pass a wrong fix.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.driver_id = d.age)",
+    # ...and the DISCRIMINATING form of the same shape. Above, the two outer
+    # columns are compared against the same body column, so a fix that kept only
+    # the first key still answers 20. Here the second key is the only thing that
+    # can be wrong: `l.season = d.age` matches nothing (ages are not seasons), so
+    # every correlation group is empty, every COUNT is 0, and the answer is 20
+    # only if BOTH keys reached the join. Dropping the season key gives a
+    # non-empty group per driver and a different answer.
+    "SELECT COUNT(*) AS n FROM drivers d WHERE d.age > "
+    "(SELECT COUNT(*) FROM laps l WHERE l.driver_id = d.driver_id "
+    "AND l.season = d.age)",
 ]
 
 # Three entries wrap their correlated scalar in an IN, and has_in is tested

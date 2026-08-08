@@ -405,8 +405,58 @@ ScalarLoweringResult lowerCorrelatedScalars(std::unique_ptr<LogicalPlanNode> spi
             // drift.
             const std::string alias = "$scalar" + std::to_string(out.lowered);
             TableRef synthetic = TableRef::named("", alias);
+
+            // SEAM AUDIT (subquery chain, pass 1) — F1 and F2, which are ONE
+            // defect seen from two sides, and must be fixed together.
+            //
+            // F1: two correlated equalities on the SAME body column
+            // (`l.k = d.a AND l.k = d.b`) push two group keys named `k`, and
+            // derivedRelationSchema — written for a user's `FROM (…) AS d` —
+            // refuses a duplicate output name with "give one of them an alias".
+            // The user wrote no derived table and cannot alias a column of
+            // `$scalar0`, so a legal query that SQLite answers is refused with
+            // advice nobody can act on.
+            //
+            // F2: this is the only one of the four subquery lowerings whose
+            // BUILD-SIDE key is resolved by BARE NAME — the join it builds is
+            // STANDARD, so rightKeyIndices takes the `indexOf(k.join_col)`,
+            // first-match-wins path rather than the positional one the semi/anti
+            // lowerings get. That was safe only because F1's refusal made a
+            // duplicate build-side name unreachable. Relaxing F1's check would
+            // therefore have opened a silent wrong answer through F2.
+            //
+            // Both close by RENAMING the group-key columns to generated,
+            // per-index names instead of relaxing anything. `$k0…$k{n-1}` are
+            // pairwise distinct by construction, so F1's collision cannot arise;
+            // and `$` is not lexable in an identifier, so no body column can ever
+            // share one of these names — the bare-name lookup is now unique by
+            // construction rather than by another pass's refusal. Duplicate keys
+            // then behave as SQL says: `$k0` and `$k1` both carry `l.k`, and the
+            // join tests `d.a = l.k AND d.b = l.k`, which is the written meaning.
+            //
+            // The AGGREGATE column keeps its own name: the outer predicate reads
+            // it by that name (the ColumnRef built below), and it is the one
+            // column of this relation the enclosing query refers to.
+            // The rename is applied to the RELATION, not to the body: it is the
+            // same thing `FROM (…) AS d (a, b)` does, and derivedRelationSchema
+            // is given the already-renamed schema so its duplicate check runs on
+            // the names the relation will actually publish.
+            std::vector<ColumnDef> renamed = body_plan->output_schema.columns();
+            // buildAggregateSchema emits group keys first, in key order, then the
+            // aggregates — so the body is exactly [keys…, aggregate].
+            if (renamed.size() != keys.size() + 1) {
+                throw std::runtime_error(
+                    "internal: correlated scalar body produced "
+                    + std::to_string(renamed.size()) + " columns for "
+                    + std::to_string(keys.size()) + " correlation keys");
+            }
+            for (size_t i = 0; i < keys.size(); ++i) {
+                renamed[i].name = "$k" + std::to_string(i);
+                keys[i].join_col = renamed[i].name;
+            }
+
             Schema normalized =
-                derivedRelationSchema(body_plan->output_schema, synthetic);
+                derivedRelationSchema(Schema(std::move(renamed)), synthetic);
             auto derived = std::make_unique<LogicalDerived>(
                 std::move(body_plan), alias, normalized);
 
