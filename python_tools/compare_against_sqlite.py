@@ -2004,8 +2004,26 @@ def assert_b32_pins_discriminate():
 # `DESC` fixes both at once: the two LARGEST rows win, so the integer is IN the
 # output (the Volcano diff now actually compares 9007199254740993 against
 # SQLite's) and it reaches the materialization the vectorized path refuses.
-# The ascending form is kept — as `e10_guard_cut_before_materialize` below,
-# where it belongs, because the behaviour it pins is real and worth holding.
+# The ascending form is kept — as the last boundary guard below, where it
+# belongs, because the behaviour it pins is real and worth holding.
+#
+# DISCRIMINATION, MEASURED against a binary with `narrowToDoubleColumn` reduced
+# to `return v.toNumeric();` (pre-fix semantics, throwaway worktree):
+#
+#   E10_VECTORIZED_REFUSED   0/8 pre-fix ("expected a rejection, got rows")
+#                            8/8 post-fix
+#   E10_BOUNDARY_GUARDS      16/16 both — they are guards; they must NOT move
+#   E10_VOLCANO_ONLY         8/8 both — Volcano was always right, so these
+#                            assert Volcano's correctness, not the fix
+#
+# And the wrong answers themselves, pre-fix, on col-vec:
+#   * the row-count witness returned TWO rows, `0.5` and `9.00719925474099e+15`,
+#     where SQLite and Volcano return THREE — the value collapsed AND the
+#     rendering went exponential;
+#   * the render witness returned `1e+15` where both return `1000000000000001`,
+#     which is the half a 2^53 bound would have missed;
+#   * `COUNT(DISTINCT ...)` over the SAME expression returned 3 — the engine
+#     answering 2 and 3 to one question at the same time.
 E10_VOLCANO_ONLY = [
     # THE VALUE WITNESS: above 2^53, so the double cannot hold it.
     "SELECT CASE WHEN round > 10 THEN 9007199254740993 ELSE 0.5 END AS c "
