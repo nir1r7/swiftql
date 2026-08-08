@@ -11,6 +11,42 @@ Current: **FIX ROUND 4 GATED GREEN on b14d086. SEAM PASS 5 RUNNING — THE LAST 
   summary line), not merely free of failures.
 AFTER PASS 5: doc sweep -> q21 -> sf0.1 -> final gate.
 
+## PASS 5 — optimizer preservation: **0 BLOCKER / 1 HIGH / 3 MEDIUM / 2 LOW.**
+**VERDICT LINE WORTH KEEPING:** *"Round 4 got the design right and the plumbing wrong. The
+definition, the precondition and the five-site partition all hold under attack; `exprMayRaise` is
+exact for every expression form the dialect has. What is wrong is that the screen is a function of
+a schema and two callers hand it the wrong one — and the definition was strengthened faster than
+its consumers were enumerated."*
+**P5-2 (HIGH) — a LIVE LEG DIVERGENCE.** `staticTypeOf`'s ColumnRef **bare-name fallback**
+(inherited from `resolveColumnIndex`, where it is CORRECT) types a FOREIGN relation's conjunct
+against the SCANNING relation's schema. Two tables sharing a column name with different types ->
+a raising conjunct types TOTAL -> `collectSimplePredicates` walks past it -> a later conjunct's
+zone-map skip removes the rows it was owed.
+  SELECT a.k FROM a JOIN b ON b.k = a.k WHERE a.v = 5 AND b.v = 5 AND a.k > 999999
+    optimized -> Error: Type mismatch | --no-optimize -> 0 rows (chunks_skipped=3/3)
+  Control with `a.k > 0` errors on BOTH legs, isolating the cause to the skip.
+  **Round 4 guarded `canSkipChunk`; it did not guard REACHING it.**
+  UNREACHABLE BY ANY HARNESS: TPC-H sf0.01 has no shared column name at all, and catalog.json's
+  two are type-matched. A user with two same-named columns of different types hits it.
+**P5-1 (MED)** — the definition's *"nothing may change that set … not a plan rewrite"* is FALSE:
+  `lowerInSubqueries`/`lowerExistsSubqueries` DELETE their conjunct and interpose a row-reducing
+  semi-join BELOW the filter. `raiser AND IN (999999)` errors; `raiser AND IN (SELECT …)` answers
+  0 rows. **Both legs agree, so no harness sees it.** `lowerCorrelatedScalars` is clean (LEFT join).
+**P5-3 (MED)** — P4-2 is **HALF closed**. The DOUBLE fix is real (plans byte-identical, verified);
+  the **INT spelling still measures 90x** (38847us vs 432us, 5 runs, wall-clock corroborated),
+  still silent at all four movers.
+**P5-4 (MED)** — a comparison against a NULL literal is classified may-raise, which the file's own
+  comment proves impossible; **2.55x** measured on a query that answers 0 rows.
+LOW: the "missed subtype answers TRUE" safety claim fails OPEN at OPERATOR granularity; the harness
+  census says 6 ungated passes, there are **9** (`applyLimit` is round 4's new one).
+**IT WITHDREW ITS OWN P4-B2 — the fixer was right.** Both disputed examples verified as answering
+  today, plus an argument NEITHER PARTY MADE: a plan-time refusal would say the SCHEMA decides
+  whether `team = 5` errors, contradicting the definition round 4 shipped (the ROW SET decides).
+  Both cannot be the rule.
+**THE +17.7% PRUNING LOSS AND P5-2 ARE THE SAME BUG** — the fix `chunk_pruner.h` proposes for one
+  (thread the filter's child schema through `pruningHintForPreservedSide`) is exactly the fix for
+  the other. One fix, two findings.
+
 ## !! THE `setsid` BUG — it explains an earlier false "green"
 The detached-plus-`tail --pid` pattern I propagated **does not survive the 10-minute Bash cap**.
 Plain `setsid` does NOT fork when the shell's child is not already a process-group leader, so the
