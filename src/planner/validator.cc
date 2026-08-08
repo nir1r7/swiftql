@@ -106,7 +106,103 @@ void checkGroupedRefs(const Expr* expr, const std::vector<GroupByColumn>& group_
     // Literal / IntervalLiteral: fine
 }
 
+// THE JOIN-KEY TYPE RULE — one comparison, one message, for all four JoinKey
+// producers (validator.h explains why it converges on the plan rather than on
+// the producers).
+//
+// WHAT IS WRONG, stated because a refusal that does not name its cause gets
+// deleted by the next person who meets it. A join key is serialized to TEXT
+// (execution/key_encoding.h) and the texts are compared. Text carries no type
+// tag, so a STRING key matches a numeric one only when the STRING already IS the
+// number's canonical rendering: '16' matches the INT 16, while '016', ' 16',
+// '+16' and '16.0' do not. SQLite applies numeric affinity and matches all five.
+// So the engine returns a strict SUBSET of the right rows for a positive test
+// and a strict SUPERSET for a negated one, with no error either way — the
+// "half a match" Week 29 named.
+//
+// REFUSING RATHER THAN IMPLEMENTING AFFINITY, deliberately, and the reason is
+// not effort:
+//   - `Value::operator==` throws `Type mismatch` across the STRING boundary, so
+//     the identical predicate in a WHERE clause is an error. And an INNER join's
+//     ON conjuncts that are NOT keys are folded into the WHERE conjunction by
+//     LogicalPlanBuilder::build. Give keys affinity and one written predicate
+//     answers differently depending on whether classifyJoinCondition made it a
+//     key — the same conjunct, two semantics, decided by a planner detail.
+//   - the encoding could not implement it locally anyway: keyFieldText sees ONE
+//     Value and would need the OPPOSING column's type threaded through six
+//     serializers and both engines.
+//   - the encoding is NOT the defect. keyFieldText's numeric affinity (an
+//     integral DOUBLE takes the integer path, so 7.0 joins 7) is correct
+//     everywhere, including in all three lowerings — seam audit pass 3, C3-4,
+//     measured it. The defect was only ever the missing guard.
+//
+// Coarse on purpose — both STRING or both numeric — matching `Value::operator==`,
+// which coerces INT/DOUBLE and throws only across the STRING boundary.
+void requireJoinKeyTypes(const char* context,
+                         const Schema& left, int li,
+                         const Schema& right, int ri,
+                         const std::string& from_col,
+                         const std::string& join_col) {
+    const bool l_str = left.column(li).type  == TypeId::STRING;
+    const bool r_str = right.column(ri).type == TypeId::STRING;
+    if (l_str == r_str) return;
+    throw std::runtime_error(
+        std::string(context) + ": cannot join a STRING column with a numeric one ('"
+        + from_col + "' and '" + join_col + "'). Keys are matched as serialized "
+        "text, which carries no type tag, so the STRING would match only when it "
+        "is already the number's canonical rendering ('16' matches the INT 16, "
+        "'016' does not) while SQLite's affinity converts and matches both. "
+        "Make the two columns the same type.");
+}
+
+// Which construct produced this node's keys, for the message only. SEMI is the
+// one that cannot be narrowed: lowerInSubqueries (IN) and lowerExistsSubqueries
+// (EXISTS) both build it and nothing on the node tells them apart, so the
+// message names both rather than guessing one — naming the wrong cause for the
+// right refusal is a defect this tree has logged three times.
+const char* joinKeyContext(const LogicalJoin& join) {
+    switch (join.semantics) {
+        case JoinSemantics::SEMI:          return "IN / EXISTS subquery";
+        case JoinSemantics::ANTI:          return "NOT EXISTS subquery";
+        case JoinSemantics::ANTI_NOT_IN:   return "NOT IN subquery";
+        // A written JOIN ON reaches the AST loop in validate() first, so what
+        // normally arrives here as STANDARD is the correlated-scalar rewrite's
+        // `$scalarN` LEFT join. NOT named as such: the AST loop legitimately
+        // skips an unresolved key, so a written join CAN arrive here too, and a
+        // prefix that asserted otherwise would be a wrong-cause diagnostic.
+        case JoinSemantics::STANDARD:      break;
+    }
+    return "join key";
+}
+
 } // namespace
+
+void Validator::validateJoinKeyTypes(const LogicalPlanNode& plan) {
+    for (const auto& child : plan.children) validateJoinKeyTypes(*child);
+    if (plan.type != LogicalNodeType::JOIN) return;
+    const auto& join = static_cast<const LogicalJoin&>(plan);
+    const Schema& left  = join.children[0]->output_schema;
+    const Schema& right = join.children[1]->output_schema;
+
+    // RESOLVED EXACTLY AS THE PHYSICAL BUILDER RESOLVES, so the check is
+    // guaranteed to be about the columns the probe will actually compare:
+    // leftKeyIndices honours from_slot (a merged left schema can hold `team` at
+    // two slots), and rightKeyIndices is POSITIONAL for a semi/anti join —
+    // whose build input the lowering has already arranged to BE the key tuple,
+    // in key order — and by name otherwise. See vectorized_plan_builder.cc.
+    const bool positional = join.semantics != JoinSemantics::STANDARD;
+    for (size_t k = 0; k < join.keys.size(); ++k) {
+        const JoinKey& key = join.keys[k];
+        const int li = (key.from_slot >= 0) ? left.indexOf(key.from_col, key.from_slot)
+                                            : left.indexOf(key.from_col);
+        const int ri = positional ? static_cast<int>(k) : right.indexOf(key.join_col);
+        // A MISS IS NOT THIS RULE'S TO REPORT: leftKeyIndices and rightKeyIndices
+        // throw on it by name at lowering, with the message that owns it.
+        if (li < 0 || ri < 0 || ri >= right.size()) continue;
+        requireJoinKeyTypes(joinKeyContext(join), left, li, right, ri,
+                            key.from_col, key.join_col);
+    }
+}
 
 void Validator::validate(const SelectStatement& stmt, const Catalog& catalog){
     validateQuery(stmt, catalog);
@@ -282,23 +378,31 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
                                                      static_cast<int>(i) + 1);
             validateJoinCondition(stmt.joins[i].condition.get(), relations);
 
-            // Week 29 (deferred from the Week 27 audit). A join key is compared as
-            // TEXT, which carries no type tag: a STRING "7" matches an INT 7 while
-            // "007" does not, while the identical predicate in a WHERE clause
-            // throws Type mismatch — half a match, with no error either way, and
-            // both halves reachable on the shipped catalog (drivers.team vs
-            // laps.lap_id). Under an outer join the unmatched half comes back as
-            // null-extended rows rather than as missing ones, which is why it is
-            // closed here. Also makes the int_keys SIMD gate's assumption explicit.
+            // Week 29 (deferred from the Week 27 audit), rescoped by seam audit
+            // pass 3 (B3-2). The rule itself is requireJoinKeyTypes above, and
+            // the reason it is refused rather than given affinity is stated
+            // there. What this loop is, precisely:
             //
-            // Coarse on purpose — both STRING or both numeric — matching
-            // Value::operator==, which coerces INT/DOUBLE and throws only across
-            // the STRING boundary, and keyFieldText's numeric affinity (7.0 and 7
-            // must keep joining, as they do in SQLite).
+            // !! IT COVERS `stmt.joins` AND NOTHING ELSE. Week 29's comment stood
+            // here saying the defect "is closed here" and claimed one check
+            // covered all four modes. It covered one of the FOUR PRODUCERS of a
+            // JoinKey — the written JOIN — and the three that arrived after it
+            // (IN / NOT IN lowering, EXISTS / NOT EXISTS decorrelation, the
+            // correlated-scalar rewrite) went uncovered for four weeks and
+            // returned wrong row sets in both directions. Validator::
+            // validateJoinKeyTypes is where all four converge; this loop is not
+            // that containment and must never be read as it again.
+            //
+            // WHY IT IS KEPT ANYWAY, rather than deleted in favour of the walk:
+            // Planner::plan (Volcano) builds its HashJoinNode straight from
+            // `stmt.joins` and never builds a logical plan, so the walk cannot
+            // see it. `stmt.joins` is also the only producer Volcano HAS — it
+            // refuses IN, correlated and derived shapes outright — so this loop
+            // is exactly that path's cover, and no more than it. On the
+            // vectorized path it merely fires first, with the same message.
             //
             // `relations` is in range-table order, so relations[slot] is the schema
-            // a JoinKey slot addresses. Both engines route through this function,
-            // so one check covers all four modes with one message.
+            // a JoinKey slot addresses.
             for (const JoinKey& k : on.keys) {
                 if (k.from_slot < 0) continue;   // unbound: positional routing, no
                                                  // relation identity to be exact about
@@ -308,13 +412,8 @@ void Validator::validateQuery(const SelectStatement& stmt, const Catalog& catalo
                 int li = left_schema->indexOf(k.from_col);
                 int ri = right_schema->indexOf(k.join_col);
                 if (li < 0 || ri < 0) continue;  // existence is validateJoinCondition's
-                const bool l_str = left_schema->column(li).type  == TypeId::STRING;
-                const bool r_str = right_schema->column(ri).type == TypeId::STRING;
-                if (l_str != r_str) {
-                    throw std::runtime_error(
-                        "JOIN ON: cannot join a STRING column with a numeric one ('"
-                        + k.from_col + "' and '" + k.join_col + "')");
-                }
+                requireJoinKeyTypes("JOIN ON", *left_schema, li, *right_schema, ri,
+                                    k.from_col, k.join_col);
             }
         }
     }

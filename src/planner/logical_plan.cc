@@ -1134,5 +1134,21 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
         node = std::make_unique<LogicalLimit>(std::move(node), stmt.limit.value());
     }
 
+    // Seam audit pass 3, B3-2 — THE JOIN-KEY TYPE RULE, once, on the finished
+    // tree. This is the only point at which all four JoinKey producers converge:
+    // the `stmt.joins` fold above, lowerInSubqueries, lowerExistsSubqueries and
+    // lowerCorrelatedScalars have all run, and every node they built is in this
+    // tree. Checking at the producers instead is writing the rule four times,
+    // which is how it came to be missing three times.
+    //
+    // LAST, not first, and both halves of that matter. It needs `semantics` and
+    // the projected body schemas, which only exist after the lowerings; and a
+    // genuine query defect (a missing column, an ill-typed WHERE) must still
+    // outrank an engine rule, which the checks above deliver by running before
+    // it. Nested blocks validate their own subtree in their own build() and are
+    // then re-walked here as part of this one — idempotent, and the inner
+    // message is the more local one.
+    Validator::validateJoinKeyTypes(*node);
+
     return node;
 }
