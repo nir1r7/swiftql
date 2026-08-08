@@ -2071,23 +2071,158 @@ MULTIWAY_VOLCANO_REJECTED = [
 # survive, not in their order.
 #
 # Why SQLite cannot adjudicate it: with a tie at the cut EVERY choice of the tied
-# rows is a correct answer, SQLite's included (SQLite emits its own group order,
-# which happens to be sorted by group key, and picks a third set again). Putting
-# such a query in QUERIES would assert a non-guarantee and fail for the wrong
-# reason. The property that IS real, and that the fix establishes, is that the
-# four SwiftQL modes agree with EACH OTHER and are deterministic -- Volcano is
-# the correctness baseline, so a baseline whose row order is decided by a hash
-# seed is not one. That is what this suite pins.
+# rows is a correct answer, SQLite's included. Putting such a query in QUERIES
+# would assert a non-guarantee. The property that IS real is that the four
+# SwiftQL modes agree with EACH OTHER and are deterministic -- Volcano is the
+# correctness baseline, so a baseline whose row order is decided by a plan
+# decision is not one. That is what this suite pins.
 #
-# Each query must have a tie SPANNING the LIMIT cut, or it proves nothing: with
-# no tie the total order does all the work and any emission order passes.
+# CORRECTION, seam audit pass 2. The sentence that stood here said SQLite "picks
+# a third set again", and cited that as the reason these queries cannot be
+# diffed. That was TRUE when written and is FALSE now. The pass-2 fix gives the
+# sort a deterministic tie-break -- when every declared ORDER BY key ties, the
+# whole row decides, ascending (src/execution/sort_comparator.h) -- and for a
+# GROUP BY tie that sorts the tied groups by their group key, which is also the
+# order SQLite's GROUP BY emits. So SwiftQL and SQLite now COINCIDE on both of
+# the original entries: audit A7 measured SQLite at AlphaTauri/Alpine/Ferrari
+# against SwiftQL's AlphaTauri/Alpine/McLaren, and SwiftQL now answers
+# AlphaTauri/Alpine/Ferrari too.
+#
+# The suite stays here anyway, and deliberately does not diff against SQLite.
+# The coincidence is not a guarantee: it holds only while the tie-break's first
+# discriminating column is the group key, and it does not hold in general (an
+# entry whose sort input is a raw join row is broken by that row's first column,
+# not by the group key -- see the DISTINCT entry below, which all four modes
+# answer RedBull/AlphaTauri/McLaren while SQLite is free to answer otherwise).
+# A suite that quietly started depending on SQLite's arbitrary choice would be
+# the vacuous-entry class this file keeps having to fix.
+#
+# ---------------------------------------------------------------------------
+# WHAT EACH ENTRY MUST SATISFY, AND WHY IT IS DATA RATHER THAN A COMMENT
+#
+# The entire discriminating power of this suite comes from the DATA producing a
+# MATERIAL tie spanning the LIMIT cut. Until pass 2 the requirement was written
+# in this comment and asserted nowhere: regenerate data/laps.csv with a wider
+# season range and every entry would become a vacuous pass with no signal. That
+# is finding E-4, and it is the same failure mode as a test that passes for a
+# reason its comment DESCRIBES rather than ENFORCES.
+#
+# So each entry is a dict, and the precondition is a field:
+#
+#   query      what the four modes run and must agree on
+#   tie_probe  the same ORDER BY with the LIMIT removed, run through SQLITE by
+#              check_engine_agreement_tie_precondition(). It must expose the
+#              ORDER BY key as a column named `k`; the check reads that name, so
+#              a probe that drifts away from its query fails loudly instead of
+#              silently measuring the wrong column. For an entry whose tie lives
+#              in a SUBQUERY BODY, this is the BODY, not the outer query.
+#   cut        the LIMIT the tie must span
+#
+# The check asserts, per entry: rows exist beyond the cut; the tied block
+# STRADDLES the cut; and the block holds at least two DISTINCT rows, so that at
+# least two different answers are legal. A tie among identical rows satisfies a
+# naive "is there a tie" check while asserting nothing at all.
+#
+# ---------------------------------------------------------------------------
+# E-4: THE ORIGINAL TWO ENTRIES HAVE NO `WHERE` CLAUSE, WHICH IS THE ONE
+# CONFIGURATION WHERE THE TWO BUILD-SIDE RULES PROVABLY COINCIDE.
+#
+# Volcano picks a join's build side from RAW table row counts (planner.cc); the
+# vectorized builder picks it from POST-PUSHDOWN cardinality ESTIMATES and real
+# row widths (vectorized_plan_builder.cc). With no WHERE the estimate equals the
+# raw count, so the two rules agree and the seam looks closed. Every entry added
+# in pass 2 carries a WHERE whose ESTIMATE crosses the other side's cardinality
+# while its actual selectivity does not, which is what makes the two engines
+# choose different build sides -- and the build side is what decides probe
+# order, group first-encounter order, and which tied row survives the cut.
+#
+# Each pass-2 entry was RUN against a build of this tree with the tie-break loop
+# removed (byte-for-byte the pre-fix semantics) and DIVERGES there across the
+# four modes; all four agree at HEAD. The measured pre-fix disagreements are
+# quoted per entry.
+_TIE_WHERE = " AND ".join(["l.season = 2022"] * 6)
+
 ENGINE_AGREEMENT_QUERIES = [
     # all seven teams tie on MIN(season)=2022, cut at 3 -- four of the seven are
     # discarded purely on emission order
-    "SELECT team, MIN(season) FROM laps GROUP BY team ORDER BY MIN(season) LIMIT 3",
+    {"query": "SELECT team, MIN(season) FROM laps GROUP BY team "
+              "ORDER BY MIN(season) LIMIT 3",
+     "tie_probe": "SELECT team, MIN(season) AS k FROM laps GROUP BY team ORDER BY k",
+     "cut": 3},
     # the same exposure one level up: a tie at the cut over a JOIN's output
-    "SELECT d.team, MIN(l.season) FROM laps l JOIN drivers d "
-    "ON l.driver_id = d.driver_id GROUP BY d.team ORDER BY MIN(l.season) LIMIT 3",
+    {"query": "SELECT d.team, MIN(l.season) FROM laps l JOIN drivers d "
+              "ON l.driver_id = d.driver_id GROUP BY d.team ORDER BY MIN(l.season) LIMIT 3",
+     "tie_probe": "SELECT d.team, MIN(l.season) AS k FROM laps l JOIN drivers d "
+                  "ON l.driver_id = d.driver_id GROUP BY d.team ORDER BY k",
+     "cut": 3},
+
+    # --- pass 2: entries whose WHERE makes the two build-side rules DISAGREE ---
+    #
+    # E-1, the audit's A1-repro. The estimator's AND rule is the textbook
+    # independence product, so six copies of one conjunct drive the estimate for
+    # `laps` to the floor (10000 * 0.25^6 -> 2) while every one of the 2417
+    # matching rows survives. Volcano compares raw 20 < 10000 and probes laps;
+    # the optimized vec path compares estimated 20 vs 2 and probes drivers.
+    # PRE-FIX: row-volcano / col-volcano / col-vec-noopt returned
+    # {AlphaTauri, Alpine, McLaren}; col-vec returned {RedBull, AlphaTauri,
+    # McLaren} -- a different row SET, which no sorting in this harness repairs.
+    {"query": f"SELECT d.team, MIN(l.season) FROM drivers d JOIN laps l "
+              f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+              f"GROUP BY d.team ORDER BY MIN(l.season) LIMIT 3",
+     "tie_probe": f"SELECT d.team, MIN(l.season) AS k FROM drivers d JOIN laps l "
+                  f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+                  f"GROUP BY d.team ORDER BY k",
+     "cut": 3},
+
+    # the same shape DESCENDING. The tie-break is NOT a key the user wrote, so
+    # its direction is fixed to ascending regardless of `desc`; this entry is
+    # what makes that a pinned decision rather than an implementation accident.
+    # PRE-FIX: same split as above ({AlphaTauri, Alpine, McLaren} against
+    # {RedBull, AlphaTauri, McLaren}).
+    {"query": f"SELECT d.team, MIN(l.season) FROM drivers d JOIN laps l "
+              f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+              f"GROUP BY d.team ORDER BY MIN(l.season) DESC LIMIT 3",
+     "tie_probe": f"SELECT d.team, MIN(l.season) AS k FROM drivers d JOIN laps l "
+                  f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+                  f"GROUP BY d.team ORDER BY k DESC",
+     "cut": 3},
+
+    # DISTINCT, which audit B5 named as inheriting the same exposure and which
+    # 87c08a2's reasoning never covered: DISTINCT emits in INPUT order, so it
+    # inherits every join-side and join-order decision above it.
+    #
+    # This is also the only entry whose sort input is a RAW JOIN ROW rather than
+    # an aggregate's output, and that makes it the one that can see a second
+    # asymmetry: row storage hands Volcano's scan the FULL table schema while
+    # every columnar mode hands it the narrowed one (planner.cc), so the two
+    # legs tie-break over different column sets. Here they agree because the
+    # first discriminating column is driver_id in both. It is kept precisely
+    # because it is the entry that would go red if that ever stopped being true.
+    # PRE-FIX: {AlphaTauri, Alpine, McLaren} on three modes against
+    # {RedBull, AlphaTauri, McLaren} on col-vec.
+    {"query": f"SELECT DISTINCT d.team, l.season FROM drivers d JOIN laps l "
+              f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+              f"ORDER BY l.season LIMIT 3",
+     "tie_probe": f"SELECT DISTINCT d.team, l.season AS k FROM drivers d JOIN laps l "
+                  f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} ORDER BY k",
+     "cut": 3},
+
+    # E-1b, and the reason E-1 is a BLOCKER rather than a dialect choice.
+    # `materializeSubqueries` turns a SCALAR body's first row into a `Literal`,
+    # so a tie at the body's cut stops being a row order and becomes a VALUE
+    # propagating into the outer query. PRE-FIX this returned COUNT(*) = 977 on
+    # row-volcano, col-volcano and col-vec-noopt and 1536 on col-vec -- a single
+    # scalar differing by 559 between two modes of the same engine, and a direct
+    # violation of `optimized == --no-optimize`.
+    #
+    # The tie_probe is the BODY with its key exposed, at the body's own cut of 1.
+    {"query": f"SELECT COUNT(*) FROM laps WHERE team = "
+              f"(SELECT d.team FROM drivers d JOIN laps l ON d.driver_id = l.driver_id "
+              f"WHERE {_TIE_WHERE} GROUP BY d.team ORDER BY MIN(l.season) LIMIT 1)",
+     "tie_probe": f"SELECT d.team, MIN(l.season) AS k FROM drivers d JOIN laps l "
+                  f"ON d.driver_id = l.driver_id WHERE {_TIE_WHERE} "
+                  f"GROUP BY d.team ORDER BY k",
+     "cut": 1},
 ]
 
 QUERIES = PHASE2_WEEK12_BENCHMARK_QUERIES + [
@@ -2407,10 +2542,15 @@ def run_engine_agreement_suite(queries, label: str, modes):
     at a LIMIT cut. Comparison is ORDERED and unnormalized-by-sort
     (`preserve_order=True`), because an emission-order difference is precisely
     what sorting would hide.
+
+    Entries are dicts, not strings: each carries the tie precondition it rests
+    on, which check_engine_agreement_tie_precondition() enforces before any of
+    this runs. See the comment on ENGINE_AGREEMENT_QUERIES.
     """
     passed = failed = errors = 0
     print(f"\n--- {label} ---")
-    for query in queries:
+    for entry in queries:
+        query = entry["query"]
         try:
             baseline_label, baseline_extra = modes[0]
             baseline = normalize(run_swiftql(query, baseline_extra), True)
@@ -2641,10 +2781,74 @@ def check_year_coercion_dependency():
     print("normalize() STRING-year coercion: contract holds")
 
 
+def check_engine_agreement_tie_precondition(conn):
+    """Seam audit pass 2, E-4 — the precondition ENGINE_AGREEMENT_QUERIES rests on.
+
+    That suite proves something only if its data produces a MATERIAL tie
+    spanning each entry's LIMIT cut. Until now the requirement was a sentence in
+    a comment and nothing checked it, so regenerating data/laps.csv with a wider
+    season range would have turned every entry into a vacuous pass — green, and
+    asserting nothing. This file already had the pattern and did not use it
+    (check_rows_equal_non_finite, check_year_coercion_dependency).
+
+    Three assertions per entry, and the third is the one that matters:
+
+      1. there are rows BEYOND the cut, so the LIMIT actually discards something;
+      2. the tied block STRADDLES the cut, so which rows survive is a choice;
+      3. that block holds at least two DISTINCT rows.
+
+    (3) is what makes the tie MATERIAL. A tie among identical rows satisfies
+    (1) and (2) and still proves nothing: every choice yields the same answer,
+    so the entry would pass whether or not the engine is deterministic. That is
+    the exact shape of a test that passes because of what its comment describes
+    rather than what it enforces.
+
+    Raises rather than counting: a vacuous entry does not fail, it stops meaning
+    anything, so there is nothing to keep running for.
+    """
+    for entry in ENGINE_AGREEMENT_QUERIES:
+        probe, cut = entry["tie_probe"], entry["cut"]
+        cur = conn.execute(probe)
+        cols = [d[0] for d in cur.description]
+        if "k" not in cols:
+            raise AssertionError(
+                "engine-agreement tie probe does not expose its ORDER BY key as `k` "
+                "(columns %r) — the probe has drifted from its query:\n  %s" % (cols, probe))
+        ki = cols.index("k")
+        rows = cur.fetchall()
+
+        if len(rows) <= cut:
+            raise AssertionError(
+                "engine-agreement entry has no rows beyond its cut of %d (%d rows) — "
+                "the LIMIT discards nothing, so the entry proves nothing:\n  %s"
+                % (cut, len(rows), entry["query"]))
+
+        boundary = rows[cut - 1][ki]
+        tied = [i for i, r in enumerate(rows) if r[ki] == boundary]
+        if max(tied) < cut:
+            raise AssertionError(
+                "engine-agreement entry has NO TIE spanning its cut of %d "
+                "(boundary key %r is not shared across the cut) — the ORDER BY is "
+                "total there, so any emission order passes:\n  %s"
+                % (cut, boundary, entry["query"]))
+
+        distinct_tied = {tuple(rows[i]) for i in tied}
+        if len(distinct_tied) < 2:
+            raise AssertionError(
+                "engine-agreement entry's tie at the cut of %d is IMMATERIAL — all "
+                "%d tied rows are identical (%r), so every choice gives the same "
+                "answer and the entry passes whether or not the engines agree:\n  %s"
+                % (cut, len(tied), next(iter(distinct_tied)), entry["query"]))
+
+    print("engine-agreement tie precondition: %d entries, all material ties at the cut"
+          % len(ENGINE_AGREEMENT_QUERIES))
+
+
 def main():
     conn = load_sqlite()
     check_rows_equal_non_finite()
     check_year_coercion_dependency()
+    check_engine_agreement_tie_precondition(conn)
 
     p1, f1, e1 = run_query_suite(conn, QUERIES, "Default (row storage, Volcano)")
     p2, f2, e2 = run_query_suite(

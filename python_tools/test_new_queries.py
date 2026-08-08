@@ -141,8 +141,25 @@ QUERIES = [
      "SELECT DISTINCT round FROM laps WHERE season = 2025 ORDER BY round"),
 
     # ── ORDER BY numeric column (no GROUP BY) ────────────────────────────────
+    #
+    # `, lap_id` is not decoration. Written as `ORDER BY speed LIMIT 5` this
+    # entry had two rows tied at speed=280.01 INSIDE the cut, so SQL left their
+    # relative order unspecified and the entry passed only because SwiftQL and
+    # SQLite happened to break the tie the same way -- both by input/rowid
+    # order. Seam audit pass 2 gave the sort a deterministic tie-break
+    # (src/execution/sort_comparator.h), which broke that coincidence: SwiftQL
+    # now answers 3882 before 5275 where SQLite answers 5275 first. Both are
+    # correct; neither is an oracle for the other.
+    #
+    # No gate could see it -- this query is not in compare_against_sqlite.py,
+    # and normalize() below sorts unconditionally -- which is exactly why it is
+    # worth fixing rather than leaving. The entry was written to exercise
+    # ORDER BY + LIMIT, not to pin a tie SQL does not define, and it still does
+    # that with a total order. Queries that DO deliberately depend on a tie at
+    # the cut live in compare_against_sqlite.py's ENGINE_AGREEMENT_QUERIES,
+    # where the oracle is the other SwiftQL modes rather than SQLite.
     ("order_by_speed_asc",
-     "SELECT lap_id, speed FROM laps ORDER BY speed LIMIT 5"),
+     "SELECT lap_id, speed FROM laps ORDER BY speed, lap_id LIMIT 5"),
 
     # ── drivers table: not tested anywhere ───────────────────────────────────
     ("drivers_simple_filter",
