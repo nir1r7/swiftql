@@ -49,8 +49,8 @@
     "q20|col-vec-noopt": "MATCH",
     "q20|col-volcano": "REFUSED_EXPECTED",
     "q20|row-volcano": "REFUSED_EXPECTED",
-    "q21|col-vec": "UNPORTED",
-    "q21|col-vec-noopt": "UNPORTED",
+    "q21|col-vec": "MATCH",
+    "q21|col-vec-noopt": "MATCH",
     "q21|col-volcano": "REFUSED_EXPECTED",
     "q21|row-volcano": "REFUSED_EXPECTED",
     "q22|col-vec": "MATCH",
@@ -107,8 +107,6 @@
     "q18|row-volcano": "multi-way joins are not supported on the Volcano path",
     "q20|col-volcano": "not supported on the Volcano path",
     "q20|row-volcano": "not supported on the Volcano path",
-    "q21|col-vec": "correlated subquery: only an equality between two columns can become a join key (a correlated inequality has no equi-join to lower to; it would have to ride as an ON residual on the semi/anti join, wh",
-    "q21|col-vec-noopt": "correlated subquery: only an equality between two columns can become a join key (a correlated inequality has no equi-join to lower to; it would have to ride as an ON residual on the semi/anti join, wh",
     "q21|col-volcano": "multi-way joins are not supported on the Volcano path",
     "q21|row-volcano": "multi-way joins are not supported on the Volcano path",
     "q22|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
@@ -279,6 +277,7 @@
       "q19",
       "q2",
       "q20",
+      "q21",
       "q22",
       "q3",
       "q4",
@@ -303,7 +302,7 @@
       "q19": 4,
       "q2": 2,
       "q20": 2,
-      "q21": 0,
+      "q21": 2,
       "q22": 2,
       "q3": 2,
       "q4": 2,
@@ -315,9 +314,7 @@
     },
     "mutation_broken": [],
     "unexplained": [],
-    "unported": [
-      "q21"
-    ],
+    "unported": [],
     "vacuous": {
       "q18": [
         "EMPTY",
