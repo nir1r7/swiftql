@@ -921,6 +921,19 @@ construct lands. A missing row is worse than a wrong one.
 | `lowerCorrelatedScalars` (`subquery_decorrelation.cc`) | **Builds a `LogicalDerived`, not a special case.** Its slot is `range_table_size + n`, one past the last the Binder issued, and it is a real merged-schema slot because the outer `WHERE` reads the aggregate's column. The join is **LEFT**: a zero-row group must yield NULL, not a dropped outer row |
 | `Planner::plan` | **Refuses.** Third Volcano capability refusal, after Week 32's `IN` and Week 33's correlated. It builds its scan from a catalog name and one `HashJoinNode`, so there is no shape there that can hold a relation which is a plan |
 
+### Weeks 36–37 consumers (the totality screen)
+
+**Added by the Week 37 doc sweep, under the rule this section states for itself
+— and it was missing, which makes it the fourth time this list has been wrong by
+omission.** `staticTypeOf` (`src/parser/expr_totality.h`) is a `ColumnId`
+consumer: it does `indexOf(name, slot)` slot-first with a bare-name fallback, at
+a named `localSlot("staticTypeOf")`. It arrived with the seam audit's totality
+screen and no row was added for it.
+
+| Consumer | Status |
+|---|---|
+| `staticTypeOf` / `exprMayRaise` / `conjunctMayRaise` (`parser/expr_totality.h`) | **Contained, and its failure mode is the OPPOSITE SIGN of every row above.** Resolution is the shared rule — slot-first when `isResolved() && isLocal()`, bare name otherwise — so a `level > 0` ref skips the slot lookup and lands on the fallback, which on a shared column name (`team`, `driver_id`, `l_suppkey`) is a clean **hit on the wrong relation**. Every other row here loses a check or reads the wrong column. This one is a **conservative screen**, so a wrong resolution does not make it answer *"I cannot type this"* — it makes it answer *"I typed it"*, and a false **FALSE** unfreezes a pass that should have declined. Its own header states the two errors are not symmetric: a false TRUE costs plan quality on one query, a false FALSE is a **divergence**. **Contained today, in two independent ways:** `refuseSurvivingCorrelatedRefs` (`subquery_decorrelation.cc`) refuses a correlated ref anywhere except a top-level equality in the body's `WHERE` — by name, for exactly this collapse — and `collectSlots` maps `level > 0` to `-1`, so pushdown never routes such a conjunct. **The live half of the risk is not the LEVEL but the SCHEMA**: pass 5 (E-20 / S-13 / P5-2) found the screen handed the *scanning relation's* schema rather than the one the expression was written against, and that was a divergence in three seams at once. Every call site must pass the schema the expression is evaluated in — `orderByWork` the child's, `pushIntoJoin` the join's, `refuseMaskedResidualRaiser` the full residual schema, `ChunkPruner` the hint's. Checked at HEAD: all four do |
+
 ### Null constants (Week 31)
 
 A second "find every reader" question, with the same shape as the slot one and
