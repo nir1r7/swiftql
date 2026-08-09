@@ -134,6 +134,32 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 > alternative is evaluating row-at-a-time, which is the thing vectorization exists
 > to avoid.
 
+> **`AND` IS NOT COMMUTATIVE IN SWIFTQL, AND THAT IS A DIALECT FACT, NOT AN
+> ENGINE DETAIL.** Standard SQL leaves the evaluation order of `AND` unspecified;
+> SwiftQL **defines** it. **A conjunct is evaluated only on the rows for which
+> every conjunct WRITTEN BEFORE IT evaluated TRUE.** Because per-row evaluation
+> can *throw* — integer overflow, `SUBSTRING` out-of-domain positions, a
+> comparison across the STRING boundary — reordering your `WHERE` can change
+> whether the query **errors**, and `p AND q` and `q AND p` are different
+> programs whenever `q` can raise. Measured on the shipped F1 catalog, identically
+> in all four storage × execution modes and under `--no-optimize`:
+>
+> ```sql
+> WHERE speed > 400 AND lap_id * 2305843009213693952 > 0   -- 0 rows
+> WHERE lap_id * 2305843009213693952 > 0 AND speed > 400   -- Error: integer overflow in '*'
+> ```
+>
+> `speed > 400` matches nothing on this data, so written first it is a **guard**.
+> This is what C and SQLite do, and it is chosen rather than inherited: the
+> alternative is for the answer to depend on which engine ran the query. Because
+> it is a *plan* property and not an engine one, **every pass that could move a
+> row set is bound by it** — predicate pushdown will not move a conjunct across a
+> raiser, zone-map chunk pruning will not skip on a hint written after one, and a
+> `LIMIT` is placed below a projection that can raise. The one place the cascade
+> does **not** apply is inside a join's `ON` residual, which is evaluated eagerly
+> over the whole conjunction per candidate pair. The rule and its consumers are
+> stated once, in `src/parser/expr_totality.h`.
+
 ---
 
 ## Architecture
@@ -1600,6 +1626,10 @@ re-derived.
 >   child's, so the body's slot numbering is never in scope above the join —
 >   which Week 34's derived tables genuinely do break, because a derived table's
 >   columns *are* in scope above it.
+>   *(Week 37 doc sweep: the function is `slotDeclineReason` since `18af84f`,
+>   and that commit also made this decline **reported** — `join-ordering=skipped
+>   (semi/anti join)`. Left in its Week-32 wording per the dated-record policy in
+>   "Documentation conventions" below.)*
 
 ### Week 32 — Semi-Joins + Anti-Joins
 
@@ -1801,7 +1831,7 @@ rather than deleted:
 | **One schema derivation, two consumers, and a LIVE assertion between them** — `blockOutputSchema`, shared by the Binder and `LogicalPlanBuilder::build`, checked at the graft | The Binder needs the derived schema *before* `build` has run, and a private second derivation is the two-paths drift Weeks 26/28/30 each had to undo — worse here, because the copies would have to agree on `aggregateOutputName` (which **is** `exprToString`), on `hidden` columns and on `SELECT *` expansion, and a disagreement is a silent wrong-relation lookup rather than an error. The graft-time check compares objects from two different code paths, so it **can** fail — unlike the assertion Week 33 deleted for comparing a copy of an object with the object |
 | **A derived table is not `LATERAL`, and the argument *is* the rule** — its body binds against the block's **parent** scope | Passing `&scope` would let the body see the block's own `FROM` items, which is a lateral join, and there is no dependent-join operator to run one on — the same reason Week 33 refuses rather than falling back. There is no separate check: sibling relations are invisible by construction. A reference reaching *further* out still resolves, marks the body correlated and is refused by name. Known boundary, pinned in the harness: at top level there is no parent, so a lateral reference reports as an ordinary unresolved qualifier, because a sibling genuinely is not in scope and the Binder cannot tell a lateral reference from a typo |
 | **`LogicalDerived` is a node, not a bare graft** | Four walkers find "the relation" by descending `children[0]` to a `SCAN` — `leafScanTable`, `isSingleRelation`, `leafScanTableOf`, `countRelations` — and each then feeds the cost model. Walked *through* a derived subtree they return the **body's base table**, attributing one table's per-column `avg_width` to another relation's columns. That is the attribution error Week 27 refused to make when it had `rowWidth` print `join-subtree` instead of guessing. All four are silent; the node is the wall they stop at |
-| **`countRelations` counts RELATIONS, not scans** | It sized the range table `hasSlotOutsideRangeTable` tests `join_slot` against. Counting scans equals the range-table size only while every scan in the tree belongs to this block — and a derived relation is *one* relation whose body may hold many (over-count), while a semi/anti `children[1]` is not a relation at all (also counted). Over-counting makes `slot >= n` **too permissive**, so the guard stops meaning what it says |
+| **`countRelations` counts RELATIONS, not scans** | It sized the range table `slotDeclineReason` (called `hasSlotOutsideRangeTable` until `18af84f`) tests `join_slot` against. Counting scans equals the range-table size only while every scan in the tree belongs to this block — and a derived relation is *one* relation whose body may hold many (over-count), while a semi/anti `children[1]` is not a relation at all (also counted). Over-counting makes `slot >= n` **too permissive**, so the guard stops meaning what it says |
 | **`Validator::validateQuery` rebuilt around ONE range table** | It recomputed the same keying four times — the FROM schema, the `SUM`/`AVG` slot arithmetic, the `relations` vector for join conditions, and the GROUP BY existence check — and the `SUM`/`AVG` one resolved slot *k* through `catalog.getTable(joins[k-1].join_table)`, which has no answer for a derived relation. Week 30 round 2 moved the *correlated* half of that same check to the Binder for the identical reason: the layer that owns slot → schema is the only one that can resolve it |
 | **Q17: a correlated scalar subquery is a derived table with an implicit join** — `lowerCorrelatedScalars`, a third sibling beside Weeks 32 and 33 at the same call site | Week 33's recorded blocker was that the rewrite needs a `STANDARD` join whose output schema is MERGED, requiring the body's aggregate column to carry a slot in the *outer* range table. That slot is this week's core deliverable, so the rewrite is what it is spent on. The right child is built as a `LogicalDerived` — the same node, not a special case — because a special case would need a second argument at the four walkers, the range-table size and every `development.md` row, and the two would drift |
 | **That join is `LEFT`, not `INNER`** | A scalar subquery over zero rows is NULL for `SUM`/`AVG`/`MIN`/`MAX` — Week 31 shipped the typed-null `Literal` for exactly that — while an inner join **deletes** the outer row. Only one query shape can see the difference (a correlated scalar under an `OR`, where the inner join removes rows the `OR` would rescue), and it is in the harness for that reason. Week 29's three consequences then follow and are all correct here: pushdown declines the null-supplying side, the build side is forced, and enumeration declines the tree and *reports* it |
@@ -1812,7 +1842,8 @@ rather than deleted:
 | **`DISTINCT` reaches `exprToString`, `exprKey` and `cloneExpr`** | `aggregateOutputName` **is** `exprToString`, and `extractAggregates` dedupes specs by that name — so rendering the node as `COUNT(x)` collapses `SELECT COUNT(x), COUNT(DISTINCT x)` into **one** spec and one output column that both select items read. Five missing characters, a wrong answer in a single query, no error. The harness query that catches it exists only for that |
 
 **A prediction four weeks made, and Week 34 disproved.** Weeks 28, 29, 30 and 31
-each recorded that `JoinEnumeration::hasSlotOutsideRangeTable` would start
+each recorded that `JoinEnumeration::hasSlotOutsideRangeTable` (renamed
+`slotDeclineReason` in `18af84f`) would start
 declining legitimate plans once a nested scan genuinely joined the outer one, and
 this week's own starting notes name it as the first of three consumers that break
 silently. **It does not fire.** What was actually wrong was `countRelations`;
@@ -1893,6 +1924,11 @@ had **never executed**. It is reachable now.
 >   multi-relation join, so this is a real plan-quality loss with **no reported
 >   decision** — precisely the shape Week 30's hand-forward said must earn a
 >   `join-ordering=skipped (...)` string before it is accepted.
+>   *(Week 37 doc sweep: both halves were discharged after this was written. The
+>   function is `slotDeclineReason`, and `18af84f` gave it the string this bullet
+>   demanded — it is no longer silent. It also does not fire for a derived
+>   relation at all: `countRelations` was the actual defect. Left in its
+>   Week-33 wording per the dated-record policy in "Documentation conventions".)*
 > - `Validator`'s `SUM`/`AVG` argument check indexes `stmt.joins[slot - 1]` with
 >   the same slot arithmetic, and a synthetic slot is outside that vector.
 > - Every `indexOf(name, slot)` above the join resolves against a merged schema
