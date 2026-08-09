@@ -81,9 +81,18 @@ All commands are run from the **project root**.
 | `--explain` | Print the query plan tree for each query, without executing |
 | `--explain-analyze` | Execute each query and print the plan tree annotated with timing and row counts |
 | `--no-cache` | Skip the in-memory result cache |
-| `--no-optimize` | Accepted flag, no effect in Phase 1 |
-| `--storage row\|columnar` | Accepted flag, no effect in Phase 1 |
-| `--execution volcano\|vectorized` | Accepted flag, no effect in Phase 1 |
+| `--no-optimize` | Skip **every** optimizer pass — pushdown, join enumeration, cost-based join selection. The differential oracle's fourth mode: optimized and `--no-optimize` must agree, row for row, on every supported query. Note `foldConstants` is **not** an optimizer pass and is *not* gated by this — see *Constant folding* |
+| `--storage row\|columnar` | Which storage layout the loader builds (Phase 2 on) |
+| `--execution volcano\|vectorized` | Which executor runs the plan (Phase 3 on). `vectorized` requires `--storage columnar`, and is the only path with multi-way joins, `IN`/`EXISTS` lowering, correlated subqueries and derived tables — the Volcano path refuses each by name |
+| `--storage-stats` | Print each columnar table's total size in MB **and exit without running the query**. Requires `--storage columnar`; it is a no-op under `--storage row`. (The per-column raw→encoded lines and the `[columnar]` ratio are printed by the loader on every columnar run, not by this flag) |
+| `--format aligned\|tsv` | Output rendering. `tsv` is what the Python harnesses parse; `aligned` is the default and pads columns |
+
+> ⚠️ **CORRECTED (Week 37 doc sweep).** The last three rows of this table read
+> *"Accepted flag, no effect in Phase 1"* — true when written, at Week 7, and
+> carried unchanged through four phases in which each of them became the axis the
+> engine is tested along. `--storage` and `--execution` are the mode matrix the
+> regression harness sweeps; `--no-optimize` is one leg of the correctness
+> oracle. Two flags the CLI has always parsed were also missing entirely.
 
 ### Examples
 
@@ -598,6 +607,41 @@ Measured (1M rows, Release, per-node self-time from `--explain-analyze`):
 | `VecHashAggregate` — `SUM(speed)` vs `SUM(speed*(1-sector_1))` | 16 ms | 17 ms | 290 ms |
 | `VecFilter` — `speed > 300` vs `speed*2 > 600` | 0.64 ms | 1.7 ms | 222 ms |
 | `VecProject` — `speed` vs `speed*2` | 8.7 ms | 1.0 ms | 162 ms |
+
+### Written evaluation order, and why it is a plan property
+
+Per-row evaluation is **not total** — `evaluate()` can throw on a row (integer
+overflow, `SUBSTRING` out-of-domain positions, a comparison across the STRING
+boundary). So *which rows an expression is evaluated on* decides whether a query
+**errors**, and SwiftQL fixes that set in the **plan** rather than leaving it to
+whichever engine happens to run it. The rule, stated once in
+`src/parser/expr_totality.h`:
+
+- **A conjunct of a filter is evaluated on the rows for which every conjunct
+  written before it evaluated TRUE.** Both engines implement exactly this cascade
+  (`evaluatePredicate` in `evaluator.cc`, `evalPredicate` in `columnar_eval.cc`).
+  This makes `AND` non-commutative in the presence of a raiser and is a
+  **user-visible dialect fact** — it is in the README's dialect section for that
+  reason, with the measured pair.
+- **A join's `ON` residual is evaluated on every candidate pair the keys
+  matched**, in the probe loop, **eagerly over the whole residual conjunction**.
+  There is no conjunct cascade inside a residual; `evaluate()` computes both
+  operands of an `AND` before it looks at the operator. All four legs agree, so
+  it is not a divergence — it is the cascade rule not holding for a construct the
+  parser accepts. Recorded on `LogicalJoin::on_residual`.
+- **Every other expression is evaluated on every row that reaches its node** —
+  and the rule **binds the rewrite, not the expression**: a pass may not change
+  which rows reach a node holding an expression that can raise. *An expression
+  need not move to be moved.* That last clause is where five consecutive audit
+  passes landed, each on the one entry a shorter enumeration was missing.
+
+The obligation is therefore **per expression whose row set a rewrite changes, not
+per move the rewrite makes** — a strictly larger set. The screen is
+`exprMayRaise` / `conjunctMayRaise` / `firstMayRaise` (`parser/expr_totality.h`),
+a conservative over-approximation with **one** implementation and five consumers:
+predicate pushdown (twice — the conjunct moves *and* `on_residual`), zone-map
+chunk pruning, the `LIMIT`-below-a-raising-projection rule, and decorrelation
+(in both directions: a lift can remove a guard *or* add one).
 
 ### Constant folding
 
