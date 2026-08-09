@@ -47,9 +47,22 @@ The project is structured in five progressive phases, each leaving a working and
 - Benchmarking: Google Benchmark / custom harness
 - Data generation + correctness testing: Python
 
----
+### Documentation conventions
 
-## Feature Scope
+This project's most productive defect class is **not wrong code — it is a claim
+that was true when written and was never re-checked against what changed
+underneath it.** Three silent wrong answers shipped from it in Week 33 alone, two
+of them living in header comments. So the docs are split into two kinds, and they
+are maintained under different rules.
+
+| Kind | What it is | Rule |
+|---|---|---|
+| **Live documentation** — `README.md` prose outside a dated block, `development.md`, and every source comment and header | A statement about **what the engine does now** | **Swept.** A refuted claim is retracted *in place*, with what is true put beside it. A renamed function is renamed here. A reader may act on any of it |
+| **Dated records** — every `docs/week-NN-plan.md`, plus README blocks explicitly framed as a week's own notes, predictions or corrections (`> **Week NN …**`) | A statement about **what a week predicted, found or decided at the time** | **Not rewritten.** Rewriting one destroys the evidence that the prediction was made, which is the only reason to keep it. But a claim a later week refuted **must carry the refutation inline, dated, at the point of the claim** — a reader who lands only there must not be misled. Don't rewrite history; annotate it |
+
+The distinction settles a question two sweeps have now re-litigated (`docs/week-29-plan.md`'s
+unconditional-recursion claim): **leave it, mark it.** A dated record with no
+annotation is not a historical record — it is just a stale claim with a date on it.
 
 ### In Scope
 
