@@ -1029,7 +1029,12 @@ bool orderIsPlanStable(const LogicalPlanNode* node) {
 // each column's `(relation_slot, name)` identity — nothing the optimizer can
 // permute. It is inserted directly beneath the `LIMIT`, i.e. ABOVE the
 // projection, so it orders the OUTPUT row: fewer columns to compare, and the
-// projected schema's own order is a function of the SELECT list.
+// projected schema's own order is fixed HERE, in `build`, before any optimizer
+// pass runs. (It used to say "a function of the SELECT list" — false for
+// `SELECT *`, which copies the child's schema column by column a few hundred
+// lines below; seam audit pass 4's P4-L1, corrected in the Week 37 doc sweep.
+// The conclusion is unchanged: both orders are settled before `apply` sees the
+// tree, so no pass can permute them.)
 //
 // WHAT THIS DELIBERATELY CHANGES. `LIMIT n` with no `ORDER BY` over a join now
 // returns the n canonically-smallest output rows rather than the first n the
