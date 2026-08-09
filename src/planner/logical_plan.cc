@@ -1338,6 +1338,16 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     // tree. Checking at the producers instead is writing the rule four times,
     // which is how it came to be missing three times.
     //
+    // ONE THING RUNS AFTER THIS AND BUILDS JoinKeys, and it is stated rather than
+    // left for the next reader to wonder about (Week 37 doc sweep — "the only
+    // point at which all four converge" is true of the PRODUCERS and reads as a
+    // claim that the key set is final, which it is not). JoinEnumeration::rebuild
+    // constructs fresh JoinKey values from its edge list, after this call. It is
+    // not a fifth producer: every edge came from a key that was checked here, and
+    // rebuild only re-pairs and possibly SWAPS the two sides. requireJoinKeyTypes
+    // is symmetric (`l_str == r_str`), so a swap cannot turn a passing key into a
+    // failing one. Give that check a direction and this note becomes a defect.
+    //
     // LAST, not first, and both halves of that matter. It needs `semantics` and
     // the projected body schemas, which only exist after the lowerings; and a
     // genuine query defect (a missing column, an ill-typed WHERE) must still

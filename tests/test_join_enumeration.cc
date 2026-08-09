@@ -792,7 +792,8 @@ TEST(JoinEnumeration, OuterJoinEstimateAppliesTheOnResidualToTheMatchTerm) {
 
 // ── Week 32: the slot-outside-the-range-table decline goes live ─────────────
 
-// Week 30 added hasSlotOutsideRangeTable and Weeks 28-30 expected Week 31 to
+// Week 30 added hasSlotOutsideRangeTable (`slotDeclineReason` since 18af84f,
+// which also gave it its reason string) and Weeks 28-30 expected Week 31 to
 // make it live; Week 31 reported it had not, because a materialized subquery's
 // scans form their own plan with their own range table and never enter the
 // outer tree. Semi-join lowering is what finally grafts a second range table

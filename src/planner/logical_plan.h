@@ -79,15 +79,22 @@ struct LogicalScan : LogicalPlanNode {
 // Week 34 — a relation of this block that is a PLAN rather than a table.
 //
 // WHY THIS IS A NODE AND NOT A BARE GRAFT, which is the smaller diff and the
-// wrong one. Four walkers in this tree find "the relation" by descending
-// children[0] until they hit a SCAN — leafScanTable and isSingleRelation
-// (vectorized_plan_builder.cc), leafScanTableOf and countRelations
-// (join_enumeration.cc) — and every one of them then draws a conclusion the cost
-// model consumes. Walked THROUGH a derived subtree they return the BODY's base
-// table, so the derived relation's column widths are attributed to whatever
-// table its body happens to scan first, and countRelations inflates the range
-// table's size so JoinEnumeration's out-of-range test stops meaning what it
-// says. All four failures are silent. This node is the wall they stop at, which
+// wrong one. Four walkers in this tree answer a question about "the relation" by
+// walking past the graft, and every one of them then draws a conclusion the cost
+// model consumes. THREE of them find it by descending children[0] until they hit
+// a SCAN — leafScanTable and isSingleRelation (vectorized_plan_builder.cc),
+// leafScanTableOf (join_enumeration.cc); walked THROUGH a derived subtree they
+// return the BODY's base table, so the derived relation's column widths are
+// attributed to whatever table its body happens to scan first. The FOURTH,
+// countRelations (join_enumeration.cc), is not a finder at all — it is a
+// recursive COUNT over every child, and walked through a derived subtree it
+// inflates the range table's size so JoinEnumeration's out-of-range test stops
+// meaning what it says. (Named separately since the Week 37 doc sweep: this
+// paragraph described all four as the same children[0]-to-SCAN descent, which
+// countRelations has never been, and the shared description is what let its
+// distinct failure direction — TOO PERMISSIVE, not too strict — go unnoticed for
+// four weeks of predictions.)
+// All four failures are silent. This node is the wall they stop at, which
 // is Week 27's stance for a join-shaped input restated: refuse to guess rather
 // than return a plausible wrong number.
 //
