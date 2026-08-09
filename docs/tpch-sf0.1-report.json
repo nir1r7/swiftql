@@ -1,0 +1,326 @@
+{
+  "catalog": "data/tpch/sf0.1/catalog.json",
+  "cells": {
+    "q10|col-vec": "MATCH",
+    "q10|col-vec-noopt": "MATCH",
+    "q10|col-volcano": "REFUSED_EXPECTED",
+    "q10|row-volcano": "REFUSED_EXPECTED",
+    "q11|col-vec": "MATCH",
+    "q11|col-vec-noopt": "MATCH",
+    "q11|col-volcano": "REFUSED_EXPECTED",
+    "q11|row-volcano": "REFUSED_EXPECTED",
+    "q12|col-vec": "MATCH",
+    "q12|col-vec-noopt": "MATCH",
+    "q12|col-volcano": "MATCH",
+    "q12|row-volcano": "MATCH",
+    "q13|col-vec": "MATCH",
+    "q13|col-vec-noopt": "MATCH",
+    "q13|col-volcano": "REFUSED_EXPECTED",
+    "q13|row-volcano": "REFUSED_EXPECTED",
+    "q14|col-vec": "MATCH",
+    "q14|col-vec-noopt": "MATCH",
+    "q14|col-volcano": "MATCH",
+    "q14|row-volcano": "MATCH",
+    "q15|col-vec": "MATCH",
+    "q15|col-vec-noopt": "MATCH",
+    "q15|col-volcano": "REFUSED_EXPECTED",
+    "q15|row-volcano": "REFUSED_EXPECTED",
+    "q16|col-vec": "MATCH",
+    "q16|col-vec-noopt": "MATCH",
+    "q16|col-volcano": "REFUSED_EXPECTED",
+    "q16|row-volcano": "REFUSED_EXPECTED",
+    "q17|col-vec": "MATCH",
+    "q17|col-vec-noopt": "MATCH",
+    "q17|col-volcano": "REFUSED_EXPECTED",
+    "q17|row-volcano": "REFUSED_EXPECTED",
+    "q18|col-vec": "MATCH",
+    "q18|col-vec-noopt": "MATCH",
+    "q18|col-volcano": "REFUSED_EXPECTED",
+    "q18|row-volcano": "REFUSED_EXPECTED",
+    "q19|col-vec": "MATCH",
+    "q19|col-vec-noopt": "MATCH",
+    "q19|col-volcano": "MATCH",
+    "q19|row-volcano": "MATCH",
+    "q1|col-vec": "MATCH",
+    "q1|col-vec-noopt": "MATCH",
+    "q1|col-volcano": "MATCH",
+    "q1|row-volcano": "MATCH",
+    "q20|col-vec": "MATCH",
+    "q20|col-vec-noopt": "MATCH",
+    "q20|col-volcano": "REFUSED_EXPECTED",
+    "q20|row-volcano": "REFUSED_EXPECTED",
+    "q21|col-vec": "MATCH",
+    "q21|col-vec-noopt": "MATCH",
+    "q21|col-volcano": "REFUSED_EXPECTED",
+    "q21|row-volcano": "REFUSED_EXPECTED",
+    "q22|col-vec": "MATCH",
+    "q22|col-vec-noopt": "MATCH",
+    "q22|col-volcano": "REFUSED_EXPECTED",
+    "q22|row-volcano": "REFUSED_EXPECTED",
+    "q2|col-vec": "MATCH",
+    "q2|col-vec-noopt": "MATCH",
+    "q2|col-volcano": "REFUSED_EXPECTED",
+    "q2|row-volcano": "REFUSED_EXPECTED",
+    "q3|col-vec": "MATCH",
+    "q3|col-vec-noopt": "MATCH",
+    "q3|col-volcano": "REFUSED_EXPECTED",
+    "q3|row-volcano": "REFUSED_EXPECTED",
+    "q4|col-vec": "MATCH",
+    "q4|col-vec-noopt": "MATCH",
+    "q4|col-volcano": "REFUSED_EXPECTED",
+    "q4|row-volcano": "REFUSED_EXPECTED",
+    "q5|col-vec": "MATCH",
+    "q5|col-vec-noopt": "MATCH",
+    "q5|col-volcano": "REFUSED_EXPECTED",
+    "q5|row-volcano": "REFUSED_EXPECTED",
+    "q6|col-vec": "MATCH",
+    "q6|col-vec-noopt": "MATCH",
+    "q6|col-volcano": "MATCH",
+    "q6|row-volcano": "MATCH",
+    "q7|col-vec": "MATCH",
+    "q7|col-vec-noopt": "MATCH",
+    "q7|col-volcano": "REFUSED_EXPECTED",
+    "q7|row-volcano": "REFUSED_EXPECTED",
+    "q8|col-vec": "MATCH",
+    "q8|col-vec-noopt": "MATCH",
+    "q8|col-volcano": "REFUSED_EXPECTED",
+    "q8|row-volcano": "REFUSED_EXPECTED",
+    "q9|col-vec": "MATCH",
+    "q9|col-vec-noopt": "MATCH",
+    "q9|col-volcano": "REFUSED_EXPECTED",
+    "q9|row-volcano": "REFUSED_EXPECTED"
+  },
+  "details": {
+    "q10|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q10|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q11|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q11|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q13|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q13|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q15|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q15|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q16|col-volcano": "not supported on the Volcano path",
+    "q16|row-volcano": "not supported on the Volcano path",
+    "q17|col-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q17|row-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q18|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q18|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q20|col-volcano": "not supported on the Volcano path",
+    "q20|row-volcano": "not supported on the Volcano path",
+    "q21|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q21|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q22|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q22|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q2|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q2|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q3|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q3|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q4|col-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q4|row-volcano": "correlated subqueries are decorrelated to a semi-join",
+    "q5|col-volcano": "multi-way joins are not supported on the Volcano path",
+    "q5|row-volcano": "multi-way joins are not supported on the Volcano path",
+    "q7|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q7|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q8|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q8|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q9|col-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path",
+    "q9|row-volcano": "derived tables (FROM (subquery)) are not supported on the Volcano path"
+  },
+  "fingerprints": {
+    "q22|col-vec": {
+      "LogicalAntiJoin": 2,
+      "LogicalDerived": 2
+    },
+    "q22|col-vec-noopt": {
+      "LogicalAntiJoin": 1,
+      "LogicalDerived": 1
+    }
+  },
+  "modes": [
+    "row-volcano",
+    "col-volcano",
+    "col-vec",
+    "col-vec-noopt"
+  ],
+  "mutations": {
+    "q1": [
+      "DISCRIMINATING",
+      "the l_shipdate cutoff",
+      "3 rows -> 3"
+    ],
+    "q10": [
+      "DISCRIMINATING",
+      "the l_returnflag = 'R' filter",
+      "20 rows -> 20"
+    ],
+    "q11": [
+      "DISCRIMINATING",
+      "the HAVING with its uncorrelated scalar subquery",
+      "2264 rows -> 3084"
+    ],
+    "q12": [
+      "DISCRIMINATING",
+      "the commit/receipt/ship date ordering",
+      "2 rows -> 2"
+    ],
+    "q13": [
+      "DISCRIMINATING",
+      "the LEFT JOIN's outer-ness (customers with no orders)",
+      "32 rows -> 31"
+    ],
+    "q14": [
+      "DISCRIMINATING",
+      "the PROMO CASE arm",
+      "1 rows -> 1"
+    ],
+    "q15": [
+      "DISCRIMINATING",
+      "the = (SELECT MAX(total_revenue)) equality",
+      "1 rows -> 1000"
+    ],
+    "q16": [
+      "DISCRIMINATING",
+      "the NOT IN (suppliers with complaints) anti-join",
+      "2814 rows -> 2814"
+    ],
+    "q17": [
+      "DISCRIMINATING",
+      "the correlated 0.2 * AVG(l_quantity) scalar subquery",
+      "1 rows -> 1"
+    ],
+    "q18": [
+      "DISCRIMINATING",
+      "the IN (subquery with HAVING) semi-join",
+      "5 rows -> 100"
+    ],
+    "q19": [
+      "DISCRIMINATING",
+      "the second and third OR arms",
+      "1 rows -> 1"
+    ],
+    "q2": [
+      "DISCRIMINATING",
+      "the correlated MIN(ps_supplycost) scalar subquery",
+      "53 rows -> 73"
+    ],
+    "q20": [
+      "DISCRIMINATING",
+      "the nested IN (subquery) semi-joins",
+      "33 rows -> 48"
+    ],
+    "q21": [
+      "DISCRIMINATING",
+      "the NOT EXISTS anti-join",
+      "52 rows -> 52"
+    ],
+    "q22": [
+      "DISCRIMINATING",
+      "the NOT EXISTS anti-join (customers with no orders)",
+      "7 rows -> 7"
+    ],
+    "q3": [
+      "DISCRIMINATING",
+      "the c_mktsegment filter",
+      "10 rows -> 10"
+    ],
+    "q4": [
+      "DISCRIMINATING",
+      "the correlated EXISTS semi-join",
+      "5 rows -> 5"
+    ],
+    "q5": [
+      "DISCRIMINATING",
+      "the customer/supplier same-nation join condition",
+      "5 rows -> 5"
+    ],
+    "q6": [
+      "DISCRIMINATING",
+      "the l_discount BETWEEN band",
+      "1 rows -> 1"
+    ],
+    "q7": [
+      "DISCRIMINATING",
+      "the nation-pair filter over the derived table",
+      "4 rows -> 1250"
+    ],
+    "q8": [
+      "DISCRIMINATING",
+      "the p_type filter inside the derived body",
+      "2 rows -> 2"
+    ],
+    "q9": [
+      "DISCRIMINATING",
+      "the p_name LIKE '%color%' filter",
+      "175 rows -> 175"
+    ]
+  },
+  "provenance": [
+    "generator: python_tools/generate_tpch.py (NOT the official dbgen)",
+    "scale:     0.1",
+    "seed:      20250101",
+    "The schema, column order, referential integrity and value domains",
+    "are the TPC-H spec's. The value DISTRIBUTIONS are not, so the",
+    "published TPC-H answer set DOES NOT APPLY to this data. The only",
+    "valid oracle here is SQLite over these same files."
+  ],
+  "summary": {
+    "meaningful": [
+      "q1",
+      "q10",
+      "q11",
+      "q12",
+      "q13",
+      "q14",
+      "q15",
+      "q16",
+      "q17",
+      "q18",
+      "q19",
+      "q2",
+      "q20",
+      "q21",
+      "q22",
+      "q3",
+      "q4",
+      "q5",
+      "q6",
+      "q7",
+      "q8",
+      "q9"
+    ],
+    "mismatched": [],
+    "modes": {
+      "q1": 4,
+      "q10": 2,
+      "q11": 2,
+      "q12": 4,
+      "q13": 2,
+      "q14": 4,
+      "q15": 2,
+      "q16": 2,
+      "q17": 2,
+      "q18": 2,
+      "q19": 4,
+      "q2": 2,
+      "q20": 2,
+      "q21": 2,
+      "q22": 2,
+      "q3": 2,
+      "q4": 2,
+      "q5": 2,
+      "q6": 4,
+      "q7": 2,
+      "q8": 2,
+      "q9": 2
+    },
+    "mutation_broken": [],
+    "unexplained": [],
+    "unported": [],
+    "vacuous": {}
+  },
+  "timings": {},
+  "tolerance": {
+    "abs": 1e-06,
+    "rel": 1e-09
+  }
+}
