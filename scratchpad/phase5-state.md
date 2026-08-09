@@ -1,4 +1,15 @@
 # Phase 5 orchestrator state
+Current: **q21 CONFIRMED ANSWERING — measured, not inferred.** Narrow run at 00:02 UTC:
+  `GATE tpch: PARTIAL-NO-BASELINE (1/1 meaningful vs SQLite of a 1-QUERY SUBSET ... 1 vectorized-only)`
+  So q21 matches SQLite, is MEANINGFUL under mutation, and runs vec-only (2 modes) — exactly the
+  prediction. **The figure should now be 21/22, but that is NOT yet measured:** the recorded
+  baseline still says q21 is `unported`, so a full 22-query run with `--baseline` will report
+  `PASS -- IMPROVED` and the baseline must then be refreshed by a SECOND, SEPARATE run carrying
+  `--write-baseline docs/tpch-baseline.json --json docs/tpch-sf0.01-report.json` and NO `--baseline`
+  (the harness refuses --write-baseline without --json: the baseline IS the report's `summary` key).
+  NEXT: full 22-query gated run -> refresh baseline -> then sf0.1 for q18.
+  **A narrow run is not quotable** — the harness printed PARTIAL-NO-BASELINE itself and said so.
+
 Current: **SEAM AUDIT COMPLETE — CLOSING GATE GREEN on fe9119a.** Next: q21 + doc sweep, then sf0.1.
 
 
