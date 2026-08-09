@@ -2048,11 +2048,62 @@ and `.claude/skills/verify/SKILL.md` for the current line). A run narrowed with
 subset figure cannot be quoted as a full measurement. A query that stops
 answering, becomes vacuous, or answers in fewer modes than
 `docs/tpch-baseline.json` records exits non-zero; an improvement passes, says so,
-and asks for the baseline to be refreshed in the same commit. **It costs ~5
+and asks for the baseline to be refreshed in the same commit. **It costs ~4
 minutes** on sf0.01 (88 `swiftql` invocations, each reloading a 9 MB
-`lineitem.tbl`) and is not parallelised — sf0.01 is the default and
+`lineitem.tbl`) and is not parallelised — sf0.01 **remains the gate** and
 `data/tpch/sf0.1` is opt-in via `--catalog`. Full detail, including why the claim
 is "matches SQLite" and never "correct", is in `.claude/skills/verify/SKILL.md`.
+
+**SF=0.1 is a SECOND dataset with its OWN baseline, not a bigger version of the
+first.** Which queries are vacuous is a property of the *data*, so the figure
+cannot be carried across scale factors and is re-derived, never diffed. Both
+datasets are gitignored and both regenerate byte-identically from the seeded
+generator — verified for sf0.1 by regenerating and comparing every `.tbl` and
+`catalog.json`:
+
+```bash
+python3 python_tools/generate_tpch.py --scale 0.01 --out-dir data/tpch/sf0.01
+python3 python_tools/generate_tpch.py --scale 0.1  --out-dir data/tpch/sf0.1
+
+python3 python_tools/run_tpch.py \
+    --catalog data/tpch/sf0.1/catalog.json \
+    --baseline docs/tpch-sf0.1-baseline.json
+```
+
+| | sf0.01 (the gate) | sf0.1 (opt-in) |
+|---|---|---|
+| baseline / report | `docs/tpch-baseline.json`, `docs/tpch-sf0.01-report.json` | `docs/tpch-sf0.1-baseline.json`, `docs/tpch-sf0.1-report.json` |
+| meaningful vs SQLite | **21/22** — 5 in all four modes, 16 vectorized-only | **22/22** — 5 in all four modes, 17 vectorized-only |
+| vacuous / unported | 1 (q18) / 0 | 0 / 0 |
+| measured cost | ~4 min | **~41 min** |
+
+The **one** difference is q18, and it is a property of the data rather than of
+the engine. Measured directly on the generated `lineitem.tbl`: at sf0.01 the
+maximum per-order `SUM(l_quantity)` is **295.0** and **no** order clears 300; at
+sf0.1 the maximum is **319.0** and **five** orders clear it. Both scales share
+the same ceiling of 350 (7 lineitems max × quantity 50) — sf0.1 simply has ten
+times as many draws at it. The threshold stays the spec's **300**, unchanged and
+not lowered, and q18's mutation check reads `DISCRIMINATING (5 rows -> 100)`
+where sf0.01 reads `EMPTY`. Nothing became vacuous at the larger scale.
+
+sf0.01 stays the gate for one reason: **cost**. Ten times the data is ten times
+the figure's price, the gate is the fifth of five steps run before every commit,
+and sf0.1 adds exactly one query to what is checked. The 22/22 is real and
+recorded, and it is not the number the per-commit gate reports.
+
+**The sf0.1 gate did not terminate until the oracle was indexed.**
+`load_from_catalog` builds an index-free SQLite mirror, which is fine at sf0.01
+and is not one scale factor up: q21's correlated `EXISTS`/`NOT EXISTS` makes
+SQLite full-scan 600k `lineitem` rows per candidate, and since `lineitem` is
+stored in `l_orderkey` order each scan's early-exit position grows with the key,
+so the cost is quadratic in the data. Measured: **q21's oracle ran 105 minutes
+without finishing; with an index on `lineitem(l_orderkey)` it is 0.3 s, off a
+0.2 s build** — and the harness evaluates that oracle *three* times per query.
+`run_tpch.py` now indexes the mirror's correlation columns before the first
+query. An index cannot change *which* rows a query returns, but it can reorder
+rows that tie under `ORDER BY` and this harness compares ordered queries in
+order, so the guard is empirical rather than argued: the sf0.01 run still
+reproduces `docs/tpch-baseline.json` **byte for byte**.
 
 > **Carried forward, not judged unnecessary.** Two items inherited from earlier
 > weeks were **not** absorbed here and are re-declined with reasons rather than
