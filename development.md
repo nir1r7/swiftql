@@ -993,9 +993,19 @@ standalone commit**, never folded into the feature.
 
 ## Extending the expression language
 
-Nineteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
-one is missed — no error, no crash, a wrong answer or a lost optimization
+**Twenty-one** functions dispatch on `Expr` subtype. **Ten fail silently** when a
+new one is missed — no error, no crash, a wrong answer or a lost optimization
 somewhere far away. Adding a node type means visiting all of them.
+
+> ⚠️ **This said NINETEEN until the Week 37 doc sweep**, and had been short by
+> two since the seam audit's totality screen shipped. Sites 20 and 21
+> (`staticTypeOf`, `exprMayRaise`) are the screen that decides whether a query
+> **errors**, and `expr_totality.h` names its own dispatch as a thing to keep in
+> lockstep with sites 8 and 9 — but this list, which is the list, did not hold
+> them. It is the same defect class the list exists to prevent, one level up.
+> `forEachLocalColumnRef` (`predicate_pushdown.h`) is deliberately **not** a
+> twentieth: site 9 (`restampSlots`) and both derived-body remappers are all
+> expressed in terms of it, so it is the one writing-side dispatch, not a new one.
 
 > **A node that CONTAINS a query changes the question at several of these.**
 > `SubqueryExpr` (Week 30) is the first, and the rule it established is: descend
@@ -1030,6 +1040,8 @@ Ordered by how hard the failure is to find:
 | 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents. **The "re-checks by relation slot, never by `table_name`" rule above is only true within one query block.** `validateQuery` recurses into a NESTED statement's ON clauses, where a correlated ref is an ordinary top-level ref carrying an *enclosing* block's slot; indexing `relations` with it compares two numbering domains. Both this site and `classifyJoinCondition` therefore test `query_level` first — skip for existence here, and refuse to make a KEY there, or a key-less nested join joins on a fabricated key instead of hitting the cross-product refusal |
 
 | 19 | `forEachSubquery` — `subquery_materialization.cc` (Week 31) | returns | **Loud, by construction.** The subquery inside the missed subtype is never materialized, survives into planning and hits site 12's throw. That backstop is the whole reason this walker may be added without becoming the eleventh silent site — do not "simplify" sites 12/13 into the generic unknown-subtype throw, which says nothing about which walker failed. It is also the ONE walker that deliberately descends INTO a `SubqueryExpr`'s body: Week 30's rule (descend into the parts written in THIS block, never into the body) is a rule about SCOPE, and "which statements must run, and in what order" is not a scope question — a nested body must be materialized before the body containing it can run. Its read-only twin `forEachSubqueryConst` answers the same question for the CLI's table loader, so a nested query's tables are loaded; the two must stay in step |
+| 20 | `staticTypeOf` — `parser/expr_totality.h` (Weeks 36–37) | returns `false` | Safe **at subtype granularity**: `false` is "I cannot type this here", which every caller reads as "may raise", so the screen freezes rather than lets through. The cost is real and measured — seam audit pass 4's P4-2 timed **87×** on a three-conjunct `WHERE` from screening arithmetic too coarsely. **NOT safe at OPERATOR granularity** (pass 5's P5-5): the `BinaryExpr` arm falls through to `out = TypeId::INT` assuming a comparison, and the `UnaryExpr` arm never tests `un->op` at all, so a new *operator* (`\|\|`, or a `NOT` built as a `UnaryExpr`) is classified TOTAL from its first day instead of landing on the safe fallthrough. A new subtype is safe here; a new operator is not |
+| 21 | `exprMayRaise` — `parser/expr_totality.h` (Weeks 36–37) | returns `true` | Safe: the final `return true` is the conservative answer, so an unhandled subtype is treated as able to raise and everything after it in the conjunct list is frozen. Same operator-granularity hazard as site 20, which it inherits by calling it. **This is the screen that decides whether a legal query ERRORS** — see *Written evaluation order* — so a wrong answer here is a divergence, not a lost optimization, and the two error directions are not symmetric: a false TRUE costs plan quality on one query, a false FALSE is a wrong answer on the differential leg |
 
 `ChunkPruner::shouldSkip` is not on the list *for the dispatch question*:
 `collectSimplePredicates` returns immediately on anything that is not a
