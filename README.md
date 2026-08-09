@@ -154,8 +154,10 @@ Plausible SQL that SwiftQL rejects. Each is a clean error, not a wrong answer.
 > can *throw* — integer overflow, `SUBSTRING` out-of-domain positions, a
 > comparison across the STRING boundary — reordering your `WHERE` can change
 > whether the query **errors**, and `p AND q` and `q AND p` are different
-> programs whenever `q` can raise. Measured on the shipped F1 catalog, identically
-> in all four storage × execution modes and under `--no-optimize`:
+> programs whenever `q` can raise. Measured on the shipped F1 catalog, identical
+> in all four modes (`row-volcano`, `col-volcano`, `col-vec`, `col-vec-noopt`)
+> and under `--no-optimize` on each of the three engine legs — six cells, same
+> answer:
 >
 > ```sql
 > WHERE speed > 400 AND lap_id * 2305843009213693952 > 0   -- 0 rows
