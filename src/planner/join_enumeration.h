@@ -89,8 +89,13 @@
 // method=dp, optimized == --no-optimize). What was actually wrong was
 // countRelations, which counted SCANS and so over-counted a derived body's —
 // making `slot >= n` too permissive rather than too strict. It counts the spine
-// now. No reported decline was added because no supported query pays a
-// plan-quality cost, which is the condition Week 30 set for earning one.
+// now. No reported decline was added FOR THIS CASE, because there is no decline
+// for this case at all — a derived relation is reordered like any other. Read it
+// no wider than that (Week 37 doc sweep): the identical sentence, stated about
+// the SEMI/ANTI case on the same "no supported query pays a plan-quality cost"
+// argument Week 30 set, was FALSE and was retracted by 18af84f — see the reported
+// `join-ordering=skipped (semi/anti join)` twelve lines above, and the matching
+// retraction in development.md's Week 34 consumer table.
 //
 // !! THE PARAGRAPH THAT STOOD HERE WAS FALSE IN BOTH HALVES, and it is the exact
 // text `18af84f` deleted from join_enumeration.cc — swept in the .cc and left
