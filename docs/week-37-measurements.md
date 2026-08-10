@@ -300,8 +300,8 @@ invocation, each capped at 600 s covering 1 warmup + 3 repetitions:
 
 | query | SwiftQL | SQLite no-index | Postgres no-index | Postgres indexed |
 |---|---|---|---|---|
-| q17 | 1367 ms | **did not finish** | **did not finish** | 49 ms |
-| q21 | 2566 ms | **did not finish** | **did not finish** | 666 ms |
+| q17 | 1367 ms | **1 495 726 ms** (24.9 min) | **1 288 989 ms** (21.5 min) | 49 ms |
+| q21 | 2566 ms | **> 3 600 000 ms** (>1 h, capped) | **> 3 600 000 ms** (>1 h, capped) | 666 ms |
 | q22 | 107 ms | **413 273 ms** (one execution) | 283 ms | 24 ms |
 | q19 | 379 ms | 3827 ms | 214 ms | 13.6 ms |
 | q18 | 2718 ms | 1998 ms | 1315 ms | 802 ms |
@@ -322,6 +322,18 @@ gap to SQLite and a 2.6x gap to PostgreSQL.
 
 The earlier row is corrected accordingly. This is exactly why the
 single-execution bound was worth running rather than quoting the cap.
+
+**All three bounds, one execution each, `--reps 1 --warmups 0`, 3600 s cap:**
+
+| query | SwiftQL | SQLite no-index | PostgreSQL no-index | SwiftQL advantage |
+|---|---|---|---|---|
+| q22 | 107 ms | 413 274 ms | 283 ms | **3 860x** vs SQLite |
+| q17 | 1 367 ms | 1 495 726 ms (24.9 min) | 1 288 989 ms (21.5 min) | **1 094x / 943x** |
+| q21 | 2 566 ms | > 1 h (capped) | > 1 h (capped) | **> 1 400x** |
+
+q17 is the one that separates cleanly: **both** row stores take over twenty
+minutes without an index, so it is not a SQLite quirk. q21 exceeded a full hour
+on both and is reported as a bound, not a measurement.
 
 Three readings, and the third is the one that keeps this honest:
 
