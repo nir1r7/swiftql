@@ -5,6 +5,28 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# DEFAULT TO Release, because the alternative is silently -O0.
+#
+# CMake passes NO -O flag at all when CMAKE_BUILD_TYPE is empty, and it is empty
+# unless the configuring command names one. Every benchmark this project
+# published before Week 37 was therefore taken on an unoptimized binary:
+# measured on TPC-H sf0.01, q18 ran 1568ms that way against 72ms from the same
+# commit built Release, and q1 260ms against 9ms. A ~21x factor with no source
+# change behind it, which inverted the headline result against SQLite.
+#
+# Nothing about the old behaviour was visible: `cmake ..` succeeds, the tests
+# pass, and the only evidence is the absence of a flag in compile_commands.json.
+# A default that must be remembered is a default that will be forgotten, so it
+# is set here. `-DCMAKE_BUILD_TYPE=Debug` still works and is still the right
+# choice for debugging; it just has to be asked for.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING
+      "Build type (Release by default; see the note in CMakeLists.txt)" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+               Debug Release RelWithDebInfo MinSizeRel)
+endif()
+message(STATUS "SwiftQL build type: ${CMAKE_BUILD_TYPE}")
+
 # GoogleTest via FetchContent (downloads automatically).
 # Fetched over git rather than by archive URL: sandboxed CI/agent environments
 # commonly proxy egress and reject the codeload archive endpoints with a 403
