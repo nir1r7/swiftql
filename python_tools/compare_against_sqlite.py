@@ -3504,6 +3504,41 @@ def load_from_catalog(catalog_path):
         # 10k laps and is not for 60k+ lineitem rows at even a small scale factor.
         conn.executemany("INSERT INTO {} VALUES ({})".format(t["name"], placeholders),
                          rows)
+
+        # INDEX EVERY KEY-SHAPED COLUMN. The oracle's job is to produce the
+        # right answer, and how fast it does that is not a property under test --
+        # but it does decide whether the comparison can run at all.
+        #
+        # Without this, the mirror has no index of any kind, so SQLite evaluates
+        # TPC-H q21's correlated NOT EXISTS as a nested scan: 19.7 s at SF=0.01,
+        # and a SF=0.1 correctness run was killed after 55 minutes still inside
+        # that one query. THE ORACLE, NOT SwiftQL, was the scale ceiling --
+        # SwiftQL answers the same query in 18.6 ms.
+        #
+        # The heuristic is the naming convention both datasets already follow:
+        # TPC-H writes *_partkey / *_orderkey / *_custkey, and the F1 fixture
+        # writes driver_id / lap_id. An index on a column no query joins on
+        # costs load time and nothing else, so over-indexing is the safe
+        # direction. Answers cannot change: an index is not visible to SQL
+        # semantics.
+        for c in cols:
+            if c["name"].lower().endswith(("key", "id")):
+                conn.execute("CREATE INDEX idx_{0}_{1} ON {0}({1})".format(
+                    t["name"], c["name"]))
+    conn.commit()
+
+    # ANALYZE, because indexes alone are not enough at SF=1.
+    #
+    # Without sqlite_stat1 SQLite plans a multi-way join from static heuristics,
+    # and on TPC-H q5 -- six tables, 6M lineitem rows -- it picked an order that
+    # ran for 28 minutes without finishing. The indexes were already in place;
+    # what was missing was any basis for choosing between them. Measured at
+    # SF=0.1 the whole 22-query run is 177s, so the planner is not the ceiling
+    # there and this only matters as the data grows.
+    #
+    # One-off per run and cheap relative to the load itself. Like the indexes,
+    # it cannot change an answer -- it changes which plan produces it.
+    conn.execute("ANALYZE")
     conn.commit()
     return conn
 
