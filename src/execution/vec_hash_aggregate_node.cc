@@ -4,22 +4,111 @@
 #include "parser/expr_utils.h"
 #include "execution/key_encoding.h"
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <numeric>
+#include <type_traits>
 
 namespace {
     // The encoding is shared with every other key serializer (key_encoding.h):
     // length-prefixed so it is injective for any bytes, 'N' for NULL so a NULL
     // group cannot collide with the string value "NULL", and exact rather than
     // display text for DOUBLE — `%.15g` gave two distinct doubles one group.
-    std::string serializeKey(const std::vector<Value>& key) {
-        std::string result;
-        for (const auto& v : key) appendGroupKeyField(result, v);
-        return result;
+    void serializeKey(const std::vector<Value>& key, std::string& out) {
+        out.clear();
+        for (const auto& v : key) appendGroupKeyField(out, v);
+    }
+
+    // `<len>` written straight into the buffer. std::to_string would give the
+    // same digits but materializes a std::string to do it, once per key field
+    // per row.
+    void appendDecimal(std::string& out, size_t v) {
+        char buf[20];
+        char* p = buf + sizeof(buf);
+        do { *--p = static_cast<char>('0' + v % 10); v /= 10; } while (v);
+        out.append(p, static_cast<size_t>(buf + sizeof(buf) - p));
+    }
+
+    // `<len>:<bytes>\x01` for bytes already in hand. Splitting this out is what
+    // lets the STRING arm below prefix a chunk cell IN PLACE — appendGroupKeyField
+    // has to go via keyFieldText, which returns the cell's text by value and so
+    // copies every string key column of every input row.
+    void appendLengthPrefixed(std::string& out, const char* bytes, size_t len) {
+        appendDecimal(out, len);
+        out += ':';
+        out.append(bytes, len);
+        out += '\x01';
+    }
+
+    // std::to_chars renders an integer with the same digits std::to_string does
+    // (that is the guarantee that keeps this byte-identical to keyFieldText),
+    // into a stack buffer rather than into a fresh std::string.
+    void appendIntField(std::string& out, int64_t v) {
+        char buf[24];
+        const auto res = std::to_chars(buf, buf + sizeof(buf), v);
+        appendLengthPrefixed(out, buf, static_cast<size_t>(res.ptr - buf));
+    }
+
+    // One key field read STRAIGHT OUT OF A COLUMN, byte-for-byte what
+    // appendGroupKeyField(valueAt(cv, row)) writes — same 'N' for NULL, same
+    // length prefix, and for DOUBLE the same keyFieldText rules (integral doubles
+    // through the integer text so 7.0 keys with the INT 7; both NaN signs to
+    // "nan" so a NaN is one group of its own; %.17g otherwise so two distinct
+    // doubles never share a group).
+    //
+    // The point of the duplication is that it never builds a Value: the row loop
+    // below used to construct one per key column per row, each a
+    // std::variant<int64_t,double,std::string> copy of the cell, purely to read
+    // its text back out. Dispatch is on the VARIANT alternative, not on cv.type,
+    // matching readColumnValue.
+    void appendGroupKeyFromColumn(std::string& out, const ColumnVector& cv, int row) {
+        if (cv.isNull(row)) {
+            out += 'N';
+            out += '\x01';
+            return;
+        }
+        std::visit([&](const auto& vec) {
+            using T = std::decay_t<decltype(vec[0])>;
+            if constexpr (std::is_same_v<T, std::string>) {
+                const std::string& s = vec[row];
+                appendLengthPrefixed(out, s.data(), s.size());
+            } else if constexpr (std::is_same_v<T, double>) {
+                const double d = vec[row];
+                if (std::isnan(d)) {
+                    appendLengthPrefixed(out, "nan", 3);
+                } else if (std::isfinite(d) && std::trunc(d) == d &&
+                           d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
+                    appendIntField(out, static_cast<int64_t>(d));
+                } else {
+                    char buf[40];
+                    const int n = snprintf(buf, sizeof(buf), "%.17g", d);
+                    appendLengthPrefixed(out, buf, static_cast<size_t>(n));
+                }
+            } else {
+                appendIntField(out, vec[row]);
+            }
+        }, cv.data);
     }
 
     double toDouble(const Value& v) {
         return v.type() == TypeId::DOUBLE ? v.asDouble() : static_cast<double>(v.asInt());
+    }
+
+    // Which accumulator update an AggregateSpec wants, decided ONCE per query
+    // instead of per spec per row. The inner loop used to ask
+    // `spec.function == "SUM"` and up to three more std::string comparisons for
+    // every aggregate of every input row; on q1 that is eight specs times 60k
+    // rows. COUNT needs no update beyond non_null_count, which the loop already
+    // maintains for every kind.
+    enum class AggKind { COUNT, SUM_AVG, MIN, MAX };
+
+    AggKind aggKindOf(const std::string& function) {
+        if (function == "SUM" || function == "AVG") return AggKind::SUM_AVG;
+        if (function == "MIN") return AggKind::MIN;
+        if (function == "MAX") return AggKind::MAX;
+        return AggKind::COUNT;
     }
 }
 
@@ -30,7 +119,7 @@ void VecHashAggregateNode::open() {
     materialized_ = false;
     cursor_ = 0;
     groups_.clear();
-    group_order_.clear();
+    group_index_.clear();
     result_rows_.clear();
 }
 
@@ -66,6 +155,11 @@ void VecHashAggregateNode::consumeAll() {
         if (idx < 0) idx = child_schema.indexOf(spec.column);
         agg_idxs.push_back(idx);
     }
+
+    // Function-name dispatch, resolved once (see AggKind).
+    std::vector<AggKind> agg_kinds;
+    agg_kinds.reserve(specs_.size());
+    for (const auto& spec : specs_) agg_kinds.push_back(aggKindOf(spec.function));
 
     // Compile expression group keys and expression aggregate arguments into
     // chunk-at-a-time executors, once for the whole scan. This is the hot path
@@ -103,6 +197,22 @@ void VecHashAggregateNode::consumeAll() {
     std::vector<const ColumnVector*> group_vecs(group_by_cols_.size(), nullptr);
     std::vector<const ColumnVector*> arg_vecs(specs_.size(), nullptr);
 
+    // Every group key that is a plain column OR a compiled expression is a
+    // ColumnVector cell, and the key can be serialized straight out of it. The
+    // one key shape that cannot is an expression compile() declined, which only
+    // exists as a per-row evaluate() into a Value. all_key_cols says no such key
+    // is present, which is the case for every TPC-H group-by and lets the row
+    // loop skip building a Value vector per row.
+    // A compiled result is indexed by POSITION (dense in selection order); a
+    // plain column by the chunk ROW index. src.by_pos carries which.
+    struct KeySource { const ColumnVector* cv; bool by_pos; };
+    std::vector<KeySource> key_srcs(group_by_cols_.size(), {nullptr, false});
+    bool all_key_cols = true;
+    for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
+        if (group_idxs[gi] < 0 && !group_execs[gi]) { all_key_cols = false; break; }
+    }
+    if (!all_key_cols) key_vals_.assign(group_idxs.size(), Value());
+
     while (DataChunk* chunk = child_->nextChunk()) {
         // child time excluded
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -129,50 +239,81 @@ void VecHashAggregateNode::consumeAll() {
             if (arg_execs[i]) arg_vecs[i] = &arg_execs[i]->execute(*chunk, *indices_ptr);
         }
 
+        // Bind each key to the chunk column it reads, once per chunk. The
+        // executor results only exist after the loop above, so this cannot be
+        // hoisted out of the chunk loop with the index resolution.
+        if (all_key_cols) {
+            for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
+                key_srcs[gi] = group_idxs[gi] < 0
+                    ? KeySource{group_vecs[gi], true}
+                    : KeySource{&chunk->columns[group_idxs[gi]], false};
+            }
+        }
+
         // Iterate by position, not by row index: executor results are dense in
         // selection order, so result index `pos` corresponds to chunk row `r`.
         const int n_rows = static_cast<int>(indices_ptr->size());
+        Row tmp;   // reused; clear() keeps its capacity across rows
         for (int pos = 0; pos < n_rows; ++pos) {
             const int r = (*indices_ptr)[pos];
             stats.rows_in++;
 
             // full Row only for expressions that fell back to evaluate()
-            Row tmp;
             if (needs_row) {
+                tmp.clear();
                 tmp.reserve(chunk->columns.size());
                 for (const auto& cv : chunk->columns) {
                     tmp.push_back(valueAt(cv, r));
                 }
             }
 
-            // build group key vector from group by columns
-            std::vector<Value> key;
-            key.reserve(group_idxs.size());
-            for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
-                if (group_idxs[gi] < 0) {
-                    if (group_vecs[gi]) {
-                        key.emplace_back();
-                        readColumnValue(*group_vecs[gi], pos, key.back());
-                    } else {
-                        key.push_back(evaluate(group_by_cols_[gi].expr.get(), tmp, child_schema));
-                    }
-                    continue;
+            // Serialize the group key into the reused buffer. The columnar path
+            // writes each field straight from its column; only an expression
+            // compile() declined needs a Value, and then only for that field.
+            if (all_key_cols) {
+                key_buf_.clear();
+                for (size_t gi = 0; gi < key_srcs.size(); ++gi) {
+                    appendGroupKeyFromColumn(key_buf_, *key_srcs[gi].cv,
+                                             key_srcs[gi].by_pos ? pos : r);
                 }
-                // emplace-then-read avoids a temporary Value per key column per row
-                key.emplace_back();
-                readColumnValue(chunk->columns[group_idxs[gi]], r, key.back());
-            }
-            std::string key_str = serializeKey(key);
-
-            // initialize accumulator on first encounter
-            auto [it, inserted] = groups_.try_emplace(key_str);
-            if (inserted) {
-                it->second.group_vals = key;
-                it->second.per_spec.resize(specs_.size());
-                group_order_.push_back(key_str);
+            } else {
+                for (size_t gi = 0; gi < group_idxs.size(); ++gi) {
+                    if (group_idxs[gi] < 0) {
+                        if (group_vecs[gi]) readColumnValue(*group_vecs[gi], pos, key_vals_[gi]);
+                        else key_vals_[gi] = evaluate(group_by_cols_[gi].expr.get(), tmp, child_schema);
+                        continue;
+                    }
+                    readColumnValue(chunk->columns[group_idxs[gi]], r, key_vals_[gi]);
+                }
+                serializeKey(key_vals_, key_buf_);
             }
 
-            Accumulator& acc = it->second;
+            // initialize accumulator on first encounter. find() before insert so
+            // a repeat row — the overwhelmingly common case — never copies the
+            // key string; only a genuinely new group pays for one.
+            auto it = group_index_.find(key_buf_);
+            uint32_t gidx;
+            if (it == group_index_.end()) {
+                gidx = static_cast<uint32_t>(groups_.size());
+                groups_.emplace_back();
+                Accumulator& fresh = groups_.back();
+                fresh.per_spec.resize(specs_.size());
+                if (all_key_cols) {
+                    fresh.group_vals.resize(key_srcs.size());
+                    for (size_t gi = 0; gi < key_srcs.size(); ++gi) {
+                        readColumnValue(*key_srcs[gi].cv,
+                                        key_srcs[gi].by_pos ? pos : r,
+                                        fresh.group_vals[gi]);
+                    }
+                } else {
+                    fresh.group_vals = key_vals_;
+                }
+                group_index_.emplace(key_buf_, gidx);
+            } else {
+                gidx = it->second;
+            }
+
+            Accumulator& acc = groups_[gidx];
             acc.count++;
 
             // update each aggregate
@@ -212,19 +353,23 @@ void VecHashAggregateNode::consumeAll() {
                     sa.distinct_keys.insert(std::move(dk));
                 }
 
-                if (spec.function == "SUM" || spec.function == "AVG") {
-                    sa.sum += toDouble(val);
-                }
-                // MIN/MAX are order statistics: they return an element of the
-                // input domain, so they keep the argument's own Value (and type,
-                // per aggregateResultType) instead of coercing to double.
-                // Value's comparison operators coerce INT/DOUBLE and compare
-                // STRING lexicographically, matching SQLite.
-                if (spec.function == "MIN") {
-                    if (sa.min_val.isNull() || val < sa.min_val) sa.min_val = val;
-                }
-                if (spec.function == "MAX") {
-                    if (sa.max_val.isNull() || val > sa.max_val) sa.max_val = val;
+                switch (agg_kinds[i]) {
+                    case AggKind::SUM_AVG:
+                        sa.sum += toDouble(val);
+                        break;
+                    // MIN/MAX are order statistics: they return an element of the
+                    // input domain, so they keep the argument's own Value (and
+                    // type, per aggregateResultType) instead of coercing to
+                    // double. Value's comparison operators coerce INT/DOUBLE and
+                    // compare STRING lexicographically, matching SQLite.
+                    case AggKind::MIN:
+                        if (sa.min_val.isNull() || val < sa.min_val) sa.min_val = val;
+                        break;
+                    case AggKind::MAX:
+                        if (sa.max_val.isNull() || val > sa.max_val) sa.max_val = val;
+                        break;
+                    case AggKind::COUNT:
+                        break;  // non_null_count above is the whole update
                 }
             }
         }
@@ -235,19 +380,16 @@ void VecHashAggregateNode::consumeAll() {
     // SQL: a scalar aggregate (no GROUP BY) over empty input still emits one row
     // (COUNT -> 0, SUM/AVG/MIN/MAX -> NULL). A default accumulator yields exactly that.
     if (group_by_cols_.empty() && groups_.empty()) {
-        auto [it, inserted] = groups_.try_emplace("");
-        it->second.per_spec.resize(specs_.size());
-        group_order_.push_back("");
+        groups_.emplace_back();
+        groups_.back().per_spec.resize(specs_.size());
     }
 }
 
 void VecHashAggregateNode::materializeResults() {
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // emit in insertion order for stable output
-    for (const auto& key_str : group_order_) {
-        const Accumulator& acc = groups_[key_str];
-
+    // emit in insertion order for stable output — groups_ is already in it
+    for (const Accumulator& acc : groups_) {
         // group by column values first (matching buildAggregateSchema order)
         Row row = acc.group_vals;
 

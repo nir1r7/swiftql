@@ -1,6 +1,7 @@
 #pragma once
 #include "planner/vec_plan_node.h"
 #include "planner/logical_plan.h"
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -57,8 +58,22 @@ class VecHashAggregateNode : public VecPlanNode {
             std::vector<SpecAccum> per_spec; // one entry per specs_ element
         };
 
-        std::unordered_map<std::string, Accumulator> groups_;
-        std::vector<std::string> group_order_; // insertion order
+        // Accumulators live in a vector in FIRST-APPEARANCE ORDER and the map
+        // holds only an index into it. That is what preserves group output order
+        // now that there is no separate group_order_ list: the vector IS the
+        // order, so emitting is a walk over it and no key string is stored twice.
+        // (The old shape kept one std::string copy of every key in group_order_
+        // on top of the map's own, and re-hashed each of them to emit.)
+        std::vector<Accumulator> groups_;
+        std::unordered_map<std::string, uint32_t> group_index_;
+
+        // Reused across every input row so the per-row key costs no allocation:
+        // clear() keeps the capacity. Same discipline as vec_hash_join_node's
+        // key_buf_. key_vals_ only carries the evaluate() fallback path (see
+        // consumeAll); the columnar path never materializes a Value per row.
+        std::string key_buf_;
+        std::vector<Value> key_vals_;
+
         std::vector<Row> result_rows_;
         int cursor_ = 0;
         bool materialized_ = false;
