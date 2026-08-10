@@ -18,7 +18,14 @@ int VecDistinctNode::consumeAndDedup() {
     int rows_consumed = 0;
     std::unordered_set<std::string> seen;
 
-    while (DataChunk* chunk = child_->nextChunk()) {
+    // Child time EXCLUDED, per chunk. The timer used to sit in nextChunk()
+    // around this whole call, so a blocking node reported its entire subtree as
+    // its own self-time -- see the same fix in vec_sort_node.cc.
+    while (true) {
+        DataChunk* chunk = child_->nextChunk();
+        if (!chunk) break;
+        auto t0 = std::chrono::high_resolution_clock::now();
+
         // determine valid row indices, handles both filtered and unfiltered chunks
         const std::vector<int>* indices_ptr = nullptr;
         std::vector<int> all_indices;
@@ -50,6 +57,8 @@ int VecDistinctNode::consumeAndDedup() {
                 dedup_buffer_.push_back(std::move(row));
             }
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(
+            std::chrono::high_resolution_clock::now() - t0).count();
     }
     return rows_consumed;
 }
@@ -73,10 +82,11 @@ void VecDistinctNode::fillChunk(int start, int count) {
 
 DataChunk* VecDistinctNode::nextChunk() {
     if (!materialized_) {
-        auto t0 = std::chrono::high_resolution_clock::now();
+        // consumeAndDedup accumulates stats.elapsed_us itself, per chunk and
+        // excluding the child call. Timing it from here would re-include the
+        // whole subtree, which is the defect this replaced.
         stats.rows_in  = consumeAndDedup();
         stats.rows_out = static_cast<int>(dedup_buffer_.size());
-        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         materialized_ = true;
     }
 

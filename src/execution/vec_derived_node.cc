@@ -22,8 +22,12 @@ VecDerivedNode::VecDerivedNode(std::unique_ptr<VecPlanNode> child, std::string a
 void VecDerivedNode::open() { child_->open(); }
 
 DataChunk* VecDerivedNode::nextChunk() {
-    auto t0 = std::chrono::high_resolution_clock::now();
+    // Child time EXCLUDED — t0 starts after the child returns. README's
+    // --explain-analyze contract is per-node *exclusive* self-time, and this
+    // node used to start its timer above the call, charging the whole body's
+    // execution to a node that does no work at all.
     DataChunk* chunk = child_->nextChunk();
+    auto t0 = std::chrono::high_resolution_clock::now();
     // Rows in == rows out, always: this node selects nothing and computes
     // nothing. What it must NOT do is count the chunk's WIDTH when the body
     // applied a filter — `num_rows` is the buffer size and `sel.indices.size()`

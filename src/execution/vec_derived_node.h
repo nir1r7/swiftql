@@ -31,6 +31,16 @@ class VecDerivedNode : public VecPlanNode {
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
 
+        // Week 38 — forwarded verbatim, and INDICES are what makes that safe.
+        // This node forwards its child's chunk untouched and differs only in the
+        // NAMES its schema reports, so column i is the same ColumnVector on both
+        // sides while the name at i may not be the same name. The constructor
+        // already refuses a width mismatch, so the index is in range below too.
+        void pushBloomFilter(const std::vector<int>& key_indices,
+                             std::shared_ptr<const BloomFilter> filter) override {
+            child_->pushBloomFilter(key_indices, std::move(filter));
+        }
+
     private:
         std::unique_ptr<VecPlanNode> child_;
         std::string alias_;
