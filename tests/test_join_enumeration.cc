@@ -412,17 +412,17 @@ TEST(JoinEnumeration, AboveTheDpLimitFallsBackToGreedyAndStaysLegal) {
 
 // ── result preservation ─────────────────────────────────────────────────────
 
-static std::unordered_map<std::string, ColumnarTable> loadColumnar(
+static std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
     tables.emplace(stmt.from.tableName("test loader"),
-                   CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
+                   std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema)));
     for (const auto& j : stmt.joins) {
         if (tables.count(j.relation.tableName("test loader"))) continue;
         const auto& jm = cat.getTable(j.relation.tableName("test loader"));
         tables.emplace(j.relation.tableName("test loader"),
-                       CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
+                       std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema)));
     }
     return tables;
 }
@@ -808,7 +808,16 @@ TEST(JoinEnumeration, OuterJoinEstimateAppliesTheOnResidualToTheMatchTerm) {
 // itself — which is a strictly more specific assertion, not a weaker one. The
 // silence stopped being honest once a fully inner three-relation block could sit
 // below the semi join and lose its ordering with nothing printed.
-TEST(JoinEnumeration, DeclinesASemiJoinTreeAsSlotOutsideTheRangeTable) {
+//
+// !! WEEK 38 INVERTED THIS TEST, and the inversion is the change: a semi/anti
+// join is a SPINE BOUNDARY, not a global veto. The node itself still declines —
+// its position may not move, because its lowered operand's binder slot resolves
+// in the domain leftKeyIndices() uses — but the fully inner tree UNDERNEATH it is
+// now enumerated. What used to be asserted here ("only the declining node carries
+// a decision") was the assertion subquery_lowering.cc's decline comment predicted
+// would have to be inverted; it is, and the CONTROL below is what it inverted to:
+// the query and its no-IN twin now reach the SAME order.
+TEST(JoinEnumeration, SemiJoinIsASpineBoundaryAndTheTreeBelowIsEnumerated) {
     Catalog cat(CATALOG);
     seedStats(cat);
     // THE SPINE MUST BE THREE RELATIONS, not three SCANs. The old query here was
@@ -832,35 +841,55 @@ TEST(JoinEnumeration, DeclinesASemiJoinTreeAsSlotOutsideTheRangeTable) {
     const LogicalJoin* semi = joins.front();
     ASSERT_EQ(semi->semantics, JoinSemantics::SEMI);
 
-    // REPORTED, and the reason names THIS decline: the outer-join decline would
-    // have stamped "join-ordering=skipped (outer join)", so the exact string is
+    // THE NODE ITSELF STILL DECLINES, and the string still names the cause: the
+    // outer-join decline would have stamped "(outer join)", so the exact text is
     // what identifies which one fired. It is deliberately not `order=` — no order
-    // was chosen, and that token must keep meaning "the search ran".
-    EXPECT_EQ(decisionOf(plan.get()), "join-ordering=skipped (semi/anti join)");
+    // was chosen AT THIS NODE, and that token must keep meaning "the search ran
+    // over these relations" — but it now says where the search DID run, so a
+    // partially reordered tree does not read as a fully declined one.
+    EXPECT_EQ(decisionOf(plan.get()),
+              "join-ordering=skipped (semi/anti join; spine below enumerated separately)");
     EXPECT_EQ(decisionOf(plan.get()).find("order="), std::string::npos);
-    // ...and only the declining node carries it. An inner join below it made no
-    // decision either and must not claim one.
-    EXPECT_TRUE(semi->order_decision.rfind("join-ordering=skipped", 0) == 0);
-    for (const LogicalJoin* j : joins) {
-        if (j != semi) EXPECT_TRUE(j->order_decision.empty());
-    }
-
-    // ...and the condition it declined on is the one this test names: the semi
-    // join has no slot in this block's range table.
     EXPECT_EQ(semi->join_slot, -1);
 
-    // The written order survives untouched, which is the point of declining.
-    auto baseline = writtenOrder(SQL, cat);
-    EXPECT_EQ(chosenOrder(plan.get()), chosenOrder(baseline.get()));
+    // ...and the fully inner three-relation spine UNDERNEATH it carries the
+    // search's decision. This is the assertion Week 38 inverted.
+    int decided = 0;
+    for (const LogicalJoin* j : joins) {
+        if (j->order_decision.find("method=dp") != std::string::npos) ++decided;
+    }
+    EXPECT_EQ(decided, 1) << "the spine below the semi join should carry the decision";
 
-    // CONTROL, and it is what makes the decline a real COST rather than a no-op:
-    // the same three-relation FROM spine WITHOUT the IN is reordered by the DP.
-    // So the ordering the query above loses is one that was genuinely available.
+    // AND IT REACHES THE SAME ORDER AS THE SAME SPINE WITHOUT THE IN. That
+    // control used to prove the decline cost something real; it now proves the
+    // cost is gone.
     auto no_semi = optimize(
         "SELECT COUNT(*) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id "
         "JOIN drivers d2 ON d.team = d2.team", cat);
     EXPECT_NE(decisionOf(no_semi.get()).find("method=dp"), std::string::npos)
         << decisionOf(no_semi.get());
+    // Read off the SPINE, not off the plan root: the semi join contributes its
+    // own join_slot (-1, by contract) to chosenOrder and the no-IN twin has no
+    // such node, so the two roots are not comparable shapes.
+    EXPECT_EQ(chosenOrder(semi->children[0].get()), chosenOrder(no_semi.get()));
+
+    // ...which is a DIFFERENT order from the written one, so the assertions above
+    // are about a tree that genuinely moved.
+    auto baseline = writtenOrder(SQL, cat);
+    EXPECT_NE(chosenOrder(plan.get()), chosenOrder(baseline.get()));
+
+    // THE SCHEMA THE SEMI JOIN PUBLISHES IS ITS PROBE INPUT'S, still — the
+    // containment subquery_lowering.cc names, and the one a permuted spine
+    // underneath would otherwise silently break. Column POSITION is how every
+    // lowered operator above addresses its input, so a stale copy here is a wrong
+    // answer rather than a lost optimization.
+    ASSERT_EQ(semi->output_schema.size(), semi->children[0]->output_schema.size());
+    for (int i = 0; i < semi->output_schema.size(); ++i) {
+        EXPECT_EQ(semi->output_schema.column(i).name,
+                  semi->children[0]->output_schema.column(i).name) << "column " << i;
+        EXPECT_EQ(semi->output_schema.column(i).relation_slot,
+                  semi->children[0]->output_schema.column(i).relation_slot) << "column " << i;
+    }
 }
 
 // The semi/anti rule is stamped at the estimator and is NEVER reachable from
@@ -944,8 +973,11 @@ TEST(JoinEnumeration, SemiJoinDeclineIsNotMisattributedToAnOuterJoinInItsBody) {
         "WHERE l.lap_id IN (SELECT l3.lap_id FROM laps l3 "
         "                   LEFT JOIN drivers d3 ON l3.driver_id = d3.driver_id)", cat);
 
-    // WITHOUT THE FIX this is "join-ordering=skipped (outer join)".
-    EXPECT_EQ(decisionOf(plan.get()), "join-ordering=skipped (semi/anti join)");
+    // WITHOUT THE FIX this is "join-ordering=skipped (outer join)". The cause
+    // named is still the semi/anti one — Week 38 changed what happens BELOW the
+    // node, not which construct the node reports.
+    EXPECT_EQ(decisionOf(plan.get()),
+              "join-ordering=skipped (semi/anti join; spine below enumerated separately)");
 }
 
 // ── descending past the topmost JOIN (seam audit pass 2, B-3) ──────────────

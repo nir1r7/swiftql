@@ -236,6 +236,88 @@ void decompose(std::unique_ptr<LogicalPlanNode> node,
     decompose(std::move(join->children[0]), leaves, edges);
 }
 
+// THE MERGE RULE for a left-deep join's output schema, in ONE place: the left
+// input's columns verbatim, then the newly added relation's stamped with its
+// binder slot. LogicalPlanBuilder::build writes it, `rebuild` below writes it
+// generalized off the written order, and `refreshSchema` below has to write it a
+// third time for a join whose left subtree this pass permuted. Two spellings of
+// it are how they drift, and a schema that disagrees with the rows the operator
+// actually emits is read as column IDENTITY by every consumer above it.
+//
+// By-value loop variable: a reference would mutate the right child's own schema
+// and destroy its slot stamping. Copying whole ColumnDefs also preserves `hidden`.
+void appendStamped(std::vector<ColumnDef>& merged, const Schema& right, int slot) {
+    for (ColumnDef c : right.columns()) {
+        c.relation_slot = slot;
+        merged.push_back(c);
+    }
+}
+
+// Column-sequence identity. Reordering PRESERVES a merged schema's
+// (relation_slot, name) SET and PERMUTES its sequence, so this is exactly the
+// property an ancestor's stored copy of a child schema can lose — and the test
+// the refresh below is gated on.
+bool sameColumnSequence(const Schema& a, const Schema& b) {
+    if (a.size() != b.size()) return false;
+    for (int i = 0; i < a.size(); ++i) {
+        if (a.column(i).name != b.column(i).name) return false;
+        if (a.column(i).relation_slot != b.column(i).relation_slot) return false;
+    }
+    return true;
+}
+
+// WEEK 38 — RE-DERIVE ONE NODE'S OUTPUT SCHEMA FROM ITS CHILDREN, for the node
+// kinds that COPY a child's (FILTER / SORT / DISTINCT / LIMIT, and a SEMI/ANTI
+// join, whose output schema is its PROBE input's by contract) or CONCATENATE
+// over both (a STANDARD join). PROJECT / AGGREGATE / DERIVED / SCAN derive their
+// own and are where the propagation stops.
+//
+// It exists because Week 38 let this pass reorder the spine BELOW a semi/anti
+// join, and subquery_lowering.cc's decline comment named exactly this as the
+// blocker: `rebuild` preserves the merged schema's (relation_slot, name) pair
+// SET but PERMUTES its sequence, so every ancestor that stored a copy is stale
+// afterwards — a wrong answer, not a lost optimization, since column POSITION is
+// how the lowered operators above address their inputs.
+//
+// !! IT MUST NEVER RUN ON A JOIN `rebuild` PRODUCED. rebuild stamps the LEFTMOST
+// LEAF's columns with order[0] in the merged schema while deliberately leaving
+// the leaf's OWN schema stamping 0 (ChunkPruner reads slot < 1 as scan-local and
+// leftKeyIndices resolves the first join's keys there), so re-deriving a rebuilt
+// bottom join from its children hands back slot-0 columns where the merge put
+// order[0]. The call sites guard that by refreshing ONLY when a child's schema
+// actually changed, and nothing below a rebuilt spine can change:
+// applyToSpineLeaves re-enters only leaves, and a leaf is a scan, a filter over
+// one, or a derived relation whose body plan is topped by a PROJECT or AGGREGATE.
+void refreshSchema(LogicalPlanNode* node) {
+    switch (node->type) {
+        case LogicalNodeType::JOIN: {
+            auto* join = static_cast<LogicalJoin*>(node);
+            if (join->semantics != JoinSemantics::STANDARD) {
+                // THE CONTAINMENT (subquery_lowering.cc): a semi/anti join's
+                // output schema is its left child's, never a merged one — which
+                // is what keeps the body's slot numbering out of the outer plan.
+                node->output_schema = join->children[0]->output_schema;
+                return;
+            }
+            std::vector<ColumnDef> merged = join->children[0]->output_schema.columns();
+            appendStamped(merged, join->children[1]->output_schema, join->join_slot);
+            node->output_schema = Schema(merged);
+            return;
+        }
+        case LogicalNodeType::FILTER:
+        case LogicalNodeType::SORT:
+        case LogicalNodeType::DISTINCT:
+        case LogicalNodeType::LIMIT:
+            node->output_schema = node->children[0]->output_schema;
+            return;
+        case LogicalNodeType::SCAN:
+        case LogicalNodeType::DERIVED:
+        case LogicalNodeType::AGGREGATE:
+        case LogicalNodeType::PROJECT:
+            return;   // self-derived: the propagation stops here
+    }
+}
+
 // Fold `order` into a left-deep tree, re-deriving each join's keys and merged
 // schema for the order actually chosen. Mirrors LogicalPlanBuilder::build's fold,
 // generalized off the written order.
@@ -290,10 +372,9 @@ std::unique_ptr<LogicalPlanNode> rebuild(const std::vector<int>& order,
 
         // merged schema: [left block] ++ [this relation's columns, stamped r].
         // Order matches VecHashJoinNode's two contiguous output blocks — a
-        // slot-sorted "canonical" order is not available (invariant 1). By-value
-        // loop var: a reference would mutate the join scan's own schema and
-        // destroy its slot-0 stamping. Copying whole ColumnDefs also preserves
-        // `hidden`.
+        // slot-sorted "canonical" order is not available (invariant 1). The
+        // append itself is `appendStamped` above, shared with refreshSchema so
+        // the two cannot spell the merge differently.
         //
         // !! THIS IS THE LINE THE SORT TIE-BREAK USED TO READ AS DATA (seam audit
         // pass 3: engine E-9, join-chain B3-1, optimizer B3-1). The permutation
@@ -312,10 +393,7 @@ std::unique_ptr<LogicalPlanNode> rebuild(const std::vector<int>& order,
         // comparison order from exactly that. Any future consumer that needs a
         // plan-independent column ORDER must do the same; the schema's own
         // sequence is a physical detail of this fold.
-        for (ColumnDef c : rels[r].subtree->output_schema.columns()) {
-            c.relation_slot = r;
-            merged.push_back(c);
-        }
+        appendStamped(merged, rels[r].subtree->output_schema, r);
         node = std::make_unique<LogicalJoin>(std::move(node),
                                              std::move(rels[r].subtree),
                                              std::move(keys), r, Schema(merged));
@@ -652,9 +730,19 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
     return root;
 }
 
+// Is `node` a link of the spine `reorder` just worked on — as opposed to a
+// BOUNDARY that ends it? Week 38: a semi/anti join is a boundary. Its children[0]
+// is a join tree of its own, still in WRITTEN order (nothing decomposed it), so
+// handing it to `apply` is legal; its children[1] is a subquery body, which was
+// always a separate tree.
+bool isSpineLink(const LogicalPlanNode* node) {
+    return node->type == LogicalNodeType::JOIN
+        && static_cast<const LogicalJoin*>(node)->semantics == JoinSemantics::STANDARD;
+}
+
 // Re-enter every subtree hanging off a join spine that is NOT part of the spine:
-// each relation leaf, and a semi/anti join's body. Called on a spine this pass
-// has just finished with.
+// each relation leaf, a semi/anti join, and a semi/anti join's body. Called on a
+// spine this pass has just finished with.
 //
 // It exists because `apply` must NOT recurse into its own result. `decompose`
 // (above) is only decomposable on a WRITTEN-ORDER tree — its own comment says so:
@@ -662,13 +750,23 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
 // there, and would not be decomposable this way". A plain `for (child) apply()`
 // after `reorder` would hand the spine's inner joins straight back to
 // `decompose`, so the descent has to step OVER the spine and into its leaves.
+//
+// WEEK 38 — IT STEPS OVER STANDARD JOINS ONLY. A semi/anti join reached down the
+// children[0] chain (the `LogicalLeftJoin > LogicalSemiJoin > LogicalJoin` shape
+// lowerCorrelatedScalars builds) is not part of this spine and was never
+// decomposed, so it goes to `apply`, which enumerates the fully-inner tree
+// underneath it. The refresh on the way back up is the other half; see
+// refreshSchema for why it is gated on an actual change.
 void applyToSpineLeaves(LogicalPlanNode* node, const Catalog& catalog) {
     auto* join = static_cast<LogicalJoin*>(node);
-    if (join->children[0]->type == LogicalNodeType::JOIN)
+    const Schema before = join->children[0]->output_schema;
+    if (isSpineLink(join->children[0].get()))
         applyToSpineLeaves(join->children[0].get(), catalog);
     else
         join->children[0] = JoinEnumeration::apply(std::move(join->children[0]), catalog);
     join->children[1] = JoinEnumeration::apply(std::move(join->children[1]), catalog);
+    if (!sameColumnSequence(before, join->children[0]->output_schema))
+        refreshSchema(node);
 }
 
 } // namespace
@@ -696,13 +794,59 @@ std::unique_ptr<LogicalPlanNode> JoinEnumeration::apply(std::unique_ptr<LogicalP
     // optimizer B3-1's `optimized != --no-optimize` to every sort inside a derived
     // body. Verified rather than assumed: see the derived-body ORDER BY entry in
     // tests/test_join_enumeration.cc.
+    // WEEK 38 — A SEMI/ANTI JOIN IS A SPINE BOUNDARY, NOT A GLOBAL VETO.
+    //
+    // What stood here handed every JOIN to `reorder`, which declined the whole
+    // tree the moment `slotDeclineReason` met a semi/anti node (its join_slot is
+    // -1 by contract), and `applyToSpineLeaves` then stepped OVER every join on
+    // the children[0] chain — so the FULLY INNER sub-spine underneath a lowered
+    // IN / EXISTS was never enumerated. Measured on TPC-H q21, whose inner spine
+    // is 4 relations: it kept the WRITTEN order `supplier JOIN l1 JOIN orders
+    // JOIN nation`, so `n_name = ':NATION'` (1 of 25 rows, already pushed to the
+    // nation scan) joined LAST and the intermediates ran ~3.0M then ~1.5M rows.
+    //
+    // WHAT DOES NOT MOVE, and each is load-bearing:
+    //   * THIS NODE'S POSITION. Its probe input must remain the whole FROM/JOIN
+    //     spine, because the lowered operand's binder slot resolves in the domain
+    //     leftKeyIndices() uses (logical_plan.cc's lowering site). Only the
+    //     ORDER of the relations inside that spine changes.
+    //   * OUTER JOINS. `containsOuterJoin` is untouched and still declines the
+    //     tree it is called on — R ⟕ S ≠ S ⟕ R.
+    //   * `slotDeclineReason`'s semi/anti branch, which still names the cause for
+    //     the case this function cannot route: a semi/anti join reached as
+    //     children[0] of a STANDARD join that `reorder` was already called on.
     if (node->type == LogicalNodeType::JOIN) {
+        auto* join = static_cast<LogicalJoin*>(node.get());
+        if (join->semantics != JoinSemantics::STANDARD) {
+            const Schema before = join->children[0]->output_schema;
+            join->children[0] = apply(std::move(join->children[0]), catalog);
+            join->children[1] = apply(std::move(join->children[1]), catalog);
+            // The stored copy of the probe schema is stale exactly when the
+            // subtree was permuted; see refreshSchema.
+            if (!sameColumnSequence(before, join->children[0]->output_schema))
+                refreshSchema(node.get());
+            // THE CHECKPOINT SURFACE, and it deliberately keeps the `skipped`
+            // token rather than growing an `order=`: no ordering decision was
+            // made AT THIS NODE, and `order=` must keep meaning "the search ran
+            // over these relations". What changed is that the reader is now told
+            // where the search did run, so a partially-reordered tree does not
+            // read as a fully declined one.
+            join->order_decision =
+                "join-ordering=skipped (semi/anti join; spine below enumerated separately)";
+            return node;
+        }
         node = reorder(std::move(node), catalog);
         // reorder() returns a JOIN in every path (rebuild folds a left-deep tree;
         // the declines return the node untouched).
         applyToSpineLeaves(node.get(), catalog);
         return node;
     }
-    for (auto& child : node->children) child = apply(std::move(child), catalog);
+    bool child_changed = false;
+    for (auto& child : node->children) {
+        const Schema before = child->output_schema;
+        child = apply(std::move(child), catalog);
+        child_changed = child_changed || !sameColumnSequence(before, child->output_schema);
+    }
+    if (child_changed) refreshSchema(node.get());
     return node;
 }
