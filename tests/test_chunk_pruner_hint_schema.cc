@@ -260,16 +260,16 @@ namespace {
 
 const char* E2E_CATALOG = "../tests/data/test_catalog.json";
 
-std::unordered_map<std::string, ColumnarTable> loadFor(const SelectStatement& stmt,
+std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadFor(const SelectStatement& stmt,
                                                        const Catalog& cat) {
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     std::vector<std::string> names;
     collectQueryTables(stmt, names);
     for (const auto& n : names) {
         if (tables.count(n)) continue;
         const auto& m = cat.getTable(n);
-        tables.emplace(n, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema),
-                                                 m.schema));
+        tables.emplace(n, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema),
+                                                 m.schema)));
     }
     return tables;
 }

@@ -89,16 +89,16 @@ namespace {
 
 const char* CATALOG = "../tests/data/test_catalog.json";
 
-std::unordered_map<std::string, ColumnarTable> loadColumnar(
+std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     std::vector<std::string> names;
     collectQueryTables(stmt, names);
     for (const auto& name : names) {
         if (tables.count(name)) continue;
         const auto& m = cat.getTable(name);
-        tables.emplace(name, CSVToColumnar::convert(
-            CSVLoader::load(m.filepath, m.schema), m.schema));
+        tables.emplace(name, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(
+            CSVLoader::load(m.filepath, m.schema), m.schema)));
     }
     return tables;
 }

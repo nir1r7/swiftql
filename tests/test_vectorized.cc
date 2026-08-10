@@ -4512,3 +4512,602 @@ TEST(VecSemiJoin, ExplainNamesTheKind) {
     EXPECT_NE(semiJoin(JoinSemantics::ANTI, {})->explain().find("VecAntiHashJoin"),
               std::string::npos);
 }
+
+// ============================================================
+// Week 38 — BLOOM FILTER JOIN PUSHDOWN (sideways information passing)
+//
+// Two families of test, and they guard different failures.
+//
+//   1. THE FILTER ITSELF must have no false negatives. That is the property the
+//      whole optimization rests on, and it is a property of the bit array.
+//   2. THE GATE must refuse LEFT, ANTI and ANTI_NOT_IN. A Bloom filter drops
+//      rows that CANNOT match, which for those three semantics is precisely the
+//      set of rows that must be emitted — so a wrong gate does not crash or
+//      error, it returns FEWER ROWS. Each excluded semantics therefore gets a
+//      test that no filter is installed at all, asserted on the scan's own
+//      explain() rather than on a row count, so it fails at the cause.
+// ============================================================
+
+namespace {
+// A join over two VecScanNodes that hands back a borrowed pointer to the PROBE
+// scan, so a test can ask that scan whether a filter reached it. The join owns
+// it; the pointer is valid for as long as the join is.
+struct BloomProbe {
+    std::unique_ptr<VecHashJoinNode> join;
+    VecScanNode* probe_scan;
+};
+
+BloomProbe bloomJoin(const Schema& probe_schema, const std::vector<Row>& probe_rows,
+                     const Schema& build_schema, const std::vector<Row>& build_rows,
+                     const Schema& out_schema, JoinSemantics sem, bool left_outer) {
+    auto scan = makeScan(probe_schema, probe_rows);
+    VecScanNode* raw = scan.get();
+    auto join = std::make_unique<VecHashJoinNode>(
+        std::move(scan), makeScan(build_schema, build_rows),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema,
+        /*swapped=*/false, left_outer, /*on_residual=*/nullptr, sem);
+    return {std::move(join), raw};
+}
+
+// probe 1..8, build {2, 4, 6} — half the probe keys cannot match.
+const std::vector<Row> kBloomProbeRows = {
+    {Value(int64_t(1))}, {Value(int64_t(2))}, {Value(int64_t(3))}, {Value(int64_t(4))},
+    {Value(int64_t(5))}, {Value(int64_t(6))}, {Value(int64_t(7))}, {Value(int64_t(8))}};
+const std::vector<Row> kBloomBuildRows = {
+    {Value(int64_t(2))}, {Value(int64_t(4))}, {Value(int64_t(6))}};
+
+Schema oneIntSchema(const std::string& name) { return vecSchema({{name, TypeId::INT}}); }
+} // namespace
+
+// ----- the filter itself -----
+
+TEST(BloomFilter, NeverGivesAFalseNegative) {
+    BloomFilter f(1000);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 1000; ++i) keys.push_back("key-" + std::to_string(i * 7));
+    for (const auto& k : keys) f.add(k);
+    // THE property: every key that was added must test positive. A single
+    // failure here makes the pushdown delete result rows.
+    for (const auto& k : keys) EXPECT_TRUE(f.maybeContains(k)) << k;
+}
+
+TEST(BloomFilter, RejectsTheOverwhelmingMajorityOfAbsentKeys) {
+    BloomFilter f(1000);
+    for (int i = 0; i < 1000; ++i) f.add("key-" + std::to_string(i));
+    int false_positives = 0;
+    for (int i = 1000; i < 2000; ++i) {
+        if (f.maybeContains("key-" + std::to_string(i))) ++false_positives;
+    }
+    // 10 bits/key with k=3 predicts ~1.7%; the assertion is loose because the
+    // point is "it rejects", not the exact rate.
+    EXPECT_LT(false_positives, 100) << false_positives;
+}
+
+TEST(BloomFilter, AnEmptyFilterRejectsEverything) {
+    BloomFilter f(0);
+    EXPECT_FALSE(f.maybeContains("anything"));
+    EXPECT_FALSE(f.maybeContains(""));
+}
+
+// ----- the gate: APPLIED -----
+
+TEST(BloomPushdown, AnInnerJoinPushesAFilterIntoItsProbeScan) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto p = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                       out_schema, JoinSemantics::STANDARD, /*left_outer=*/false);
+    auto rows = drainRows(*p.join);
+    // the answer is unchanged: 2, 4, 6 join
+    std::vector<int64_t> got;
+    for (const Row& r : rows) got.push_back(r[0].asInt());
+    EXPECT_EQ(got, (std::vector<int64_t>{2, 4, 6}));
+    // and the five non-matching probe rows never reached the join
+    const std::string s = p.probe_scan->explain();
+    EXPECT_NE(s.find("bloom=on"), std::string::npos) << s;
+    EXPECT_NE(s.find("rows_rejected=5"), std::string::npos) << s;
+}
+
+TEST(BloomPushdown, ASemiJoinPushesAFilterIntoItsProbeScan) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    auto p = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                       probe_schema, JoinSemantics::SEMI, /*left_outer=*/false);
+    auto rows = drainRows(*p.join);
+    EXPECT_EQ(pids(rows), (std::vector<int64_t>{2, 4, 6}));
+    const std::string s = p.probe_scan->explain();
+    EXPECT_NE(s.find("bloom=on"), std::string::npos) << s;
+    EXPECT_NE(s.find("rows_rejected=5"), std::string::npos) << s;
+}
+
+// A key the filter rejects is a key the join could not have matched, so the
+// answer must be BYTE-IDENTICAL to the same join with no filter reachable. The
+// probe side here is a NullableSourceNode, which does not implement the push —
+// the "unsupported probe shape silently declines" path — so this is the same
+// join measured both ways.
+TEST(BloomPushdown, TheFilterChangesNoAnswer) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto with = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                          out_schema, JoinSemantics::STANDARD, false);
+    VecHashJoinNode without(
+        std::make_unique<NullableSourceNode>(probe_schema, kBloomProbeRows),
+        std::make_unique<NullableSourceNode>(build_schema, kBloomBuildRows),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto a = drainRows(*with.join);
+    auto b = drainRows(without);
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        ASSERT_EQ(a[i].size(), b[i].size());
+        for (size_t c = 0; c < a[i].size(); ++c) EXPECT_EQ(a[i][c].asInt(), b[i][c].asInt());
+    }
+}
+
+// A COMPOSITE key must be encoded the same way on both sides, in the same
+// column ORDER. A different order is a different key, and the failure mode is
+// the silent one: the filter rejects rows that match.
+TEST(BloomPushdown, AMultiColumnKeyStillMatchesTheJoin) {
+    Schema probe_schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::STRING}});
+    Schema out_schema   = vecSchema({{"a", TypeId::INT}, {"b", TypeId::STRING},
+                                     {"x", TypeId::INT}, {"y", TypeId::STRING}});
+    std::vector<Row> probe_rows = {
+        {Value(int64_t(1)), Value(std::string("aa"))},
+        {Value(int64_t(2)), Value(std::string("bb"))},
+        {Value(int64_t(1)), Value(std::string("bb"))},   // swapped members: no match
+        {Value(int64_t(3)), Value(std::string("cc"))},
+    };
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(std::string("aa"))},
+        {Value(int64_t(2)), Value(std::string("bb"))},
+    };
+    auto scan = makeScan(probe_schema, probe_rows);
+    VecScanNode* raw = scan.get();
+    VecHashJoinNode join(std::move(scan), makeScan(build_schema, build_rows),
+                         std::vector<int>{0, 1}, std::vector<int>{0, 1}, out_schema);
+    auto rows = drainRows(join);
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_EQ(rows[0][0].asInt(), 1);
+    EXPECT_EQ(rows[1][0].asInt(), 2);
+    EXPECT_NE(raw->explain().find("rows_rejected=2"), std::string::npos) << raw->explain();
+}
+
+// The filter travels through a VecFilterNode, which stamps a selection onto its
+// child's chunk and passes the pointer through — so the scan's column i is the
+// join's column i and the indices mean the same thing on both sides.
+TEST(BloomPushdown, ItTravelsThroughAFilterNode) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto scan = makeScan(probe_schema, kBloomProbeRows);
+    VecScanNode* raw = scan.get();
+    auto filter = std::make_unique<VecFilterNode>(
+        std::move(scan), binOp(">", col("pid"), intLit(0)));
+    VecHashJoinNode join(std::move(filter), makeScan(build_schema, kBloomBuildRows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    EXPECT_EQ(rows.size(), 3u);
+    EXPECT_NE(raw->explain().find("bloom=on"), std::string::npos) << raw->explain();
+}
+
+// ----- the gate: NEVER -----
+//
+// One test per excluded semantics, each asserting that NO filter is installed.
+// The row counts are asserted too, because they are what a wrong gate would
+// actually change.
+
+TEST(BloomPushdown, ALeftOuterJoinInstallsNoFilter) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto p = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                       out_schema, JoinSemantics::STANDARD, /*left_outer=*/true);
+    auto rows = drainRows(*p.join);
+    // every probe row survives — three joined, five null-extended
+    EXPECT_EQ(rows.size(), 8u);
+    const std::string s = p.probe_scan->explain();
+    EXPECT_EQ(s.find("bloom"), std::string::npos) << s;
+}
+
+TEST(BloomPushdown, AnAntiJoinInstallsNoFilter) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    auto p = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                       probe_schema, JoinSemantics::ANTI, /*left_outer=*/false);
+    // the answer IS the rows a filter would have dropped
+    EXPECT_EQ(pids(drainRows(*p.join)), (std::vector<int64_t>{1, 3, 5, 7, 8}));
+    const std::string s = p.probe_scan->explain();
+    EXPECT_EQ(s.find("bloom"), std::string::npos) << s;
+}
+
+TEST(BloomPushdown, ANotInAntiJoinInstallsNoFilter) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    auto p = bloomJoin(probe_schema, kBloomProbeRows, build_schema, kBloomBuildRows,
+                       probe_schema, JoinSemantics::ANTI_NOT_IN, /*left_outer=*/false);
+    EXPECT_EQ(pids(drainRows(*p.join)), (std::vector<int64_t>{1, 3, 5, 7, 8}));
+    const std::string s = p.probe_scan->explain();
+    EXPECT_EQ(s.find("bloom"), std::string::npos) << s;
+}
+
+// VecLimitNode DELIBERATELY does not forward the push, and this is the test that
+// says why: dropping rows BELOW a limit changes WHICH rows the limit passes. Here
+// probe rows 1..8 are limited to the first 4 (1,2,3,4), of which 2 and 4 join —
+// two output rows. A filter applied under the limit would drop 1, 3, 5, 7 first,
+// leaving the limit to pass 2,4,6,8 and the join to emit THREE. Same query, an
+// extra row: a wrong answer, not a lost optimization.
+TEST(BloomPushdown, ALimitBelowTheJoinInstallsNoFilter) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto scan = makeScan(probe_schema, kBloomProbeRows);
+    VecScanNode* raw = scan.get();
+    auto limit = std::make_unique<VecLimitNode>(std::move(scan), 4);
+    VecHashJoinNode join(std::move(limit), makeScan(build_schema, kBloomBuildRows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    EXPECT_EQ(rows.size(), 2u);
+    const std::string s = raw->explain();
+    EXPECT_EQ(s.find("bloom"), std::string::npos) << s;
+}
+
+// An out-of-range key index is DECLINED rather than approximated: the scan has
+// one column, so a push naming column 3 stores nothing.
+TEST(BloomPushdown, AScanDeclinesAKeyItCannotResolve) {
+    VecScanNode scan("t", ColumnarTable(oneIntSchema("pid"), 0), oneIntSchema("pid"));
+    scan.pushBloomFilter(std::vector<int>{3}, std::make_shared<BloomFilter>(4));
+    EXPECT_EQ(scan.explain().find("bloom"), std::string::npos) << scan.explain();
+    scan.pushBloomFilter(std::vector<int>{0}, std::make_shared<BloomFilter>(4));
+    EXPECT_NE(scan.explain().find("bloom=on"), std::string::npos) << scan.explain();
+}
+
+// A FILTER WHOSE PREDICATE CAN RAISE STOPS THE PUSHDOWN. Rows dropped below it
+// are rows the predicate is never evaluated on, so an overflow that the engine
+// is documented to raise would silently become an answer instead — which is
+// what compare_against_sqlite.py's SCREENING_REFUSED_VEC_ONLY caught when this
+// node forwarded unconditionally. Same rule, same helper (conjunctMayRaise) and
+// same direction as ChunkPruner::shouldSkip's screen.
+TEST(BloomPushdown, AFilterThatCanRaiseStopsThePush) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto scan = makeScan(probe_schema, kBloomProbeRows);
+    VecScanNode* raw = scan.get();
+    // pid * INT64_MAX overflows for every pid > 1 — exprMayRaise says so
+    // statically, which is the only thing the screen consults.
+    auto filter = std::make_unique<VecFilterNode>(
+        std::move(scan),
+        binOp(">", binOp("*", col("pid"), intLit(9223372036854775807LL)), intLit(0)));
+    VecHashJoinNode join(std::move(filter), makeScan(build_schema, kBloomBuildRows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    join.open();
+    const std::string s = raw->explain();
+    join.close();
+    EXPECT_EQ(s.find("bloom"), std::string::npos) << s;
+}
+
+// THE CASE THE INT64 FAST PATH MUST REFUSE. The key encoding renders an
+// integral DOUBLE through the integer path, so the INT 7 and the DOUBLE 7.0
+// serialize alike and JOIN (keyFieldText's rule, matching SQLite's numeric
+// affinity). Hashing raw bits instead would put them in different buckets and
+// the filter would reject a row that matches — a FALSE NEGATIVE, the one thing
+// this structure may never produce. So a DOUBLE on either side must keep the
+// serialized mode, and the join must still return the row.
+TEST(BloomPushdown, AnIntProbeAgainstADoubleBuildStillMatches) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::DOUBLE}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::DOUBLE}});
+    std::vector<Row> probe_rows = {{Value(int64_t(7))}, {Value(int64_t(8))}};
+    std::vector<Row> build_rows = {{Value(7.0)}};
+    auto scan = makeScan(probe_schema, probe_rows);
+    VecScanNode* raw = scan.get();
+    VecHashJoinNode join(std::move(scan), makeScan(build_schema, build_rows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 7);
+    // and pid=8 was still dropped early, so the filter really was installed
+    EXPECT_NE(raw->explain().find("rows_rejected=1"), std::string::npos) << raw->explain();
+}
+
+// A chunk that loses no row is left DENSE: an identity selection would put every
+// operator above onto its gather path for no reduction. Same answer either way,
+// so this is asserted on the chunk rather than on the rows.
+TEST(BloomPushdown, AChunkThatLosesNothingKeepsNoSelection) {
+    Schema probe_schema = oneIntSchema("pid");
+    auto scan = makeScan(probe_schema, kBloomProbeRows);
+    auto keep_all = std::make_shared<BloomFilter>(8, BloomKeyMode::INT64);
+    for (const Row& r : kBloomProbeRows) keep_all->addInt(r[0].asInt());
+    scan->pushBloomFilter(std::vector<int>{0}, keep_all);
+    scan->open();
+    DataChunk* chunk = scan->nextChunk();
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->num_rows, 8);
+    EXPECT_FALSE(chunk->filter_applied);
+    EXPECT_TRUE(chunk->sel.indices.empty());
+    scan->close();
+
+    // and one that DOES lose a row carries the selection instead
+    auto scan2 = makeScan(probe_schema, kBloomProbeRows);
+    auto keep_some = std::make_shared<BloomFilter>(8, BloomKeyMode::INT64);
+    keep_some->addInt(3);
+    scan2->pushBloomFilter(std::vector<int>{0}, keep_some);
+    scan2->open();
+    DataChunk* c2 = scan2->nextChunk();
+    ASSERT_NE(c2, nullptr);
+    EXPECT_TRUE(c2->filter_applied);
+    EXPECT_EQ(c2->sel.indices, (std::vector<int>{2}));
+    scan2->close();
+}
+
+// AN UNSELECTIVE FILTER IS ABANDONED after the sample, and the abandonment says
+// so on the plan. 20000 rows against a filter holding every key: nothing is
+// rejected, so testing the remaining 11808 rows would be pure cost.
+TEST(BloomPushdown, AnUnselectiveFilterIsAbandonedAfterTheSample) {
+    Schema schema = oneIntSchema("pid");
+    std::vector<Row> rows;
+    for (int i = 0; i < 20000; ++i) rows.push_back({Value(int64_t(i))});
+    auto scan = makeScan(schema, rows);
+    auto keep_all = std::make_shared<BloomFilter>(20000, BloomKeyMode::INT64);
+    for (int i = 0; i < 20000; ++i) keep_all->addInt(i);
+    scan->pushBloomFilter(std::vector<int>{0}, keep_all);
+    scan->open();
+    int total = 0;
+    while (DataChunk* c = scan->nextChunk()) total += c->num_rows;
+    // every row still comes out — giving up removes an optimization, not rows
+    EXPECT_EQ(total, 20000);
+    const std::string s = scan->explain();
+    scan->close();
+    EXPECT_NE(s.find("bloom=gave_up"), std::string::npos) << s;
+    // it stopped testing at the sample boundary rather than running to the end
+    EXPECT_NE(s.find("rows_rejected=0/8192"), std::string::npos) << s;
+}
+
+// ...and a SELECTIVE one survives the sample and keeps working to the last row.
+TEST(BloomPushdown, ASelectiveFilterSurvivesTheSample) {
+    Schema schema = oneIntSchema("pid");
+    std::vector<Row> rows;
+    for (int i = 0; i < 20000; ++i) rows.push_back({Value(int64_t(i))});
+    auto scan = makeScan(schema, rows);
+    auto keep_few = std::make_shared<BloomFilter>(20, BloomKeyMode::INT64);
+    for (int i = 0; i < 20000; i += 1000) keep_few->addInt(i);
+    scan->pushBloomFilter(std::vector<int>{0}, keep_few);
+    scan->open();
+    int kept = 0;
+    while (DataChunk* c = scan->nextChunk()) {
+        kept += c->filter_applied ? static_cast<int>(c->sel.indices.size()) : c->num_rows;
+    }
+    const std::string s = scan->explain();
+    scan->close();
+    EXPECT_NE(s.find("bloom=on"), std::string::npos) << s;
+    EXPECT_NE(s.find("/20000"), std::string::npos) << s;   // tested every row
+    // 20 real keys plus false positives. The bound is loose on purpose: 20 keys
+    // buy a 256-bit array, and 20000 DISTINCT probes against it produce ~1% false
+    // positives — the shape of a filter sized for its build side and asked about
+    // a thousand times more keys than it holds. The assertion is "it rejected
+    // nearly everything", not a rate.
+    EXPECT_LT(kept, 500);
+}
+
+// A BUILD SIDE ESTIMATED LARGER THAN THE PROBE SIDE BUILDS NO FILTER. The
+// summary costs one hash and three scattered writes per build key, and a filter
+// with more keys than the probe side has rows cannot win that back — TPC-H q4
+// summarized 379809 lineitem keys for ~5.5k orders rows. Decided from the
+// estimates before the build loop, so the per-row collection is skipped too.
+TEST(BloomPushdown, ABuildSideLargerThanTheProbeSideBuildsNoFilter) {
+    Schema probe_schema = oneIntSchema("pid");
+    Schema build_schema = oneIntSchema("bid");
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    auto scan = makeScan(probe_schema, kBloomProbeRows);
+    VecScanNode* raw = scan.get();
+    auto build = makeScan(build_schema, kBloomBuildRows);
+    scan->estimated_rows  = 10.0;
+    build->estimated_rows = 1000.0;
+    VecHashJoinNode join(std::move(scan), std::move(build),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    EXPECT_EQ(rows.size(), 3u);                       // the answer is unaffected
+    EXPECT_NE(raw->explain().find("rows_rejected=0/0"), std::string::npos)
+        << raw->explain();                            // nothing was ever tested
+}
+
+// ============================================================
+// Week 39 — BUILD-ROW ORDER, and the INT64 key path
+//
+// Two things are being pinned here and they fail differently.
+//
+// ORDER. An inner join emits a key's matches in ASCENDING BUILD ROW, and that
+// order is OBSERVABLE: a TPC-H query with no total ORDER BY prints its rows in
+// whatever order the join produced them, and the recorded answers are byte
+// compared. Nothing about the join's structure forces it — both indexes thread
+// their chains BACK TO FRONT for exactly this reason, and reversing either
+// leaves every test that checks a SET of rows still passing.
+//
+// THE INT64 GATE. It is taken only when BOTH sides are a single INT column,
+// because the serialized encoding renders INT 7 and DOUBLE 7.0 alike ON PURPOSE
+// so that they join. Raw int64 bits do not, so a widened gate DELETES matching
+// rows — the silent failure, not an error.
+namespace {
+
+// Probe side: one row per key. Build side: several rows per key, tagged with a
+// payload that says which build row they came from. `keys` and `payloads` are
+// positional.
+std::vector<Row> orderBuildRows(const std::vector<int64_t>& keys,
+                                const std::vector<int64_t>& payloads) {
+    std::vector<Row> rows;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        rows.push_back({Value(keys[i]), Value(payloads[i])});
+    }
+    return rows;
+}
+
+// (key, payload) of every output row, in the order the join emitted them.
+std::vector<std::pair<int64_t, int64_t>> keyPayloadPairs(const std::vector<Row>& rows,
+                                                         int key_col, int payload_col) {
+    std::vector<std::pair<int64_t, int64_t>> out;
+    for (const Row& r : rows) out.push_back({r[key_col].asInt(), r[payload_col].asInt()});
+    return out;
+}
+
+} // namespace
+
+// THE ORDER TEST for the INT64 table. Twelve build rows over four keys, with the
+// duplicates of each key SPREAD APART so that a key's slots cannot be a single
+// contiguous run put there by luck, and enough keys that several collide into
+// one region of a 32-slot table. Every key's payloads must come back ascending.
+//
+// A table filled back to front, or a probe that walked its path in the other
+// direction, reverses each key's payloads and changes nothing else — the row
+// SET is identical, so only this assertion catches it.
+TEST(VecHashJoinBuildOrder, AnIntKeysMatchesComeBackInAscendingBuildRowOrder) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}, {"payload", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT},
+                                     {"bid", TypeId::INT}, {"payload", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(10))}, {Value(int64_t(20))},
+                                   {Value(int64_t(30))}, {Value(int64_t(40))}};
+    // build row i carries payload i, so "ascending payload" IS "ascending build
+    // row" and the assertion needs no second source of truth
+    const std::vector<int64_t> keys = {10, 20, 30, 40, 10, 20, 30, 40, 10, 20, 10, 40};
+    const std::vector<int64_t> pay  = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11};
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, orderBuildRows(keys, pay)),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto got = keyPayloadPairs(drainRows(join), 0, 2);
+    const std::vector<std::pair<int64_t, int64_t>> want = {
+        {10, 0}, {10, 4}, {10, 8}, {10, 10},
+        {20, 1}, {20, 5}, {20, 9},
+        {30, 2}, {30, 6},
+        {40, 3}, {40, 7}, {40, 11}};
+    EXPECT_EQ(got, want)
+        << "a key's matches must be emitted in ascending BUILD ROW order; the "
+           "row set is the same either way, so nothing else here would notice";
+}
+
+// The same property for the SERIALIZED path, reached by making the key a STRING
+// so the INT64 mode declines. This is the chained index's own guarantee — the
+// one buildIndex() threads its chains backwards for — and it must not be lost
+// while the INT64 table is added beside it.
+TEST(VecHashJoinBuildOrder, AStringKeysMatchesComeBackInAscendingBuildRowOrder) {
+    Schema probe_schema = vecSchema({{"pk", TypeId::STRING}});
+    Schema build_schema = vecSchema({{"bk", TypeId::STRING}, {"payload", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pk", TypeId::STRING},
+                                     {"bk", TypeId::STRING}, {"payload", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(std::string("a"))}, {Value(std::string("b"))}};
+    std::vector<Row> build_rows = {
+        {Value(std::string("a")), Value(int64_t(0))},
+        {Value(std::string("b")), Value(int64_t(1))},
+        {Value(std::string("a")), Value(int64_t(2))},
+        {Value(std::string("b")), Value(int64_t(3))},
+        {Value(std::string("a")), Value(int64_t(4))}};
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, build_rows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    std::vector<int64_t> payloads;
+    for (const Row& r : drainRows(join)) payloads.push_back(r[2].asInt());
+    EXPECT_EQ(payloads, (std::vector<int64_t>{0, 2, 4, 1, 3}));
+}
+
+// A COMPOSITE key never takes the INT64 path however INT its columns are, and
+// its matches keep the same order. Two key columns is the gate's `size() == 1`
+// clause, and getting it wrong would read one column and join on it alone.
+TEST(VecHashJoinBuildOrder, ACompositeIntKeyStillJoinsOnBothColumnsInOrder) {
+    Schema probe_schema = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT}});
+    Schema build_schema = vecSchema({{"x", TypeId::INT}, {"y", TypeId::INT},
+                                     {"payload", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"a", TypeId::INT}, {"b", TypeId::INT},
+                                     {"x", TypeId::INT}, {"y", TypeId::INT},
+                                     {"payload", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1)), Value(int64_t(2))}};
+    std::vector<Row> build_rows = {
+        {Value(int64_t(1)), Value(int64_t(2)), Value(int64_t(0))},   // matches
+        {Value(int64_t(1)), Value(int64_t(9)), Value(int64_t(1))},   // first col only
+        {Value(int64_t(1)), Value(int64_t(2)), Value(int64_t(2))}};  // matches
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, build_rows),
+                         std::vector<int>{0, 1}, std::vector<int>{0, 1}, out_schema);
+    std::vector<int64_t> payloads;
+    for (const Row& r : drainRows(join)) payloads.push_back(r[4].asInt());
+    EXPECT_EQ(payloads, (std::vector<int64_t>{0, 2}));
+}
+
+// !! THE GATE. An INT column and a DOUBLE column MUST still join where the
+// values are equal: the serialized encoding renders 7 and 7.0 to the same text
+// deliberately, and hashing raw bits does not. This is the test that fails if
+// the INT64 mode is decided from one side, or from "is either side INT".
+TEST(VecHashJoinIntKeyGate, AnIntKeyStillJoinsADoubleKeyOfTheSameValue) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::DOUBLE}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::DOUBLE}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(7.0)}, {Value(8.5)}, {Value(9.0)}};
+    std::vector<Row> build_rows = {{Value(int64_t(7))}, {Value(int64_t(9))}};
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, build_rows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    ASSERT_EQ(rows.size(), 2u) << "7.0 joins 7 and 9.0 joins 9";
+    EXPECT_EQ(rows[0][1].asInt(), 7);
+    EXPECT_EQ(rows[1][1].asInt(), 9);
+}
+
+// The same gate from the other side: a DOUBLE BUILD column against an INT probe
+// column. Both orderings are tested because singleIntKeyMode reads two schemas
+// and dropping either clause leaves a version that passes the test above.
+TEST(VecHashJoinIntKeyGate, ADoubleBuildKeyStillJoinsAnIntProbeKey) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::DOUBLE}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::DOUBLE}});
+    std::vector<Row> probe_rows = {{Value(int64_t(7))}, {Value(int64_t(8))}};
+    std::vector<Row> build_rows = {{Value(7.0)}};
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, build_rows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    auto rows = drainRows(join);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0][0].asInt(), 7);
+}
+
+// A NEGATIVE INT key, which the INT64 table hashes as an unsigned bit pattern
+// and the serialized path renders with a '-'. Both must find it, and a
+// signed/unsigned slip in the hash is invisible to every other test here
+// because every other key in this file is positive.
+TEST(VecHashJoinIntKeyGate, NegativeAndZeroIntKeysJoin) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(-5))}, {Value(int64_t(0))},
+                                   {Value(int64_t(5))}};
+    std::vector<Row> build_rows = {{Value(int64_t(0))}, {Value(int64_t(-5))}};
+    VecHashJoinNode join(makeScan(probe_schema, probe_rows),
+                         makeScan(build_schema, build_rows),
+                         std::vector<int>{0}, std::vector<int>{0}, out_schema);
+    std::vector<int64_t> got;
+    for (const Row& r : drainRows(join)) got.push_back(r[0].asInt());
+    EXPECT_EQ(got, (std::vector<int64_t>{-5, 0}));
+}
+
+// A LEFT join on an INT key still emits its unmatched preserved-side rows, and
+// a NULL probe key is one of them. The INT64 path tests the validity mask
+// instead of calling serializeKey, so this is where "the key is NULL" has to
+// keep meaning what it did.
+TEST(VecHashJoinIntKeyGate, ALeftJoinOnAnIntKeyNullExtendsNullAndUnmatchedKeys) {
+    Schema probe_schema = vecSchema({{"pid", TypeId::INT}});
+    Schema build_schema = vecSchema({{"bid", TypeId::INT}});
+    Schema out_schema   = vecSchema({{"pid", TypeId::INT}, {"bid", TypeId::INT}});
+    std::vector<Row> probe_rows = {{Value(int64_t(1))}, {Value::null()},
+                                   {Value(int64_t(3))}};
+    std::vector<Row> build_rows = {{Value(int64_t(1))}};
+    VecHashJoinNode join(
+        std::make_unique<NullableSourceNode>(probe_schema, std::move(probe_rows)),
+        std::make_unique<NullableSourceNode>(build_schema, std::move(build_rows)),
+        std::vector<int>{0}, std::vector<int>{0}, out_schema,
+        /*swapped=*/false, /*left_outer=*/true);
+    auto rows = drainRows(join);
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(rows[0][1].asInt(), 1);
+    EXPECT_TRUE(rows[1][0].isNull());
+    EXPECT_TRUE(rows[1][1].isNull());
+    EXPECT_EQ(rows[2][0].asInt(), 3);
+    EXPECT_TRUE(rows[2][1].isNull());
+}

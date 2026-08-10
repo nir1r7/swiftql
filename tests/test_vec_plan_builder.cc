@@ -26,7 +26,7 @@ static const char* CATALOG = "../tests/data/test_catalog.json";
 
 // Load columnar tables for every table the statement touches (self-join keys
 // once by name; VectorizedPlanBuilder copies internally for the extra scan).
-static std::unordered_map<std::string, ColumnarTable> loadColumnar(
+static std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
     // Week 34: through collectQueryTables (subquery_materialization.h), the one
     // walker main.cc itself uses. Reading stmt.from/joins directly missed every
@@ -34,14 +34,14 @@ static std::unordered_map<std::string, ColumnarTable> loadColumnar(
     // a DERIVED relation has no catalog name and tableName() throws on it. This
     // is a widening of what the helper loads, never a narrowing: it is a superset
     // of what the two-clause walk found.
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     std::vector<std::string> names;
     collectQueryTables(stmt, names);
     for (const auto& name : names) {
         if (tables.count(name)) continue;   // self-join: load once
         const auto& m = cat.getTable(name);
-        tables.emplace(name, CSVToColumnar::convert(
-            CSVLoader::load(m.filepath, m.schema), m.schema));
+        tables.emplace(name, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(
+            CSVLoader::load(m.filepath, m.schema), m.schema)));
     }
     return tables;
 }
@@ -280,7 +280,7 @@ TEST(VecPlanBuilder, VolcanoColumnarSelectStarJoinKeepsJoinColumns) {
     auto stmt = p.parse();
     Binder::bind(stmt, cat);
 
-    std::unordered_map<std::string, ColumnarTable> tables = loadColumnar(stmt, cat);
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables = loadColumnar(stmt, cat);
     auto plan = Planner::plan(std::move(stmt), cat, {}, std::move(tables));
 
     ASSERT_EQ(plan->outputSchema().size(), 14);
@@ -990,10 +990,10 @@ static std::string lapsScanExplain(const Catalog& cat, int leftmost_slot) {
     std::unique_ptr<LogicalPlanNode> root =
         std::make_unique<LogicalFilter>(std::move(join), std::move(pred));
 
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     for (const char* t : {"laps", "drivers"}) {
         const auto& m = cat.getTable(t);
-        tables.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+        tables.emplace(t, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema)));
     }
     auto plan = VectorizedPlanBuilder::build(std::move(root), std::move(tables), cat);
 
@@ -1180,7 +1180,7 @@ static std::unique_ptr<VecPlanNode> buildVecWithBodyTable(const std::string& sql
     if (!tables.count(body_table)) {
         const auto& bm = cat.getTable(body_table);
         tables.emplace(body_table,
-                       CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema));
+                       std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema)));
     }
     auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
     logical = PredicatePushdown::apply(std::move(logical), cat);
@@ -1395,7 +1395,7 @@ TEST(VecPlanBuilder, ANotInAntiJoinWithAnOnResidualIsRefusedByTheBuilder) {
     if (!tables.count("laps")) {
         const auto& bm = cat.getTable("laps");
         tables.emplace("laps",
-                       CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema));
+                       std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(bm.filepath, bm.schema), bm.schema)));
     }
     auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
 

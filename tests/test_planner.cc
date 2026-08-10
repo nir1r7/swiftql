@@ -362,10 +362,10 @@ TEST(PlannerTest, ResidualOnConjunctReachesTheFromScanAsAPruningHint) {
     auto stmt = p.parse();
     Binder::bind(stmt, catalog);
 
-    std::unordered_map<std::string, ColumnarTable> columnar;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar;
     for (const std::string& t : {std::string("laps"), std::string("drivers")}) {
         const auto& m = catalog.getTable(t);
-        columnar.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+        columnar.emplace(t, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema)));
     }
     auto plan = Planner::plan(std::move(stmt), catalog, {}, std::move(columnar));
 
@@ -479,10 +479,10 @@ static std::unique_ptr<PlanNode> bindAndPlanColumnar(const std::string& sql,
     Parser p(sql);
     auto stmt = p.parse();
     Binder::bind(stmt, catalog);
-    std::unordered_map<std::string, ColumnarTable> columnar;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar;
     for (const std::string& t : {std::string("laps"), std::string("drivers")}) {
         const auto& m = catalog.getTable(t);
-        columnar.emplace(t, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+        columnar.emplace(t, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema)));
     }
     return Planner::plan(std::move(stmt), catalog, {}, std::move(columnar));
 }
