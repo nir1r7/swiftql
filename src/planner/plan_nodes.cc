@@ -46,12 +46,17 @@ namespace {
 // SeqScanNode
 SeqScanNode::SeqScanNode(std::string table_name, std::vector<Row> rows, Schema schema) : table_name_(std::move(table_name)), rows_(std::move(rows)), schema_(std::move(schema)), cursor_(0) {}
 
-SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where, const Schema* hint_schema) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), cursor_(0), use_columnar_(true), pruning_where_(pruning_where) {
+SeqScanNode::SeqScanNode(std::string table_name, std::shared_ptr<const ColumnarTable> columnar_table, Schema schema, const Expr* pruning_where, const Schema* hint_schema) : table_name_(std::move(table_name)), columnar_table_(std::move(columnar_table)), schema_(std::move(schema)), cursor_(0), use_columnar_(true), pruning_where_(pruning_where) {
     // Assigned in the body rather than the list: it defaults to `schema_`, and
     // reading one member from another in a mem-init list depends on DECLARATION
     // order rather than on the order written here.
     hint_schema_ = hint_schema ? *hint_schema : schema_;
 }
+
+SeqScanNode::SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where, const Schema* hint_schema)
+    : SeqScanNode(std::move(table_name),
+                  std::make_shared<const ColumnarTable>(std::move(columnar_table)),
+                  std::move(schema), pruning_where, hint_schema) {}
 
 
 void SeqScanNode::open() {
@@ -65,13 +70,13 @@ Row* SeqScanNode::next() {
     Row* row = nullptr;
 
     if (use_columnar_){
-        while (cursor_ < columnar_table_.num_rows) {
+        while (cursor_ < columnar_table_->num_rows) {
             // decide whether to skip the entire chunk
             if (pruning_where_ && cursor_ % CHUNK_SIZE == 0) {
                 int chunk_idx = cursor_/CHUNK_SIZE;
-                if (ChunkPruner::shouldSkip(pruning_where_, columnar_table_.zone_maps, chunk_idx, hint_schema_)) {
+                if (ChunkPruner::shouldSkip(pruning_where_, columnar_table_->zone_maps, chunk_idx, hint_schema_)) {
                     // advance past the whole chunk, never call getValue()
-                    cursor_ += std::min(CHUNK_SIZE, columnar_table_.num_rows - cursor_);
+                    cursor_ += std::min(CHUNK_SIZE, columnar_table_->num_rows - cursor_);
                     ++skipped_chunks_;
                     continue;
                 }
@@ -79,7 +84,7 @@ Row* SeqScanNode::next() {
             // not skipped, reconstruct this row and return it
             reconstructed_row_.clear();
             for (int c = 0; c < schema_.size(); ++c){
-                reconstructed_row_.push_back(columnar_table_.getValue(schema_.column(c).name, cursor_));
+                reconstructed_row_.push_back(columnar_table_->getValue(schema_.column(c).name, cursor_));
             }
             ++cursor_;
             row = &reconstructed_row_;
@@ -110,7 +115,7 @@ std::string SeqScanNode::explain() const {
         // the counter is a runtime value; before execution only report that a
         // pruning hint is attached (plain --explain never runs the plan)
         if (executed_) {
-            int total = (columnar_table_.num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            int total = (columnar_table_->num_rows + CHUNK_SIZE - 1) / CHUNK_SIZE;
             s += " chunks_skipped=" + std::to_string(skipped_chunks_) + "/" + std::to_string(total);
         } else {
             s += " pruning=on";

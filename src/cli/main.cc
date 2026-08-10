@@ -1,4 +1,5 @@
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -131,7 +132,7 @@ std::vector<Row> drainVec(VecPlanNode* node) {
 // value about to be divided BY AN INTEGER?", and it is the only thing that
 // crosses the cut between the two builds — see subquery_materialization.h.
 SubqueryResult runVectorizedToRows(SelectStatement stmt, const Catalog& catalog,
-                                   std::unordered_map<std::string, ColumnarTable> tables,
+                                   std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables,
                                    bool no_optimize, bool int_type_observable) {
     auto logical = LogicalPlanBuilder::build(std::move(stmt), catalog);
     if (!no_optimize) {
@@ -153,7 +154,7 @@ SubqueryResult runVectorizedToRows(SelectStatement stmt, const Catalog& catalog,
 // one a top-level multi-way join already has.
 SubqueryResult runVolcanoToRows(SelectStatement stmt, const Catalog& catalog,
                                 std::unordered_map<std::string, std::vector<Row>> table_rows,
-                                std::unordered_map<std::string, ColumnarTable> columnar_tables) {
+                                std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar_tables) {
     auto plan = Planner::plan(std::move(stmt), catalog, std::move(table_rows),
                               std::move(columnar_tables));
     plan->open();
@@ -454,17 +455,18 @@ int main(int argc, char* argv[]) {
 
             // build columnar tables if --storage columnar
             // part of loading section
-            std::unordered_map<std::string, ColumnarTable> columnar_tables;
+            std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar_tables;
             if (args.storage == "columnar") {
                 for (const auto& [name, rows] : table_rows) {
                     const Schema& s = catalog.getTable(name).schema;
-                    columnar_tables.emplace(name, CSVToColumnar::convert(rows, s));
+                    columnar_tables.emplace(
+                        name, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(rows, s)));
                 }
                 table_rows.clear(); // row data no longer needed; free before plan timer starts
-            
+
                 if (args.storage_stats) {
                     for (const auto& [name, ct] : columnar_tables) {
-                        size_t mb = columnarTableByteSize(ct) / (1024 * 1024);
+                        size_t mb = columnarTableByteSize(*ct) / (1024 * 1024);
                         std::cout << name << " (columnar): " << mb << " MB\n";
                     }
                     return 0;  // exit after first query; storage size doesn't change per query
@@ -511,13 +513,12 @@ int main(int argc, char* argv[]) {
                 SubqueryRunner run_subquery;
                 if (args.execution == "vectorized" && args.storage == "columnar") {
                     run_subquery = [&](SelectStatement body, bool int_type_observable) {
-                        // Its own copies: both scan nodes take their table BY
-                        // VALUE and the outer query still needs the originals.
-                        // Lowering's scan_uses counter already copies for a
-                        // self-join, so this is the existing cost model rather
-                        // than a new one — and the reason a shared table
-                        // representation is on Week 37's list, not this week's.
-                        std::unordered_map<std::string, ColumnarTable> tables;
+                        // SHARED with the outer query, not copied. Both scan
+                        // nodes hold the table by shared reference and only read
+                        // it, so a subquery body that names a table the outer
+                        // query also reads costs a refcount bump instead of a
+                        // deep copy of every column.
+                        std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
                         std::vector<std::string> names;
                         collectQueryTables(body, names);
                         for (const auto& n : names) tables.emplace(n, columnar_tables.at(n));
@@ -531,7 +532,7 @@ int main(int argc, char* argv[]) {
                     // arm and the flag is not its business.
                     run_subquery = [&](SelectStatement body, bool) {
                         std::unordered_map<std::string, std::vector<Row>> rows_copy;
-                        std::unordered_map<std::string, ColumnarTable> cols_copy;
+                        std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> cols_copy;
                         std::vector<std::string> names;
                         collectQueryTables(body, names);
                         for (const auto& n : names) {

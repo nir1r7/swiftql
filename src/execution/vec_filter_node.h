@@ -14,6 +14,14 @@ class VecFilterNode : public VecPlanNode{
         const Schema& outputSchema() const override;
         std::string explain() const override;
         std::vector<VecPlanNode*> children() const override;
+
+        // Week 38 — forwarded, but ONLY when this node's predicate cannot RAISE.
+        // The indices survive the trip (this node stamps a SelectionVector onto
+        // its CHILD's chunk and passes the pointer through, so column i is the
+        // same ColumnVector on both sides); what does not automatically survive
+        // is WHICH ROWS the predicate above is evaluated on. See the definition.
+        void pushBloomFilter(const std::vector<int>& key_indices,
+                             std::shared_ptr<const BloomFilter> filter) override;
     private:
     std::unique_ptr<Expr> predicate_;      // declared before child_ so child_ is destroyed first
     std::unique_ptr<VecPlanNode> child_;

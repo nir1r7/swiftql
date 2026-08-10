@@ -5,6 +5,7 @@
 #include "parser/ast.h"
 #include "storage/csv_loader.h"
 #include "storage/columnar_table.h"
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +26,17 @@ class SeqScanNode : public PlanNode {
         // same-named column of a different type in the other relation typed the
         // conjunct off the wrong column (chunk_pruner.h states the repro).
         // nullptr = "the same as `schema`", the single-relation case.
+        //
+        // THE TABLE IS SHARED, NOT OWNED — same change, same reason, as
+        // VecScanNode's (see its constructor comment for the measurement). Every
+        // use of it here is a READ, so a scan never needed its own image, and the
+        // by-value member this replaced made Planner::plan deep-copy the table
+        // for a self-join and main.cc copy it again for every subquery body that
+        // names it.
+        SeqScanNode(std::string table_name, std::shared_ptr<const ColumnarTable> columnar_table, Schema schema, const Expr* pruning_where = nullptr, const Schema* hint_schema = nullptr);
+
+        // The same, taking sole ownership of a table no one else holds — what a
+        // hand-built test tree has. Wraps and forwards; there is one member.
         SeqScanNode(std::string table_name, ColumnarTable columnar_table, Schema schema, const Expr* pruning_where = nullptr, const Schema* hint_schema = nullptr);
 
         void open() override; // initialize cursor
@@ -42,7 +54,7 @@ class SeqScanNode : public PlanNode {
         std::vector<Row> rows_;
 
         // columnar path
-        ColumnarTable columnar_table_;
+        std::shared_ptr<const ColumnarTable> columnar_table_;
         bool use_columnar_ = false;
         Row reconstructed_row_; // reuse on every columnar next()
 

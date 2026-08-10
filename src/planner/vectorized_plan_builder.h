@@ -8,10 +8,13 @@
 #include <unordered_map>
 
 // lowers a logical plan into a vectorized physical operator tree
-// consumes the logical/table arguments: expressions are moved out of the logical
-// nodes into the physical operators, and tables are moved into the scan nodes —
-// the logical tree must not be reused after this call. catalog is borrowed
-// (read-only) for build-side cost estimation (per-column avg_width stats).
+// consumes the logical argument: expressions are moved out of the logical nodes
+// into the physical operators — the logical tree must not be reused after this
+// call. The TABLES are SHARED with the scan nodes rather than moved into them,
+// so a self-join lowers to two scans over one image of the table instead of
+// copying it (see VecScanNode's constructor for the measurement). catalog is
+// borrowed (read-only) for build-side cost estimation (per-column avg_width
+// stats).
 // physical-only decisions (build/probe side, pruning-hint routing) are made
 // here, not in the logical plan
 class VectorizedPlanBuilder {
@@ -25,7 +28,7 @@ class VectorizedPlanBuilder {
         // see the comment in build() and vec_types.h's IntNarrowing.
         static std::unique_ptr<VecPlanNode> build(
             std::unique_ptr<LogicalPlanNode> logical,
-            std::unordered_map<std::string, ColumnarTable> columnar_tables,
+            std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar_tables,
             const Catalog& catalog,
             bool result_int_type_observable = false);
 };
