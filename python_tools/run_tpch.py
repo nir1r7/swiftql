@@ -74,6 +74,12 @@ MODES = [
                        "--no-optimize"]),
 ]
 
+# The full set, kept because `--modes` REBINDS MODES to a subset. Every count in
+# this file is "of the modes that ran", so without the original to compare
+# against, a two-mode run's "22/22 meaningful" is indistinguishable in shape from
+# a four-mode one -- the same defect PARTIAL-* exists to prevent for --queries.
+ALL_MODES = list(MODES)
+
 # Boundaries this project has already decided and already pins by message
 # elsewhere. Substrings, matched the way run_rejection_suite matches them:
 # "it failed" is not the property under test, "it failed for the stated reason"
@@ -553,20 +559,30 @@ def gate_line(summary, qids, ok, baseline_lines):
     while iterating. PARTIAL-* is carried in the verdict token so the words
     travel with any quotation of the line, however it is excerpted.
     """
+    narrowed_queries = set(qids) != set(QUERY_IDS)
+    narrowed_modes = len(MODES) != len(ALL_MODES)
+    partial = narrowed_queries or narrowed_modes
+
     modes = summary["modes"]
     split = {}
     for q in summary["meaningful"]:
         split.setdefault(modes[q], []).append(q)
     parts = []
     for n in sorted(split, reverse=True):
-        label = {4: "in all four modes", 2: "vectorized-only"}.get(n, f"in {n} modes")
+        # "vectorized-only" is a claim about the OTHER two modes refusing. In a
+        # narrowed run they never ran, so the count is stated against what did.
+        label = (f"in {n} of the {len(MODES)} modes run" if narrowed_modes else
+                 {4: "in all four modes", 2: "vectorized-only"}.get(n, f"in {n} modes"))
         parts.append(f"{len(split[n])} {label}")
-
-    partial = set(qids) != set(QUERY_IDS)
     shape = (f"{len(summary['meaningful'])}/{len(qids)} meaningful vs SQLite"
              + (f" of a {len(qids)}-QUERY SUBSET -- {len(QUERY_IDS) - len(qids)}"
                 f" of {len(QUERY_IDS)} NOT RUN, so this is NOT a full measurement"
-                if partial else "")
+                if narrowed_queries else "")
+             + ((" and" if narrowed_queries else "")
+                + f" in {len(MODES)} of {len(ALL_MODES)} MODES"
+                f" ({', '.join(m for m, _ in MODES)}), so the mode split below is"
+                f" NOT the engine's full coverage"
+                if narrowed_modes else "")
              + (f": {', '.join(parts)}" if parts else "")
              + f"; {len(summary['vacuous'])} vacuous"
              + f"; {len(summary['unported'])} unported")
@@ -621,11 +637,47 @@ def main():
                          "--json: the baseline IS the report's \"summary\" key, "
                          "so moving one without the other publishes two "
                          "artifacts that disagree")
+    ap.add_argument("--modes", default="",
+                    help="comma-separated mode names; default all four. Narrowing "
+                         "makes the verdict PARTIAL-*, exactly as --queries does: "
+                         "only col-vec and col-vec-noopt answer more than 5 of the "
+                         "22, so a two-mode run at a large scale factor costs half "
+                         "the invocations and measures the same queries")
     ap.add_argument("--fingerprint-all", action="store_true",
                     help="capture a plan fingerprint for every answering cell. "
                          "Off by default: only q22's is reported, and an extra "
                          "--explain invocation per cell roughly doubles the run")
     args = ap.parse_args()
+
+    # Rebound rather than threaded through: every function here reads the module
+    # global, and a parameter would have to reach ten call sites to say the same
+    # thing. ALL_MODES keeps the original so gate_line can tell it was narrowed.
+    if args.modes:
+        global MODES
+        wanted = [m.strip() for m in args.modes.split(",") if m.strip()]
+        known = {m for m, _ in ALL_MODES}
+        unknown = [m for m in wanted if m not in known]
+        if unknown:
+            sys.exit(f"--modes: unknown mode(s) {unknown}; "
+                     f"choose from {sorted(known)}")
+        MODES = [(m, extra) for m, extra in ALL_MODES if m in wanted]
+
+        # Both refused up front, for the same reason and in opposite directions.
+        # The baseline records a per-query MODE COUNT, so comparing a two-mode
+        # run against it reports every four-mode query as "answers in fewer
+        # modes" -- REGRESSION lines that are artifacts of the flag, in the one
+        # output a reader is meant to trust without re-deriving. And writing a
+        # narrowed run's summary BACK would lower every one of those counts,
+        # silently weakening the gate for every later run. Neither is a
+        # combination worth supporting: --modes exists for benchmarking at a
+        # scale factor the gate does not use.
+        if args.baseline or args.write_baseline:
+            sys.exit(
+                "--modes cannot be combined with --baseline/--write-baseline: "
+                "the baseline records how many MODES each query answers in, so a "
+                "narrowed run either reports regressions that are artifacts of "
+                "the flag, or records a weakened baseline. Gate on the full four "
+                "modes; use --modes with --json for benchmark runs.")
 
     # The baseline is not a separate measurement -- it is byte-for-byte the
     # report's "summary" key, written by the same run from the same dict. When
