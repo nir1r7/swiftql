@@ -508,6 +508,53 @@ oracle, 345 regression).
 **This revises a published claim.** The earlier "22/22 meaningful" at SF=0.1 and
 SF=1 counted a q20 that did not test what Q20 tests.
 
+## 14. A regression Week 37 introduced, found by the F1 benchmark
+
+`benchmark.py`'s optimizer-impact rows on the 1M-row F1 dataset now read **0.34x
+and 0.56x** — the optimizer making two join queries *slower* — against 2.22x
+faster on TPC-H. `--explain` names the cause:
+
+```
+optimized      VecSimdLoopJoin  build=drivers cost=400020 (alt=1415350) algo=simd (hash=1000040)
+--no-optimize  VecHashJoin
+```
+
+The cost model picks the SIMD loop join because it scores the hash join at
+1 000 040 against 400 020. **That constant was calibrated in Week 23.5 against
+the old hash join.** Week 37 made `VecHashJoinNode` ~3x faster (column-wise build
+store, chained index, INT64 key path, late materialization) and gave
+`VecSimdLoopJoinNode` none of it — it still builds a `Row` per build row, the
+exact pattern removed from the hash join. The crossover moved; the cost model
+does not know.
+
+**The general lesson: optimizing an operator invalidates any cost constant
+calibrated against its old performance.** Nothing in the gate suite can see this,
+because every gate asserts *answers*, and this changes only which of two correct
+plans is chosen.
+
+**TPC-H did not catch it, and in fact points the other way** — q19's plan flips
+to a SIMD loop join and gets 7.1x faster there. The two workloads disagree
+because the shapes differ: F1's build side is 20 rows against a 1M-row probe,
+q19's is a 480-row filtered `part` against a Bloom-reduced `lineitem`.
+
+Fix, not yet applied: re-run `benchmarks/calibrate_join_crossover.cc` (which
+exists for exactly this) and give the SIMD loop join the Week 37 treatment.
+Recorded rather than quietly fixed — a benchmark that finds a regression the
+gates cannot see is the finding.
+
+### Phase comparison, F1 dataset, 1M rows (never measured until now)
+
+| query | row+volcano | col+volcano | col+vectorized | vec/row |
+|---|---|---|---|---|
+| Full scan aggregate | 76.2 ms | 79.3 ms | 14.1 ms | 5.4x |
+| Selective filter + zone-map pruning | 156.0 ms | 47.2 ms | **1.9 ms** | **82.8x** |
+| Projection pushdown (2 of 9 cols) | 231.8 ms | 238.5 ms | 40.4 ms | 5.7x |
+| GROUP BY dictionary-encoded string | 117.8 ms | 123.3 ms | 21.8 ms | 5.4x |
+| Hash join + aggregate | 243.2 ms | 260.5 ms | 114.3 ms | 2.1x |
+
+Columnar storage alone is neutral on scans (0.96-0.97x) and pays only where zone
+maps prune. The vectorized executor carries the gain.
+
 ## Not yet measured
 
 - A single-execution lower bound for the three unindexed timeouts (q17, q21,

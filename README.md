@@ -2388,14 +2388,21 @@ table is converted, so peak is the row image plus the columnar image.
 
 ### Phase Comparison (Weeks 12 / 15, F1 dataset, 1M rows)
 
-> **Never measured, and recorded as such.** These were Week 12 and Week 15
-> deliverables and the table shipped with em-dashes in every cell. Week 37 did
-> not invent numbers for them: the F1 dataset they describe is a different
-> workload from TPC-H, and the Phase 5 measurements above supersede them for
-> every question this project now asks. A run is scripted
-> (`python_tools/benchmark.py`, 1M rows) for whoever wants the row-vs-columnar
-> and Volcano-vs-vectorized comparison on the original dataset; the honest state
-> until then is that it was not taken.
+Measured in Week 37 — these cells were em-dashes from Week 12 until now. Release
+build, average of 5 runs, load excluded.
+
+| Query | Row + Volcano (ms) | Col + Volcano (ms) | Col + Vectorized (ms) | Vec/Row |
+|---|---|---|---|---|
+| Full scan aggregate | 76.2 | 79.3 | 14.1 | 5.4× |
+| Selective filter + zone-map pruning | 156.0 | 47.2 | **1.9** | **82.8×** |
+| Projection pushdown (2 of 9 cols) | 231.8 | 238.5 | 40.4 | 5.7× |
+| GROUP BY dictionary-encoded string | 117.8 | 123.3 | 21.8 | 5.4× |
+| Hash join + aggregate | 243.2 | 260.5 | 114.3 | 2.1× |
+
+Columnar storage alone is roughly neutral on scans (0.96–0.97×) and pays only
+where zone maps prune (3.3× on the selective filter). **The vectorized executor
+is where the gain is**, and the 82.8× on the pruning query is the two mechanisms
+compounding: fewer chunks read, then batch evaluation over what survives.
 
 ### Optimizer Impact (Phase 4, Col + Vectorized mode)
 
@@ -2411,9 +2418,35 @@ Query 1 is flat by design — zone-map pruning already dominates it. Query 2's m
 
 ### Batch Size Sensitivity (Phase 3, `SELECT AVG(speed) FROM laps`)
 
-> **Never measured.** Same status as the Phase Comparison table above. The
-> vectorized batch size is 1024 (`vec_types.h`) and was chosen rather than tuned;
-> no sensitivity sweep was ever run, and none is reported here.
+> **Never measured.** The vectorized batch size is 1024 (`vec_types.h`) and was
+> chosen rather than tuned; no sensitivity sweep was ever run, and none is
+> invented here.
+
+### A regression Week 37 introduced, found by this table
+
+`benchmark.py`'s optimizer-impact rows now read **0.34×** and **0.56×** — the
+optimizer making two F1 join queries *slower*, against **2.22×** faster on
+TPC-H. The cause is precise and is visible in `--explain`:
+
+```
+optimized     VecSimdLoopJoin  build=drivers cost=400020 (alt=1415350) algo=simd (hash=1000040)
+--no-optimize VecHashJoin
+```
+
+The cost model picks the SIMD loop join because its crossover constant says the
+hash join costs 1 000 040 against 400 020. That constant was calibrated in Week
+23.5 **against the old hash join**. Week 37 made `VecHashJoinNode` roughly 3×
+faster (column-wise build store, chained index, INT64 keys, late
+materialization) and did **not** give `VecSimdLoopJoinNode` the same treatment —
+it still builds a `Row` per build row, the exact pattern removed from the hash
+join. So the crossover moved and the cost model does not know.
+
+**Optimizing an operator invalidated a constant calibrated against its old
+performance.** TPC-H did not catch it: there the same choice *helps* (q19 flips
+to a SIMD loop join and gets 7.1× faster), because the shapes differ. The fix is
+to re-run `benchmarks/calibrate_join_crossover.cc`, which exists for this, and to
+give the SIMD loop join the Week 37 treatment. Recorded rather than quietly
+fixed, because the measurement is the point.
 
 ---
 
