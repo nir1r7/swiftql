@@ -2090,9 +2090,17 @@ making the engine do more, not by softening a query:
 ```
 Week 35   GATE tpch: PASS (19/22 meaningful vs SQLite: 5 in all four modes,
                            14 vectorized-only; 1 vacuous; 2 unported)
-Week 36   GATE tpch: PASS (20/22 meaningful vs SQLite: 5 in all four modes,
-                           15 vectorized-only; 1 vacuous; 1 unported)
+Week 36   GATE tpch: PASS (21/22 meaningful vs SQLite: 5 in all four modes,
+                           16 vectorized-only; 1 vacuous; 0 unported)
 ```
+
+> **This line read `20/22 ... 1 unported` until Week 37 corrected it.** q21 was
+> ported and answering before Week 36 closed, and `docs/tpch-baseline.json`
+> recorded 21/22 the whole time — the prose was written from the earlier figure
+> and never caught up. It is the exact failure the harness was built to prevent
+> (a count in a paragraph going stale beside a computed one), landing in the
+> paragraph that argues for computing counts. **Quote the baseline, never this
+> block.**
 
 The full report — the mode split on every count, the Volcano breakdown, the six
 inherited divergences with a verdict each, and which queries were hand-verified —
@@ -2121,7 +2129,29 @@ is in [docs/week-36-plan.md](docs/week-36-plan.md).
 - Measure per-query latency, throughput, optimizer impact, and estimate accuracy
 - Publish coverage, limitations, plans, and benchmark plots
 
-**Checkpoint:** TPC-H results are reproducible and the full project story is documented.
+**Checkpoint:** TPC-H results are reproducible and the full project story is documented. ✅
+
+Read the numbers in [Benchmarks](#benchmarks); the full record, including every
+measurement that is not a result, is
+[docs/week-37-measurements.md](docs/week-37-measurements.md).
+
+| Shipped | Why it was required |
+|---|---|
+| **`CMakeLists.txt` defaults to Release** | CMake passes no `-O` flag when `CMAKE_BUILD_TYPE` is empty, and it was empty, so **every benchmark this project had ever published was taken at `-O0`**. Measured: q18 1568 ms against 72 ms from the same commit, q1 260 ms against 9 ms — a ~21× factor with no source change behind it, which inverted the headline result against SQLite. Nothing was visible: `cmake ..` succeeds and the tests pass; the only evidence is an absent flag in `compile_commands.json` |
+| **Three blocking nodes reported INCLUSIVE time while the README documented exclusive** | `VecSortNode`, `VecDistinctNode` and `VecDerivedNode` started their timer before draining the child. On q18 the sort read 42.4 ms (64.8%) and now reads 3.0 µs — the profile had been naming the sort as the hot node on every `ORDER BY` query and hiding the join beneath it. **The week's own deliverable is per-node profiling, so this had to be fixed before any of it could be trusted** |
+| **Six optimizations, each measured separately, all 22 answers byte-identical** | Narrowing subquery scans (q18 2.55×, q21 2.00×), enumerating the spine below a semi/anti join (q21 1.47×), deriving single-relation restrictions from an OR (**q19 7.1×**), sharing `ColumnarTable` instead of copying per scan, replacing the semi/anti string set, and an INT64 join key path. Together they moved SF=1 from **1.52× slower than PostgreSQL to 1.15× faster** |
+| **Two controls, because the first Postgres comparison measured the wrong thing** | PostgreSQL defaults to two parallel workers and every TPC-H table over 8 MB qualifies, so at SF=1 it was running on ~3 processes against SwiftQL's 1 — its own parallel speedup is **1.73×**, which is most of what had been attributed to "its planner scales better". And with indexes stripped, SQLite and PostgreSQL cannot finish q17, q21 or q22 in 600 s, where SwiftQL answers them in 1.4 s, 2.6 s and 0.1 s. Both numbers are published; either alone is cherry-picking |
+| **Bloom filter pushdown — and it MISSED the queries it was chosen for** | Picked because the join family is the top node in 8 of the 10 queries losing to PostgreSQL. Of the six named targets only q20 moved; the wins landed on q8 (−55%) and q3 (−35%), queries SwiftQL was already winning. Recorded as a wrong prediction rather than re-framed around what it did help |
+| **A design specified here was measured and rejected** | An inline `{uint64 key, int32 row}` bucket array for the join cost 60.3 ms against the chained index's 44.1 ms on q9, because 16-byte slots at 0.5 load factor make the table 4× larger and the build pays for it in full. The chained index in place gives 38.7 ms |
+| **Clustering was measured and rejected, not deferred** | Every 8192-row chunk's `l_shipdate` zone map spans the entire 7-year corpus, so `ChunkPruner` skips **zero** chunks on every date, quantity, discount, brand and shipmode predicate. Sorting at load would help q6, q12, q14 and q1 — every one of which SwiftQL already wins — and cost the `l_orderkey` clustering. `CHUNK_SIZE` is irrelevant for the same reason: no chunk size prunes a chunk whose min/max is the whole domain |
+| **The three duplicated key encoders are pinned by a mutation-verified test** | Two column-side encoders were added for measured reasons (~3 ms on q18, ~13 ns per probe row) and each carried a comment saying it must stay byte-identical to `key_encoding.h`. A comment is not a test: the build side of a join encodes with one function and the probe side with another, so one byte of disagreement means matching rows silently stop matching |
+
+> **The Week 36 gate line in this README said `20/22 ... 1 unported` for a week
+> while `docs/tpch-baseline.json` said 21/22.** q21 was ported and answering
+> before Week 36 closed; the prose was written from the earlier figure and never
+> caught up. That is precisely the failure the harness was built to prevent — a
+> count in a paragraph going stale beside a computed one — landing in the
+> paragraph that argues for computing counts.
 
 > **Starting note, from Week 32's semi-joins.** **The semi/anti probe is
 > structurally a filter that does not behave like one.** Its output schema *is*
@@ -2191,25 +2221,85 @@ is in [docs/week-36-plan.md](docs/week-36-plan.md).
 | 34 | Derived tables + distinct aggregates | Q15 rewrite, `COUNT(DISTINCT)` and Q17's correlated-scalar **mechanism** ✅ — the constant-outside shape only; TPC-H Q17's own text is refused and the harness reports it 0-mode UNPORTED |
 | 35 | TPC-H data + harness | Reproducible data and query workflow |
 | 36 | Query coverage + correctness | Supported queries match reference results |
-| 37 | TPC-H benchmarks + documentation | Coverage and performance published |
+| 37 | TPC-H benchmarks + documentation | Coverage and performance published ✅ |
 
 ---
 
 ## Benchmarks
 
-*To be populated during Weeks 12, 15, 23, and 37.*
-
 > **Note:** Phase benchmarks exclude data loading to isolate query execution. Phase 5 adds formal TPC-H correctness and performance measurements.
 
-### Phase Comparison
+### Phase 5 — TPC-H against SQLite, PostgreSQL and DuckDB (Week 37)
 
-| Query | Row + Volcano (ms) | Col + Volcano (ms) | Col + Vectorized (ms) |
+Official `dbgen` V3.0.1 data. Geometric mean of SwiftQL ÷ engine, so **below 1.0
+means SwiftQL is faster**. Full per-query detail in
+[docs/week-37-per-query.md](docs/week-37-per-query.md); every measurement,
+including the ones that are not results, in
+[docs/week-37-measurements.md](docs/week-37-measurements.md).
+
+| | SF=0.01 | SF=0.1 | SF=1 |
 |---|---|---|---|
-| `SELECT AVG(speed) FROM laps` | — | — | — |
-| `SELECT COUNT(*) FROM laps WHERE season = 2025` | — | — | — |
-| `SELECT team, speed FROM laps WHERE speed > 300` | — | — | — |
-| `SELECT team, COUNT(*) FROM laps GROUP BY team` | — | — | — |
-| `SELECT l.team, AVG(l.speed) FROM laps l JOIN drivers d ON l.driver_id = d.driver_id GROUP BY l.team` | — | — | — |
+| vs **SQLite** | 0.74× | **0.37×** | **0.33× — 3.0× faster** |
+| vs **PostgreSQL** (default) | **0.29×** | **0.65×** | **0.87× — 1.15× faster** |
+| vs **PostgreSQL** (single-threaded) | — | — | **0.49× — 2.0× faster** |
+| vs **DuckDB** | 1.20× | 4.70× | 15.37× |
+| optimizer (`--no-optimize` ÷ optimized) | 1.69× | 1.92× | **2.22×** |
+
+**Conditions, because they decide what these numbers mean.** SQLite and
+PostgreSQL carry the TPC-H specification's own PRIMARY and FOREIGN key indexes
+(from `dbgen/dss.ri`) plus `ANALYZE` — properly configured competitors, not
+crippled ones. SwiftQL and DuckDB carry no indexes; both prune with automatic
+min/max zone maps instead. SwiftQL is single-threaded throughout. Load excluded
+for every engine. Median of 5 repetitions (3 at SF=1) after one discarded
+warmup. 24 GB, 14 cores, macOS.
+
+**PostgreSQL is reported twice on purpose.** Its default allows two parallel
+workers and every TPC-H table over 8 MB qualifies, so at SF=1 the default column
+is PostgreSQL on up to three processes against SwiftQL's one. Single-threaded is
+the engine-against-engine comparison; default is the configuration anyone
+actually runs. Quoting either alone is cherry-picking.
+
+**The DuckDB gap widens with scale** — 1.20× → 4.70× → 15.37×, and SwiftQL wins
+9 of 22 queries at SF=0.01 but none at either larger scale. DuckDB uses 14 cores.
+Parallelism is a Possible Extension, not Phase 5 work.
+
+**Estimate accuracy**, 276 plan nodes (`python_tools/qerror_tpch.py`):
+
+| | SF=0.1 | SF=1 |
+|---|---|---|
+| geometric mean q-error | 4.52 | 6.59 |
+| median | 1.59 | 1.86 |
+| within 2× / 10× / 100× | 52% / 77% / 92% | 51% / 75% / 83% |
+
+Half of all estimates land within 1.6–1.9×; the tail degrades with scale as the
+independence assumption compounds along a join spine. One systematic defect:
+semi/anti joins estimate 1 row (q16 estimates 1 against an actual 11 635),
+because the body plan's `LogicalProject` empties its `StatsContext` and the
+right-side NDV lookup misses.
+
+**Scale and memory**, `SELECT COUNT(*) FROM lineitem`, peak RSS of the whole
+process:
+
+| dataset | `lineitem` rows | `--storage row` | `--storage columnar` |
+|---|---|---|---|
+| `dbgen-sf0.01` | 60 175 | 0.1 s / 51 MB | 0.1 s / 72 MB |
+| `dbgen-sf0.1` | 600 572 | 1.2 s / 475 MB | 1.7 s / 726 MB |
+| `dbgen-sf1` | 6 001 215 | 14.7 s / 4 521 MB | 20.3 s / 5 450 MB |
+
+SF=1 is the largest scale exercised. Columnar still peaks higher than row for the
+reason recorded in Limitations: `main.cc` clears `table_rows` only after every
+table is converted, so peak is the row image plus the columnar image.
+
+### Phase Comparison (Weeks 12 / 15, F1 dataset, 1M rows)
+
+> **Never measured, and recorded as such.** These were Week 12 and Week 15
+> deliverables and the table shipped with em-dashes in every cell. Week 37 did
+> not invent numbers for them: the F1 dataset they describe is a different
+> workload from TPC-H, and the Phase 5 measurements above supersede them for
+> every question this project now asks. A run is scripted
+> (`python_tools/benchmark.py`, 1M rows) for whoever wants the row-vs-columnar
+> and Volcano-vs-vectorized comparison on the original dataset; the honest state
+> until then is that it was not taken.
 
 ### Optimizer Impact (Phase 4, Col + Vectorized mode)
 
@@ -2225,13 +2315,9 @@ Query 1 is flat by design — zone-map pruning already dominates it. Query 2's m
 
 ### Batch Size Sensitivity (Phase 3, `SELECT AVG(speed) FROM laps`)
 
-| Batch Size | Latency (ms) |
-|---|---|
-| 128 | — |
-| 256 | — |
-| 512 | — |
-| 1024 | — |
-| 2048 | — |
+> **Never measured.** Same status as the Phase Comparison table above. The
+> vectorized batch size is 1024 (`vec_types.h`) and was chosen rather than tuned;
+> no sensitivity sweep was ever run, and none is reported here.
 
 ---
 
@@ -2406,6 +2492,11 @@ these numbers were taken on.
   Histograms and multi-column correlation statistics are a Possible Extension,
   not Phase 5 work
 - Result cache invalidation not implemented — cache is cleared on process restart only
+- **No index of any kind, and that is the shape of every remaining loss.** There is one access path: a full scan with min/max zone-map chunk pruning over 8192-row chunks, plus hash joins. A B-tree would give point lookup, range scan without touching every chunk, index-nested-loop join, and pre-sorted output — none of which SwiftQL can express. Measured at SF=1, that costs it q17 and q19 against an indexed PostgreSQL. **The converse was also measured**: strip the indexes and the row stores cannot finish q17, q21 or q22 within 600 s, where SwiftQL answers them in 1.4 s, 2.6 s and 0.1 s. **Clustering the data was measured and rejected**, not deferred: every 8192-row chunk's `l_shipdate` zone map spans the entire 7-year corpus, so pruning skips zero chunks today, and sorting at load would only help queries SwiftQL already wins
+- **Single-threaded, against parallel competitors.** SwiftQL uses one core. PostgreSQL defaults to two parallel workers and DuckDB uses all 14, which is most of the DuckDB gap (15.4× at SF=1) and all of the PostgreSQL default-configuration gap. Parallel scan and aggregation is a Possible Extension
+- **Bloom filter join pushdown applies to INNER and SEMI joins only** (Week 37). The join builds a filter from its build-side keys and pushes it into the probe side's scan, so rows that cannot match are dropped before reaching the join. A Bloom filter has false positives but never false negatives, so a rejection is safe **only where a non-matching probe row produces no output** — which is false for LEFT (the row must still be emitted null-extended) and false for ANTI (non-matching rows *are* the answer). Forcing the gate open makes q13 return 38 rows instead of 39 and q22 return 7 instead of 9; three tests pin each excluded semantics. It is also shape-dependent rather than a general speedup: q8 gained 55% and q3 35%, while eight queries regress 1–3% paying for a filter that rejects little, and a filter that rejects under 1/8 of its first 8192 rows abandons itself (`bloom=gave_up` in `--explain-analyze`)
+- **`--explain-analyze`'s per-node times were not all exclusive until Week 37.** `VecSortNode`, `VecDistinctNode` and `VecDerivedNode` started their timer before draining the child, charging their whole subtree to themselves — so every `ORDER BY` query reported ~100% in the sort and hid the real hot node. Fixed; on q18 the sort line went from 42.4 ms (64.8%) to 3.0 µs. Any per-node profile taken before this is wrong
+- **A subquery no longer widens every scan in its block** (Week 37). `buildScanSchema` used to return the full schema for any statement containing a subquery; it now narrows to the block's referenced columns unioned with the outer columns nested bodies correlate on. Derived-table bodies are still not narrowed — that would mean rewriting the body's select list and changing the schema the enclosing block was bound against
 
 ---
 
