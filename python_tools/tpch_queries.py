@@ -354,19 +354,19 @@ TEMPLATES = {
                AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
                AND l_quantity >= :QTY1 AND l_quantity <= :QTY1 + 10
                AND p_size BETWEEN 1 AND 5
-               AND l_shipmode IN ('AIR', 'REG AIR')
+               AND l_shipmode IN ('AIR', 'AIR REG')
                AND l_shipinstruct = 'DELIVER IN PERSON')
            OR (p_brand = ':BRAND2'
                AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
                AND l_quantity >= :QTY2 AND l_quantity <= :QTY2 + 10
                AND p_size BETWEEN 1 AND 10
-               AND l_shipmode IN ('AIR', 'REG AIR')
+               AND l_shipmode IN ('AIR', 'AIR REG')
                AND l_shipinstruct = 'DELIVER IN PERSON')
            OR (p_brand = ':BRAND3'
                AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
                AND l_quantity >= :QTY3 AND l_quantity <= :QTY3 + 10
                AND p_size BETWEEN 1 AND 15
-               AND l_shipmode IN ('AIR', 'REG AIR')
+               AND l_shipmode IN ('AIR', 'AIR REG')
                AND l_shipinstruct = 'DELIVER IN PERSON')
     """,
 
@@ -379,7 +379,7 @@ TEMPLATES = {
         WHERE s_suppkey IN (
                 SELECT ps_suppkey FROM partsupp
                 WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE ':COLOR%')
-                  AND ps_availqty > 0)
+                  AND ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= ':DATE' AND l_shipdate < ':DATE_PLUS_1Y'))
           AND n_name = ':NATION'
         ORDER BY s_name
     """,
@@ -500,7 +500,8 @@ VALIDATION_PARAMS = {
     # arms 2 and 3 carry 85% of the answer and neutering them is now visible.
     "q19": {"BRAND1": "Brand#14", "BRAND2": "Brand#34", "BRAND3": "Brand#23",
             "QTY1": "1", "QTY2": "10", "QTY3": "20"},
-    "q20": {"COLOR": "forest", "NATION": "CANADA"},
+    "q20": {"COLOR": "forest", "NATION": "CANADA",
+            "DATE": "1994-01-01", "DATE_PLUS_1Y": "1995-01-01"},
     "q21": {"NATION": "SAUDI ARABIA"},
     "q22": {"CC1": "13", "CC2": "31", "CC3": "23", "CC4": "29",
             "CC5": "30", "CC6": "18", "CC7": "17"},
@@ -601,15 +602,22 @@ MUTATIONS = {
             "OR (p_brand = ':BRAND2' AND p_container IN ('MED BAG', 'MED BOX', "
             "'MED PKG', 'MED PACK') AND l_quantity >= :QTY2 AND l_quantity <= "
             ":QTY2 + 10 AND p_size BETWEEN 1 AND 10 AND l_shipmode IN ('AIR', "
-            "'REG AIR') AND l_shipinstruct = 'DELIVER IN PERSON') OR (p_brand = "
+            "'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON') OR (p_brand = "
             "':BRAND3' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', "
             "'LG PKG') AND l_quantity >= :QTY3 AND l_quantity <= :QTY3 + 10 AND "
-            "p_size BETWEEN 1 AND 15 AND l_shipmode IN ('AIR', 'REG AIR') AND "
+            "p_size BETWEEN 1 AND 15 AND l_shipmode IN ('AIR', 'AIR REG') AND "
             "l_shipinstruct = 'DELIVER IN PERSON')", ""),
-    "q20": ("the nested IN (subquery) semi-joins",
-            "WHERE s_suppkey IN ( SELECT ps_suppkey FROM partsupp "
-            "WHERE ps_partkey IN (SELECT p_partkey FROM part "
-            "WHERE p_name LIKE ':COLOR%') AND ps_availqty > 0) AND", "WHERE"),
+    # The CORRELATED AGGREGATE is q20's characteristic feature, not the nested
+    # IN. Until Week 38 this template carried `ps_availqty > 0` in place of the
+    # spec's `> (SELECT 0.5 * SUM(l_quantity) ...)`, so the query returned 233
+    # rows against the published answer's 186 and the mutation check was aimed
+    # at a predicate that was not the point. Neutering the availability test is
+    # what makes this query discriminate.
+    "q20": ("the 0.5 * SUM(l_quantity) availability test",
+            "AND ps_availqty > (SELECT 0.5 * SUM(l_quantity) FROM lineitem "
+            "WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey "
+            "AND l_shipdate >= ':DATE' AND l_shipdate < ':DATE_PLUS_1Y'))",
+            ")"),
     "q21": ("the NOT EXISTS anti-join",
             "AND NOT EXISTS (SELECT * FROM lineitem l3 "
             "WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey != l1.l_suppkey "

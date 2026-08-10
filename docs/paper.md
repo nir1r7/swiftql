@@ -7,9 +7,12 @@ C++ over 37 weeks, and evaluate it on TPC-H against SQLite, PostgreSQL and
 DuckDB at three scale factors. SwiftQL supports a documented subset of SQL —
 multi-way joins, left outer joins, correlated and uncorrelated subqueries,
 derived tables, and grouped aggregation — and answers all 22 TPC-H queries. On
-official `dbgen` data at SF=0.1 and SF=1, all 22 match SQLite's answers and all
-22 survive a mutation check that neuters each query's characteristic predicate,
-so no query is counted as correct while asserting nothing. On latency, SwiftQL
+official `dbgen` data all 22 queries match **the published TPC-H answer set** at
+SF=1, and at SF=0.1 and SF=1 all 22 also match SQLite and survive a mutation
+check that neuters each query's characteristic predicate, so no query is counted
+as correct while asserting nothing. Adding the published answers as a second,
+independent oracle immediately found two defects in our own query port that
+SQLite could not detect, because SQLite executed the same ported text. On latency, SwiftQL
 is **3.0× faster than SQLite** and **1.15× faster than PostgreSQL** at SF=1 by
 geometric mean, rising to **2.0× against PostgreSQL restricted to one core**;
 against DuckDB it is **15.4× slower**, a gap that widens monotonically with scale
@@ -132,10 +135,12 @@ Machine: Apple silicon, 14 cores, 24 GB, macOS. Aggregates are **geometric
 means**, because the per-query ratios span four orders of magnitude and an
 arithmetic mean over them is decided by one query.
 
-**Correctness oracle.** SQLite over the same files, with a relative tolerance for
-floating-point sums. We write "matches SQLite", never "correct": the published
-TPC-H answer set does not apply to data our harness generated, and one query
-(q15) demonstrates why — see Section 5.
+**Correctness oracles, two of them.** SQLite over the same files, and — since
+the data is produced by official `dbgen` V3.0.1 at SF=1 — **the published TPC-H
+answer set itself** (`dbgen/answers/*.out`, using the specification's
+qualification parameters). Section 4.1 reports the second, which is what
+upgrades the claim from "matches SQLite" to "matches the published answers", and
+which found two defects SQLite structurally could not.
 
 ---
 
@@ -146,6 +151,40 @@ TPC-H answer set does not apply to data our harness generated, and one query
 | `dbgen-sf0.01` | 4 | 20/22 | q16, q17 |
 | **`dbgen-sf0.1`** | 2 | **22/22** | none |
 | **`dbgen-sf1`** | 2 | **22/22** | none |
+
+### 4.1 Against the published answer set
+
+**All 22 queries match the official TPC-H answers at SF=1**, bit-for-bit within
+the answer files' two-decimal rounding, using the specification's own
+qualification parameters.
+
+Reaching that number required fixing **two defects in our query port, not in the
+engine**, and the way they were found is the point. SQLite had been our only
+oracle, and SQLite ran *the same ported text we did* — so on both queries it
+returned answers byte-identical to SwiftQL's while both differed from the
+specification. An oracle that shares your query text cannot check your query
+text.
+
+- **q19** rendered `l_shipmode IN ('AIR', 'REG AIR')`. The specification writes
+  `('AIR', 'AIR REG')`, and `AIR REG` matches no value `dbgen` produces. Our port
+  had silently repaired what looks like a typo in the specification, admitting a
+  whole shipmode and roughly doubling the answer: 6 388 788.11 against the
+  published 3 083 843.06.
+- **q20** replaced the specification's correlated availability test —
+  `ps_availqty > (SELECT 0.5 * SUM(l_quantity) ... WHERE l_partkey = ps_partkey
+  AND l_suppkey = ps_suppkey AND l_shipdate >= ...)` — with the constant
+  predicate **`ps_availqty > 0`**, which is trivially true. That is not a dialect
+  port; it deletes the query's central feature, and it returned 233 rows against
+  the published 186. The engine was never the obstacle: given the specification's
+  actual predicate, SwiftQL returns exactly 186. The mutation check had reported
+  q20 as discriminating because neutering the *nested `IN`* changed the answer,
+  so a weakened query passed a check designed to catch weakened queries.
+
+Both are now fixed and the mutation target for q20 is the availability test.
+**We report this because it revises a claim we had already published**: the
+earlier "22/22 meaningful" counted a q20 that did not test what Q20 tests.
+
+---
 
 "Meaningful" means the query matched SQLite **and** survived mutation. The
 mutation check names, per query, the one predicate carrying its characteristic
@@ -378,6 +417,8 @@ configuration that produced it are not reporting a measurement.
 
 | Claim | Evidence | Status |
 |---|---|---|
+| **22/22 match the published TPC-H answer set at SF=1** | `validate_answers.py` vs `dbgen/answers/*.out`, spec qualification parameters | supported |
+| Two port defects found by the published answers, not by SQLite | q19 shipmode literal, q20 deleted correlated predicate; SQLite returned SwiftQL's answers on both | supported |
 | All 22 queries answered | `run_tpch.py` 22×4 matrix, `docs/week-37-measurements.md` §1 | supported |
 | 22/22 meaningful at SF=0.1 and SF=1 | mutation check per query, same table | supported |
 | 3.0× faster than SQLite at SF=1 | geomean 0.33× over 21 queries, `week-37-per-query.md` | supported |
@@ -405,9 +446,11 @@ mutation-checked), "vacuous", "geometric mean", "q-error". Each is defined at
 first use.
 
 **Experimental strength.** Three scale factors, four engines, two controls,
-one correctness oracle, and a mutation check on every correctness claim. The
-weakest point is that the correctness oracle is SQLite rather than the published
-answer set; §3 states why and q15 demonstrates the consequence.
+**two independent correctness oracles**, and a mutation check on every
+correctness claim. The previously-stated weakness — that SQLite was the only
+oracle — is now closed, and closing it immediately found two defects in our own
+query port that SQLite could not see. That is the strongest argument in this
+paper for not trusting a single oracle, and it cost us a published claim.
 
 **Evaluation completeness.** Cold start, concurrency, writes and
 larger-than-memory operation are unmeasured and named in §7. The SF=10 figure is

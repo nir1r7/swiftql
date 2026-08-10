@@ -1,0 +1,122 @@
+{
+  "abs_tol": 0.005,
+  "answers": "tpch-tools/TPC-H V3.0.1/dbgen/answers",
+  "catalog": "data/tpch/dbgen-sf1/catalog.json",
+  "errored": [],
+  "matched": [
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "q5",
+    "q6",
+    "q7",
+    "q8",
+    "q9",
+    "q10",
+    "q11",
+    "q12",
+    "q13",
+    "q14",
+    "q15",
+    "q16",
+    "q17",
+    "q18",
+    "q19",
+    "q20",
+    "q21",
+    "q22"
+  ],
+  "mismatched": [],
+  "per_query": {
+    "q1": {
+      "rows": 4,
+      "status": "MATCH"
+    },
+    "q10": {
+      "rows": 20,
+      "status": "MATCH"
+    },
+    "q11": {
+      "rows": 1048,
+      "status": "MATCH"
+    },
+    "q12": {
+      "rows": 2,
+      "status": "MATCH"
+    },
+    "q13": {
+      "rows": 42,
+      "status": "MATCH"
+    },
+    "q14": {
+      "rows": 1,
+      "status": "MATCH"
+    },
+    "q15": {
+      "rows": 1,
+      "status": "MATCH"
+    },
+    "q16": {
+      "rows": 18314,
+      "status": "MATCH"
+    },
+    "q17": {
+      "rows": 1,
+      "status": "MATCH"
+    },
+    "q18": {
+      "rows": 57,
+      "status": "MATCH"
+    },
+    "q19": {
+      "rows": 1,
+      "status": "MATCH"
+    },
+    "q2": {
+      "rows": 100,
+      "status": "MATCH"
+    },
+    "q20": {
+      "rows": 186,
+      "status": "MATCH"
+    },
+    "q21": {
+      "rows": 100,
+      "status": "MATCH"
+    },
+    "q22": {
+      "rows": 7,
+      "status": "MATCH"
+    },
+    "q3": {
+      "rows": 10,
+      "status": "MATCH"
+    },
+    "q4": {
+      "rows": 5,
+      "status": "MATCH"
+    },
+    "q5": {
+      "rows": 5,
+      "status": "MATCH"
+    },
+    "q6": {
+      "rows": 1,
+      "status": "MATCH"
+    },
+    "q7": {
+      "rows": 4,
+      "status": "MATCH"
+    },
+    "q8": {
+      "rows": 2,
+      "status": "MATCH"
+    },
+    "q9": {
+      "rows": 175,
+      "status": "MATCH"
+    }
+  },
+  "rel_tol": 1e-06
+}

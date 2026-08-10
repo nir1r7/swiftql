@@ -456,6 +456,46 @@ narrowed at SF=1 (1.21x against 1.53x at SF=0.1) but the shape is unchanged.
 would need roughly 55 GB and is not attempted; that figure is an extrapolation
 and is labelled as one.
 
+## 13. Against the published TPC-H answer set (added after Week 37 closed)
+
+`dbgen` ships `answers/*.out` — the official answers for SF=1. Every correctness
+claim this project made said "matches SQLite, never correct" because the
+published set does not apply to hand-generated data. **That premise stopped
+holding the moment `dbgen` SF=1 data existed, and the caveat was carried forward
+without re-checking it.**
+
+`python_tools/validate_answers.py` compares SwiftQL's output against those files
+using the spec's own qualification parameters (q2's SIZE and q19's brands
+restored from this project's documented deviations).
+
+**Result: 22/22 match**, within the answer files' two-decimal rounding.
+
+### It found two defects in our QUERY PORT that SQLite structurally could not
+
+SQLite had been the only oracle, and SQLite ran **the same ported text**. On both
+queries below it returned answers byte-identical to SwiftQL's while both differed
+from the specification. An oracle that shares your query text cannot check your
+query text.
+
+| query | our port | the spec | effect |
+|---|---|---|---|
+| q19 | `l_shipmode IN ('AIR', 'REG AIR')` | `('AIR', 'AIR REG')` | `AIR REG` matches no value dbgen produces. The port silently repaired what looks like a spec typo, admitting a whole shipmode: **6 388 788.11 against the published 3 083 843.06** |
+| q20 | `ps_availqty > 0` | `ps_availqty > (SELECT 0.5 * SUM(l_quantity) ... WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= ...)` | The port replaced the query's central correlated availability test with a trivially-true constant: **233 rows against the published 186** |
+
+**q20 is the serious one.** It is not a dialect port; it deletes the feature Q20
+exists to test. The engine was never the obstacle — given the spec's actual
+predicate SwiftQL returns exactly 186 rows. Worse, **the mutation check reported
+q20 as DISCRIMINATING**, because neutering the nested `IN` did change the answer:
+a weakened query passed the check built to catch weakened queries, since the
+check was aimed at a predicate that was not the point.
+
+Both ports are fixed, q20's mutation now targets the availability test, and all
+five gates re-pass (`GATE tpch: PASS (21/22 meaningful, 0 unported)`, 1796
+oracle, 345 regression).
+
+**This revises a published claim.** The earlier "22/22 meaningful" at SF=0.1 and
+SF=1 counted a q20 that did not test what Q20 tests.
+
 ## Not yet measured
 
 - A single-execution lower bound for the three unindexed timeouts (q17, q21,
