@@ -18,6 +18,8 @@ void VecSortNode::open() {
 
 void VecSortNode::consumeAndSort() {
     const Schema& schema = child_->outputSchema();
+    const int num_cols = schema.size();
+    const int num_keys = static_cast<int>(order_by_.size());
 
     // ONE comparator, shared with Volcano's SortNode — including the
     // deterministic tie-break below the declared keys, which is what makes the
@@ -29,8 +31,53 @@ void VecSortNode::consumeAndSort() {
     // comparator — and it is what makes the tie-break independent of the column
     // ORDER of the merged join schema, which JoinEnumeration permutes.
     const std::vector<int> tie_order = sort_comparator::tieBreakOrder(schema);
+
+    // PRECOMPUTED DECLARED KEYS, and why the buffered row is WIDER than the
+    // schema.
+    //
+    // `sort_comparator::rowLess` calls `evaluate()` on every declared key of
+    // BOTH sides of EVERY comparison, so a sort of n rows over k keys costs
+    // O(k·n·log n) walks of an expression tree whose value is a function of the
+    // row alone. That is not a small constant: `evaluate` dispatches through a
+    // chain of `dynamic_cast`s, and an ORDER BY over an AGGREGATE — the shape
+    // every `GROUP BY ... ORDER BY SUM(...)` produces — additionally rebuilds
+    // `aggregateOutputName` and runs a linear `Schema::indexOf` on it, per
+    // comparison. Measured on TPC-H sf0.01 before this change: q10 sorts 399
+    // rows in 3614µs (45.6% of execution) and q3 sorts 138 rows in 1007µs
+    // (25.8%) — row counts far too small for the sort itself to cost that.
+    //
+    // So each key is evaluated ONCE per buffered row, at materialization, and
+    // parked in a slot appended AFTER the schema's columns: a buffer row is
+    // `num_cols` real columns followed by `num_keys` key values. One vector, one
+    // allocation, and the heap moves the keys with their row for free.
+    //
+    // Nothing below the declared keys changes. `tie_order`'s entries are all
+    // schema indices (< num_cols), so the trailing slots are invisible to the
+    // tie-break, and the tie-break is still the SHARED one: when every declared
+    // key ties, this comparator hands both rows to `rowLess` with NO declared
+    // keys, which falls straight through to `compareCanonical`. There is exactly
+    // one implementation of the canonical order, and it is Volcano's.
+    const std::vector<OrderByItem> no_declared_keys;
     auto less = [&](const Row& a, const Row& b) {
-        return sort_comparator::rowLess(order_by_, schema, tie_order, a, b);
+        for (int k = 0; k < num_keys; ++k) {
+            // compareForSort and the `desc` rule, identical to rowLess's
+            // declared-key loop — only the operands are already computed.
+            const int c = compareForSort(a[num_cols + k], b[num_cols + k]);
+            if (c != 0) return order_by_[k].desc ? c > 0 : c < 0;
+        }
+        return sort_comparator::rowLess(no_declared_keys, schema, tie_order, a, b);
+    };
+
+    // One buffer row: the schema's columns, then the declared keys evaluated
+    // against those columns. `out` is reserved to its full width first, so the
+    // `evaluate` calls cannot be reading a row that push_back is reallocating.
+    auto materialize = [&](Row& out, const DataChunk& chunk, int r) {
+        out.clear();   // keeps capacity when the row is the reused candidate
+        out.reserve(static_cast<size_t>(num_cols + num_keys));
+        for (int c = 0; c < num_cols; ++c) out.push_back(valueAt(chunk.columns[c], r));
+        for (const auto& item : order_by_) {
+            out.push_back(evaluate(item.expr.get(), out, schema));
+        }
     };
 
     // BOUNDED TOP-N, when the parent is a LIMIT (row_cap_ > 0).
@@ -55,7 +102,16 @@ void VecSortNode::consumeAndSort() {
     // tied are equal in every column and whichever the heap keeps renders the
     // same. That is the same property `sort_comparator.h` states for the cut.
     Row candidate;
-    while (DataChunk* chunk = child_->nextChunk()) {
+    // Child time EXCLUDED, per chunk. This node is a pipeline breaker, so the
+    // old timer -- which wrapped this entire call from nextChunk() -- charged
+    // every operator beneath it to the sort. On any ORDER BY query that made the
+    // sort read ~100% of execution and hid the real hot node, which is exactly
+    // what the README's "child time excluded" contract exists to prevent.
+    while (true) {
+        DataChunk* chunk = child_->nextChunk();
+        if (!chunk) break;
+        auto t0 = std::chrono::high_resolution_clock::now();
+
         // determine valid row indices, same pattern as VecProjectNode
         const std::vector<int>* indices_ptr = nullptr;
         std::vector<int> all_indices;
@@ -79,21 +135,25 @@ void VecSortNode::consumeAndSort() {
             const bool heap_full = row_cap_ > 0
                 && static_cast<int>(flat_buffer_.size()) >= row_cap_;
             if (lazy && heap_full) {
+                // `lazy` implies no declared keys, so a buffer row is exactly
+                // the schema's columns and `worst` carries no key slots.
                 const Row& worst = flat_buffer_.front();
-                const int n = std::min(static_cast<int>(chunk->columns.size()),
-                                       static_cast<int>(worst.size()));
                 auto read = [&](int i) { return valueAt(chunk->columns[i], r); };
-                if (sort_comparator::compareCanonical(tie_order, n, read, worst) >= 0) continue;
+                if (sort_comparator::compareCanonical(tie_order, num_cols, read, worst) >= 0)
+                    continue;
             }
 
-            candidate.clear();   // keeps capacity: no per-row reallocation
-            candidate.reserve(chunk->columns.size());
-            for (const auto& cv : chunk->columns) {
-                candidate.push_back(valueAt(cv, r));
-            }
+            // Unbounded: build straight into its final home. Going through the
+            // reusable candidate would copy every Value — strings included — a
+            // second time, for a row that is being kept either way.
             if (row_cap_ <= 0) {
-                flat_buffer_.push_back(candidate);
-            } else if (!heap_full) {
+                flat_buffer_.emplace_back();
+                materialize(flat_buffer_.back(), *chunk, r);
+                continue;
+            }
+
+            materialize(candidate, *chunk, r);
+            if (!heap_full) {
                 flat_buffer_.push_back(candidate);
                 std::push_heap(flat_buffer_.begin(), flat_buffer_.end(), less);
             } else if (lazy || less(candidate, flat_buffer_.front())) {
@@ -102,13 +162,19 @@ void VecSortNode::consumeAndSort() {
                 std::push_heap(flat_buffer_.begin(), flat_buffer_.end(), less);
             }
         }
+        stats.elapsed_us += std::chrono::duration<double, std::micro>(
+            std::chrono::high_resolution_clock::now() - t0).count();
     }
 
+    // The sort itself is this node's own work and is timed as such.
+    auto t_sort = std::chrono::high_resolution_clock::now();
     if (row_cap_ > 0) {
         std::sort_heap(flat_buffer_.begin(), flat_buffer_.end(), less);
     } else {
         std::stable_sort(flat_buffer_.begin(), flat_buffer_.end(), less);
     }
+    stats.elapsed_us += std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t_sort).count();
 }
 
 void VecSortNode::fillChunk(int start, int count) {
@@ -130,12 +196,13 @@ void VecSortNode::fillChunk(int start, int count) {
 
 DataChunk* VecSortNode::nextChunk() {
     if (!materialized_) {
-        auto t0 = std::chrono::high_resolution_clock::now();
+        // consumeAndSort accumulates stats.elapsed_us itself, per chunk plus the
+        // sort, and excludes the child call. Timing it from here would
+        // re-include the whole subtree.
         consumeAndSort();
         // rows_in is the INPUT count, which the bounded top-N no longer keeps
         stats.rows_in  = rows_seen_;
         stats.rows_out = static_cast<int>(flat_buffer_.size());
-        stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
         materialized_ = true;
     }
 

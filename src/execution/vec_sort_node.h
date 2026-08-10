@@ -25,6 +25,10 @@ class VecSortNode : public VecPlanNode {
         std::unique_ptr<VecPlanNode> child_;
         std::vector<OrderByItem> order_by_;
         int row_cap_ = 0;
+        // One entry per buffered row, WIDER than the schema: the schema's
+        // columns, then one slot per declared ORDER BY key holding that key
+        // already evaluated. See consumeAndSort for why the keys are precomputed
+        // and why the extra slots are invisible to the shared tie-break.
         std::vector<Row> flat_buffer_;
         int rows_seen_ = 0;
         int cursor_ = 0;

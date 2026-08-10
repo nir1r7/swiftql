@@ -512,13 +512,13 @@ TEST(SortTieBreak, TieBreakOrderIsTheSamePermutationOfIDENTITIESInEitherSchemaOr
 
 namespace {
 
-std::unordered_map<std::string, ColumnarTable> loadColumnarFor(const SelectStatement& stmt,
+std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadColumnarFor(const SelectStatement& stmt,
                                                                const Catalog& cat) {
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     auto add = [&](const std::string& name) {
         if (tables.count(name)) return;
         const auto& m = cat.getTable(name);
-        tables.emplace(name, CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema));
+        tables.emplace(name, std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(m.filepath, m.schema), m.schema)));
     };
     add(stmt.from.tableName("tie-break test loader"));
     for (const auto& j : stmt.joins) add(j.relation.tableName("tie-break test loader"));
