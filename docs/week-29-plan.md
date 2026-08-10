@@ -733,6 +733,32 @@ through; if any of those is a `LEFT` join with `R` on its `children[1]`, the
 descent stops there — which is precisely the condition "R is null-supplied by
 some join between it and the WHERE".
 
+> ⚠️ **RETRACTED IN WEEK 37 — the recursion is no longer unconditional, and
+> "correct" was the wrong axis.** *(Annotation added by the Week 37 doc sweep;
+> the paragraph above is left in its Week-29 wording under the dated-record
+> policy in README's "Documentation conventions". Two sweeps have now argued
+> about whether to delete it. The answer is: leave it, mark it — and this note
+> is the mark, so it need not be argued again.)*
+>
+> Week 29 checked **result preservation** and got it right: the row sets are
+> equal at every depth, exactly as argued. What it did not check is **error
+> behaviour**. Per-row evaluation can throw, so which rows an expression is
+> evaluated on decides whether the query errors — and pushing a conjunct into a
+> `LEFT` join's **preserved** side removes rows, and with them evaluations of
+> that join's `ON` residual, which is evaluated once per **candidate pair**
+> inside the probe loop. The residual is not a conjunct of any list the pass
+> touches, so no argument about the conjunct's own descent could have found it.
+> Seam audit pass 5 (P5-B1) reproduced it in both directions on the shipped
+> catalogs: `optimized` answered where `--no-optimize` and both Volcano legs
+> threw. Since Week 37 `distribute` declines the preserved side too, when the
+> join's `on_residual` can raise (`predicate_pushdown.cc`; the screen is
+> `conjunctMayRaise` in `parser/expr_totality.h`).
+>
+> The general form, which is the part worth carrying forward: **the obligation is
+> per EXPRESSION whose row set a rewrite changes, not per MOVE the rewrite
+> makes** — a strictly larger set. Five consecutive audit passes found the defect
+> in exactly the entry a shorter enumeration was missing.
+
 Two consequences to hold in your head:
 
 - A conjunct that stops here could legally be attached just above *its* outer

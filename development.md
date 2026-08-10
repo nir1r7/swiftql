@@ -81,9 +81,18 @@ All commands are run from the **project root**.
 | `--explain` | Print the query plan tree for each query, without executing |
 | `--explain-analyze` | Execute each query and print the plan tree annotated with timing and row counts |
 | `--no-cache` | Skip the in-memory result cache |
-| `--no-optimize` | Accepted flag, no effect in Phase 1 |
-| `--storage row\|columnar` | Accepted flag, no effect in Phase 1 |
-| `--execution volcano\|vectorized` | Accepted flag, no effect in Phase 1 |
+| `--no-optimize` | Skip **every** optimizer pass — pushdown, join enumeration, cost-based join selection. The differential oracle's fourth mode: optimized and `--no-optimize` must agree, row for row, on every supported query. Note `foldConstants` is **not** an optimizer pass and is *not* gated by this — see *Constant folding* |
+| `--storage row\|columnar` | Which storage layout the loader builds (Phase 2 on) |
+| `--execution volcano\|vectorized` | Which executor runs the plan (Phase 3 on). `vectorized` requires `--storage columnar`, and is the only path with multi-way joins, `IN`/`EXISTS` lowering, correlated subqueries and derived tables — the Volcano path refuses each by name |
+| `--storage-stats` | Print each columnar table's total size in MB **and exit without running the query**. Requires `--storage columnar`; it is a no-op under `--storage row`. (The per-column raw→encoded lines and the `[columnar]` ratio are printed by the loader on every columnar run, not by this flag) |
+| `--format aligned\|tsv` | Output rendering. `tsv` is what the Python harnesses parse; `aligned` is the default and pads columns |
+
+> ⚠️ **CORRECTED (Week 37 doc sweep).** The last three rows of this table read
+> *"Accepted flag, no effect in Phase 1"* — true when written, at Week 7, and
+> carried unchanged through four phases in which each of them became the axis the
+> engine is tested along. `--storage` and `--execution` are the mode matrix the
+> regression harness sweeps; `--no-optimize` is one leg of the correctness
+> oracle. Two flags the CLI has always parsed were also missing entirely.
 
 ### Examples
 
@@ -599,12 +608,64 @@ Measured (1M rows, Release, per-node self-time from `--explain-analyze`):
 | `VecFilter` — `speed > 300` vs `speed*2 > 600` | 0.64 ms | 1.7 ms | 222 ms |
 | `VecProject` — `speed` vs `speed*2` | 8.7 ms | 1.0 ms | 162 ms |
 
+### Written evaluation order, and why it is a plan property
+
+Per-row evaluation is **not total** — `evaluate()` can throw on a row (integer
+overflow, `SUBSTRING` out-of-domain positions, a comparison across the STRING
+boundary). So *which rows an expression is evaluated on* decides whether a query
+**errors**, and SwiftQL fixes that set in the **plan** rather than leaving it to
+whichever engine happens to run it. The rule, stated once in
+`src/parser/expr_totality.h`:
+
+- **A conjunct of a filter is evaluated on the rows for which every conjunct
+  written before it evaluated TRUE.** Both engines implement exactly this cascade
+  (`evaluatePredicate` in `evaluator.cc`, `evalPredicate` in `columnar_eval.cc`).
+  This makes `AND` non-commutative in the presence of a raiser and is a
+  **user-visible dialect fact** — it is in the README's dialect section for that
+  reason, with the measured pair.
+- **A join's `ON` residual is evaluated on every candidate pair the keys
+  matched**, in the probe loop, **eagerly over the whole residual conjunction**.
+  There is no conjunct cascade inside a residual; `evaluate()` computes both
+  operands of an `AND` before it looks at the operator. All four legs agree, so
+  it is not a divergence — it is the cascade rule not holding for a construct the
+  parser accepts. Recorded on `LogicalJoin::on_residual`.
+- **Every other expression is evaluated on every row that reaches its node** —
+  and the rule **binds the rewrite, not the expression**: a pass may not change
+  which rows reach a node holding an expression that can raise. *An expression
+  need not move to be moved.* That last clause is where five consecutive audit
+  passes landed, each on the one entry a shorter enumeration was missing.
+
+The obligation is therefore **per expression whose row set a rewrite changes, not
+per move the rewrite makes** — a strictly larger set. The screen is
+`exprMayRaise` / `conjunctMayRaise` / `firstMayRaise` (`parser/expr_totality.h`),
+a conservative over-approximation with **one** implementation and five consumers:
+predicate pushdown (twice — the conjunct moves *and* `on_residual`), zone-map
+chunk pruning, the `LIMIT`-below-a-raising-projection rule, and decorrelation
+(in both directions: a lift can remove a guard *or* add one).
+
 ### Constant folding
 
 `foldConstants` (`constant_folding.cc`) runs as the last step of `Binder::bind`,
 rewriting constant arithmetic subtrees to literals before validation. It is
-unconditional — folding cannot change results, so it is canonicalization rather
-than a cost-based decision, and both execution paths and `--no-optimize` get it.
+unconditional, and both execution paths and `--no-optimize` get it.
+
+> ⚠️ **RETRACTED (Week 37 doc sweep; seam audit pass 2's B-5, pass 4's P4-6).**
+> This paragraph used to end *"folding cannot change results, so it is
+> canonicalization rather than a cost-based decision"*. It was withdrawn from
+> `constant_folding.h` and from `binder.cc` by execution, and this prose copy —
+> the canonical version the headers paraphrase — was the last unqualified
+> statement of it in the repository. **What is true is narrower:** for any
+> expression `foldNode` agrees to fold, the folded node evaluates to the *same
+> `Value`* the original would have, on every row. What does **not** follow is
+> that the query's *outcome* is unchanged — five consumers pattern-match on the
+> *shape* of the tree and see a `Literal` the user did not write; `binder.cc`
+> carries the census with a verdict each. And the pass is **load-bearing for
+> correctness**, not an optimization: it is the only thing that removes an
+> `IntervalLiteral`, and `inferExprType` and `evaluate` both throw on one that
+> survives, so every TPC-H date-range predicate depends on it having run.
+> Gating it behind `--no-optimize` does not make those queries slower; it makes
+> them **error, on the differential leg only** (`logical_plan.cc` names that
+> exact reader). It is unconditional because it must be, not because it is free.
 
 It matters far beyond saving a multiply: three separate fast paths pattern-match
 on the literal shape `ColumnRef op Literal`, and a constant subexpression defeats
@@ -719,7 +780,7 @@ above; the parenthesised call is which one.
 |---|---|
 | `Binder::resolveColumnRef` (`binder.cc`) | **Level-aware.** The producer: walks scopes outward and stamps `(level, slot)` together |
 | `Binder::checkCorrelatedAggregateArg` | **Level-aware.** Resolves the argument's type through the scope chain — the only layer that can, which is why the check lives here rather than in `Validator` |
-| `collectSlots` (`predicate_pushdown.cc`, site 8) | **Level-aware.** Maps `level > 0` to `-1`, this walker's "cannot name it here" value, which makes all three callers conservative |
+| `collectSlots` (`predicate_pushdown.cc`, site 8) | **Level-aware.** Maps `level > 0` to `-1`, this walker's "cannot name it here" value. **CORRECTED (Week 37 doc sweep):** this row used to end *"which makes all three callers conservative"*. There are **four** callers, and the fourth is not conservative — `reachesOutsideThisBody` (`subquery_decorrelation.cc`, added by seam audit pass 2's B-3) reads `-1` as a **positive** answer and **refuses the query** on it. Nor were the other three ever uniform: `classifyJoinCondition` is permissive on an empty set and says so. See site 8 in *Extending the expression language* |
 | `exprKey` (`expr_utils.h`, site 1) | **Level-aware** since round 2. Was wrong: `0#driver_id` meant two different columns, so a *correlated* expression group key satisfied an ungrouped *local* reference, and `substituteInto` would have rewritten on the same collision |
 | `checkGroupedRefs` (`validator.cc`, site 5) | **Level-aware.** Returns for `query_level > 0`, and the plain-column match compares the level as well as the slot |
 | `validateExpr` (`validator.cc`, site 4) | **Level-aware.** Returns for `query_level > 0`: the Binder verified the ref against the scope that supplies it |
@@ -805,7 +866,7 @@ alone.
 | `lowerInSubqueries` (`subquery_lowering.cc`) | **Safe by domain.** Reads `SubqueryExpr::operand`'s `relation_slot` into `JoinKey::from_slot`. The operand belongs to the **enclosing** query and is bound at level 0 there, so the slot is in the OUTER range table — the same domain `leftKeyIndices()` resolves against. `join_col` is the body's single output column, resolved against the body plan's own schema. The two never meet |
 | `CardinalityEstimator::estimateNode`, SEMI/ANTI branch | **Safe by domain, but only since the merge was guarded.** `out.findForRef(from_col, from_slot)` uses the outer merged context; `right.find(join_col, -1)` is a bare-name lookup against the body's own one-relation context, where a bare name is unambiguous. The context-merge above the branch stamps `right.entries` with `join.join_slot` and so ran for SEMI/ANTI too, handing the parent body columns at slot -1 — columns not in the node's schema at all. It is now `if (semantics == STANDARD)`, which is what makes "reads `join.join_slot` only on the STANDARD path" a fact rather than a claim. Latent, not live: `StatsContext::find`'s bare-name fallback scans every entry, so a lookup missing on the left could have landed on a body column, but every outer ref above the join binds to a real slot today. Week 34's derived tables are what would have made it a wrong estimate |
 | `VectorizedPlanBuilder`, SEMI/ANTI lowering | **Safe by domain — and it has a second `join_slot` reader that had to be guarded.** The lowering itself: `leftKeyIndices` against the probe (outer spine) schema, `rightKeyIndices` against the body's own; `output_schema` handed to the operator is the probe schema, unmerged, and the operator's constructor re-checks its width. But `collectSlotTables` (`vectorized_plan_builder.cc`) also reads `join->join_slot`, from the cost block, which runs **before** the SEMI/ANTI early return. It is reachable: two `IN` conjuncts stack two semi joins, and `rowWidth()` on the outer one's left child walks the inner one. Unguarded it stamped the **body's** table at key `-1`, which names no relation of this block. Latent, never a wrong answer — **because the entry could not be read**: the map's only consumer is `slot_tables.find(col.relation_slot)` over the child's `output_schema`, and a semi/anti join's output schema *is its left child's* (asserted in `subquery_lowering.cc`), so every column in it carries a real binder slot and nothing ever looks up `-1`. The width is bit-identical before and after the guard. (An earlier rationale said "the widths are discarded before `setCostDecision`"; that is true today only via a build-order fact in `logical_plan.cc` — no STANDARD join is ever built above a semi join — which the cost block does not enforce, so it is not the reason and must not be inherited as verified.) Still a live violation of the contract this table exists to enforce, so it now stamps only on `semantics == STANDARD` while still walking the left side. Third time this row was wrong by omission; it names both readers now |
-| `JoinEnumeration::hasSlotOutsideRangeTable` | **Level-agnostic, and now LIVE.** Fires on `join_slot == -1`, which is exactly a semi/anti join. Weeks 28–30 expected Week 31 to make this decline live and Week 31 reported it had not; **Week 32 is where it became live**, not Week 34. The decline is silent, in the same shape as the <3-relation one — there was no ordering decision to report |
+| `JoinEnumeration::slotDeclineReason` (called `hasSlotOutsideRangeTable` when this row was written; renamed in `18af84f`) | **Level-agnostic, and now LIVE.** Fires on `join_slot == -1`, which is exactly a semi/anti join. Weeks 28–30 expected Week 31 to make this decline live and Week 31 reported it had not; **Week 32 is where it became live**, not Week 34. **CORRECTED (Week 37 doc sweep; seam audit pass 2's B-1, still open after three fix rounds):** this row used to end *"The decline is silent, in the same shape as the <3-relation one — there was no ordering decision to report"*. Both halves are false at HEAD. `18af84f` made the cause **reported** — `--explain` prints `join-ordering=skipped (semi/anti join)` on the `LogicalSemiJoin` line, verified on the shipped F1 catalog — and it did so by refuting the premise: on `FROM a JOIN b JOIN c WHERE x IN (SELECT …)` the block below the semi join *is* a fully inner three-relation spine the search could have reordered, so an ordering decision **was** available. Measured, same file: the spine alone gets `order=drivers@1,drivers@2,laps@0 cost=43104 (written=60637) method=dp`; with the `IN` it gets nothing. The row at *Week 34 consumers* below has said so since pass 2 — this one contradicted it in the same file for three fix rounds, which is the failure mode this table's own header warns about |
 | `PredicatePushdown::pushIntoJoin` | **Declines.** Tests `semantics == STANDARD` alongside `join_type == INNER` before `by_slot.find(join_slot)`. A stronger reason than the outer join's: children[1]'s columns are not in the output schema at all, so a conjunct pushed there is unresolvable, not merely mis-scoped. The recursion into `children[0]` is unconditional **for a semi/anti join**, which is what keeps a `WHERE` conjunct reaching the spine's scans. It is **not** unconditional in general: Week 37 (seam audit pass 5, P5-B1) made it decline at a LEFT join whose `on_residual` can raise, because that residual is evaluated per CANDIDATE PAIR and the preserved-side push shrinks the pair set. This row read "stays unconditional" as a virtue for five weeks and was quoted back as one by the audit |
 | `VecHashJoinNode` SEMI/ANTI probe | **Reads no slot.** Takes resolved column **indices**, and its output schema is the probe child's |
 | `buildAggregateSchema` (Week 30 tripwire) | **Still armed, still unreached.** An `IN` body may hold its own `GROUP BY`; its `GroupByColumn`s are level 0 against the **body's** range table, and the body is validated and planned as its own block, so the guard does not fire. The call context changed even though the data did not — covered by a query in `WEEK32_SEMI_JOIN_VEC_ONLY` rather than by reading |
@@ -859,6 +920,19 @@ construct lands. A missing row is worse than a wrong one.
 | `Lowering::lowerNode` DERIVED case / `VecDerivedNode` | **Reads no slot.** Forwards chunks unchanged and reports the renamed schema, which has to reach the physical layer because `resolveColumnIndex` and every `indexOf` above the graft look the new names up |
 | `lowerCorrelatedScalars` (`subquery_decorrelation.cc`) | **Builds a `LogicalDerived`, not a special case.** Its slot is `range_table_size + n`, one past the last the Binder issued, and it is a real merged-schema slot because the outer `WHERE` reads the aggregate's column. The join is **LEFT**: a zero-row group must yield NULL, not a dropped outer row |
 | `Planner::plan` | **Refuses.** Third Volcano capability refusal, after Week 32's `IN` and Week 33's correlated. It builds its scan from a catalog name and one `HashJoinNode`, so there is no shape there that can hold a relation which is a plan |
+
+### Weeks 36–37 consumers (the totality screen)
+
+**Added by the Week 37 doc sweep, under the rule this section states for itself
+— and it was missing, which makes it the fourth time this list has been wrong by
+omission.** `staticTypeOf` (`src/parser/expr_totality.h`) is a `ColumnId`
+consumer: it does `indexOf(name, slot)` slot-first with a bare-name fallback, at
+a named `localSlot("staticTypeOf")`. It arrived with the seam audit's totality
+screen and no row was added for it.
+
+| Consumer | Status |
+|---|---|
+| `staticTypeOf` / `exprMayRaise` / `conjunctMayRaise` (`parser/expr_totality.h`) | **Contained, and its failure mode is the OPPOSITE SIGN of every row above.** Resolution is the shared rule — slot-first when `isResolved() && isLocal()`, bare name otherwise — so a `level > 0` ref skips the slot lookup and lands on the fallback, which on a shared column name (`team`, `driver_id`, `l_suppkey`) is a clean **hit on the wrong relation**. Every other row here loses a check or reads the wrong column. This one is a **conservative screen**, so a wrong resolution does not make it answer *"I cannot type this"* — it makes it answer *"I typed it"*, and a false **FALSE** unfreezes a pass that should have declined. Its own header states the two errors are not symmetric: a false TRUE costs plan quality on one query, a false FALSE is a **divergence**. **Contained today, in two independent ways:** `refuseSurvivingCorrelatedRefs` (`subquery_decorrelation.cc`) refuses a correlated ref anywhere except a top-level equality in the body's `WHERE` — by name, for exactly this collapse — and `collectSlots` maps `level > 0` to `-1`, so pushdown never routes such a conjunct. **The live half of the risk is not the LEVEL but the SCHEMA**: pass 5 (E-20 / S-13 / P5-2) found the screen handed the *scanning relation's* schema rather than the one the expression was written against, and that was a divergence in three seams at once. Every call site must pass the schema the expression is evaluated in — `orderByWork` the child's, `pushIntoJoin` the join's, `refuseMaskedResidualRaiser` the full residual schema, `ChunkPruner` the hint's. Checked at HEAD: all four do |
 
 ### Null constants (Week 31)
 
@@ -919,9 +993,19 @@ standalone commit**, never folded into the feature.
 
 ## Extending the expression language
 
-Nineteen functions dispatch on `Expr` subtype. **Ten fail silently** when a new
-one is missed — no error, no crash, a wrong answer or a lost optimization
+**Twenty-one** functions dispatch on `Expr` subtype. **Ten fail silently** when a
+new one is missed — no error, no crash, a wrong answer or a lost optimization
 somewhere far away. Adding a node type means visiting all of them.
+
+> ⚠️ **This said NINETEEN until the Week 37 doc sweep**, and had been short by
+> two since the seam audit's totality screen shipped. Sites 20 and 21
+> (`staticTypeOf`, `exprMayRaise`) are the screen that decides whether a query
+> **errors**, and `expr_totality.h` names its own dispatch as a thing to keep in
+> lockstep with sites 8 and 9 — but this list, which is the list, did not hold
+> them. It is the same defect class the list exists to prevent, one level up.
+> `forEachLocalColumnRef` (`predicate_pushdown.h`) is deliberately **not** a
+> twentieth: site 9 (`restampSlots`) and both derived-body remappers are all
+> expressed in terms of it, so it is the one writing-side dispatch, not a new one.
 
 > **A node that CONTAINS a query changes the question at several of these.**
 > `SubqueryExpr` (Week 30) is the first, and the rule it established is: descend
@@ -943,7 +1027,7 @@ Ordered by how hard the failure is to find:
 | 5 | `checkGroupedRefs` — `validator.cc` | falls through | **Silent.** A separate function from #4. An ungrouped column inside the new node passes validation, then fails at plan time with `column not found` from `inferExprType` against the post-aggregate schema — the classic far-from-the-cause error |
 | 6 | `substituteInto` — `logical_plan.cc` | returns | **Silent.** A group-key reference inside the new node is not rewritten post-aggregate |
 | 7 | `collectAggregates` — `expr_utils.h` | returns | **Silent.** An aggregate nested inside the new node is never collected as a spec |
-| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, now THREE callers, never a private copy. The third (Week 29) is `pruningHintForPreservedSide`, which decides whether an outer join may hand its `WHERE` down to the preserved side's scan as a zone-map hint — and it is the one caller where an empty slot set is *dangerous* rather than merely lossy, because "mentions no relation" would read as "mentions nothing unpreserved". It therefore fails **closed**: empty means withhold. A new node type that this walker misses costs pushdown at the first two callers and would have silently reopened a null-supplying predicate's route to the wrong table's zone maps at the third. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one. **Week 30** corrected the justification in `predicate_pushdown.h`/`.cc`, which claimed "every other caller treats empty as the conservative answer" — false of `classifyJoinCondition`, where an empty set means the forward-reference loop never runs and the conjunct is ACCEPTED. This caller fails closed on its OWN account, not on a property of the others. A `SubqueryExpr` contributes its operand's slots plus `-1` when the Binder marked it correlated: the body's slots belong to another scope's range table, while a correlated ref genuinely does reference this one and cannot be named here |
+| 8 | `collectSlots` — `predicate_pushdown.cc` | empty slot set | **Silent, performance — and, since Week 27, silent correctness.** `soleSlot()` sees no single relation and returns `-1`, so the conjunct is evaluated above the join as a residual instead of on its own scan: right answers, lost pushdown. The second caller is `classifyJoinCondition`, which uses it to reject a *forward reference* inside a residual `ON` conjunct of any shape — a missed subtype makes that reference invisible, and the conjunct then resolves against whatever column of that name the left tree happens to have. Declared in `predicate_pushdown.h` for that reason: one walker, now **FOUR** callers, never a private copy. The third (Week 29) is `pruningHintForPreservedSide`, which decides whether an outer join may hand its `WHERE` down to the preserved side's scan as a zone-map hint — and it is the one caller where an empty slot set is *dangerous* rather than merely lossy, because "mentions no relation" would read as "mentions nothing unpreserved". It therefore fails **closed**: empty means withhold. A new node type that this walker misses costs pushdown at the first two callers and would have silently reopened a null-supplying predicate's route to the wrong table's zone maps at the third. It covers `AggregateExpr` too, which pushdown alone never needs (aggregates are forbidden in `WHERE`) but an `ON` conjunct can contain — `validateJoinCondition` refuses those one line later, so the full pipeline cannot tell a blind walker from a seeing one. **Week 30** corrected the justification in `predicate_pushdown.h`/`.cc`, which claimed "every other caller treats empty as the conservative answer" — false of `classifyJoinCondition`, where an empty set means the forward-reference loop never runs and the conjunct is ACCEPTED. This caller fails closed on its OWN account, not on a property of the others. A `SubqueryExpr` contributes its operand's slots plus `-1` when the Binder marked it correlated: the body's slots belong to another scope's range table, while a correlated ref genuinely does reference this one and cannot be named here. **THE FOURTH CALLER, and the reason this entry said THREE for two phases (Week 37 doc sweep; the undercount shipped with seam audit pass 2's B-3 fix and survived five audit passes because every copy of it *paraphrases* rather than quotes):** `reachesOutsideThisBody` (`subquery_decorrelation.cc`) asks *"does this expression reach outside THIS body"* — and it is the only caller for which `-1` is a **positive answer producing a hard refusal**, not a withheld optimization. That matters because `-1` has **three producers** (a ref resolved to an enclosing block; an UNRESOLVED ref; a nested correlated `SubqueryExpr`) and only the first two answer *its* question. The third is right for pushdown and simply the wrong reading as a correlation test: for a one-level reference the scope `sq->correlated` names is *this body*, so the ref is body-local. Read as correlation it refused legal queries with a wrong-cause message about inequalities they did not contain. The caller therefore **suppresses** producer 3 across its one `collectSlots` call (`SuppressNestedCorrelation`, restored by destructor) rather than growing a private walker. **The consequence for anyone adding a fifth caller:** `predicate_pushdown.cc`'s *"the effect is therefore only withheld pushdown"* is a claim about **this pass's own callers**, not about the sentinel, and must not be inherited |
 | 9 | `restampSlots` — `predicate_pushdown.cc` | returns | **Silent, performance.** Must stay in lockstep with #8: a pushed conjunct keeps its own relation's slot (any `k >= 1`) below the join, where `ChunkPruner` ignores it and the zone-map hint is lost |
 | 10 | `exprToString` — `expr_utils.h` | returns `"?"` | Visible: output column literally named `?` |
 | 11 | `cloneExpr` — `expr_utils.h` | **throws** | Loud. Marked `DISPATCH SITE` for this reason |
@@ -956,6 +1040,8 @@ Ordered by how hard the failure is to find:
 | 18 | `Validator::validateJoinCondition` — `validator.cc` | falls through | **Extended in Week 26**, in the same commit that relaxed `classifyJoinCondition` to accept multi-key equi-joins. It now dispatches every `Expr` subtype and its relation list is keyed by *ref name* (alias when present), without which every aliased qualifier fell through the unknown-qualifier escape and was checked by nothing. For a bound statement it re-checks by *relation slot*, never by `table_name` — the Binder rewrites an unqualified ref's `table_name` to its relation's table name, so matching on it lands on whichever relation is aliased to that name and rejects a legal query. Name matching survives only for validator-only callers that skip the Binder. **Live since Week 27**: `classifyJoinCondition` now hands every non-key conjunct on as a residual instead of refusing it on shape, so the Week 25 branches and the `AggregateExpr` branch are reached for real. This is the ONLY column-existence check those conjuncts get — `Validator::validate` runs before the residual is folded into the `WHERE` conjunction, so `validateExpr` never sees it. A gap here surfaces as a far-from-the-cause `column not found` from `inferExprType`. **Week 30** added a `SubqueryExpr` **throw** beside the `AggregateExpr` one: a residual carrying a subquery would reach a probe loop that cannot evaluate it, or be folded into the `WHERE` conjunction and routed by a relation slot it does not have. Note `classifyJoinCondition` runs one line earlier, so a subquery that also forward-references a later relation reports the forward reference — shape before contents. **The "re-checks by relation slot, never by `table_name`" rule above is only true within one query block.** `validateQuery` recurses into a NESTED statement's ON clauses, where a correlated ref is an ordinary top-level ref carrying an *enclosing* block's slot; indexing `relations` with it compares two numbering domains. Both this site and `classifyJoinCondition` therefore test `query_level` first — skip for existence here, and refuse to make a KEY there, or a key-less nested join joins on a fabricated key instead of hitting the cross-product refusal |
 
 | 19 | `forEachSubquery` — `subquery_materialization.cc` (Week 31) | returns | **Loud, by construction.** The subquery inside the missed subtype is never materialized, survives into planning and hits site 12's throw. That backstop is the whole reason this walker may be added without becoming the eleventh silent site — do not "simplify" sites 12/13 into the generic unknown-subtype throw, which says nothing about which walker failed. It is also the ONE walker that deliberately descends INTO a `SubqueryExpr`'s body: Week 30's rule (descend into the parts written in THIS block, never into the body) is a rule about SCOPE, and "which statements must run, and in what order" is not a scope question — a nested body must be materialized before the body containing it can run. Its read-only twin `forEachSubqueryConst` answers the same question for the CLI's table loader, so a nested query's tables are loaded; the two must stay in step |
+| 20 | `staticTypeOf` — `parser/expr_totality.h` (Weeks 36–37) | returns `false` | Safe **at subtype granularity**: `false` is "I cannot type this here", which every caller reads as "may raise", so the screen freezes rather than lets through. The cost is real and measured — seam audit pass 4's P4-2 timed **87×** on a three-conjunct `WHERE` from screening arithmetic too coarsely. **NOT safe at OPERATOR granularity** (pass 5's P5-5): the `BinaryExpr` arm falls through to `out = TypeId::INT` assuming a comparison, and the `UnaryExpr` arm never tests `un->op` at all, so a new *operator* (`\|\|`, or a `NOT` built as a `UnaryExpr`) is classified TOTAL from its first day instead of landing on the safe fallthrough. A new subtype is safe here; a new operator is not |
+| 21 | `exprMayRaise` — `parser/expr_totality.h` (Weeks 36–37) | returns `true` | Safe: the final `return true` is the conservative answer, so an unhandled subtype is treated as able to raise and everything after it in the conjunct list is frozen. Same operator-granularity hazard as site 20, which it inherits by calling it. **This is the screen that decides whether a legal query ERRORS** — see *Written evaluation order* — so a wrong answer here is a divergence, not a lost optimization, and the two error directions are not symmetric: a false TRUE costs plan quality on one query, a false FALSE is a wrong answer on the differential leg |
 
 `ChunkPruner::shouldSkip` is not on the list *for the dispatch question*:
 `collectSimplePredicates` returns immediately on anything that is not a

@@ -96,9 +96,20 @@
 //     share a slot, and one relation cannot repeat a column name (the catalog
 //     refuses duplicate names, and so does `derivedRelationSchema`). Where it is
 //     NOT unique — a projected schema with two identically named output columns —
-//     the sort is stable, so those columns keep their schema order, and a
-//     PROJECTED schema's order is a function of the SELECT list rather than of
-//     the plan.
+//     the sort is stable, so those columns keep their SCHEMA order, and that
+//     order is fixed inside `LogicalPlanBuilder::build`, BEFORE any optimizer
+//     pass runs. That is the whole load-bearing claim, and it is the reason the
+//     sentence here used to be wrong: it read *"a PROJECTED schema's order is a
+//     function of the SELECT list rather than of the plan"* (seam audit pass 4's
+//     P4-L1, corrected in the Week 37 doc sweep). For `SELECT *` there is no
+//     SELECT list — `build` copies the CHILD's schema column by column
+//     (logical_plan.cc's `stmt.select_star` branch), so the order IS a function
+//     of the plan shape. It is still deterministic across the two legs because
+//     the copy happens while the spine is in WRITTEN order, before
+//     `JoinEnumeration` permutes anything; verified on the F1 catalog, a
+//     three-relation `SELECT *` prints identical column order optimized and
+//     `--no-optimize`. Say "fixed before the optimizer runs", not "a function of
+//     the SELECT list".
 //
 // !! THE OTHER PLACE THE PRECONDITION FAILED, AND WHY THAT IS NOW A FACT RATHER
 // THAN AN ARGUMENT. Row storage under Volcano used to hand `SeqScanNode` the FULL
@@ -152,8 +163,9 @@ inline int compareForTieBreak(const Value& a, const Value& b) {
 inline std::vector<int> tieBreakOrder(const Schema& schema) {
     std::vector<int> order(static_cast<size_t>(schema.size()));
     std::iota(order.begin(), order.end(), 0);
-    // stable: identical (slot, name) pairs keep schema order, which is a
-    // function of the SELECT list wherever such pairs can occur.
+    // stable: identical (slot, name) pairs keep schema order, which is fixed in
+    // LogicalPlanBuilder::build before any optimizer pass runs — see the header
+    // (it is NOT "a function of the SELECT list"; `SELECT *` has none).
     std::stable_sort(order.begin(), order.end(), [&schema](int x, int y) {
         const ColumnDef& a = schema.column(x);
         const ColumnDef& b = schema.column(y);

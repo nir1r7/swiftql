@@ -111,6 +111,14 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     //   classifyJoinCondition       -> -1 <= right_slot, so no forward-reference
     //                                  throw. Moot: validateJoinCondition
     //                                  (site 18) refuses a subquery in ON.
+    //   reachesOutsideThisBody      -> WOULD READ IT AS "YES, REACHES OUTSIDE"
+    //     (subquery_decorrelation.cc)  and REFUSE the query. Wrong reading: for a
+    //                                  one-level ref the scope `sq->correlated`
+    //                                  names is THIS BODY, i.e. body-local. That
+    //                                  caller therefore SUPPRESSES this branch
+    //                                  for the duration of its call
+    //                                  (SuppressNestedCorrelation) rather than
+    //                                  inheriting the reading below.
     //
     // An UNCORRELATED subquery contributes nothing, which is also right: it is
     // a constant with respect to this block, so `WHERE r1.x = (SELECT ...)`
@@ -123,9 +131,16 @@ void collectSlots(const Expr* expr, std::unordered_set<int>& out) {
     // Week 33 DELETED, so it justifies nothing now. What is true, and is
     // checkable rather than historical: -1 is the conservative "cannot name it
     // here" sentinel, soleSlot rejects any conjunct whose slot set contains it,
-    // and the effect is therefore only WITHHELD PUSHDOWN. Safe in either
-    // reachability state, which is why nothing else had to change when the
-    // refusal came down.
+    // and the effect AT THIS PASS'S OWN CALLERS is only WITHHELD PUSHDOWN. Safe
+    // in either reachability state, which is why nothing else had to change when
+    // the refusal came down.
+    //
+    // !! "ONLY WITHHELD PUSHDOWN" IS A CLAIM ABOUT THIS PASS AND MUST NOT BE
+    // READ AS A CLAIM ABOUT THE SENTINEL (corrected in the Week 37 doc sweep;
+    // the sentence above stood unqualified while the fourth caller shipped).
+    // reachesOutsideThisBody reads -1 as a POSITIVE answer and REFUSES the query
+    // on it — a hard error, not lost work. It is the one caller that must, and
+    // does, opt out of this branch. See the caller list in predicate_pushdown.h.
     if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
         collectSlots(sq->operand.get(), out);   // IN's operand is THIS block's
         if (sq->correlated) out.insert(-1);

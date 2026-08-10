@@ -1148,7 +1148,12 @@ bool orderIsPlanStable(const LogicalPlanNode* node) {
 // each column's `(relation_slot, name)` identity — nothing the optimizer can
 // permute. It is inserted directly beneath the `LIMIT`, i.e. ABOVE the
 // projection, so it orders the OUTPUT row: fewer columns to compare, and the
-// projected schema's own order is a function of the SELECT list.
+// projected schema's own order is fixed HERE, in `build`, before any optimizer
+// pass runs. (It used to say "a function of the SELECT list" — false for
+// `SELECT *`, which copies the child's schema column by column a few hundred
+// lines below; seam audit pass 4's P4-L1, corrected in the Week 37 doc sweep.
+// The conclusion is unchanged: both orders are settled before `apply` sees the
+// tree, so no pass can permute them.)
 //
 // WHAT THIS DELIBERATELY CHANGES. `LIMIT n` with no `ORDER BY` over a join now
 // returns the n canonically-smallest output rows rather than the first n the
@@ -1451,6 +1456,16 @@ std::unique_ptr<LogicalPlanNode> LogicalPlanBuilder::build(SelectStatement stmt,
     // lowerCorrelatedScalars have all run, and every node they built is in this
     // tree. Checking at the producers instead is writing the rule four times,
     // which is how it came to be missing three times.
+    //
+    // ONE THING RUNS AFTER THIS AND BUILDS JoinKeys, and it is stated rather than
+    // left for the next reader to wonder about (Week 37 doc sweep — "the only
+    // point at which all four converge" is true of the PRODUCERS and reads as a
+    // claim that the key set is final, which it is not). JoinEnumeration::rebuild
+    // constructs fresh JoinKey values from its edge list, after this call. It is
+    // not a fifth producer: every edge came from a key that was checked here, and
+    // rebuild only re-pairs and possibly SWAPS the two sides. requireJoinKeyTypes
+    // is symmetric (`l_str == r_str`), so a swap cannot turn a passing key into a
+    // failing one. Give that check a direction and this note becomes a defect.
     //
     // LAST, not first, and both halves of that matter. It needs `semantics` and
     // the projected body schemas, which only exist after the lowerings; and a

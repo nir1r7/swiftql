@@ -56,6 +56,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -302,6 +303,46 @@ def mutation_check(conn, qid):
     if same:
         return INERT, label, VACUITY_REASON[INERT]
     return DISCRIMINATING, label, f"{len(base)} rows -> {len(mutant)}"
+
+
+# Indexes built on the ORACLE mirror only, never on SwiftQL. load_from_catalog
+# creates plain tables with no indexes, which is fine at SF=0.01 and is NOT fine
+# one scale factor up: q21's correlated EXISTS/NOT EXISTS forces SQLite into a
+# full 600k-row lineitem scan per candidate row, and since lineitem is stored in
+# l_orderkey order the scan's early-exit position grows with the key, so the cost
+# is quadratic in the data. Measured at sf0.1: q21's oracle ran 105 MINUTES
+# without finishing, and 0.3s with an index on lineitem(l_orderkey) -- a 0.2s
+# build. The harness evaluates that oracle THREE times per query (once at line
+# 677, twice more inside mutation_check), so without this the gate does not
+# terminate at sf0.1 and the scale factor, not the engine, is the wall.
+#
+# An index cannot change WHICH rows a query returns. It can change the order of
+# rows that tie under ORDER BY, and this harness compares ordered queries in
+# order -- so the guard is empirical, not argued: the sf0.01 run must still
+# reproduce docs/tpch-baseline.json byte for byte.
+#
+# Only the columns the TPC-H subqueries actually correlate on. Nothing
+# speculative: q17/q20 on l_partkey, q21 on l_orderkey, q22 on o_custkey,
+# q2/q20 on ps_partkey.
+ORACLE_INDEXES = {
+    "lineitem": [("l_orderkey",), ("l_partkey", "l_suppkey")],
+    "orders":   [("o_custkey",)],
+    "partsupp": [("ps_partkey",)],
+}
+
+
+def index_oracle(conn):
+    """Index the SQLite mirror's correlation columns. Returns seconds spent."""
+    have = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    t0 = time.time()
+    for table, cols_list in ORACLE_INDEXES.items():
+        if table not in have:
+            continue
+        for cols in cols_list:
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_{}_{} ON {} ({})".format(
+                table, "_".join(cols), table, ", ".join(cols)))
+    return time.time() - t0
 
 
 def oracle_answer(conn, sql):
@@ -720,6 +761,7 @@ def main():
         provenance = [l.rstrip() for l in open(prov_path) if l.strip()]
 
     conn = load_from_catalog(args.catalog)
+    print(f"  oracle indexes built in {index_oracle(conn):.1f}s")
 
     cells, details, fingerprints, timings, vacuity = {}, {}, {}, {}, {}
 

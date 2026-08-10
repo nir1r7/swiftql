@@ -461,7 +461,7 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
             // depend on the path that reached it and the DP's optimal
             // substructure would be gone. Identical argument to the >=1-row
             // floor (Week 28) and the outer-join max() below (Week 29).
-            // JoinEnumeration also declines these trees — hasSlotOutsideRangeTable
+            // JoinEnumeration also declines these trees — slotDeclineReason
             // fires on join_slot == -1 — and both facts must hold INDEPENDENTLY.
             //
             // Semi-join selectivity is a property of the LEFT side: the fraction
@@ -484,9 +484,10 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 //     over here, since a semi/anti residual reads build columns
                 //     that are in NO context this function holds.
                 //   * nothing consults this number for a semi/anti join anyway:
-                //     JoinEnumeration declines the whole tree
-                //     (hasSlotOutsideRangeTable fires on join_slot == -1), so the
-                //     estimate is reported by --explain and drives no decision.
+                //     JoinEnumeration declines the whole tree (slotDeclineReason
+                //     fires on join_slot == -1, and SAYS SO — the node prints
+                //     `join-ordering=skipped (semi/anti join)`), so the estimate
+                //     is reported by --explain and drives no decision.
                 //
                 // So the honest thing is an unadjusted semi-join estimate and
                 // this comment, not a factor invented to look adjusted. The
@@ -527,7 +528,7 @@ StatsContext CardinalityEstimator::estimateNode(LogicalPlanNode& node, const Cat
                 // deliberately kept out of joinCardinality because the DP's
                 // optimal substructure needs a path-independent estimate — and
                 // the DP never sees a semi/anti join anyway
-                // (hasSlotOutsideRangeTable declines the tree on join_slot -1).
+                // (slotDeclineReason declines the tree on join_slot -1).
                 node.estimated_rows = flooredJoinCardinality(l_rows, r_rows, rows);
                 return out;
             }

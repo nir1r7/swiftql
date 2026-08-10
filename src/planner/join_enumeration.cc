@@ -660,9 +660,15 @@ std::unique_ptr<LogicalPlanNode> reorder(std::unique_ptr<LogicalPlanNode> node,
 
     std::vector<uint32_t> adj(n, 0u);
     for (const Edge& e : edges) {
-        // DEAD since Week 30: hasSlotOutsideRangeTable declines the whole tree
-        // before decompose() runs, which is the only point at which returning
-        // it untouched is still possible. Kept as the invariant it always was —
+        // DEAD since Week 30: slotDeclineReason (above; called
+        // hasSlotOutsideRangeTable until 18af84f) declines the whole tree before
+        // decompose() runs, which is the only point at which returning it
+        // untouched is still possible. It is dead for the precise reason that it
+        // screens EXACTLY these two integers over EXACTLY this walk: decompose
+        // builds Edge{k.from_slot, …, join->join_slot, …} while recursing into
+        // children[0] only, and slotDeclineReason range-checks `join_slot` and
+        // every key's `from_slot` over that same children[0] descent. Change
+        // either walk and this stops being dead. Kept as the invariant it always was —
         // an endpoint outside the range table means the rebuilt tree would drop
         // a key, and a dropped key is MORE rows, not an error — so that
         // reordering these two passes fails loudly instead of silently.

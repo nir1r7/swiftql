@@ -130,9 +130,34 @@ const Expr* pruningHintForPreservedSide(const Expr* hint, JoinType join_type,
 // instead of growing an eleventh silent site; keep it in lockstep with
 // restampSlots.
 //
-// THREE callers since Week 29, not two: soleSlot, classifyJoinCondition and
-// pruningHintForPreservedSide above. They disagree about an empty set — see the
-// list at that function, and development.md's site-8 row.
+// FOUR callers since Week 37, not three — and the count is not the point, the
+// DISAGREEMENT is. This comment said THREE (soleSlot, classifyJoinCondition,
+// pruningHintForPreservedSide) from Week 29 until the Week 37 doc sweep, and it
+// had been short by one since seam audit pass 2's B-3 fix shipped. They disagree
+// about an EMPTY set — see the list at pruningHintForPreservedSide, and
+// development.md's site-8 row — and, since the fourth arrived, about the -1
+// SENTINEL as well:
+//
+//   soleSlot                    -1 in the set => do not push. WITHHOLDS work.
+//   pruningHintForPreservedSide -1 not in preserved_slots => withhold the hint.
+//                               WITHHOLDS work.
+//   classifyJoinCondition       -1 <= right_slot => no forward-reference throw.
+//                               ACCEPTS. Permissive, and says so in as many words.
+//   reachesOutsideThisBody      -1 in the set => THE ANSWER IS YES, and the
+//     (subquery_decorrelation.cc,  caller REFUSES the query by name. The only
+//      pass 2's B-3)              caller for which -1 is a POSITIVE answer that
+//                                 produces a hard error rather than lost work.
+//
+// !! THAT LAST ROW BREAKS THE BLAST-RADIUS ARGUMENT THE .cc MAKES, and it is why
+// this enumeration being short mattered. The .cc argues the SubqueryExpr branch's
+// -1 is safe because "the effect is therefore only WITHHELD PUSHDOWN". It is not,
+// at the fourth caller: producer (3) of the sentinel (a nested correlated
+// SubqueryExpr) is NOT AN ANSWER to "does this reach outside THIS body", and
+// reading it as one refused legal queries with a wrong-cause message about
+// inequalities they did not contain. That caller suppresses producer (3) for the
+// duration of its call, and the suppression is the whole reason it can share this
+// walker. A fifth caller must state which producers of -1 it means, and must not
+// inherit "only withheld pushdown" from here.
 //
 // Week 30: -1 means "references something this block cannot name" — an
 // unresolved ref, or a correlated reference inside a subquery, whose slot is a
