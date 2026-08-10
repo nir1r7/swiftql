@@ -1,0 +1,124 @@
+{
+  "catalog": "data/tpch/dbgen-sf1/catalog.json",
+  "engines": [
+    "postgres"
+  ],
+  "indexes": "TPC-H spec PK/FK on sqlite+postgres, ANALYZE",
+  "postgres_parallelism": "disabled (max_parallel_workers_per_gather=0)",
+  "reps": 3,
+  "results": {
+    "q10|postgres": {
+      "min_ms": 881.5257921814919,
+      "ms": 918.8220838550478,
+      "rows": 20
+    },
+    "q11|postgres": {
+      "min_ms": 19.847874995321035,
+      "ms": 20.355582935735583,
+      "rows": 1048
+    },
+    "q12|postgres": {
+      "min_ms": 1114.8497499525547,
+      "ms": 1138.1622080225497,
+      "rows": 2
+    },
+    "q13|postgres": {
+      "min_ms": 475.7212500553578,
+      "ms": 499.2969171144068,
+      "rows": 42
+    },
+    "q14|postgres": {
+      "min_ms": 1346.7970408964902,
+      "ms": 1366.5002500638366,
+      "rows": 1
+    },
+    "q15|postgres": {
+      "min_ms": 2649.5234158355743,
+      "ms": 2666.4944167714566,
+      "rows": 1
+    },
+    "q16|postgres": {
+      "min_ms": 348.9698329940438,
+      "ms": 355.08416686207056,
+      "rows": 18314
+    },
+    "q17|postgres": {
+      "min_ms": 51.59862502478063,
+      "ms": 51.77016695961356,
+      "rows": 1
+    },
+    "q18|postgres": {
+      "min_ms": 731.544833863154,
+      "ms": 745.7290422171354,
+      "rows": 57
+    },
+    "q19|postgres": {
+      "min_ms": 26.575000025331974,
+      "ms": 26.854957919567823,
+      "rows": 1
+    },
+    "q1|postgres": {
+      "min_ms": 1750.353166135028,
+      "ms": 1794.8151249438524,
+      "rows": 4
+    },
+    "q20|postgres": {
+      "min_ms": 38.015833124518394,
+      "ms": 39.14266708306968,
+      "rows": 233
+    },
+    "q21|postgres": {
+      "min_ms": 693.4285839088261,
+      "ms": 698.8894168753177,
+      "rows": 100
+    },
+    "q22|postgres": {
+      "min_ms": 47.76104190386832,
+      "ms": 49.58599992096424,
+      "rows": 7
+    },
+    "q2|postgres": {
+      "min_ms": 131.13250001333654,
+      "ms": 136.48787513375282,
+      "rows": 100
+    },
+    "q3|postgres": {
+      "min_ms": 601.0401661042124,
+      "ms": 610.5926670134068,
+      "rows": 10
+    },
+    "q4|postgres": {
+      "min_ms": 507.59870815090835,
+      "ms": 508.3181669469923,
+      "rows": 5
+    },
+    "q5|postgres": {
+      "min_ms": 551.389082800597,
+      "ms": 555.0453749019653,
+      "rows": 5
+    },
+    "q6|postgres": {
+      "min_ms": 1509.9370419047773,
+      "ms": 1531.0597501229495,
+      "rows": 1
+    },
+    "q7|postgres": {
+      "min_ms": 808.3777078427374,
+      "ms": 818.7758750282228,
+      "rows": 4
+    },
+    "q8|postgres": {
+      "min_ms": 222.21687505953014,
+      "ms": 222.22779202274978,
+      "rows": 2
+    },
+    "q9|postgres": {
+      "min_ms": 1730.9367500711232,
+      "ms": 1736.8022499140352,
+      "rows": 175
+    }
+  },
+  "stamped_retroactively": "conditions known from the run log; the harness did not record them until after these files were written",
+  "swiftql_bin": "n/a (postgres only)",
+  "warmups": 1
+}

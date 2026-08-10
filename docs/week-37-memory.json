@@ -1,0 +1,26 @@
+{
+  "sf0.01/columnar": {
+    "peak_mb": 72,
+    "wall_s": 0.1
+  },
+  "sf0.01/row": {
+    "peak_mb": 51,
+    "wall_s": 0.1
+  },
+  "sf0.1/columnar": {
+    "peak_mb": 726,
+    "wall_s": 1.7
+  },
+  "sf0.1/row": {
+    "peak_mb": 475,
+    "wall_s": 1.2
+  },
+  "sf1/columnar": {
+    "peak_mb": 5450,
+    "wall_s": 20.3
+  },
+  "sf1/row": {
+    "peak_mb": 4521,
+    "wall_s": 14.7
+  }
+}

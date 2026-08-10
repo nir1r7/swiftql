@@ -1,0 +1,1885 @@
+{
+  "binary": "./build-release/swiftql",
+  "catalog": "data/tpch/dbgen-sf0.1/catalog.json",
+  "mode": "--storage columnar --execution vectorized",
+  "nodes": {
+    "q1": [
+      {
+        "actual": 4,
+        "est": 6,
+        "node": "VecProject",
+        "qerror": 1.5
+      },
+      {
+        "actual": 4,
+        "est": 6,
+        "node": "VecSort",
+        "qerror": 1.5
+      },
+      {
+        "actual": 4,
+        "est": 6,
+        "node": "VecHashAggregate",
+        "qerror": 1.5
+      },
+      {
+        "actual": 591856,
+        "est": 200191,
+        "node": "VecFilter",
+        "qerror": 2.956456583962316
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q10": [
+      {
+        "actual": 20,
+        "est": 20,
+        "node": "VecLimit",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1024,
+        "est": 22243,
+        "node": "VecProject",
+        "qerror": 21.7216796875
+      },
+      {
+        "actual": 3767,
+        "est": 22243,
+        "node": "VecSort",
+        "qerror": 5.904698699230156
+      },
+      {
+        "actual": 3767,
+        "est": 22243,
+        "node": "VecHashAggregate",
+        "qerror": 5.904698699230156
+      },
+      {
+        "actual": 11439,
+        "est": 22243,
+        "node": "VecHashJoin",
+        "qerror": 1.944488154558965
+      },
+      {
+        "actual": 13057,
+        "est": 200191,
+        "node": "VecFilter",
+        "qerror": 15.332082407903806
+      },
+      {
+        "actual": 29369,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 20.44918110933297
+      },
+      {
+        "actual": 5677,
+        "est": 16667,
+        "node": "VecHashJoin",
+        "qerror": 2.9358816276202218
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5677,
+        "est": 16667,
+        "node": "VecFilter",
+        "qerror": 2.9358816276202218
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q11": [
+      {
+        "actual": 2541,
+        "est": 1600,
+        "node": "VecProject",
+        "qerror": 1.588125
+      },
+      {
+        "actual": 2541,
+        "est": 1600,
+        "node": "VecSort",
+        "qerror": 1.588125
+      },
+      {
+        "actual": 2541,
+        "est": 1600,
+        "node": "VecFilter",
+        "qerror": 1.588125
+      },
+      {
+        "actual": 3716,
+        "est": 3200,
+        "node": "VecHashAggregate",
+        "qerror": 1.16125
+      },
+      {
+        "actual": 4000,
+        "est": 3200,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.25
+      },
+      {
+        "actual": 80000,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 50,
+        "est": 40,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.25
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q12": [
+      {
+        "actual": 2,
+        "est": 7,
+        "node": "VecProject",
+        "qerror": 3.5
+      },
+      {
+        "actual": 2,
+        "est": 7,
+        "node": "VecSort",
+        "qerror": 3.5
+      },
+      {
+        "actual": 2,
+        "est": 7,
+        "node": "VecHashAggregate",
+        "qerror": 3.5
+      },
+      {
+        "actual": 3155,
+        "est": 4766,
+        "node": "VecHashJoin",
+        "qerror": 1.5106180665610143
+      },
+      {
+        "actual": 4828,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 31.068765534382766
+      },
+      {
+        "actual": 3155,
+        "est": 4766,
+        "node": "VecFilter",
+        "qerror": 1.5106180665610143
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q13": [
+      {
+        "actual": 37,
+        "est": 15000,
+        "node": "VecProject",
+        "qerror": 405.4054054054054
+      },
+      {
+        "actual": 37,
+        "est": 15000,
+        "node": "VecSort",
+        "qerror": 405.4054054054054
+      },
+      {
+        "actual": 37,
+        "est": 15000,
+        "node": "VecHashAggregate",
+        "qerror": 405.4054054054054
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecDerived",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 153318,
+        "est": 75000,
+        "node": "VecLeftHashJoin",
+        "qerror": 2.04424
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q14": [
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 7630,
+        "est": 66730,
+        "node": "VecHashJoin",
+        "qerror": 8.745740498034076
+      },
+      {
+        "actual": 7630,
+        "est": 66730,
+        "node": "VecFilter",
+        "qerror": 8.745740498034076
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q15": [
+      {
+        "actual": 1,
+        "est": 100,
+        "node": "VecProject",
+        "qerror": 100.0
+      },
+      {
+        "actual": 1,
+        "est": 100,
+        "node": "VecSort",
+        "qerror": 100.0
+      },
+      {
+        "actual": 1,
+        "est": 100,
+        "node": "VecHashJoin",
+        "qerror": 100.0
+      },
+      {
+        "actual": 2,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 500.0
+      },
+      {
+        "actual": 1,
+        "est": 100,
+        "node": "VecDerived",
+        "qerror": 100.0
+      },
+      {
+        "actual": 1,
+        "est": 100,
+        "node": "VecFilter",
+        "qerror": 100.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 22830,
+        "est": 66730,
+        "node": "VecFilter",
+        "qerror": 2.922908453788874
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q16": [
+      {
+        "actual": 2762,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 2762.0
+      },
+      {
+        "actual": 2762,
+        "est": 1,
+        "node": "VecSort",
+        "qerror": 2762.0
+      },
+      {
+        "actual": 2762,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 2762.0
+      },
+      {
+        "actual": 11635,
+        "est": 1,
+        "node": "VecAntiHashJoin",
+        "qerror": 11635.0
+      },
+      {
+        "actual": 11644,
+        "est": 6144,
+        "node": "VecHashJoin",
+        "qerror": 1.8951822916666667
+      },
+      {
+        "actual": 12556,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 6.371455877668047
+      },
+      {
+        "actual": 2911,
+        "est": 1536,
+        "node": "VecFilter",
+        "qerror": 1.8951822916666667
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 500,
+        "node": "VecProject",
+        "qerror": 500.0
+      },
+      {
+        "actual": 1,
+        "est": 500,
+        "node": "VecFilter",
+        "qerror": 500.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q17": [
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 43,
+        "est": 300,
+        "node": "VecFilter",
+        "qerror": 6.976744186046512
+      },
+      {
+        "actual": 555,
+        "est": 601,
+        "node": "VecLeftHashJoin",
+        "qerror": 1.082882882882883
+      },
+      {
+        "actual": 555,
+        "est": 601,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.082882882882883
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 18,
+        "est": 20,
+        "node": "VecFilter",
+        "qerror": 1.1111111111111112
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecDerived",
+        "qerror": 1.0
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q18": [
+      {
+        "actual": 5,
+        "est": 100,
+        "node": "VecLimit",
+        "qerror": 20.0
+      },
+      {
+        "actual": 5,
+        "est": 600572,
+        "node": "VecProject",
+        "qerror": 120114.4
+      },
+      {
+        "actual": 5,
+        "est": 600572,
+        "node": "VecSort",
+        "qerror": 120114.4
+      },
+      {
+        "actual": 5,
+        "est": 600572,
+        "node": "VecHashAggregate",
+        "qerror": 120114.4
+      },
+      {
+        "actual": 35,
+        "est": 600572,
+        "node": "VecSemiHashJoin",
+        "qerror": 17159.2
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecHashJoin",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecHashJoin",
+        "qerror": 1.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 75000,
+        "node": "VecProject",
+        "qerror": 15000.0
+      },
+      {
+        "actual": 5,
+        "est": 75000,
+        "node": "VecFilter",
+        "qerror": 15000.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q19": [
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 22,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 22.0
+      },
+      {
+        "actual": 62,
+        "est": 82,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.3225806451612903
+      },
+      {
+        "actual": 25402,
+        "est": 37107,
+        "node": "VecFilter",
+        "qerror": 1.4607904889378789
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 45,
+        "est": 44,
+        "node": "VecFilter",
+        "qerror": 1.0227272727272727
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q2": [
+      {
+        "actual": 51,
+        "est": 16,
+        "node": "VecLimit",
+        "qerror": 3.1875
+      },
+      {
+        "actual": 51,
+        "est": 16,
+        "node": "VecProject",
+        "qerror": 3.1875
+      },
+      {
+        "actual": 51,
+        "est": 16,
+        "node": "VecSort",
+        "qerror": 3.1875
+      },
+      {
+        "actual": 51,
+        "est": 16,
+        "node": "VecFilter",
+        "qerror": 3.1875
+      },
+      {
+        "actual": 71,
+        "est": 160,
+        "node": "VecLeftHashJoin",
+        "qerror": 2.2535211267605635
+      },
+      {
+        "actual": 71,
+        "est": 160,
+        "node": "VecSimdLoopJoin",
+        "qerror": 2.2535211267605635
+      },
+      {
+        "actual": 324,
+        "est": 800,
+        "node": "VecSimdLoopJoin",
+        "qerror": 2.4691358024691357
+      },
+      {
+        "actual": 324,
+        "est": 800,
+        "node": "VecHashJoin",
+        "qerror": 2.4691358024691357
+      },
+      {
+        "actual": 272,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 3.676470588235294
+      },
+      {
+        "actual": 324,
+        "est": 800,
+        "node": "VecHashJoin",
+        "qerror": 2.4691358024691357
+      },
+      {
+        "actual": 1132,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 70.6713780918728
+      },
+      {
+        "actual": 81,
+        "est": 200,
+        "node": "VecFilter",
+        "qerror": 2.4691358024691357
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 11985,
+        "est": 16000,
+        "node": "VecDerived",
+        "qerror": 1.3350020859407592
+      },
+      {
+        "actual": 11985,
+        "est": 16000,
+        "node": "VecProject",
+        "qerror": 1.3350020859407592
+      },
+      {
+        "actual": 11985,
+        "est": 16000,
+        "node": "VecHashAggregate",
+        "qerror": 1.3350020859407592
+      },
+      {
+        "actual": 16320,
+        "est": 16000,
+        "node": "VecHashJoin",
+        "qerror": 1.02
+      },
+      {
+        "actual": 17920,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 4.464285714285714
+      },
+      {
+        "actual": 204,
+        "est": 200,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.02
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q20": [
+      {
+        "actual": 13,
+        "est": 40,
+        "node": "VecProject",
+        "qerror": 3.076923076923077
+      },
+      {
+        "actual": 13,
+        "est": 40,
+        "node": "VecSort",
+        "qerror": 3.076923076923077
+      },
+      {
+        "actual": 13,
+        "est": 40,
+        "node": "VecSemiHashJoin",
+        "qerror": 3.076923076923077
+      },
+      {
+        "actual": 37,
+        "est": 40,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.0810810810810811
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 760,
+        "est": 80000,
+        "node": "VecProject",
+        "qerror": 105.26315789473684
+      },
+      {
+        "actual": 760,
+        "est": 80000,
+        "node": "VecSemiHashJoin",
+        "qerror": 105.26315789473684
+      },
+      {
+        "actual": 1868,
+        "est": 80000,
+        "node": "VecFilter",
+        "qerror": 42.82655246252676
+      },
+      {
+        "actual": 1868,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 42.82655246252676
+      },
+      {
+        "actual": 190,
+        "est": 10000,
+        "node": "VecProject",
+        "qerror": 52.63157894736842
+      },
+      {
+        "actual": 190,
+        "est": 10000,
+        "node": "VecFilter",
+        "qerror": 52.63157894736842
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q21": [
+      {
+        "actual": 47,
+        "est": 1,
+        "node": "VecLimit",
+        "qerror": 47.0
+      },
+      {
+        "actual": 47,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 47.0
+      },
+      {
+        "actual": 47,
+        "est": 1,
+        "node": "VecSort",
+        "qerror": 47.0
+      },
+      {
+        "actual": 47,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 47.0
+      },
+      {
+        "actual": 465,
+        "est": 1,
+        "node": "VecAntiHashJoin",
+        "qerror": 465.0
+      },
+      {
+        "actual": 8295,
+        "est": 4004,
+        "node": "VecSemiHashJoin",
+        "qerror": 2.0716783216783217
+      },
+      {
+        "actual": 8590,
+        "est": 4004,
+        "node": "VecHashJoin",
+        "qerror": 2.1453546453546455
+      },
+      {
+        "actual": 8448,
+        "est": 50000,
+        "node": "VecFilter",
+        "qerror": 5.918560606060606
+      },
+      {
+        "actual": 17466,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 8.588114050154585
+      },
+      {
+        "actual": 17752,
+        "est": 12011,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.477978519690284
+      },
+      {
+        "actual": 379809,
+        "est": 300286,
+        "node": "VecFilter",
+        "qerror": 1.2648242009284483
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 47,
+        "est": 40,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.175
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 379809,
+        "est": 300286,
+        "node": "VecProject",
+        "qerror": 1.2648242009284483
+      },
+      {
+        "actual": 379809,
+        "est": 300286,
+        "node": "VecFilter",
+        "qerror": 1.2648242009284483
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q22": [
+      {
+        "actual": 7,
+        "est": 1594,
+        "node": "VecProject",
+        "qerror": 227.71428571428572
+      },
+      {
+        "actual": 7,
+        "est": 1594,
+        "node": "VecSort",
+        "qerror": 227.71428571428572
+      },
+      {
+        "actual": 7,
+        "est": 1594,
+        "node": "VecHashAggregate",
+        "qerror": 227.71428571428572
+      },
+      {
+        "actual": 641,
+        "est": 1594,
+        "node": "VecDerived",
+        "qerror": 2.486739469578783
+      },
+      {
+        "actual": 641,
+        "est": 1594,
+        "node": "VecProject",
+        "qerror": 2.486739469578783
+      },
+      {
+        "actual": 641,
+        "est": 1594,
+        "node": "VecAntiHashJoin",
+        "qerror": 2.486739469578783
+      },
+      {
+        "actual": 1856,
+        "est": 4783,
+        "node": "VecFilter",
+        "qerror": 2.5770474137931036
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q3": [
+      {
+        "actual": 10,
+        "est": 10,
+        "node": "VecLimit",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1024,
+        "est": 13346,
+        "node": "VecProject",
+        "qerror": 13.033203125
+      },
+      {
+        "actual": 1216,
+        "est": 13346,
+        "node": "VecSort",
+        "qerror": 10.975328947368421
+      },
+      {
+        "actual": 1216,
+        "est": 13346,
+        "node": "VecHashAggregate",
+        "qerror": 10.975328947368421
+      },
+      {
+        "actual": 3321,
+        "est": 13346,
+        "node": "VecHashJoin",
+        "qerror": 4.018669075579645
+      },
+      {
+        "actual": 4797,
+        "est": 200191,
+        "node": "VecFilter",
+        "qerror": 41.732541171565565
+      },
+      {
+        "actual": 63635,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 9.437762237762238
+      },
+      {
+        "actual": 15224,
+        "est": 10000,
+        "node": "VecHashJoin",
+        "qerror": 1.5224
+      },
+      {
+        "actual": 16027,
+        "est": 50000,
+        "node": "VecFilter",
+        "qerror": 3.1197354464341425
+      },
+      {
+        "actual": 32920,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 4.5565006075334145
+      },
+      {
+        "actual": 3111,
+        "est": 3000,
+        "node": "VecFilter",
+        "qerror": 1.037
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q4": [
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecSort",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5093,
+        "est": 16667,
+        "node": "VecSemiHashJoin",
+        "qerror": 3.2725309247987435
+      },
+      {
+        "actual": 5552,
+        "est": 16667,
+        "node": "VecFilter",
+        "qerror": 3.0019812680115274
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 379809,
+        "est": 300286,
+        "node": "VecProject",
+        "qerror": 1.2648242009284483
+      },
+      {
+        "actual": 379809,
+        "est": 300286,
+        "node": "VecFilter",
+        "qerror": 1.2648242009284483
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q5": [
+      {
+        "actual": 5,
+        "est": 25,
+        "node": "VecProject",
+        "qerror": 5.0
+      },
+      {
+        "actual": 5,
+        "est": 25,
+        "node": "VecSort",
+        "qerror": 5.0
+      },
+      {
+        "actual": 5,
+        "est": 25,
+        "node": "VecHashAggregate",
+        "qerror": 5.0
+      },
+      {
+        "actual": 865,
+        "est": 534,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.6198501872659177
+      },
+      {
+        "actual": 3690,
+        "est": 2669,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.3825402772573998
+      },
+      {
+        "actual": 3690,
+        "est": 2669,
+        "node": "VecHashJoin",
+        "qerror": 1.3825402772573998
+      },
+      {
+        "actual": 92293,
+        "est": 66730,
+        "node": "VecHashJoin",
+        "qerror": 1.3830810729806684
+      },
+      {
+        "actual": 98480,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 6.098415922014622
+      },
+      {
+        "actual": 22958,
+        "est": 16667,
+        "node": "VecHashJoin",
+        "qerror": 1.377452450950981
+      },
+      {
+        "actual": 22958,
+        "est": 16667,
+        "node": "VecFilter",
+        "qerror": 1.377452450950981
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q6": [
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecProject",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecHashAggregate",
+        "qerror": 1.0
+      },
+      {
+        "actual": 11618,
+        "est": 10963,
+        "node": "VecFilter",
+        "qerror": 1.0597464197756088
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q7": [
+      {
+        "actual": 4,
+        "est": 213,
+        "node": "VecProject",
+        "qerror": 53.25
+      },
+      {
+        "actual": 4,
+        "est": 213,
+        "node": "VecSort",
+        "qerror": 53.25
+      },
+      {
+        "actual": 4,
+        "est": 213,
+        "node": "VecHashAggregate",
+        "qerror": 53.25
+      },
+      {
+        "actual": 643,
+        "est": 213,
+        "node": "VecDerived",
+        "qerror": 3.0187793427230045
+      },
+      {
+        "actual": 643,
+        "est": 213,
+        "node": "VecProject",
+        "qerror": 3.0187793427230045
+      },
+      {
+        "actual": 643,
+        "est": 213,
+        "node": "VecFilter",
+        "qerror": 3.0187793427230045
+      },
+      {
+        "actual": 182762,
+        "est": 66730,
+        "node": "VecSimdLoopJoin",
+        "qerror": 2.738828113292372
+      },
+      {
+        "actual": 182762,
+        "est": 66730,
+        "node": "VecHashJoin",
+        "qerror": 2.738828113292372
+      },
+      {
+        "actual": 182762,
+        "est": 66730,
+        "node": "VecHashJoin",
+        "qerror": 2.738828113292372
+      },
+      {
+        "actual": 150000,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 182762,
+        "est": 66730,
+        "node": "VecHashJoin",
+        "qerror": 2.738828113292372
+      },
+      {
+        "actual": 182762,
+        "est": 66730,
+        "node": "VecFilter",
+        "qerror": 2.738828113292372
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecSimdLoopJoin",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 15000,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q8": [
+      {
+        "actual": 2,
+        "est": 89,
+        "node": "VecProject",
+        "qerror": 44.5
+      },
+      {
+        "actual": 2,
+        "est": 89,
+        "node": "VecSort",
+        "qerror": 44.5
+      },
+      {
+        "actual": 2,
+        "est": 89,
+        "node": "VecHashAggregate",
+        "qerror": 44.5
+      },
+      {
+        "actual": 282,
+        "est": 89,
+        "node": "VecDerived",
+        "qerror": 3.168539325842697
+      },
+      {
+        "actual": 282,
+        "est": 89,
+        "node": "VecProject",
+        "qerror": 3.168539325842697
+      },
+      {
+        "actual": 282,
+        "est": 89,
+        "node": "VecSimdLoopJoin",
+        "qerror": 3.168539325842697
+      },
+      {
+        "actual": 282,
+        "est": 89,
+        "node": "VecHashJoin",
+        "qerror": 3.168539325842697
+      },
+      {
+        "actual": 211,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 4.739336492890995
+      },
+      {
+        "actual": 282,
+        "est": 89,
+        "node": "VecSimdLoopJoin",
+        "qerror": 3.168539325842697
+      },
+      {
+        "actual": 1429,
+        "est": 445,
+        "node": "VecSimdLoopJoin",
+        "qerror": 3.2112359550561798
+      },
+      {
+        "actual": 1429,
+        "est": 445,
+        "node": "VecHashJoin",
+        "qerror": 3.2112359550561798
+      },
+      {
+        "actual": 1468,
+        "est": 15000,
+        "node": "VecScan",
+        "qerror": 10.217983651226158
+      },
+      {
+        "actual": 1429,
+        "est": 445,
+        "node": "VecHashJoin",
+        "qerror": 3.2112359550561798
+      },
+      {
+        "actual": 1666,
+        "est": 16667,
+        "node": "VecFilter",
+        "qerror": 10.004201680672269
+      },
+      {
+        "actual": 5283,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 28.39295854628052
+      },
+      {
+        "actual": 4485,
+        "est": 4004,
+        "node": "VecHashJoin",
+        "qerror": 1.12012987012987
+      },
+      {
+        "actual": 8290,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 72.44535585042219
+      },
+      {
+        "actual": 147,
+        "est": 133,
+        "node": "VecFilter",
+        "qerror": 1.105263157894737
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1,
+        "est": 1,
+        "node": "VecFilter",
+        "qerror": 1.0
+      },
+      {
+        "actual": 5,
+        "est": 5,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ],
+    "q9": [
+      {
+        "actual": 175,
+        "est": 1201,
+        "node": "VecProject",
+        "qerror": 6.862857142857143
+      },
+      {
+        "actual": 175,
+        "est": 1201,
+        "node": "VecSort",
+        "qerror": 6.862857142857143
+      },
+      {
+        "actual": 175,
+        "est": 1201,
+        "node": "VecHashAggregate",
+        "qerror": 6.862857142857143
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecDerived",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecProject",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecHashJoin",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 29446,
+        "est": 150000,
+        "node": "VecScan",
+        "qerror": 5.094070501935747
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecSimdLoopJoin",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecHashJoin",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 32160,
+        "est": 1201,
+        "node": "VecHashJoin",
+        "qerror": 26.777685262281434
+      },
+      {
+        "actual": 1075,
+        "est": 10000,
+        "node": "VecFilter",
+        "qerror": 9.30232558139535
+      },
+      {
+        "actual": 20000,
+        "est": 20000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 600572,
+        "est": 2402,
+        "node": "VecHashJoin",
+        "qerror": 250.02997502081598
+      },
+      {
+        "actual": 600572,
+        "est": 600572,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 80000,
+        "est": 80000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 1000,
+        "est": 1000,
+        "node": "VecScan",
+        "qerror": 1.0
+      },
+      {
+        "actual": 25,
+        "est": 25,
+        "node": "VecScan",
+        "qerror": 1.0
+      }
+    ]
+  },
+  "summary": {
+    "q1": {
+      "geomean": 1.584196525951731,
+      "max": 2.956456583962316,
+      "nodes": 5,
+      "worst_actual": 591856,
+      "worst_est": 200191,
+      "worst_node": "VecFilter"
+    },
+    "q10": {
+      "geomean": 3.2187010482835356,
+      "max": 21.7216796875,
+      "nodes": 13,
+      "worst_actual": 1024,
+      "worst_est": 22243,
+      "worst_node": "VecProject"
+    },
+    "q11": {
+      "geomean": 1.2193825619895602,
+      "max": 1.588125,
+      "nodes": 10,
+      "worst_actual": 2541,
+      "worst_est": 1600,
+      "worst_node": "VecProject"
+    },
+    "q12": {
+      "geomean": 3.1444754715150003,
+      "max": 31.068765534382766,
+      "nodes": 7,
+      "worst_actual": 4828,
+      "worst_est": 150000,
+      "worst_node": "VecScan"
+    },
+    "q13": {
+      "geomean": 8.013090618136331,
+      "max": 405.4054054054054,
+      "nodes": 9,
+      "worst_actual": 37,
+      "worst_est": 15000,
+      "worst_node": "VecProject"
+    },
+    "q14": {
+      "geomean": 2.0603082218635405,
+      "max": 8.745740498034076,
+      "nodes": 6,
+      "worst_actual": 7630,
+      "worst_est": 66730,
+      "worst_node": "VecHashJoin"
+    },
+    "q15": {
+      "geomean": 20.72423564401906,
+      "max": 500.0,
+      "nodes": 10,
+      "worst_actual": 2,
+      "worst_est": 1000,
+      "worst_node": "VecScan"
+    },
+    "q16": {
+      "geomean": 83.64636988548001,
+      "max": 11635.0,
+      "nodes": 11,
+      "worst_actual": 11635,
+      "worst_est": 1,
+      "worst_node": "VecAntiHashJoin"
+    },
+    "q17": {
+      "geomean": 1.20193534243707,
+      "max": 6.976744186046512,
+      "nodes": 12,
+      "worst_actual": 43,
+      "worst_est": 300,
+      "worst_node": "VecFilter"
+    },
+    "q18": {
+      "geomean": 120.3549377980186,
+      "max": 120114.4,
+      "nodes": 14,
+      "worst_actual": 5,
+      "worst_est": 600572,
+      "worst_node": "VecProject"
+    },
+    "q19": {
+      "geomean": 1.602411587086953,
+      "max": 22.0,
+      "nodes": 8,
+      "worst_actual": 22,
+      "worst_est": 1,
+      "worst_node": "VecFilter"
+    },
+    "q2": {
+      "geomean": 1.9362199692795825,
+      "max": 70.6713780918728,
+      "nodes": 27,
+      "worst_actual": 1132,
+      "worst_est": 80000,
+      "worst_node": "VecScan"
+    },
+    "q20": {
+      "geomean": 7.497314245617269,
+      "max": 105.26315789473684,
+      "nodes": 14,
+      "worst_actual": 760,
+      "worst_est": 80000,
+      "worst_node": "VecProject"
+    },
+    "q21": {
+      "geomean": 3.8335300005046187,
+      "max": 465.0,
+      "nodes": 21,
+      "worst_actual": 465,
+      "worst_est": 1,
+      "worst_node": "VecAntiHashJoin"
+    },
+    "q22": {
+      "geomean": 7.362383068768605,
+      "max": 227.71428571428572,
+      "nodes": 10,
+      "worst_actual": 7,
+      "worst_est": 1594,
+      "worst_node": "VecProject"
+    },
+    "q3": {
+      "geomean": 4.421104271592389,
+      "max": 41.732541171565565,
+      "nodes": 12,
+      "worst_actual": 4797,
+      "worst_est": 200191,
+      "worst_node": "VecFilter"
+    },
+    "q4": {
+      "geomean": 1.3580883002769466,
+      "max": 3.2725309247987435,
+      "nodes": 9,
+      "worst_actual": 5093,
+      "worst_est": 16667,
+      "worst_node": "VecSemiHashJoin"
+    },
+    "q5": {
+      "geomean": 1.725827549794258,
+      "max": 6.098415922014622,
+      "nodes": 16,
+      "worst_actual": 98480,
+      "worst_est": 600572,
+      "worst_node": "VecScan"
+    },
+    "q6": {
+      "geomean": 1.01461315647354,
+      "max": 1.0597464197756088,
+      "nodes": 4,
+      "worst_actual": 11618,
+      "worst_est": 10963,
+      "worst_node": "VecFilter"
+    },
+    "q7": {
+      "geomean": 3.0848752180591963,
+      "max": 53.25,
+      "nodes": 18,
+      "worst_actual": 4,
+      "worst_est": 213,
+      "worst_node": "VecProject"
+    },
+    "q8": {
+      "geomean": 4.51657520209634,
+      "max": 72.44535585042219,
+      "nodes": 23,
+      "worst_actual": 8290,
+      "worst_est": 600572,
+      "worst_node": "VecScan"
+    },
+    "q9": {
+      "geomean": 7.783318493725146,
+      "max": 250.02997502081598,
+      "nodes": 17,
+      "worst_actual": 600572,
+      "worst_est": 2402,
+      "worst_node": "VecHashJoin"
+    }
+  }
+}
