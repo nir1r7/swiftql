@@ -81,13 +81,124 @@ static void collectCols(const Expr* expr, std::unordered_set<std::string>& out){
     // in THIS query, and not into the body: those names are a different scope's
     // range table, and narrowing here is by BARE NAME against one flat schema.
     // A CORRELATED ref inside the body does name an outer column that must
-    // survive narrowing, and buildScanSchema handles that conservatively by
-    // declining to narrow at all when the statement uses a subquery (see there).
+    // survive narrowing. Week 38: that is collectOuterRefs's job, not this
+    // walker's — the split is what keeps this one a pure "names THIS block
+    // writes" collector while the other answers "names a nested block reads from
+    // out here". buildScanSchema unions the two.
     if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)){
         collectCols(sq->operand.get(), out);
         return;
     }
     // IntervalLiteral: a constant, and folded away before this runs
+}
+
+// Week 38 — THE SECOND WALKER buildScanSchema's comment (below) asks for, and
+// the one that lets a subquery-bearing statement narrow its scans at all.
+//
+// It answers ONE question: which column names could a NESTED block be reading
+// from an ENCLOSING scope? Those names must survive narrowing wherever the
+// enclosing relation is scanned, because the correlated conjunct that reads them
+// is still in `stmt.where` when this runs and only becomes a join key later (at
+// lowerExistsSubqueries / lowerCorrelatedScalars, whose keys resolve against the
+// spine's schema).
+//
+// !! IT IS DELIBERATELY OVER-INCLUSIVE, on the failure-mode asymmetry
+// buildScanSchema's comment states: a column kept unnecessarily costs one
+// column's scan width, a column dropped wrongly is `column not found in schema`
+// at execution, far from the cause. Three ways it over-collects, each on
+// purpose:
+//
+//   * `depth` is not matched against `level()`. A ref one level out of a
+//     two-deep body names the MIDDLE block, not this one, and is collected all
+//     the same. Tracking which block each level lands in is exact bookkeeping
+//     whose only reward is dropping a name that must ALSO happen to match a
+//     column of the relation being narrowed to cost anything at all.
+//   * an UNRESOLVED ref (the pre-binder state, and what hand-built trees carry)
+//     is collected, because every consumer resolves it by bare name.
+//   * a DERIVED table inside a body is walked as a block of its own.
+//
+// What it does NOT collect is the depth-0 refs: those are `stmt`'s own, and
+// collectCols already has them.
+static void collectOuterRefs(const Expr* expr, std::unordered_set<std::string>& out,
+                             int depth);
+
+static void collectOuterRefs(const SelectStatement& stmt,
+                             std::unordered_set<std::string>& out, int depth) {
+    for (const auto& e : stmt.select_list) collectOuterRefs(e.get(), out, depth);
+    collectOuterRefs(stmt.where.get(), out, depth);
+    for (const auto& g : stmt.group_by) {
+        if (g.expr) { collectOuterRefs(g.expr.get(), out, depth); continue; }
+        // a plain GROUP BY item carries its ColumnId on the struct, not on an Expr
+        if (depth > 0 && (!g.id.isResolved() || !g.id.isLocal()))
+            out.insert(g.column_name);
+    }
+    collectOuterRefs(stmt.having.get(), out, depth);
+    for (const auto& item : stmt.order_by) collectOuterRefs(item.expr.get(), out, depth);
+    for (const auto& j : stmt.joins) collectOuterRefs(j.condition.get(), out, depth);
+    // A derived table is a block: its refs are written against ITS range table,
+    // so anything correlated in it is one level further out again.
+    if (stmt.from.isDerived()) collectOuterRefs(*stmt.from.body(), out, depth + 1);
+    for (const auto& j : stmt.joins)
+        if (j.relation.isDerived()) collectOuterRefs(*j.relation.body(), out, depth + 1);
+}
+
+// Same dispatch as collectCols above — a missed Expr subtype here silently drops
+// a correlated name, which is the failure this function exists to prevent, so
+// the two must be kept in lockstep.
+static void collectOuterRefs(const Expr* expr, std::unordered_set<std::string>& out,
+                             int depth) {
+    if (!expr) return;
+    if (auto* cr = dynamic_cast<const ColumnRef*>(expr)) {
+        if (depth > 0 && (!cr->id.isResolved() || !cr->id.isLocal()))
+            out.insert(cr->column_name);
+        return;
+    }
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        collectOuterRefs(bin->left.get(), out, depth);
+        collectOuterRefs(bin->right.get(), out, depth);
+        return;
+    }
+    if (auto* agg = dynamic_cast<const AggregateExpr*>(expr)) {
+        collectOuterRefs(agg->argument.get(), out, depth);
+        return;
+    }
+    if (auto* isnull = dynamic_cast<const IsNullExpr*>(expr)) {
+        collectOuterRefs(isnull->operand.get(), out, depth);
+        return;
+    }
+    if (auto* un = dynamic_cast<const UnaryExpr*>(expr)) {
+        collectOuterRefs(un->operand.get(), out, depth);
+        return;
+    }
+    if (auto* in = dynamic_cast<const InExpr*>(expr)) {
+        collectOuterRefs(in->operand.get(), out, depth);   // values are literals
+        return;
+    }
+    if (auto* lk = dynamic_cast<const LikeExpr*>(expr)) {
+        collectOuterRefs(lk->operand.get(), out, depth);
+        return;
+    }
+    if (auto* c = dynamic_cast<const CaseExpr*>(expr)) {
+        for (const auto& w : c->when_clauses) {
+            collectOuterRefs(w.condition.get(), out, depth);
+            collectOuterRefs(w.result.get(), out, depth);
+        }
+        collectOuterRefs(c->else_expr.get(), out, depth);
+        return;
+    }
+    if (auto* sub = dynamic_cast<const SubstringExpr*>(expr)) {
+        collectOuterRefs(sub->operand.get(), out, depth);
+        collectOuterRefs(sub->start.get(), out, depth);
+        collectOuterRefs(sub->length.get(), out, depth);   // nullptr-safe
+        return;
+    }
+    if (auto* sq = dynamic_cast<const SubqueryExpr*>(expr)) {
+        // The IN operand belongs to THIS scope; the body is one level in.
+        collectOuterRefs(sq->operand.get(), out, depth);
+        if (sq->subquery) collectOuterRefs(*sq->subquery, out, depth + 1);
+        return;
+    }
+    // IntervalLiteral / Literal: no column names
 }
 
 // build schema using only required columns
@@ -331,26 +442,34 @@ Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema) {
     // deliberately does not descend into (dispatch site 2: the body's names
     // belong to another scope's range table). Widening is the safe direction —
     // a narrowed-away column dies later with "column not found", far from the
-    // cause. Costs projection pushdown for subquery queries; Week 33 replaces
-    // this with the correlated columns actually referenced.
-    // Week 33, Task 8. STILL WIDENS for a correlated query, and that is a
-    // measured cost rather than an oversight. Week 31 gave projection pushdown
-    // back to MATERIALIZED subquery queries by clearing has_subquery once every
-    // node had become a constant; decorrelation cannot do the same, because this
-    // function runs while the FROM/JOIN spine is being built and the EXISTS
-    // conjunct is still in stmt.where — the extraction happens later, at
-    // lowerExistsSubqueries. So every correlated query scans its outer relation
-    // at full width.
+    // cause.
     //
-    // Narrowing correctly means collecting the outer columns the body's
-    // correlated refs name (they must survive) plus the ones the outer query
-    // uses, which is a second walker over the body — the precise-collectSlots
-    // work Week 30 handed to this week. It is a PERFORMANCE change with a real
-    // wrong-answer failure mode (a narrowed-away correlated column dies later as
-    // "column not found", far from the cause), so it is left for a week that can
-    // land it against a benchmark rather than squeezed in beside the semantics.
-    if (stmt.has_subquery) return full_schema;
+    // Week 38 CLOSED THE WIDENING. What stood here was
+    //
+    //     if (stmt.has_subquery) return full_schema;
+    //
+    // — ONE line that turned column pruning off for EVERY scan of a
+    // subquery-bearing block, on the argument that this function runs while the
+    // FROM/JOIN spine is being built (the EXISTS conjunct is still in
+    // stmt.where; the extraction happens later, at lowerExistsSubqueries), so
+    // the body's correlated refs are the outer columns nothing else in the
+    // block need name. That argument is right and the conclusion no longer
+    // follows: `collectOuterRefs` above IS the second walker Week 30 asked for
+    // and Week 33 deferred, so those names can be collected rather than
+    // approximated by "keep everything".
+    //
+    // WHAT IT COST, which is why this is worth a walker. VecScanNode
+    // materializes every schema column per chunk, copy-constructing a
+    // std::string per row for a text column — and full-width `lineitem` is 16
+    // columns including l_comment (avg 26.5 bytes, past SSO, so a heap
+    // allocation per row). Actual need against actual scan before this change:
+    // q18 2 of 16, q17 3 of 16, q21 4 of 16, q4 3 of 9 on orders.
+    //
+    // THE FAILURE MODE IS UNCHANGED and is the reason collectOuterRefs is
+    // written to over-collect: a narrowed-away column that a correlated body
+    // needs dies later as "column not found in schema", far from the cause.
     std::unordered_set<std::string> required;
+    collectOuterRefs(stmt, required, 0);
     for (const auto& expr : stmt.select_list) collectCols(expr.get(), required);
     collectCols(stmt.where.get(), required);
     for (const auto& g : stmt.group_by) {

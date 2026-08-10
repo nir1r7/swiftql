@@ -469,6 +469,13 @@ TypeId aggregateResultType(const std::string& function, TypeId arg_type);
 
 // narrowed scan schema for one table: only columns the query references;
 // returns full_schema unchanged for SELECT *
+//
+// Week 38: "the query references" now includes the OUTER columns a correlated
+// reference inside a subquery body names, collected by collectOuterRefs in the
+// .cc. Until then a statement holding any subquery widened to full_schema
+// outright. The collection is deliberately over-inclusive — see there for the
+// three ways and for why the asymmetry (a kept column costs width, a dropped one
+// is "column not found" at execution) decides them all the same way.
 Schema buildScanSchema(const SelectStatement& stmt, const Schema& full_schema);
 
 // schema of the project node's output based on the select list

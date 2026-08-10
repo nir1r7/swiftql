@@ -724,13 +724,17 @@ void materializeSubqueries(SelectStatement& stmt, const SubqueryRunner& run,
     }
 
     // The flag means "a SubqueryExpr is still in this tree". Week 32: an IN node
-    // may still be one, and the flag MUST stay set while it is — buildScanSchema
-    // widens to the full schema for as long as it is set, and the semi-join's
-    // probe key is the IN operand, which narrowing would otherwise drop. This
-    // is what returns projection pushdown to a subquery query: buildScanSchema
-    // widens to the full schema for as long as the flag is set (Week 30), which
-    // Week 30's own hand-forward note predicted would otherwise show up as a
-    // surprise in this week's first benchmark.
+    // may still be one, and the flag MUST stay set while it is, because the
+    // semi-join's probe key is the IN operand and dropping it breaks the join.
+    //
+    // **Week 37 changed HOW that protection works, and this comment used to
+    // state the old mechanism as a guarantee.** buildScanSchema no longer widens
+    // to the full schema when the flag is set — it narrows to the union of the
+    // block's own referenced columns and the outer columns nested bodies name
+    // (`collectOuterRefs`). The IN operand survives because `collectCols`
+    // collects it, not because the schema is widened. The flag still gates
+    // Planner::plan's refusal message, so it must still be accurate; what it no
+    // longer does is turn projection pushdown off wholesale.
     stmt.has_subquery = node_survives;
 
     // A substituted constant can sit under arithmetic — `> (SELECT ...) * 2` —

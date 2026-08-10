@@ -5,7 +5,7 @@
 #include "parser/expr_utils.h"
 #include <unordered_set>
 
-std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, ColumnarTable> columnar_tables){
+std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& catalog, std::unordered_map<std::string, std::vector<Row>> table_rows, std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar_tables){
     // validate
     Validator::validate(stmt, catalog);
 
@@ -206,8 +206,12 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     //
     // Nothing is lost by narrowing: buildScanSchema collects from the select
     // list, WHERE, GROUP BY, HAVING, ORDER BY and every ON condition, and
-    // returns the FULL schema for `SELECT *` or any subquery-bearing statement —
-    // so a column it drops is one no clause names. The columnar legs have run on
+    // returns the FULL schema for `SELECT *` — so a column it drops is one no
+    // clause names. **Week 37 narrowed the subquery case**: a subquery-bearing
+    // statement is no longer widened wholesale; `collectOuterRefs` gathers the
+    // columns a nested body correlates on and unions them with the block's own.
+    // The premise this paragraph rests on is unchanged (a dropped column is
+    // named by nothing), only the set of statements it applies to grew. The columnar legs have run on
     // exactly this schema since Week 30, which is the evidence that it suffices.
     //
     // Cost: one pass over the table's rows at plan time, moving Values rather
@@ -237,20 +241,16 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
     };
 
     // capture before std::move transfers ownership into SeqScanNode
-    int from_row_count = columnar_tables.count(from_table) > 0 ? columnar_tables.at(from_table).num_rows : (int)table_rows.at(from_table).size();
+    int from_row_count = columnar_tables.count(from_table) > 0 ? columnar_tables.at(from_table)->num_rows : (int)table_rows.at(from_table).size();
 
-    // Self-join: both scans read the same catalog table, keyed once in the
-    // map. The FROM scan below moves that data out, so preserve a copy for the
-    // JOIN scan. (A copy — not shared ownership — keeps this a minimal change;
-    // it costs one extra table copy, acceptable at this project's scale.)
+    // Self-join: both scans read the same catalog table, keyed once in the map.
+    // COLUMNAR storage is now SHARED — both scans hold the same image and
+    // neither moves it — so only the ROW path still has to preserve a copy
+    // before the FROM scan moves the data out.
     bool self_join = jc && jc->relation.tableName("Planner::plan JOIN") == from_table;
-    std::optional<ColumnarTable> self_join_columnar;
     std::optional<std::vector<Row>> self_join_rows;
-    if (self_join) {
-        if (columnar_tables.count(from_table) > 0)
-            self_join_columnar = columnar_tables.at(from_table);
-        else
-            self_join_rows = table_rows.at(from_table);
+    if (self_join && columnar_tables.count(from_table) == 0) {
+        self_join_rows = table_rows.at(from_table);
     }
 
     // build seqScan (bottom of tree) using narrowed schema
@@ -318,7 +318,7 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
 
     std::unique_ptr<PlanNode> node;
     if (columnar_tables.count(from_table) > 0) {
-        node = std::make_unique<SeqScanNode>(from_table, std::move(columnar_tables.at(from_table)), scan_schema, prune_hint, &hint_schema);
+        node = std::make_unique<SeqScanNode>(from_table, columnar_tables.at(from_table), scan_schema, prune_hint, &hint_schema);
     } else {
         node = std::make_unique<SeqScanNode>(
             from_table,
@@ -337,21 +337,22 @@ std::unique_ptr<PlanNode> Planner::plan(SelectStatement stmt, const Catalog& cat
         int join_row_count = self_join
             ? from_row_count
             : (columnar_tables.count(join_clause.relation.tableName("Planner::plan JOIN")) > 0
-                ? columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN")).num_rows
+                ? columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN"))->num_rows
                 : (int)table_rows.at(join_clause.relation.tableName("Planner::plan JOIN")).size());
 
         std::unique_ptr<PlanNode> right;
         if (self_join) {
-            // read from the copy preserved before the FROM scan moved the data
-            if (self_join_columnar.has_value())
-                right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(*self_join_columnar), right_scan_schema, nullptr);
+            // Columnar: the same shared image the FROM scan holds. Row storage:
+            // the copy preserved before the FROM scan moved the data.
+            if (columnar_tables.count(from_table) > 0)
+                right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), columnar_tables.at(from_table), right_scan_schema, nullptr);
             else
                 right = std::make_unique<SeqScanNode>(
                     join_clause.relation.tableName("Planner::plan JOIN"),
                     narrowRows(std::move(*self_join_rows), join_meta.schema, right_scan_schema),
                     right_scan_schema);
         } else if (columnar_tables.count(join_clause.relation.tableName("Planner::plan JOIN")) > 0) {
-            right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), std::move(columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN"))), right_scan_schema, nullptr);
+            right = std::make_unique<SeqScanNode>(join_clause.relation.tableName("Planner::plan JOIN"), columnar_tables.at(join_clause.relation.tableName("Planner::plan JOIN")), right_scan_schema, nullptr);
         } else {
             right = std::make_unique<SeqScanNode>(
                 join_clause.relation.tableName("Planner::plan JOIN"),

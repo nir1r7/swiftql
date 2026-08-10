@@ -136,10 +136,11 @@ void collectQueryTables(const SelectStatement& stmt, std::vector<std::string>& o
 // hold a SubqueryExpr?"
 //
 // SelectStatement::has_subquery answers that for ONE BLOCK ONLY, deliberately:
-// its own comment records that it drives buildScanSchema's conservative
-// widening and Planner::plan's refusal message, so propagating it upward would
-// turn projection pushdown off for every derived-table query and produce the
-// wrong Volcano refusal. So the flag must stay per-block, and the caller that
+// it drives Planner::plan's refusal message, so propagating it upward would
+// produce the wrong Volcano refusal. (Until Week 37 it ALSO drove
+// buildScanSchema's wholesale widening — that is gone; scans under a subquery
+// now narrow to the block's columns unioned with the outer columns nested
+// bodies correlate on.) So the flag must stay per-block, and the caller that
 // needs the WHOLE-TREE question needs a different question.
 //
 // Without it, main.cc's `if (stmt.has_subquery)` guard skipped materialization

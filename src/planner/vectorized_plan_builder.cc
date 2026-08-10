@@ -30,12 +30,12 @@ namespace {
 using IntNarrowingMap =
     std::unordered_map<const LogicalPlanNode*, std::vector<IntNarrowing>>;
 
-// per-build lowering state: the table map plus a remaining-use count per
-// table, so a self-join (two LogicalScans, one map entry) copies the table
-// for every scan except the last, which moves it
+// per-build lowering state: the table map, whose entries are SHARED with the
+// scan nodes. A self-join is two LogicalScans over one map entry and both scans
+// take a reference to the same image — there is no remaining-use count and no
+// copy, which is what the count used to buy.
 struct Lowering {
-    std::unordered_map<std::string, ColumnarTable>& tables;
-    std::unordered_map<std::string, int> scan_uses;
+    const std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>>& tables;
     const Catalog& catalog;   // borrowed, read-only: build-side width stats
     const IntNarrowingMap& int_narrowing;
 
@@ -579,18 +579,8 @@ OriginSets collectIntOrigins(const LogicalPlanNode* node, Arming& st) {
     return OriginSets(node->output_schema.size());
 }
 
-// count how many LogicalScans read each table (pre-pass over the whole tree)
-void countScans(const LogicalPlanNode* node, std::unordered_map<std::string, int>& uses) {
-    if (node->type == LogicalNodeType::SCAN) {
-        ++uses[static_cast<const LogicalScan*>(node)->table_name];
-    }
-    for (const auto& child : node->children) {
-        countScans(child.get(), uses);
-    }
-}
-
 // walk down children[0] to the leaf scan's table name — used to read row
-// counts for the build-side decision before lowering moves the tables
+// counts for the build-side decision
 // Week 34: NULLABLE. A DERIVED relation has no catalog table, so there is no
 // per-column avg_width to look up and no TableStats to consult — and walking
 // THROUGH it returns the BODY's base table, attributing that table's widths to
@@ -872,14 +862,15 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
     switch (node->type) {
         case LogicalNodeType::SCAN: {
             auto* scan = static_cast<LogicalScan*>(node);
-            // last scan of this table moves the data; earlier ones (self-join)
-            // copy — same one-extra-copy tradeoff as Planner::plan
-            ColumnarTable table = (--scan_uses.at(scan->table_name) > 0)
-                ? tables.at(scan->table_name)
-                : std::move(tables.at(scan->table_name));
+            // Every scan of this table shares ONE image of it. This was a
+            // use-counted copy — the last scan moved the table out, earlier ones
+            // deep-copied it — and the copy was the single largest plan-time cost
+            // in the benchmark: 344.3ms on TPC-H q21 at SF=1, which scans
+            // lineitem three times. The scan only ever READS the table, so the
+            // copy bought nothing.
             return std::make_unique<VecScanNode>(
-                scan->table_name, std::move(table), scan->output_schema, pruning_where,
-                hint_schema);
+                scan->table_name, tables.at(scan->table_name), scan->output_schema,
+                pruning_where, hint_schema);
         }
 
         // Week 34 — a derived relation lowers to its BODY's operator tree and
@@ -965,9 +956,9 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
                 // rather than throwing out of a map lookup on a legal query.
                 const std::string* fp = leafScanTableOrNull(join->children[0].get());
                 const std::string* jp = leafScanTableOrNull(join->children[1].get());
-                from_est = fp ? tables.at(*fp).num_rows
+                from_est = fp ? tables.at(*fp)->num_rows
                               : std::max(1.0, join->children[0]->estimated_rows);
-                join_est = jp ? tables.at(*jp).num_rows
+                join_est = jp ? tables.at(*jp)->num_rows
                               : std::max(1.0, join->children[1]->estimated_rows);
             }
 
@@ -1325,7 +1316,7 @@ std::unique_ptr<VecPlanNode> Lowering::lowerNode(LogicalPlanNode* node, const Ex
 
 std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         std::unique_ptr<LogicalPlanNode> logical,
-        std::unordered_map<std::string, ColumnarTable> columnar_tables,
+        std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> columnar_tables,
         const Catalog& catalog,
         bool result_int_type_observable) {
     // BEFORE lowering, not during: lowerNode MOVES the expressions out of the
@@ -1404,7 +1395,6 @@ std::unique_ptr<VecPlanNode> VectorizedPlanBuilder::build(
         }
     }
 
-    Lowering lowering{columnar_tables, {}, catalog, arming.mask};
-    countScans(logical.get(), lowering.scan_uses);
+    Lowering lowering{columnar_tables, catalog, arming.mask};
     return lowering.lower(logical.get(), nullptr);
 }

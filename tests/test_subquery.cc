@@ -319,19 +319,75 @@ TEST(SubqueryMaterialization, TheWalkerReachesASubqueryInsideEveryContainerNode)
     }
 }
 
-// Clearing has_subquery is what returns projection pushdown to a subquery query:
-// buildScanSchema widens to the full schema while the flag is set (Week 30).
-TEST(SubqueryMaterialization, ClearingTheFlagRestoresScanNarrowing) {
+// Week 30 made clearing has_subquery the thing that returned projection pushdown
+// to a subquery query, because buildScanSchema widened to the full schema while
+// the flag was set.
+//
+// !! WEEK 38 REMOVED THAT COUPLING, and this test now asserts its absence. The
+// widening was one line covering a real hazard — a correlated ref inside a body
+// names an outer column that must survive narrowing — with a blunt instrument
+// that cost EVERY subquery-bearing block its column pruning. collectOuterRefs
+// collects those names instead, so narrowing no longer depends on the flag at
+// all, before OR after materialization. What materialization still buys here is
+// the fold that turns the predicate into ColumnRef-op-Literal; see
+// RefoldsArithmeticAroundTheSubstitutedConstant.
+TEST(SubqueryMaterialization, ScanNarrowingNoLongerDependsOnTheSubqueryFlag) {
     Catalog cat(CATALOG);
     auto stmt = bindOnly("SELECT team FROM laps WHERE speed > (SELECT AVG(speed) FROM laps)", cat);
     const Schema& full = cat.getTable("laps").schema;
-    EXPECT_EQ(buildScanSchema(stmt, full).size(), full.size())
-        << "before materialization the widening is the conservative answer";
+    ASSERT_TRUE(stmt.has_subquery);
+    const Schema before = buildScanSchema(stmt, full);
+    EXPECT_EQ(before.size(), 2) << "team and speed, with the flag still set";
 
     materializeSubqueries(stmt, canned({oneCol("AVG(speed)", TypeId::DOUBLE),
                                         {Row{Value(1.0)}}}));
-    EXPECT_LT(buildScanSchema(stmt, full).size(), full.size())
-        << "after it, only team and speed are needed";
+    ASSERT_FALSE(stmt.has_subquery);
+    const Schema after = buildScanSchema(stmt, full);
+    EXPECT_EQ(after.size(), before.size());
+    for (int i = 0; i < after.size(); ++i)
+        EXPECT_EQ(after.column(i).name, before.column(i).name);
+}
+
+// THE HAZARD THE OLD WIDENING COVERED, now covered precisely. The body's
+// `l.driver_id` is the ONLY thing in the whole statement that names the outer
+// driver_id — collectCols does not descend into a body (dispatch site 2: those
+// names belong to another scope's range table), so without collectOuterRefs the
+// column is narrowed away and the decorrelated join key dies later as "column
+// not found in schema", far from the cause.
+TEST(SubqueryMaterialization, ACorrelatedBodyKeepsTheOuterColumnItNames) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT l.lap_id FROM laps l WHERE EXISTS "
+                         "(SELECT * FROM drivers d WHERE d.driver_id = l.driver_id)", cat);
+    const Schema& full = cat.getTable("laps").schema;
+    const Schema narrowed = buildScanSchema(stmt, full);
+
+    EXPECT_GE(narrowed.indexOf("lap_id"), 0);
+    EXPECT_GE(narrowed.indexOf("driver_id"), 0)
+        << "the correlated column must survive narrowing";
+    // ...and the narrowing is real: seven of nine laps columns are gone, which is
+    // the whole point of closing the widening.
+    EXPECT_EQ(narrowed.size(), 2);
+    EXPECT_LT(narrowed.indexOf("team"), 0);
+    EXPECT_LT(narrowed.indexOf("speed"), 0);
+}
+
+// The body's OWN names must not leak outward. `l2.team` is a position in the
+// BODY's range table; only a level-1 ref names this block. The collection is
+// over-inclusive by design, but not to the point of putting every body name back
+// — that would be the old widening with extra steps. The body scans the SAME
+// table as the outer block, so a leak would be visible rather than harmless.
+TEST(SubqueryMaterialization, ABodysLocalNamesDoNotWidenTheOuterScan) {
+    Catalog cat(CATALOG);
+    auto stmt = bindOnly("SELECT l.lap_id FROM laps l WHERE l.driver_id IN "
+                         "(SELECT l2.driver_id FROM laps l2 WHERE l2.team = 'x')", cat);
+    const Schema& full = cat.getTable("laps").schema;
+    const Schema narrowed = buildScanSchema(stmt, full);
+    // lap_id (SELECT list) and driver_id (the IN operand, which belongs to THIS
+    // scope). Nothing else — `team` is the body's.
+    EXPECT_EQ(narrowed.size(), 2);
+    EXPECT_GE(narrowed.indexOf("lap_id"), 0);
+    EXPECT_GE(narrowed.indexOf("driver_id"), 0);
+    EXPECT_LT(narrowed.indexOf("team"), 0);
 }
 
 // A substituted constant under arithmetic must be folded back into the
