@@ -17,6 +17,7 @@ add_executable(swiftql_tests
     test_cost_model.cc
     test_simd_loop_join.cc
     test_sort_tiebreak.cc
+    test_key_encoding_parity.cc
     test_int_double_materialization.cc
     test_int_double_type_through_division.cc
     test_int_double_arithmetic_result.cc
