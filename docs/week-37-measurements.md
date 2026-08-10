@@ -302,16 +302,26 @@ invocation, each capped at 600 s covering 1 warmup + 3 repetitions:
 |---|---|---|---|---|
 | q17 | 1367 ms | **did not finish** | **did not finish** | 49 ms |
 | q21 | 2566 ms | **did not finish** | **did not finish** | 666 ms |
-| q22 | 107 ms | **did not finish** | **did not finish** | 24 ms |
+| q22 | 107 ms | **413 273 ms** (one execution) | 283 ms | 24 ms |
 | q19 | 379 ms | 3827 ms | 214 ms | 13.6 ms |
 | q18 | 2718 ms | 1998 ms | 1315 ms | 802 ms |
 | q20 | 45 ms | 49 ms | 27 ms | 37 ms |
 | q13 | 1739 ms | 4223 ms | 252 ms | 319 ms |
 
-**Precision about "did not finish":** the cap covered a warmup plus three
-repetitions, i.e. up to four executions. It therefore proves *four executions
-exceed 600 s*, NOT that one execution does. A single-execution lower bound would
-need `--reps 1 --warmups 0` against a longer cap, and is not claimed here.
+**Precision about "did not finish":** that cap covered a warmup plus three
+repetitions, i.e. up to four executions. It proved *four executions exceed
+600 s*, not that one does.
+
+**Re-run at `--reps 1 --warmups 0` with a 3600 s cap, and the refinement matters
+— the two engines are NOT alike here.** On q22, one execution measures
+**SQLite 413 273 ms (6.9 minutes)** against **PostgreSQL 282.6 ms**. So the
+earlier "neither finished" was an artifact of timing four executions of a
+7-minute query: PostgreSQL without indexes handles q22 perfectly well, and
+SQLite without indexes does not. Against SwiftQL's 107 ms that is a **3 860x**
+gap to SQLite and a 2.6x gap to PostgreSQL.
+
+The earlier row is corrected accordingly. This is exactly why the
+single-execution bound was worth running rather than quoting the cap.
 
 Three readings, and the third is the one that keeps this honest:
 
