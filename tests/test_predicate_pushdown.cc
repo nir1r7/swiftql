@@ -94,17 +94,17 @@ static void seedDriversStats(Catalog& cat) {
 }
 
 // Load columnar tables the statement touches (mirrors test_vec_plan_builder.cc).
-static std::unordered_map<std::string, ColumnarTable> loadColumnar(
+static std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> loadColumnar(
         const SelectStatement& stmt, const Catalog& cat) {
-    std::unordered_map<std::string, ColumnarTable> tables;
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
     const auto& fm = cat.getTable(stmt.from.tableName("test loader"));
     tables.emplace(stmt.from.tableName("test loader"),
-                   CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema));
+                   std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(fm.filepath, fm.schema), fm.schema)));
     for (const auto& j : stmt.joins) {
         if (tables.count(j.relation.tableName("test loader"))) continue;   // self-join: load once
         const auto& jm = cat.getTable(j.relation.tableName("test loader"));
         tables.emplace(j.relation.tableName("test loader"),
-                       CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema));
+                       std::make_shared<const ColumnarTable>(CSVToColumnar::convert(CSVLoader::load(jm.filepath, jm.schema), jm.schema)));
     }
     return tables;
 }
@@ -358,9 +358,9 @@ TEST(PredicatePushdown, JoinSidePruningActuallySkipsChunks) {
         {Value(int64_t(3)), Value(int64_t(5)), Value(std::string("t")),
          Value(300.0), Value(1.0), Value(1.0), Value(1.0), Value(int64_t(2024)), Value(int64_t(1))},
     };
-    std::unordered_map<std::string, ColumnarTable> tables;
-    tables.emplace("drivers", CSVToColumnar::convert(drows, dschema));
-    tables.emplace("laps", CSVToColumnar::convert(lrows, lschema));
+    std::unordered_map<std::string, std::shared_ptr<const ColumnarTable>> tables;
+    tables.emplace("drivers", std::make_shared<const ColumnarTable>(CSVToColumnar::convert(drows, dschema)));
+    tables.emplace("laps", std::make_shared<const ColumnarTable>(CSVToColumnar::convert(lrows, lschema)));
 
     auto logical = LogicalPlanBuilder::build(std::move(stmt), cat);
     logical = PredicatePushdown::apply(std::move(logical), cat);
@@ -1595,4 +1595,120 @@ TEST(PredicatePushdown, RaisingOnResidualOnADeeperLeftJoinStillStopsThePush) {
     EXPECT_EQ(static_cast<const LogicalJoin*>(left_join)->join_type, JoinType::LEFT);
     EXPECT_EQ(left_join->children[0]->type, LogicalNodeType::SCAN)
         << "the screen must be re-applied at every join on the way down";
+}
+
+
+// ===== Week 38: single-relation restrictions derived from an OR =====
+
+// splitConjuncts splits on AND only, so a WHERE that is ONE top-level OR gives
+// soleSlot a multi-relation slot set, it returns -1, and NOTHING is pushed. That
+// is TPC-H q19's whole plan: a full lineitem x part hash join with no filter on
+// either side. The derivation is (A1 AND X1) OR (A2 AND X2) => A1 OR A2, taken
+// per relation slot — sound because it is strictly WEAKER, and redundant because
+// the original OR stays exactly where it was.
+TEST(PredicatePushdown, OrConjunctYieldsAPushedRestrictionForEachRelation) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+        "WHERE (a.val > 100 AND b.val > 150) OR (a.val < 10 AND b.val < 20)", cat);
+
+    auto predicateOf = [](const LogicalPlanNode* n) {
+        return exprToString(static_cast<const LogicalFilter*>(n)->predicate.get());
+    };
+
+    // The original OR is unchanged and still above the join: it names two
+    // relations, so it was never pushable and nothing here replaced it.
+    ASSERT_EQ(plan->type, LogicalNodeType::PROJECT);
+    ASSERT_EQ(plan->children[0]->type, LogicalNodeType::FILTER);
+    const std::string residual = predicateOf(plan->children[0].get());
+    EXPECT_NE(residual.find("100"), std::string::npos) << residual;
+    EXPECT_NE(residual.find("150"), std::string::npos) << residual;
+
+    const LogicalPlanNode* join = plan->children[0]->children[0].get();
+    ASSERT_EQ(join->type, LogicalNodeType::JOIN);
+
+    // relation 0 got `a.val > 100 OR a.val < 10` and NOTHING of b's
+    ASSERT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    const std::string rel0 = predicateOf(join->children[0].get());
+    EXPECT_NE(rel0.find("100"), std::string::npos) << rel0;
+    EXPECT_NE(rel0.find("10"), std::string::npos) << rel0;
+    EXPECT_EQ(rel0.find("150"), std::string::npos) << rel0;
+    EXPECT_EQ(join->children[0]->children[0]->type, LogicalNodeType::SCAN);
+
+    // relation 1 got `b.val > 150 OR b.val < 20`
+    ASSERT_EQ(join->children[1]->type, LogicalNodeType::FILTER);
+    const std::string rel1 = predicateOf(join->children[1].get());
+    EXPECT_NE(rel1.find("150"), std::string::npos) << rel1;
+    EXPECT_NE(rel1.find("20"), std::string::npos) << rel1;
+    EXPECT_EQ(rel1.find("100"), std::string::npos) << rel1;
+}
+
+// A disjunct that places NO restriction on a relation makes the disjunction over
+// all of them TRUE, so there is nothing to derive for that relation. Deriving
+// one anyway would be the wrong-answer direction: a predicate STRONGER than the
+// OR removes rows the OR keeps.
+TEST(PredicatePushdown, ARelationUnrestrictedByOneDisjunctGetsNoDerivedPredicate) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+        "WHERE (a.val > 100 AND b.val > 150) OR a.val < 10", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    // b is unrestricted by the second disjunct: its scan stays bare.
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::SCAN);
+    // a is restricted by both, so it still gets one.
+    ASSERT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    const std::string rel0 =
+        exprToString(static_cast<const LogicalFilter*>(join->children[0].get())->predicate.get());
+    EXPECT_EQ(rel0.find("150"), std::string::npos) << rel0;
+}
+
+// An OR that already names ONE relation is routed by soleSlot as it stands. The
+// derivation must not also emit a copy of it — the derived conjunct would be the
+// original, evaluated twice.
+TEST(PredicatePushdown, ASingleRelationOrIsNotDuplicated) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+        "WHERE (a.val > 100 AND a.id > 1) OR a.val < 10", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    ASSERT_EQ(join->children[0]->type, LogicalNodeType::FILTER);
+    // ONE conjunct: a second LogicalFilter or a top-level AND would both be the
+    // duplicate this guard exists to prevent.
+    const auto* f = static_cast<const LogicalFilter*>(join->children[0].get());
+    std::vector<std::unique_ptr<Expr>> parts;
+    splitConjuncts(cloneExpr(f->predicate.get()), parts);
+    EXPECT_EQ(parts.size(), 1u) << exprToString(f->predicate.get());
+    EXPECT_EQ(f->children[0]->type, LogicalNodeType::SCAN);
+}
+
+// THE TOTALITY SCREEN. Adding a conjunct changes the row set of every conjunct
+// after it, so a filter list holding ANY conjunct that can raise derives
+// nothing: a derived predicate placed ahead of the raiser would mask a raise the
+// written order owed. Same rule, same reason, as every other move in this file —
+// and the one whose failure mode is a wrong answer rather than a slow plan.
+TEST(PredicatePushdown, ARaisingConjunctInTheFilterBlocksTheOrDerivation) {
+    Catalog cat(CATALOG);
+    auto plan = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+        "WHERE ((a.val > 100 AND b.val > 150) OR (a.val < 10 AND b.val < 20)) "
+        "  AND a.id * 1000000000000000 > 0", cat);
+
+    const LogicalPlanNode* join = findNode(plan.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(join, nullptr);
+    EXPECT_EQ(join->children[0]->type, LogicalNodeType::SCAN)
+        << "nothing may be derived once the list holds a raising conjunct";
+    EXPECT_EQ(join->children[1]->type, LogicalNodeType::SCAN);
+
+    // CONTROL: the same query WITHOUT the raising conjunct does derive both.
+    auto ok = buildPushed(
+        "SELECT a.id FROM sj a JOIN sj b ON a.grp = b.id "
+        "WHERE (a.val > 100 AND b.val > 150) OR (a.val < 10 AND b.val < 20)", cat);
+    const LogicalPlanNode* ok_join = findNode(ok.get(), LogicalNodeType::JOIN);
+    ASSERT_NE(ok_join, nullptr);
+    EXPECT_EQ(ok_join->children[0]->type, LogicalNodeType::FILTER);
+    EXPECT_EQ(ok_join->children[1]->type, LogicalNodeType::FILTER);
 }

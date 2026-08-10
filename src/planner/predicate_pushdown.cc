@@ -5,6 +5,7 @@
 #include "parser/expr_totality.h"  // the totality screen: exprMayRaise / firstMayRaise
 #include <algorithm>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -166,6 +167,157 @@ int soleSlot(const Expr* conjunct) {
     collectSlots(conjunct, slots);
     if (slots.size() == 1 && !slots.count(-1)) return *slots.begin();
     return -1;
+}
+
+// Flatten an OR chain, BORROWING. The mirror of splitConjuncts (expr_utils.h)
+// for the other connective; AND / comparison / IS NULL are indivisible here
+// exactly as OR is there.
+void flattenOr(const Expr* expr, std::vector<const Expr*>& out) {
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        if (bin->op == "OR") {
+            flattenOr(bin->left.get(), out);
+            flattenOr(bin->right.get(), out);
+            return;
+        }
+    }
+    out.push_back(expr);
+}
+
+// Flatten an AND chain, BORROWING. Same split splitConjuncts makes, without
+// taking ownership — this pass has to read one disjunct's conjuncts while the
+// disjunct stays where it is.
+void flattenAnd(const Expr* expr, std::vector<const Expr*>& out) {
+    if (auto* bin = dynamic_cast<const BinaryExpr*>(expr)) {
+        if (bin->op == "AND") {
+            flattenAnd(bin->left.get(), out);
+            flattenAnd(bin->right.get(), out);
+            return;
+        }
+    }
+    out.push_back(expr);
+}
+
+std::unique_ptr<Expr> makeOr(std::unique_ptr<Expr> l, std::unique_ptr<Expr> r) {
+    auto e = std::make_unique<BinaryExpr>();
+    e->op = "OR";
+    e->left = std::move(l);
+    e->right = std::move(r);
+    return e;
+}
+
+// ── WEEK 38 — SINGLE-RELATION RESTRICTIONS DERIVED FROM AN OR ───────────────
+//
+// splitConjuncts splits on AND only, deliberately (expr_utils.h: which subtrees
+// count as one conjunct is a semantic decision the lowering shares). So a WHERE
+// that is ONE top-level OR gives soleSlot a multi-relation slot set, it returns
+// -1, and NOTHING is pushed. TPC-H q19 is exactly that shape and its fingerprint
+// was `opt = 1.00x` at every scale factor: a full 6M-row lineitem × 200k-row part
+// hash join with no filter on either side, then a three-way disjunction evaluated
+// on 6M materialized rows, to return one row.
+//
+// The derivation is the standard one:
+//
+//     (A1 ∧ X1) ∨ (A2 ∧ X2) ∨ (A3 ∧ X3)   ⟹   A1 ∨ A2 ∨ A3
+//
+// taken PER RELATION SLOT: for each slot that EVERY disjunct restricts, the
+// disjunction of that disjunct's slot-local conjuncts is a sound consequence of
+// the whole OR, names one relation, and therefore pushes.
+//
+// !! IT IS REDUNDANT AND STRICTLY WEAKER, and both halves are load-bearing.
+// WEAKER is what makes it sound: if the original OR is TRUE then some disjunct
+// is TRUE, so that disjunct's slot-local conjuncts are TRUE, so the derived
+// disjunction is TRUE. A filter keeps only TRUE, so the derived conjunct cannot
+// remove a row the original keeps — under three-valued logic and after
+// null-extension alike, since it names only columns of one relation and its
+// value on a row does not depend on where it is evaluated. REDUNDANT is why the
+// original conjunct STAYS: nothing here replaces it.
+//
+// THE SCREEN IS THE SAME ONE EVERY OTHER MOVE IN THIS FILE USES. Adding a
+// conjunct changes the row set of every conjunct after it and of every
+// expression above the filter, so it is a decision about whether the query
+// ERRORS. Two conditions, both checked:
+//   1. EVERY conjunct of the filter is TOTAL (firstMayRaise == size). A derived
+//      conjunct inserted ahead of a raising one would mask a raise it was owed;
+//      one derived FROM a list that already froze would be reasoning about an
+//      arrangement the engines do not run.
+//   2. the derived conjunct is itself TOTAL (conjunctMayRaise). It is evaluated
+//      on rows the written query never evaluated it on — every row of one
+//      relation, once it is pushed — so it may not raise on any of them.
+// That combination is what ChunkPruner::shouldSkip applies, for the same reason.
+// Getting it wrong turns an overflow error into a wrong answer.
+//
+// Returns the derived conjuncts for ONE original conjunct; empty when it is not
+// an OR, when no slot is restricted by every disjunct, or when the screen fails.
+std::vector<std::unique_ptr<Expr>> orRestrictions(const Expr* conjunct,
+                                                  const Schema& schema) {
+    std::vector<std::unique_ptr<Expr>> derived;
+    std::vector<const Expr*> disjuncts;
+    flattenOr(conjunct, disjuncts);
+    if (disjuncts.size() < 2) return derived;   // not an OR at all
+
+    // Per disjunct: its atoms, and those atoms bucketed by the ONE relation slot
+    // each names. An atom naming several relations (or none) restricts no single
+    // relation and simply contributes nothing.
+    std::vector<std::vector<const Expr*>> atoms(disjuncts.size());
+    std::vector<std::map<int, std::vector<const Expr*>>> local(disjuncts.size());
+    std::set<int> candidates;
+    for (size_t d = 0; d < disjuncts.size(); ++d) {
+        flattenAnd(disjuncts[d], atoms[d]);
+        for (const Expr* a : atoms[d]) {
+            int slot = soleSlot(a);
+            if (slot >= 0) local[d][slot].push_back(a);
+        }
+        if (d == 0) {
+            for (const auto& entry : local[0]) candidates.insert(entry.first);
+        } else {
+            // A slot missing from ONE disjunct means that disjunct places no
+            // restriction on it, so the disjunction over all of them is TRUE and
+            // there is nothing to derive.
+            for (auto it = candidates.begin(); it != candidates.end(); ) {
+                if (local[d].count(*it)) ++it;
+                else it = candidates.erase(it);
+            }
+        }
+        if (candidates.empty()) return derived;
+    }
+
+    for (int slot : candidates) {
+        // Nothing to derive when every atom of every disjunct already belongs to
+        // this slot: soleSlot answers `slot` for the WHOLE conjunct and the
+        // caller pushes it as it stands, so a copy would be pure duplication.
+        bool whole = true;
+        for (size_t d = 0; d < disjuncts.size() && whole; ++d)
+            whole = atoms[d].size() == local[d][slot].size();
+        if (whole) continue;
+
+        std::unique_ptr<Expr> acc;
+        for (size_t d = 0; d < disjuncts.size(); ++d) {
+            std::vector<std::unique_ptr<Expr>> parts;
+            for (const Expr* a : local[d][slot]) parts.push_back(cloneExpr(a));
+            std::unique_ptr<Expr> arm = conjoinAll(std::move(parts));
+            acc = acc ? makeOr(std::move(acc), std::move(arm)) : std::move(arm);
+        }
+        if (acc && !conjunctMayRaise(acc.get(), schema)) derived.push_back(std::move(acc));
+    }
+    return derived;
+}
+
+// Append every sound single-relation restriction the filter's OR conjuncts
+// imply. See orRestrictions for the derivation and for both halves of the
+// screen; the all-total precondition is checked here because it is a property of
+// the LIST, not of one conjunct.
+void deriveOrRestrictions(std::vector<std::unique_ptr<Expr>>& conjuncts,
+                          const Schema& schema) {
+    if (firstMayRaise(conjuncts, schema) != conjuncts.size()) return;
+    std::vector<std::unique_ptr<Expr>> derived;
+    for (const auto& c : conjuncts) {
+        for (auto& d : orRestrictions(c.get(), schema)) derived.push_back(std::move(d));
+    }
+    // AT THE END, so every conjunct the user wrote keeps its written position and
+    // the leftover/residual bookkeeping below stays in written order. Position is
+    // free of consequence here only because the precondition above makes the
+    // whole list total.
+    for (auto& d : derived) conjuncts.push_back(std::move(d));
 }
 
 // Re-stamp every ColumnRef in a pushed conjunct to the given slot. A conjunct
@@ -579,6 +731,13 @@ std::unique_ptr<LogicalPlanNode> pushIntoJoin(std::unique_ptr<LogicalFilter> fil
 
     std::vector<std::unique_ptr<Expr>> conjuncts;
     splitConjuncts(std::move(filter->predicate), conjuncts);   // filter is now empty
+
+    // Week 38 — BEFORE the freeze index and the bucketing, because the derived
+    // conjuncts are ordinary conjuncts from here down: soleSlot routes them,
+    // distribute places them, orderByWork ranks them and the leftover loop
+    // degrades them. See deriveOrRestrictions for why adding one is a totality
+    // decision and not only a plan-quality one.
+    deriveOrRestrictions(conjuncts, join_schema);
 
     // Seam audit pass 3, B3-2. The SECOND half of the totality screen, and the
     // one a fix confined to orderByWork would have missed: pushing a conjunct

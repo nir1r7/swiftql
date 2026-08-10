@@ -54,6 +54,17 @@
 // query with no raising conjunct, which is every TPC-H query and every harness
 // entry.
 //
+// Week 38 adds a FIFTH move, and it is the first one that INVENTS a conjunct
+// rather than relocating one: from a top-level OR whose every disjunct restricts
+// the same relation, it derives that relation's disjunction — the sound WEAKER
+// consequence (A1 ∧ X1) ∨ (A2 ∧ X2) ⟹ A1 ∨ A2 — and appends it, leaving the
+// original OR exactly where it was. The move is what gives TPC-H q19 a filter on
+// either side of its join at all; splitConjuncts splits on AND only, so its
+// single OR conjunct had a multi-relation slot set and nothing was pushed.
+// Because the derived conjunct is ADDED, its screen is the list-wide one: every
+// conjunct of the filter must be total AND the derived conjunct must be total.
+// See deriveOrRestrictions / orRestrictions in the .cc.
+//
 // Since Week 37 the pass also ENTERS a derived relation's body (seam audit pass 3,
 // B3-3) and DESCENDS past the first node it can rewrite (pass 2, B-2) — it used
 // to return from the FILTER-over-JOIN branch, so a body was optimized only when
