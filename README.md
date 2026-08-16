@@ -5,7 +5,7 @@ A toy analytical SQL engine built in C++, designed as a learning project targeti
 > **Project thesis:** *"I built a correct SQL engine, then made storage smarter, then made execution significantly faster — and measured every step."*
 
 ---
- 
+  
 ## Table of Contents
 
 - [Project Overview](#project-overview)
