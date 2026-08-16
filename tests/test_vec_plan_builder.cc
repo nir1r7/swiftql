@@ -547,8 +547,16 @@ static void seedSimdStats(Catalog& cat) {
     laps.columns.emplace("speed", speed);
     cat.setStats("laps", std::move(laps));
 
-    TableStats drivers;   // tiny INT-keyed build side — prime SIMD territory
-    drivers.row_count = 4;
+    // A ONE-ROW INT-keyed build side. This was 4 rows until Week 37, when the
+    // hash-join rewrite moved the measured crossover below 2 (cost_model.h
+    // records the numbers), so 4 rows no longer selects the loop join and these
+    // tests were asserting a selection the cost model had stopped making. The
+    // size is lowered rather than the assertion weakened: what these tests
+    // exist to cover is the SELECTION MACHINERY — that the builder can choose
+    // the operator, reports the rejected alternative, and refuses it for an
+    // outer join — and that machinery is unchanged.
+    TableStats drivers;
+    drivers.row_count = 1;
     cat.setStats("drivers", std::move(drivers));
 }
 

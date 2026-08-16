@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include "planner/cost_model.h"
 
 // ===== Build-side rule as arithmetic =====
@@ -36,8 +37,25 @@ TEST(CostModel, ZeroRowsAreFiniteAndNonNegative) {
 
 // A tiny build side is the loop join's whole reason to exist: with a handful
 // of build keys the flat SIMD scan must cost less than hashing every probe key.
-TEST(CostModel, SimdLoopWinsOnTinyBuild) {
-    EXPECT_LT(simdLoopJoinCost(4, 16, 100000), hashJoinCost(4, 16, 100000));
+// The crossover the model expresses must be the crossover the CONSTANT encodes,
+// so this test derives the boundary from CPU_SIMD_COMPARE instead of hardcoding a
+// build size. It used to assert that a 4-row build side favours the loop join,
+// which was true against the Week 23.5 hash join (measured crossover 52-57 rows)
+// and became FALSE in Week 37, when VecHashJoinNode was rewritten and the
+// re-measured crossover fell below 2 rows. A hardcoded size makes the test a
+// record of one calibration; deriving it makes the test track the calibration.
+TEST(CostModel, SimdLoopWinsOnlyBelowTheCalibratedCrossover) {
+    // For a large probe the modelled crossover is B* ~ 1 / CPU_SIMD_COMPARE.
+    const double b_star = 1.0 / CPU_SIMD_COMPARE;
+    const double probe = 100000;
+
+    // Strictly below B*, the loop join must win.
+    const double below = std::max(1.0, b_star - 1.0);
+    EXPECT_LT(simdLoopJoinCost(below, 16, probe), hashJoinCost(below, 16, probe));
+
+    // Comfortably above it, the quadratic probe term must price it out.
+    const double above = b_star * 4.0;
+    EXPECT_GT(simdLoopJoinCost(above, 16, probe), hashJoinCost(above, 16, probe));
 }
 
 // The probe term is quadratic (every probe row scans every build key), so a

@@ -436,10 +436,32 @@ WEEK24_QUERIES = [
 # --explain's Physical Plan (see run_join_steering), so the steering stays
 # true as data stats or cost constants drift instead of silently all
 # degrading to one algorithm while the output checks keep passing.
+#
+# WEEK 37 INVERTED THREE OF THESE FOUR, AND THE ASSERTION IS WHAT CAUGHT IT.
+#
+# Week 23.5 measured the hash/SIMD crossover at 52-57 build rows, so a 20-row
+# `drivers` build side selected the loop join and these three entries recorded
+# that. Week 37 rewrote VecHashJoinNode (column-wise build store, chained index,
+# INT64 key path, late-materialized output) and re-ran
+# benchmarks/calibrate_join_crossover.cc: the hash join now wins at EVERY build
+# size the harness tests, down to 2 rows. At 1M probe rows and build=32 it is
+# 5.8ms against the loop join's 19.1ms.
+#
+# So CPU_SIMD_COMPARE moved 0.02 -> 0.5 and a 20-row build side now correctly
+# picks the hash join. These entries are updated to the operator the COST MODEL
+# now chooses, which is also the operator the STOPWATCH now prefers -- measured
+# end to end, `benchmark.py`'s optimizer impact on this exact query went from
+# 0.34x (the optimizer making it 2.9x SLOWER) to 0.98x.
+#
+# This is not a weakened assertion: it still pins a specific operator per query,
+# it still fails if the steering degrades, and `w23_5_hash_string_key` still
+# covers the ineligibility path. What changed is the measured fact underneath.
+# The loop join remains reachable only for a build side below 2 rows, which is
+# what the calibration data supports and no more.
 WEEK23_5_EXPECTED_JOIN = {
-    "w23_5_simd_unfiltered_join": "VecSimdLoopJoin",
-    "w23_5_simd_filtered_probe":  "VecSimdLoopJoin",
-    "w23_5_simd_swapped_build":   "VecSimdLoopJoin",
+    "w23_5_simd_unfiltered_join": "VecHashJoin",
+    "w23_5_simd_filtered_probe":  "VecHashJoin",
+    "w23_5_simd_swapped_build":   "VecHashJoin",
     "w23_5_hash_string_key":      "VecHashJoin",
 }
 

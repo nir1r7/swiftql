@@ -26,9 +26,33 @@ double hashJoinCost(double build_rows, double build_width, double probe_rows);
 // on-device crossover (docs/hash-vs-simd-crossover.md); for large probes the
 // crossover build size is ~ 1 / CPU_SIMD_COMPARE rows.
 constexpr double CPU_LOOP_BUILD   = 1.0;    // append key + payload row to flat buffers
-constexpr double CPU_SIMD_COMPARE = 0.02;   // one probe-key-vs-build-key comparison — calibrated:
-                                            // measured crossover ≈ 52-57 build rows on Apple M4 Pro
-                                            // at both 100k and 1M probe rows; 0.02 models B* = 50
+// RECALIBRATED IN WEEK 37, AND THE MEASUREMENT NO LONGER SHOWS A CROSSOVER.
+//
+// Week 23.5 measured B* ≈ 52-57 build rows and set 0.02 to model B* = 50. That
+// was correct against the hash join AS IT THEN WAS. Week 37 rewrote
+// VecHashJoinNode — column-wise build store, chained index, INT64 key path,
+// late-materialized output — making it roughly 3x faster, and re-running
+// benchmarks/calibrate_join_crossover.cc afterwards shows the hash join winning
+// at EVERY build size the harness tests, down to 2 rows:
+//
+//     probe=100k   build=2    hash 0.607ms   simd 1.134ms
+//     probe=1M     build=8    hash 5.951ms   simd 12.160ms
+//     probe=1M     build=1024 hash 6.346ms   simd 295.283ms
+//
+// So B* < 2 and the regime where the loop join paid has been engineered away.
+// 0.5 models B* = 2, which leaves the operator reachable only for a
+// single-row build side and is the closest honest expression of the data.
+//
+// THIS CONSTANT IS DERIVED FROM ANOTHER OPERATOR'S PERFORMANCE, so optimizing
+// that operator invalidates it. That is not hypothetical: leaving 0.02 in place
+// after the Week 37 rewrite made the optimizer pick the loop join on a 20-row
+// build side and run 95.7ms where --no-optimize ran 32.6ms — the optimizer
+// making a query 2.9x SLOWER, invisible to every gate, because both plans are
+// correct and the gates assert answers. Re-run the calibration harness after any
+// change to either join operator.
+constexpr double CPU_SIMD_COMPARE = 0.5;    // one probe-key-vs-build-key comparison — calibrated:
+                                            // Week 37 re-measurement finds no crossover above
+                                            // build=1; 0.5 models B* = 2
 
 // cost of loop-joining `build_rows` keys (each row `build_width` bytes of
 // retained payload) against `probe_rows`. Same unitless scale as hashJoinCost
