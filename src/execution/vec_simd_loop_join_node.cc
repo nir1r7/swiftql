@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <chrono>
 #include <numeric>
+#include <type_traits>
+#include <variant>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -11,14 +13,40 @@
 
 VecSimdLoopJoinNode::VecSimdLoopJoinNode(std::unique_ptr<VecPlanNode> probe_child, std::unique_ptr<VecPlanNode> build_child, int probe_key_index, int build_key_index, Schema output_schema, bool swapped, bool use_simd) : probe_child_(std::move(probe_child)), build_child_(std::move(build_child)), probe_key_idx_(probe_key_index), build_key_idx_(build_key_index), output_schema_(std::move(output_schema)), swapped_(swapped), use_simd_(use_simd) {}
 
+namespace {
+
+// A reused output column's validity bookkeeping, cleared for a fresh chunk. The
+// DATA is sized by whichever gather is about to fill it, because the two want
+// opposite things: the typed copy RESIZES (a STRING column's elements survive, so
+// its `operator=` reuses the character buffer this node already allocated) while
+// an appendColumnValue gather CLEARS and pushes back. Sizing here would mean one
+// of the two throwing the other's work away.
+inline void resetValidity(ColumnVector& cv) {
+    cv.all_valid = true;
+    cv.validity.clear();
+}
+
+} // namespace
+
 void VecSimdLoopJoinNode::open() {
     probe_child_->open();
     build_child_->open();
 
     build_keys_.clear();
     build_rows_.clear();
-    output_buffer_.clear();
+    probe_chunk_ = nullptr;
+    out_probe_rows_.clear();
+    out_build_rows_.clear();
     output_cursor_ = 0;
+
+    // Where each side's block sits inside output_schema_'s fixed [FROM, JOIN]
+    // order — read off the schemas the operator was given, never derived from a
+    // chunk's column count. THE ONE PLACE swapped_ IS TRANSLATED, so neither the
+    // probe loop nor fillOutChunk has to know about it; this is what replaced the
+    // per-output-row `if (swapped_) { build; probe } else { probe; build }` that
+    // assembled each Row, and it reorders exactly the same way.
+    probe_out_base_ = swapped_ ? build_child_->outputSchema().size() : 0;
+    build_out_base_ = swapped_ ? 0 : probe_child_->outputSchema().size();
 
     // build phase: consume all build side chunks into the flat key buffer +
     // parallel payload rows
@@ -109,30 +137,108 @@ void VecSimdLoopJoinNode::probeKeySimd(int64_t key, std::vector<int>& matches) c
 #endif
 }
 
+// One output column gathered from the probe chunk at the row ids
+// out_probe_rows_[start .. start+count).
+//
+// THE FAST PATH IS A TYPED COPY, not a `Value` round trip, and the difference is
+// two string allocations per cell: valueAt() constructs a Value (copying the
+// characters into it) and appendColumnValue then copies them out again. Straight
+// `dst[i] = src[row]` on the underlying vectors copies once, and resizing rather
+// than clearing keeps the destination string's existing buffer for it to reuse.
+//
+// Taken only when the output column's storage type IS the source's and the source
+// has no NULLs — exactly the case where appendColumnValue reduces to that same
+// assignment. Anything else falls back to appendColumnValue ITSELF rather than to
+// a second copy of its rules, so every refusal in vec_types.h still applies to
+// every cell that could trip one. (The same gather VecHashJoinNode has carried
+// since Week 37, whose comment holds the full argument for why the DOUBLE arm is
+// safe here.)
+void VecSimdLoopJoinNode::gatherProbeColumn(ColumnVector& dst, const ColumnVector& src,
+                                           int start, int count) {
+    const int32_t* rows = out_probe_rows_.data() + start;
+    resetValidity(dst);
+    if (dst.type == src.type && src.all_valid) {
+        std::visit([&](auto& d) {
+            using Vec = std::decay_t<decltype(d)>;
+            d.resize(static_cast<size_t>(count));
+            const Vec& s = std::get<Vec>(src.data);
+            for (int i = 0; i < count; ++i) d[i] = s[rows[i]];
+        }, dst.data);
+        return;
+    }
+    std::visit([](auto& vec) { vec.clear(); }, dst.data);
+    for (int i = 0; i < count; ++i) appendColumnValue(dst, valueAt(src, rows[i]));
+}
+
+// One output column gathered from build_rows_, at the row ids
+// out_build_rows_[start .. start+count).
+//
+// No typed fast path, and that is a property of the STORE rather than an
+// omission: build_rows_ holds `Value`s, so `build_rows_[b][bc]` is already the
+// Value appendColumnValue wants and there is nothing to reinterpret. What matters
+// is that it is read ONCE per output cell, here, instead of being copied into a
+// per-output-row Row first — and that build_rows_ is at most ~50 rows, so the
+// whole store stays in L1 however many times these passes walk it.
+void VecSimdLoopJoinNode::gatherBuildColumn(ColumnVector& dst, int bc, int start, int count) {
+    const int32_t* rows = out_build_rows_.data() + start;
+    resetValidity(dst);
+    std::visit([](auto& vec) { vec.clear(); }, dst.data);
+    for (int i = 0; i < count; ++i) {
+        appendColumnValue(dst, build_rows_[rows[i]][bc]);
+    }
+}
+
 void VecSimdLoopJoinNode::fillOutChunk(int start, int count) {
-    out_chunk_.columns.clear();
     out_chunk_.num_rows = count;
     out_chunk_.filter_applied = false;
     out_chunk_.sel.indices.clear();
     out_chunk_.sel.size = 0;
 
-    for (int c = 0; c < output_schema_.size(); ++c) {
-        ColumnVector cv = makeColumnVector(output_schema_.column(c).type);
-        for (int i = start; i < start + count; ++i) {
-            appendColumnValue(cv, output_buffer_[i][c]);
+    // The columns are BUILT ONCE and refilled thereafter — their types come from
+    // output_schema_ and never change — so the string buffers a chunk allocates
+    // are still there for the next one. Rebuilding them per call threw those away.
+    if (static_cast<int>(out_chunk_.columns.size()) != output_schema_.size()) {
+        out_chunk_.columns.clear();
+        for (int c = 0; c < output_schema_.size(); ++c) {
+            out_chunk_.columns.push_back(makeColumnVector(output_schema_.column(c).type));
         }
-        out_chunk_.columns.push_back(std::move(cv));
+    }
+
+    // The cells are read HERE, from the probe chunk and build_rows_, rather than
+    // copied out of a per-output-row Row that was itself a copy. One traversal per
+    // output column, so each cell is copied exactly once and the writes are
+    // sequential.
+    //
+    // Which side a column comes from is pure arithmetic on the two bases open()
+    // computed; the [FROM, JOIN] order is theirs to encode and this loop never
+    // consults swapped_.
+    const int probe_width = probe_child_->outputSchema().size();
+    for (int c = 0; c < output_schema_.size(); ++c) {
+        ColumnVector& dst = out_chunk_.columns[c];
+        const int pc = c - probe_out_base_;
+        if (pc >= 0 && pc < probe_width) {
+            gatherProbeColumn(dst, probe_chunk_->columns[pc], start, count);
+        } else {
+            gatherBuildColumn(dst, c - build_out_base_, start, count);
+        }
     }
 }
 
 DataChunk* VecSimdLoopJoinNode::nextChunk() {
-    while (output_cursor_ >= static_cast<int>(output_buffer_.size())) {
-        // current output buffer exhausted, pull next probe chunk
-        output_buffer_.clear();
+    while (output_cursor_ >= static_cast<int>(out_probe_rows_.size())) {
+        // Pending output exhausted, pull the next probe chunk. Clearing HERE and
+        // nowhere else is what makes probe_chunk_ safe to read at fill time: the
+        // row ids in out_probe_rows_ only ever name the chunk this loop last
+        // pulled, and it is not pulled again until they have all been emitted.
+        // vec_types.h says the child reuses that buffer on its next call, so this
+        // ordering is the whole lifetime argument.
+        out_probe_rows_.clear();
+        out_build_rows_.clear();
         output_cursor_ = 0;
 
         DataChunk* probe_chunk = probe_child_->nextChunk();
         if (!probe_chunk) return nullptr; // probe side exhausted
+        probe_chunk_ = probe_chunk;
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -163,31 +269,17 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
             if (use_simd_) probeKeySimd(probe_keys[r], matches);
             else probeKeyScalar(probe_keys[r], matches);
 
-            for (int b : matches) {
-                // output row order always matches output_schema_'s fixed
-                // [FROM, JOIN] logical order — reorder here when the FROM
-                // table ended up on the build side (swapped_).
-                Row out_row;
-                out_row.reserve(output_schema_.size());
-
-                auto append_probe = [&]() {
-                    for (const auto& cv : probe_chunk->columns) {
-                        out_row.push_back(valueAt(cv, r));
-                    }
-                };
-                auto append_build = [&]() {
-                    for (const Value& v : build_rows_[b]) out_row.push_back(v);
-                };
-
-                if (swapped_) {
-                    append_build();
-                    append_probe();
-                } else {
-                    append_probe();
-                    append_build();
-                }
-                output_buffer_.push_back(std::move(out_row));
-            }
+            // The matching pairs are NAMED, in the same order the Rows were
+            // pushed: probe rows in probe order (the loop above) and, within one
+            // probe row, build rows in increasing build index (probeKeySimd and
+            // probeKeyScalar both append ascending). Output row order is
+            // observable without a total ORDER BY, so that sequence is the
+            // contract and it is unchanged.
+            //
+            // The [FROM, JOIN] reordering swapped_ used to do per Row now lives
+            // entirely in open()'s two base offsets, applied once per output
+            // COLUMN in fillOutChunk.
+            for (int b : matches) emitRow(r, b);
         }
 
         stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -195,9 +287,9 @@ DataChunk* VecSimdLoopJoinNode::nextChunk() {
         // if no matches from this probe chunk, loop to pull the next one
     }
 
-    // emit one BATCH_SIZE slice from output_buffer_; materialization is real
+    // emit one BATCH_SIZE slice of the pending output; materialization is real
     // work and counts toward this node's time
-    int batch = std::min(BATCH_SIZE, static_cast<int>(output_buffer_.size()) - output_cursor_);
+    int batch = std::min(BATCH_SIZE, static_cast<int>(out_probe_rows_.size()) - output_cursor_);
     auto t_fill = std::chrono::high_resolution_clock::now();
     fillOutChunk(output_cursor_, batch);
     stats.elapsed_us += std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t_fill).count();
@@ -211,6 +303,7 @@ void VecSimdLoopJoinNode::close() {
     probe_child_->close();
     build_keys_.clear();
     build_rows_.clear();
+    probe_chunk_ = nullptr;
 }
 
 const Schema& VecSimdLoopJoinNode::outputSchema() const {
