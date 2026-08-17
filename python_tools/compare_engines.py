@@ -227,6 +227,55 @@ def load_duckdb(catalog_path, workdir, rebuild):
     return path
 
 
+def engine_versions(binary):
+    """Versions of everything being compared, recorded WITH the numbers.
+
+    A latency table without them cannot be reproduced or re-checked, and
+    'PostgreSQL is faster' is a claim about a specific build.
+    """
+    out = {}
+    try:
+        import sqlite3; out["sqlite"] = sqlite3.sqlite_version
+    except Exception: pass
+    try:
+        import duckdb; out["duckdb"] = duckdb.__version__
+    except Exception: pass
+    try:
+        r = subprocess.run([f"{PG_BIN}/psql", "-d", "postgres", "-tAc",
+                            "show server_version"], capture_output=True, text=True)
+        out["postgres"] = r.stdout.strip()
+    except Exception: pass
+    out["swiftql_binary"] = binary
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True)
+        out["swiftql_commit"] = r.stdout.strip()
+    except Exception: pass
+    return out
+
+
+def swiftql_cold_start(binary, catalog):
+    """WALL time for one whole invocation, load included, minus the timed part.
+
+    Every latency in this file excludes load, correctly -- the other engines load
+    once into a persistent database. But SwiftQL has no persistence, so that
+    exclusion hides a real cost: at SF=1 a process spends ~37 s re-reading 1.1 GB
+    of text before it executes anything. Reported as its own number so the
+    exclusion is visible in the results rather than only in the prose.
+    """
+    sql = "SELECT COUNT(*) FROM lineitem"
+    t0 = time.perf_counter()
+    r = subprocess.run([binary, "--catalog", catalog] + SWIFTQL_MODE
+                       + ["--explain-analyze", "--query", sql],
+                       capture_output=True, text=True)
+    wall_ms = (time.perf_counter() - t0) * 1000.0
+    if r.returncode != 0:
+        return None
+    m = SWIFTQL_TIMES.search(r.stdout)
+    timed = sum(float(m.group(i)) * TO_MS[m.group(i + 1)] for i in (1, 3, 5)) if m else 0.0
+    return {"wall_ms": wall_ms, "timed_ms": timed, "load_ms": wall_ms - timed}
+
+
 def pg_running():
     return subprocess.run([f"{PG_BIN}/pg_isready", "-q"]).returncode == 0
 
@@ -331,6 +380,16 @@ def measure(fn, warmups, reps):
             vals = [r[key] for r in runs]
             out[key] = statistics.median(vals)
             out[f"min_{key}"] = min(vals)
+            # SPREAD, because a median alone cannot support a 10%-margin claim.
+            # Several conclusions here turn on differences smaller than plausible
+            # run-to-run variation (the SF=1 Postgres figure is 0.90x), and until
+            # this was recorded nothing in the output could distinguish those
+            # from noise. rel_spread is (max-min)/median: a claimed margin below
+            # it is not a measurement, it is a coin flip.
+            out[f"max_{key}"] = max(vals)
+            out[f"samples_{key}"] = vals
+            out[f"rel_spread_{key}"] = ((max(vals) - min(vals)) / statistics.median(vals)
+                                        if statistics.median(vals) else 0.0)
     return out
 
 
@@ -410,7 +469,15 @@ def main():
         runners["postgres"] = lambda sql, d=pg_db, su=pg_setup: time_dbapi(
             lambda: psycopg2.connect(dbname=d), sql, su)
 
+    cold = (swiftql_cold_start(args.swiftql_bin, catalog)
+            if "swiftql" in runners else None)
+
     print(f"\ncatalog: {catalog}")
+    if cold:
+        # The number the latency table deliberately excludes, stated beside it.
+        print(f"swiftql cold start: {cold['wall_ms']/1000:.1f}s wall, of which "
+              f"{cold['load_ms']/1000:.1f}s is load EXCLUDED from every row below")
+    print(f"versions: {engine_versions(args.swiftql_bin)}")
     print(f"indexes:  {'NONE (--no-index)' if args.no_index else 'TPC-H spec PK/FK on sqlite+postgres, ANALYZE'}")
     print(f"engines: {', '.join(runners)}   "
           f"median of {args.reps} after {args.warmups} warmup\n")
@@ -419,7 +486,7 @@ def main():
     print(header)
     print("-" * len(header))
 
-    results = {}
+    results, disagreements = {}, []
     for qid in qids:
         sql = render(qid)
         cells, row_counts = [], set()
@@ -433,9 +500,20 @@ def main():
         # Row counts are not the correctness oracle -- run_tpch.py is -- but four
         # engines disagreeing on how many rows they returned makes any latency
         # comparison meaningless, so it is shown rather than assumed.
-        note = (str(row_counts.pop()) if len(row_counts) == 1
-                else f"DISAGREE {sorted(row_counts)}")
+        if len(row_counts) == 1:
+            note = str(row_counts.pop())
+        else:
+            note = f"DISAGREE {sorted(row_counts)}"
+            disagreements.append(qid)
         print(f"{qid:<6}" + "".join(cells) + f"   {note}", flush=True)
+
+    if disagreements:
+        # Not a footnote. Two engines returning different row counts means the
+        # latencies on that row are for different answers, so the row is not a
+        # comparison at all. It was found by eye the first time (q15, Postgres);
+        # now the harness says so itself.
+        print(f"\n!! ROW-COUNT DISAGREEMENT on {disagreements} -- those rows compare "
+              "different answers and must be excluded from any aggregate")
 
     if args.json:
         with open(args.json, "w") as f:
@@ -453,6 +531,9 @@ def main():
                                                 if args.pg_single_threaded
                                                 else "server default"),
                        "swiftql_bin": args.swiftql_bin,
+                       "engine_versions": engine_versions(args.swiftql_bin),
+                       "swiftql_cold_start": cold,
+                       "row_count_disagreements": disagreements,
                        "results": results}, f, indent=2, sort_keys=True)
         print(f"\nwrote {args.json}")
 

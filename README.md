@@ -2336,7 +2336,7 @@ including the ones that are not results, in
 | | SF=0.01 | SF=0.1 | SF=1 |
 |---|---|---|---|
 | vs **SQLite** | 0.70× | **0.35×** | **0.33× — 3.0× faster** |
-| vs **PostgreSQL** (default) | **0.30×** | **0.62×** | **0.90× — 1.11× faster** |
+| vs **PostgreSQL** (default) | **0.30×** | **0.62×** | 0.93× — **a tie** (see below) |
 | vs **PostgreSQL** (single-threaded) | — | — | **0.54× — 1.9× faster** |
 | vs **DuckDB** | 1.16× | 4.55× | 16.07× |
 | optimizer (`--no-optimize` ÷ optimized) | 1.92× | 2.22× | **2.44×** |
@@ -2348,6 +2348,15 @@ crippled ones. SwiftQL and DuckDB carry no indexes; both prune with automatic
 min/max zone maps instead. SwiftQL is single-threaded throughout. Load excluded
 for every engine. Median of 5 repetitions (3 at SF=1) after one discarded
 warmup. 24 GB, 14 cores, macOS.
+
+**The SF=1 PostgreSQL figure is a tie, and that is a correction.** A
+five-repetition run gives a geometric mean of 0.93×, but the median relative
+spread is 11.5% for SwiftQL and 9.2% for PostgreSQL; recomputing at each engine's
+extremes gives 0.80× at best and **1.08× at worst**, so parity is inside the
+interval. Earlier three-repetition runs reported 0.87× and 0.90× as wins; both
+were inside the noise. **No margin under roughly 1.3× on this machine should be
+read as a result** — which leaves the SQLite (3.0×), single-threaded PostgreSQL
+(1.9×) and DuckDB (16×) figures standing and this one not.
 
 **PostgreSQL is reported twice on purpose.** Its default allows two parallel
 workers and every TPC-H table over 8 MB qualifies, so at SF=1 the default column

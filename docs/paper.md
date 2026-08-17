@@ -13,8 +13,10 @@ check that neuters each query's characteristic predicate, so no query is counted
 as correct while asserting nothing. Adding the published answers as a second,
 independent oracle immediately found two defects in our own query port that
 SQLite could not detect, because SQLite executed the same ported text. On latency, SwiftQL
-is **3.0× faster than SQLite** and **1.11× faster than PostgreSQL** at SF=1 by
-geometric mean, rising to **1.9× against PostgreSQL restricted to one core**;
+is **3.0× faster than SQLite** at SF=1 by geometric mean and **1.9× faster than
+PostgreSQL restricted to one core**; against PostgreSQL at its default
+parallelism it is **indistinguishable** (geometric mean 0.93×, but run-to-run
+spread of 9–12% puts parity inside the interval);
 against DuckDB it is **16.1× slower**, a gap that widens monotonically with scale
 and is attributable to parallelism, which SwiftQL does not implement. Its
 cost-based optimizer is worth **2.44×** at SF=1 and improves 17 of 21 queries.
@@ -127,8 +129,8 @@ persistence — every invocation re-reads and re-parses the `.tbl` files — so 
 timed from its own `--explain-analyze` footer, whose timers begin after the load.
 We verified the exclusion directly: 1.56 s of wall clock against a reported
 17.7 ms on the same query. Including SwiftQL's load would measure a CSV parser
-against three storage engines; excluding it hides that SwiftQL takes 36.8 s to
-*start* a query at SF=1, which Section 7 records as a system-level limitation.
+against three storage engines; excluding it hides that SwiftQL takes **21.9 s** to
+*start* a query at SF=1 (measured by the harness itself), which Section 7 records as a system-level limitation.
 
 **Statistic.** Median of 5 repetitions (3 at SF=1) after one discarded warmup.
 Machine: Apple silicon, 14 cores, 24 GB, macOS. Aggregates are **geometric
@@ -211,7 +213,7 @@ Geometric mean of SwiftQL ÷ engine; **below 1.0 means SwiftQL is faster**.
 | | SF=0.01 | SF=0.1 | SF=1 |
 |---|---|---|---|
 | vs **SQLite** | 0.70× | 0.35× | **0.33× (3.0× faster)** |
-| vs **PostgreSQL**, default | 0.30× | 0.62× | **0.90× (1.11× faster)** |
+| vs **PostgreSQL**, default | 0.30× | 0.62× | 0.93× — **a tie**, see §5.2 |
 | vs **PostgreSQL**, 1 thread | — | — | **0.54× (1.9× faster)** |
 | vs **DuckDB** | 1.16× | 4.55× | 16.07× |
 | optimizer (`--no-optimize` ÷ optimized) | 1.92× | 2.22× | **2.44×** |
@@ -240,6 +242,25 @@ assumption compounding along a join spine.*
 in rows, while SQLite's per-row index traversal degrades on large joins. The
 largest SF=1 wins are q14 (69.5×), q15 (66.9×), q5 (17.7×) and q7 (16.6×) — all
 single-pass aggregations or joins over `lineitem`.
+
+### 5.2 The SF=1 PostgreSQL comparison is a tie, not a win
+
+A second sample settles it. Five repetitions of SwiftQL against PostgreSQL at
+SF=1 give a geometric mean of 0.931×, but the **median relative spread is 11.5%
+for SwiftQL and 9.2% for PostgreSQL**, with per-query maxima above 78%.
+Recomputing the mean at each engine's extremes gives 0.804× at best and
+**1.079× at worst** — the interval contains parity.
+
+We therefore do not claim a win here. Our earlier three-repetition runs produced
+0.87× and 0.90× and we reported them as a 1.15× and 1.11× advantage; both were
+inside the noise the entire time. **The claim we were most pleased with is the
+one that did not survive being measured twice**, and the general rule this
+implies for the rest of this table is that no margin under roughly 1.3× on this
+machine should be read as a result.
+
+The two PostgreSQL claims that do survive are the single-threaded comparison
+(0.54×, a 1.9× margin) and every SQLite and DuckDB figure, whose margins are 3×
+and 16×.
 
 **Against PostgreSQL the interesting number is the pair.** At its default
 configuration PostgreSQL uses up to two parallel workers, and every TPC-H table
@@ -381,7 +402,7 @@ which is an index in a cheaper form.
 **Single-threaded**, against systems that are not. This is most of the DuckDB gap
 and all of the PostgreSQL default-configuration gap.
 
-**No persistence.** A single SwiftQL invocation at SF=1 takes 36.8 s of wall
+**No persistence.** A single SwiftQL invocation at SF=1 takes 21.9 s of wall
 clock while executing in milliseconds, because every process re-reads 1.1 GB of
 text. Our reported latencies correctly exclude this, and it is the largest gap
 between the *engine* being fast and the *system* being usable.
@@ -423,7 +444,7 @@ configuration that produced it are not reporting a measurement.
 | All 22 queries answered | `run_tpch.py` 22×4 matrix, `docs/week-37-measurements.md` §1 | supported |
 | 22/22 meaningful at SF=0.1 and SF=1 | mutation check per query, same table | supported |
 | 3.0× faster than SQLite at SF=1 | geomean 0.33× over 21 queries, `week-37-per-query.md` | supported |
-| 1.11× faster than default PostgreSQL at SF=1 | geomean 0.90× | supported |
+| ~~1.11× faster than default PostgreSQL at SF=1~~ | geomean 0.931× over 5 reps; spread 9–12% puts parity in the interval (worst case 1.079×) | **RETRACTED — stated as a tie** |
 | 1.9× faster than single-threaded PostgreSQL | geomean 0.54×, `week-37-pg-single-threaded-sf1.json` | supported |
 | 16.1× slower than DuckDB | geomean 16.07× | supported |
 | Optimizer worth 2.44× at SF=1 | `swiftql` vs `swiftql-noopt`, same run | supported |
