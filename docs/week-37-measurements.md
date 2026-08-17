@@ -555,6 +555,44 @@ gates cannot see is the finding.
 Columnar storage alone is neutral on scans (0.96-0.97x) and pays only where zone
 maps prune. The vectorized executor carries the gain.
 
+## 15. Final numbers, after the port fixes and the recalibration
+
+Everything re-measured on one binary containing every Week 37 optimization, the
+SIMD loop join rewrite, the recalibrated crossover, and the two query-port fixes.
+
+| geomean (SwiftQL / engine) | SF=0.01 | SF=0.1 | SF=1 |
+|---|---|---|---|
+| vs SQLite | 0.70x | 0.35x | **0.33x — 3.0x faster** |
+| vs Postgres (default, parallel) | 0.30x | 0.62x | **0.90x — 1.11x faster** |
+| vs Postgres (single-threaded) | — | — | **0.54x — 1.9x faster** |
+| vs DuckDB | 1.16x | 4.55x | 16.07x |
+| optimizer | 1.92x | 2.22x | **2.44x** |
+
+Correctness re-verified after the port fixes: **22/22 meaningful, 0 vacuous** at
+SF=1, and **22/22 against the published answer set**.
+
+### The port fixes made two queries slower, and that is the honest direction
+
+| query (SF=1) | before | after |
+|---|---|---|
+| q19 | 31.7 ms | 53.6 ms |
+| q20 | 45.2 ms | **505.4 ms** |
+
+**q20 is now a loss** — 505 ms against SQLite's 102 ms and Postgres's 108 ms —
+where the weakened version was competitive. Its real predicate is a correlated
+aggregate over `lineitem` per (partkey, suppkey); `ps_availqty > 0` was free.
+This moved the SF=1 Postgres geometric mean from 0.87x to 0.90x.
+
+Reporting the Week 37 speedups without this would have been publishing an
+improvement measured against a benchmark we had made easier.
+
+### The optimizer figure went UP, not down
+
+2.22x -> **2.44x** at SF=1, despite the recalibration removing an operator choice
+the optimizer used to make. Two reasons: q19's OR-restriction derivation now
+applies to the correct (heavier) query, and the hash join it now selects is
+faster than the loop join it used to pick.
+
 ## Not yet measured
 
 - A single-execution lower bound for the three unindexed timeouts (q17, q21,

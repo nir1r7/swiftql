@@ -13,11 +13,11 @@ check that neuters each query's characteristic predicate, so no query is counted
 as correct while asserting nothing. Adding the published answers as a second,
 independent oracle immediately found two defects in our own query port that
 SQLite could not detect, because SQLite executed the same ported text. On latency, SwiftQL
-is **3.0× faster than SQLite** and **1.15× faster than PostgreSQL** at SF=1 by
-geometric mean, rising to **2.0× against PostgreSQL restricted to one core**;
-against DuckDB it is **15.4× slower**, a gap that widens monotonically with scale
+is **3.0× faster than SQLite** and **1.11× faster than PostgreSQL** at SF=1 by
+geometric mean, rising to **1.9× against PostgreSQL restricted to one core**;
+against DuckDB it is **16.1× slower**, a gap that widens monotonically with scale
 and is attributable to parallelism, which SwiftQL does not implement. Its
-cost-based optimizer is worth **2.22×** at SF=1 and improves 17 of 21 queries.
+cost-based optimizer is worth **2.44×** at SF=1 and improves 17 of 21 queries.
 
 The evaluation's main contribution is methodological. We show that three
 measurement artifacts, each individually capable of inverting the headline
@@ -210,12 +210,12 @@ Geometric mean of SwiftQL ÷ engine; **below 1.0 means SwiftQL is faster**.
 
 | | SF=0.01 | SF=0.1 | SF=1 |
 |---|---|---|---|
-| vs **SQLite** | 0.74× | 0.37× | **0.33× (3.0× faster)** |
-| vs **PostgreSQL**, default | 0.29× | 0.65× | **0.87× (1.15× faster)** |
-| vs **PostgreSQL**, 1 thread | — | — | **0.49× (2.0× faster)** |
-| vs **DuckDB** | 1.20× | 4.70× | 15.37× |
-| optimizer (`--no-optimize` ÷ optimized) | 1.69× | 1.92× | **2.22×** |
-| queries won vs SQLite | 9/22 | 15/22 | 17/21 |
+| vs **SQLite** | 0.70× | 0.35× | **0.33× (3.0× faster)** |
+| vs **PostgreSQL**, default | 0.30× | 0.62× | **0.90× (1.11× faster)** |
+| vs **PostgreSQL**, 1 thread | — | — | **0.54× (1.9× faster)** |
+| vs **DuckDB** | 1.16× | 4.55× | 16.07× |
+| optimizer (`--no-optimize` ÷ optimized) | 1.92× | 2.22× | **2.44×** |
+| queries won vs SQLite | 10/22 | 17/22 | 16/21 |
 
 ![Per-query latency at SF=1](figures/fig1-per-query-sf1.png)
 *Figure 1 — per-query latency at SF=1, log axis. The distribution is heavily
@@ -249,12 +249,13 @@ speedup measures **1.73×**, and SwiftQL's margin doubles from 1.15× to 2.0×. 
 publish both: single-threaded is the engine-against-engine comparison, default is
 the configuration a user actually runs.
 
-**The DuckDB gap widens by 13× across two orders of magnitude** and SwiftQL wins
+**The DuckDB gap widens by 14× across two orders of magnitude** and SwiftQL wins
 9 of 22 queries at SF=0.01 but none at either larger scale. DuckDB uses 14 cores.
 We draw no conclusion beyond that.
 
-**The optimizer's contribution grows with scale** and is bimodal per query. At
-SF=1 it is worth 21.2× on q8, 9.3× on q21, 5.3× on q2 and 4.4× on q19 — the
+**The optimizer's contribution grows with scale** — 1.92×, 2.22×, 2.44× — and is
+bimodal per query: at SF=1 the largest gains are on the queries whose *shape* the
+planner rewrites — the
 queries whose *shape* the planner rewrites — while q1, q6, q13, q15, q18, q20 and
 q22 sit at ≈1.0×. There is no middle: a query either has a rewritable shape or it
 does not.
@@ -396,10 +397,10 @@ comparisons SwiftQL can enter.
 
 ## 8. Conclusion
 
-SwiftQL answers all 22 TPC-H queries, matches SQLite on all 22 at two scale
-factors with every match mutation-checked, and is 3.0× faster than SQLite and
-1.15× faster than PostgreSQL at SF=1 while using one core and no indexes. Its
-optimizer is worth 2.22×, and the queries it helps most are the ones whose shape
+SwiftQL answers all 22 TPC-H queries, matches **the published TPC-H answer set**
+on all 22 at SF=1, matches SQLite on all 22 at two scale factors with every match
+mutation-checked, and is 3.0× faster than SQLite and 1.11× faster than PostgreSQL
+at SF=1 while using one core and no indexes. Its optimizer is worth 2.44×, and the queries it helps most are the ones whose shape
 it rewrites — decorrelation to semi/anti joins, derived-table extraction, and
 disjunctive restriction derivation — rather than the ones where it merely
 reorders.
@@ -422,10 +423,11 @@ configuration that produced it are not reporting a measurement.
 | All 22 queries answered | `run_tpch.py` 22×4 matrix, `docs/week-37-measurements.md` §1 | supported |
 | 22/22 meaningful at SF=0.1 and SF=1 | mutation check per query, same table | supported |
 | 3.0× faster than SQLite at SF=1 | geomean 0.33× over 21 queries, `week-37-per-query.md` | supported |
-| 1.15× faster than default PostgreSQL at SF=1 | geomean 0.87× | supported |
-| 2.0× faster than single-threaded PostgreSQL | geomean 0.49×, `week-37-pg-single-threaded-sf1.json` | supported |
-| 15.4× slower than DuckDB | geomean 15.37× | supported |
-| Optimizer worth 2.22× at SF=1 | `swiftql` vs `swiftql-noopt`, same run | supported |
+| 1.11× faster than default PostgreSQL at SF=1 | geomean 0.90× | supported |
+| 1.9× faster than single-threaded PostgreSQL | geomean 0.54×, `week-37-pg-single-threaded-sf1.json` | supported |
+| 16.1× slower than DuckDB | geomean 16.07× | supported |
+| Optimizer worth 2.44× at SF=1 | `swiftql` vs `swiftql-noopt`, same run | supported |
+| Fixing the q19/q20 ports made both queries slower | q20 45.2 → 505.4 ms at SF=1; moved the Postgres geomean 0.87 → 0.90 | supported |
 | `-O0` build cost ~21× | four queries, both builds, byte-identical answers | supported |
 | PostgreSQL parallelism worth 1.73× | default vs `max_parallel_workers_per_gather=0` | supported |
 | SQLite unindexed q22 takes 6.9 min | one execution, `--reps 1 --warmups 0` | supported |

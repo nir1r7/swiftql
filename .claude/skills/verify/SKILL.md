@@ -38,7 +38,31 @@ python3 python_tools/test_new_queries.py
 python3 python_tools/run_tpch.py \
     --catalog data/tpch/sf0.01/catalog.json \
     --baseline docs/tpch-baseline.json
+
+# 6. Official TPC-H answer set. Only meaningful at SF=1 with dbgen data --
+#    the published answers are defined for that and nothing else. Requires
+#    tpch-tools/ (the official kit, gitignored) and data/tpch/dbgen-sf1.
+.venv/bin/python python_tools/validate_answers.py \
+    --catalog data/tpch/dbgen-sf1/catalog.json
 ```
+
+## Gate 6 — the published answers
+
+Gates 1-5 all rest on ONE oracle: SQLite, running **the same ported query text
+SwiftQL runs**. That oracle cannot check the port itself, and in Week 38 it
+turned out not to have: q19 rendered a shipmode literal the spec does not use,
+and q20 replaced the spec's correlated availability test with `ps_availqty > 0`.
+SQLite returned answers byte-identical to SwiftQL's on both while both differed
+from the specification, and the mutation check called q20 DISCRIMINATING because
+it was aimed at a predicate that was not the point.
+
+`dbgen/answers/*.out` was computed by neither engine. It is the only check here
+that can fail when SwiftQL and SQLite agree.
+
+**Expected: `MATCHES THE PUBLISHED TPC-H ANSWER SET: 22/22`.** Anything less is a
+defect in the engine OR in the port, and the two are distinguished by asking
+SQLite the same query on the same data: if SQLite agrees with SwiftQL, the port
+is wrong; if it agrees with the answer file, the engine is.
 
 ## Gate 5 — TPC-H
 

@@ -2335,11 +2335,11 @@ including the ones that are not results, in
 
 | | SF=0.01 | SF=0.1 | SF=1 |
 |---|---|---|---|
-| vs **SQLite** | 0.74× | **0.37×** | **0.33× — 3.0× faster** |
-| vs **PostgreSQL** (default) | **0.29×** | **0.65×** | **0.87× — 1.15× faster** |
-| vs **PostgreSQL** (single-threaded) | — | — | **0.49× — 2.0× faster** |
-| vs **DuckDB** | 1.20× | 4.70× | 15.37× |
-| optimizer (`--no-optimize` ÷ optimized) | 1.69× | 1.92× | **2.22×** |
+| vs **SQLite** | 0.70× | **0.35×** | **0.33× — 3.0× faster** |
+| vs **PostgreSQL** (default) | **0.30×** | **0.62×** | **0.90× — 1.11× faster** |
+| vs **PostgreSQL** (single-threaded) | — | — | **0.54× — 1.9× faster** |
+| vs **DuckDB** | 1.16× | 4.55× | 16.07× |
+| optimizer (`--no-optimize` ÷ optimized) | 1.92× | 2.22× | **2.44×** |
 
 **Conditions, because they decide what these numbers mean.** SQLite and
 PostgreSQL carry the TPC-H specification's own PRIMARY and FOREIGN key indexes
@@ -2355,8 +2355,8 @@ is PostgreSQL on up to three processes against SwiftQL's one. Single-threaded is
 the engine-against-engine comparison; default is the configuration anyone
 actually runs. Quoting either alone is cherry-picking.
 
-**The DuckDB gap widens with scale** — 1.20× → 4.70× → 15.37×, and SwiftQL wins
-9 of 22 queries at SF=0.01 but none at either larger scale. DuckDB uses 14 cores.
+**The DuckDB gap widens with scale** — 1.16× → 4.55× → 16.07×, and SwiftQL wins
+10 of 22 queries at SF=0.01 but none at either larger scale. DuckDB uses 14 cores.
 Parallelism is a Possible Extension, not Phase 5 work.
 
 **Estimate accuracy**, 276 plan nodes (`python_tools/qerror_tpch.py`):
