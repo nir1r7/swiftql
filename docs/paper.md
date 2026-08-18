@@ -232,6 +232,12 @@ PostgreSQL, and loses ground to DuckDB, monotonically in all three cases.*
 *Figure 3 — optimizer impact per query at SF=1. Bimodal: a query either has a
 rewritable shape or it does not.*
 
+![Measurement uncertainty](figures/fig5-variance-sf1.png)
+*Figure 5 — per-query SwiftQL ÷ PostgreSQL at SF=1 over 5 repetitions, bar
+spanning best case to worst case, with the band inside which a ratio cannot be
+distinguished from parity. Six queries straddle it. This figure is why §5.2
+reports a tie rather than a win.*
+
 ![q-error](figures/fig4-qerror.png)
 *Figure 4 — cardinality-estimation accuracy. The medians are close; the SF=1
 curve falls below the SF=0.1 curve in the tail, which is the independence
